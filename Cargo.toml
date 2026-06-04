@@ -14,12 +14,12 @@ crate-type = ["rlib"]
 
 [dependencies]
 # Async runtime
-tokio = {  version = "1.35", features = ["sync", "macros", "io-util", "rt", "rt-multi-thread", "time", "fs", "process", "signal"]  }
+tokio = { version = "1.35", features = ["sync", "macros", "io-util", "rt", "rt-multi-thread", "time", "fs", "process", "signal"] }
 tokio-stream = "0.1"
 futures = "0.3"
 
 # Serialization
-serde = {  version = "1.0", features = ["derive"]  }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 toml = "0.8"
@@ -93,13 +93,13 @@ arc-swap = "1.8"
 
 # Audio processing (for native nodes)
 rubato = "0.15"
-bytemuck = {  version = "1.14", features = ["derive"]  }
+bytemuck = { version = "1.14", features = ["derive"] }
 # `ort`, `ndarray`, `rustfft`, `tokenizers`, `half` were pulled out
 # alongside the heavy ONNX nodes (SileroVAD, WhisperToVad, LFM25Audio,
 # VogentTurn, Audio2FaceLipSync) when they moved to standalone plugins.
 # Core no longer carries any ONNX inference deps.
 # `zip` stays — still used by `activation-face` for NPZ archive loading.
-zip = {  version = "2.2", default-features = false, features = ["deflate"] , optional = true }
+zip = { version = "2.2", default-features = false, features = ["deflate"], optional = true }
 
 # Affect simulator (Phase 1 deterministic affect-state model). Used
 # by `AffectSimulatorNode` to drive runtime Channel A/B/D updates
@@ -132,8 +132,8 @@ ac-ffmpeg = { version = "0.19", optional = true }
 # multi-minute CUDA C++ build in the default workspace cargo build).
 
 # IPC for multiprocess
-iceoryx2 = "0.9.0"
-iceoryx2-log = "0.9.0"
+iceoryx2 = { version = "0.9.0", optional = true }
+iceoryx2-log = { version = "0.9.0", optional = true }
 
 # Note: Python wrapper nodes are in a separate crate (remotemedia-nodes-python).
 # Users should add that crate as a dependency to get Python nodes.
@@ -141,28 +141,28 @@ iceoryx2-log = "0.9.0"
 
 # Logging and tracing
 tracing = "0.1"
-tracing-subscriber = {  version = "0.3", features = ["env-filter", "json"]  }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1.0.100"
-bollard = {  version = "0.19.4", features = ["chrono"]  }
-hex.workspace = true
-num_cpus.workspace = true
-rand.workspace = true
-glob.workspace = true
-rusqlite.workspace = true
-uuid.workspace = true
-thiserror.workspace = true
-bytes.workspace = true
-tar.workspace = true
-reqwest.workspace = true
-chrono.workspace = true
-regex.workspace = true
+bollard = { version = "0.19.4", features = ["chrono"] }
+hex = "0.4"
+num_cpus = "1.16"
+rand = { version = "0.8" }
+glob = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+thiserror = "1.0"
+bytes = "1.0"
+tar = "0.4"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.10"
 histogram = "0.11.3"
-crossbeam.workspace = true
-sha2.workspace = true
-hdrhistogram.workspace = true
-parking_lot.workspace = true
-dashmap.workspace = true
-hyper = "1.1"
+crossbeam = "0.8"
+sha2 = "0.10"
+hdrhistogram = "7.5"
+parking_lot = "0.12"
+dashmap = "6.1"
+hyper = { version = "1.1", features = ["full"] }
 http-body-util = { version = "0.1", optional = true }
 
 # Force vendored OpenSSL to avoid system version mismatch (OPENSSL_API_COMPAT error)
@@ -180,30 +180,30 @@ flate2 = "1"
 
 # Platform-specific
 [target.'cfg(unix)'.dependencies]
-nix = {  version = "0.30.1", features = ["signal", "process"]  }
+nix = { version = "0.30.1", features = ["signal", "process"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows = {  version = "0.52", features = ["Win32_System_ProcessStatus", "Win32_Foundation"]  }
+windows = { version = "0.52", features = ["Win32_System_ProcessStatus", "Win32_Foundation"] }
 
 # Error handling
 anyhow = "1.0.100"
 thiserror = "1.0"
 
 # gRPC client (for remote pipeline nodes)
-tonic = {  version = "0.14", features = ["transport", "tls-ring"] , optional = true }
-prost = "0.14"
-prost-types = "0.14"
+tonic = { version = "0.14", features = ["transport", "tls-ring"], optional = true }
+prost = { version = "0.14", optional = true }
+prost-types = { version = "0.14", optional = true }
 
 # Utilities
-uuid = {  version = "1.6", features = ["v4", "serde"]  }
+uuid = { version = "1.6", features = ["v4", "serde"] }
 sha2 = "0.10"
 hex = "0.4"
 num_cpus = "1.16"
 regex = "1.10"
 ctrlc = "3.4"
-reqwest = {  version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"]  }
-rand = { workspace = true }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rand = { version = "0.8" }
 url = "2.5"
 # (tar / flate2 / toml moved above the windows-target section to avoid
 # the accidental cfg(windows) scoping — see note near openssl above.)
@@ -216,25 +216,25 @@ crossbeam = "0.8"
 hdrhistogram = "7.5"
 
 # Docker executor (spec 009)
-bollard = {  version = "0.19.4", features = ["chrono"] , optional = true }
-rusqlite = {  version = "0.32", features = ["bundled"] , optional = true }
+bollard = { version = "0.19.4", features = ["chrono"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 # tar is unconditional (declared above for the plugin resolver) — docker
 # feature reuses it without re-declaration.
-chrono = { workspace = true, optional = true }
-bytes = "1.0"
+chrono = { version = "0.4", features = ["serde"], optional = true }
+bytes = { version = "1.0", optional = true }
 # hyper and http-body-util are transitive deps from bollard, add them directly
-hyper = "1.1"
+hyper = { version = "1.1", optional = true }
 http-body-util = { version = "0.1", optional = true }
-glob = "0.3"
+glob = { version = "0.3", optional = true }
 
 [dev-dependencies]
 remotemedia-core = { path = "../remotemedia-sdk/crates/core" }
-tokio-test = { workspace = true }
-criterion = { workspace = true }
-tempfile = { workspace = true }
-rand = { workspace = true }
-chrono = { workspace = true }
-hound = { workspace = true }
+tokio-test = { version = "0.4" }
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = { version = "3.8" }
+rand = { version = "0.8" }
+chrono = { version = "0.4", features = ["serde"] }
+hound = { version = "3.5" }
 anyhow = "1.0.100"
 # Mel-spectrogram parity fixtures (vogent_turn). 0.8 matches workspace
 # ndarray 0.15; ndarray-npy 0.9 requires ndarray 0.16.
@@ -247,7 +247,7 @@ remotemedia-grpc = { path = "../remotemedia-sdk/crates/transports/grpc" }
 remotemedia-python-nodes = { path = "../remotemedia-sdk/crates/python-nodes" }
 axum = "0.7"
 tokio-stream = "0.1"
-tonic = {  version = "0.14", features = ["transport", "tls-ring"]  }
+tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 
 [features]
 default = []
