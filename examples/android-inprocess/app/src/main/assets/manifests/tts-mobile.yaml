@@ -1,0 +1,78 @@
+# tts-mobile.yaml
+# Text-to-Speech pipeline: LLM → TTS → Audio output
+# For text input (e.g., from chat) to speech output
+
+pipeline:
+  name: "tts-mobile"
+  version: "1.0.0"
+  description: "Offline text-to-speech with LLM and Kokoro TTS"
+  execution_mode: "InProcess"
+
+nodes:
+  # LLM - Phi-3-mini for text generation
+  - id: "llm"
+    type: "PythonNode"
+    class: "Phi3LLMNode"
+    module_path: "assets://models/llm/phi3_mini/"
+    execution_mode: "InProcess"
+    config:
+      model: "phi-3-mini-4k-instruct"
+      max_tokens: 200
+      temperature: 0.8
+      top_p: 0.9
+      top_k: 50
+      system_prompt: "You are a helpful assistant. Generate natural, conversational responses suitable for speech synthesis."
+      stream: true
+    inputs:
+      - "text_in"
+    outputs:
+      - "llm_out"
+
+  # Text-to-Speech - Kokoro (ONNX)
+  - id: "tts"
+    type: "PythonNode"
+    class: "KokoroTTSNode"
+    module_path: "assets://models/tts/kokoro/"
+    execution_mode: "InProcess"
+    config:
+      voice: "af_bella"  # Options: af_bella, af_sarah, am_michael, etc.
+      speed: 1.0
+      sample_rate: 24000
+      stream: true
+    inputs:
+      - "llm_out"
+    outputs:
+      - "audio_out"
+
+  # Audio output node
+  - id: "audio_output"
+    type: "AudioOutputNode"
+    execution_mode: "InProcess"
+    config:
+      sample_rate: 48000
+      channels: 1
+      buffer_size_ms: 100
+    inputs:
+      - "audio_out"
+    outputs: []
+
+connections:
+  - from: "llm.llm_out"
+    to: "tts.text_in"
+  - from: "tts.audio_out"
+    to: "audio_output.audio_in"
+
+runtime:
+  python:
+    interpreter: "cpython"
+    version: "3.11"
+    site_packages: "assets://site-packages/"
+  audio:
+    output_sample_rate: 48000
+  memory_limit_mb: 384
+
+android:
+  foreground_service: true
+  wake_lock: true
+  audio_focus: true
+  model_cache_dir: "cache/models/"

@@ -1,0 +1,79 @@
+# transcribe-mobile.yaml
+# Transcription-only pipeline: VAD → STT → Text output
+# Optimized for fast, accurate speech-to-text on mobile
+
+pipeline:
+  name: "transcribe-mobile"
+  version: "1.0.0"
+  description: "Offline speech transcription with VAD and Whisper"
+  execution_mode: "InProcess"
+
+nodes:
+  # Voice Activity Detection - Silero VAD (ONNX)
+  - id: "vad"
+    type: "PythonNode"
+    class: "SileroVADNode"
+    module_path: "assets://models/vad/silero_vad.onnx"
+    execution_mode: "InProcess"
+    config:
+      threshold: 0.5
+      min_speech_duration_ms: 250
+      min_silence_duration_ms: 1000
+      sample_rate: 16000
+    inputs:
+      - "audio_in"
+    outputs:
+      - "vad_out"
+
+  # Speech-to-Text - Whisper base (Candle)
+  - id: "stt"
+    type: "PythonNode"
+    class: "WhisperSTTNode"
+    module_path: "assets://models/whisper/base.pt"
+    execution_mode: "InProcess"
+    config:
+      model_size: "base"  # Better accuracy for transcription
+      language: "auto"
+      task: "transcribe"
+      temperature: 0.0
+      beam_size: 5
+      patience: 1.0
+      word_timestamps: true
+    inputs:
+      - "vad_out"
+    outputs:
+      - "text_out"
+
+  # Text output formatter
+  - id: "formatter"
+    type: "PythonNode"
+    class: "TextFormatterNode"
+    module_path: "assets://nodes/text_formatter.py"
+    execution_mode: "InProcess"
+    config:
+      include_timestamps: true
+      segment_duration_threshold: 0.5
+    inputs:
+      - "text_out"
+    outputs:
+      - "formatted_text"
+
+connections:
+  - from: "vad.vad_out"
+    to: "stt.audio_in"
+  - from: "stt.text_out"
+    to: "formatter.text_in"
+
+runtime:
+  python:
+    interpreter: "cpython"
+    version: "3.11"
+  audio:
+    input_sample_rate: 48000
+    processing_sample_rate: 16000
+  memory_limit_mb: 256
+
+android:
+  foreground_service: true
+  wake_lock: true
+  model_cache_dir: "cache/models/"

@@ -1,0 +1,45 @@
+<resources>
+    <!-- Base application theme -->
+    <style name="Theme.RemoteMediaInProcess" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+        <!-- Primary brand color -->
+        <item name="colorPrimary">@color/primary</item>
+        <item name="colorPrimaryVariant">@color/primary_dark</item>
+        <item name="colorOnPrimary">@color/white</item>
+        
+        <!-- Secondary brand color -->
+        <item name="colorSecondary">@color/accent</item>
+        <item name="colorSecondaryVariant">@color/accent_dark</item>
+        <item name="colorOnSecondary">@color/white</item>
+        
+        <!-- Status bar -->
+        <item name="android:statusBarColor">?attr/colorPrimaryVariant</item>
+        
+        <!-- Background -->
+        <item name="android:windowBackground">@color/background</item>
+        
+        <!-- Text -->
+        <item name="android:textColorPrimary">@color/primary_text</item>
+        <item name="android:textColorSecondary">@color/secondary_text</item>
+    </style>
+    
+    <!-- No action bar theme for full screen -->
+    <style name="Theme.RemoteMediaInProcess.NoActionBar" parent="Theme.RemoteMediaInProcess">
+        <item name="windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+    </style>
+    
+    <!-- Full screen theme for immersive mode -->
+    <style name="Theme.RemoteMediaInProcess.Fullscreen" parent="Theme.RemoteMediaInProcess.NoActionBar">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+    
+    <!-- Button styles -->
+    <style name="Widget.RemoteMedia.MicButton" parent="Widget.MaterialComponents.Button">
+        <item name="cornerRadius">50%</item>
+        <item name="android:insetTop">0dp</item>
+        <item name="android:insetBottom">0dp</item>
+        <item name="iconGravity">textTop</item>
+        <item name="iconSize">64dp</item>
+    </style>
+</resources>

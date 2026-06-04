@@ -1,0 +1,121 @@
+# voice-assistant-mobile.yaml
+# Mobile-optimized voice assistant pipeline: VAD → STT → LLM → TTS
+# All Python nodes use InProcess execution mode for Android
+
+pipeline:
+  name: "voice-assistant-mobile"
+  version: "1.0.0"
+  description: "Offline voice assistant with VAD, STT, LLM, and TTS"
+  execution_mode: "InProcess"  # Android requirement
+
+nodes:
+  # Voice Activity Detection - Silero VAD (ONNX)
+  - id: "vad"
+    type: "PythonNode"
+    class: "SileroVADNode"
+    module_path: "assets://models/vad/silero_vad.onnx"
+    execution_mode: "InProcess"
+    config:
+      threshold: 0.5
+      min_speech_duration_ms: 250
+      min_silence_duration_ms: 1000
+      sample_rate: 16000
+    inputs:
+      - "audio_in"
+    outputs:
+      - "vad_out"
+
+  # Speech-to-Text - Whisper tiny/base (Candle)
+  - id: "stt"
+    type: "PythonNode"
+    class: "WhisperSTTNode"
+    module_path: "assets://models/whisper/base.pt"
+    execution_mode: "InProcess"
+    config:
+      model_size: "tiny"  # or "base" for better accuracy
+      language: "auto"  # auto-detect
+      task: "transcribe"
+      temperature: 0.0
+      beam_size: 1
+      patience: 1.0
+    inputs:
+      - "vad_out"
+    outputs:
+      - "stt_out"
+
+  # LLM - Phi-3-mini-4k-instruct (Candle/GGUF)
+  - id: "llm"
+    type: "PythonNode"
+    class: "Phi3LLMNode"
+    module_path: "assets://models/llm/phi3_mini/"
+    execution_mode: "InProcess"
+    config:
+      model: "phi-3-mini-4k-instruct"
+      max_tokens: 150
+      temperature: 0.7
+      top_p: 0.9
+      top_k: 50
+      system_prompt: "You are a concise voice assistant. Keep responses brief and natural for speech."
+      stream: true
+    inputs:
+      - "stt_out"
+    outputs:
+      - "llm_out"
+
+  # Text-to-Speech - Kokoro (ONNX)
+  - id: "tts"
+    type: "PythonNode"
+    class: "KokoroTTSNode"
+    module_path: "assets://models/tts/kokoro/"
+    execution_mode: "InProcess"
+    config:
+      voice: "af_bella"
+      speed: 1.0
+      sample_rate: 24000
+      stream: true
+    inputs:
+      - "llm_out"
+    outputs:
+      - "audio_out"
+
+  # Audio output node
+  - id: "audio_output"
+    type: "AudioOutputNode"
+    execution_mode: "InProcess"
+    config:
+      sample_rate: 48000
+      channels: 1
+      buffer_size_ms: 100
+    inputs:
+      - "audio_out"
+    outputs: []
+
+connections:
+  - from: "vad.vad_out"
+    to: "stt.audio_in"
+  - from: "stt.stt_out"
+    to: "llm.text_in"
+  - from: "llm.llm_out"
+    to: "tts.text_in"
+  - from: "tts.audio_out"
+    to: "audio_output.audio_in"
+
+# Runtime configuration
+runtime:
+  python:
+    interpreter: "cpython"
+    version: "3.11"
+    site_packages: "assets://site-packages/"
+  audio:
+    input_sample_rate: 48000
+    processing_sample_rate: 16000
+    output_sample_rate: 48000
+  memory_limit_mb: 512
+  
+# Android-specific
+android:
+  foreground_service: true
+  wake_lock: true
+  audio_focus: true
+  model_cache_dir: "cache/models/"
+  extract_on_first_run: true
