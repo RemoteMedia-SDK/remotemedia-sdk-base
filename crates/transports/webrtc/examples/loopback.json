@@ -1,0 +1,9 @@
+{
+  "version": "1.0",
+  "metadata": {
+    "name": "loopback",
+    "description": "Simple loopback pipeline"
+  },
+  "nodes": [],
+  "connections": []
+}

@@ -1,0 +1,23 @@
+{
+  "name": "remotemedia-webrtc-signaling-server",
+  "version": "1.0.0",
+  "description": "JSON-RPC 2.0 signaling server for RemoteMedia WebRTC transport",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test-client.js"
+  },
+  "keywords": [
+    "webrtc",
+    "signaling",
+    "jsonrpc",
+    "websocket"
+  ],
+  "author": "",
+  "license": "MIT OR Apache-2.0",
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

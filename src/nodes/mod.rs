@@ -67,28 +67,6 @@ pub mod emotion_extractor;
 #[cfg(feature = "avatar-emotion")]
 pub use emotion_extractor::{EmotionExtractorConfig, EmotionExtractorNode};
 
-// Affect-aware agent: runtime driver for the persona-vector affect chain.
-// `AffectSimulatorNode` (SourceWall(5) Hz) owns a per-session
-// `affect_simulator::AffectState`, ingests VAD/STT/prosody events, and
-// emits Channel A/B/D aux-port envelopes to a downstream language head.
-// See `docs/references/activation-steering-audio-llm/notes/spike-i-affect-runtime-driver.md`.
-#[cfg(feature = "affect-sim")]
-pub mod affect_sim;
-#[cfg(feature = "affect-sim")]
-pub use affect_sim::{
-    AffectSimulatorConfig, AffectSimulatorNode, AffectSimulatorNodeFactory, SessionAffectState,
-};
-
-// Companion to `affect_sim`: hand-tuned mapping from
-// `(EmotionChannels, RegulationPolicy)` → ARKit-52 blendshape weights.
-// Lets the simulator drive an avatar face alongside the language head;
-// pre-empts the learned audio→blendshape model in
-// `tools/affect_avatar/`. Same gate as `affect-sim` (and pulls in
-// `avatar-lipsync` for `BlendshapeFrame` / `ARKIT_52`).
-#[cfg(feature = "affect-sim")]
-pub mod affect_expression;
-#[cfg(feature = "affect-sim")]
-pub use affect_expression::{compute_blendshapes, compute_blendshapes_with_gain, top_active};
 
 // Activation-projection face track (proposal:
 // `openspec/changes/add-activation-projection-face/`). Reads LLM

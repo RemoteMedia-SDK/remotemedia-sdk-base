@@ -1,0 +1,369 @@
+// Bidirectional streaming pipeline execution RPC (Generic Streaming Protocol)
+// Feature: 004-generic-streaming
+//
+// This file defines a generic streaming protocol supporting all data types.
+// Key features:
+// - DataChunk message (supports audio, video, tensors, JSON, text, binary)
+// - StreamRequest accepts DataChunk for generic streaming
+// - ChunkResult uses generic data_outputs map
+// - StreamMetrics tracks generic item counts and type breakdown
+//
+// Use this RPC for:
+// - Real-time processing of any data type
+// - Multi-input streaming nodes (e.g., audio + JSON control parameters)
+// - Latency-sensitive applications (<50ms per chunk)
+syntax = "proto3";
+
+package remotemedia.v1;
+
+import "common.proto";
+import "execution.proto";
+
+// ============================================================================
+// Streaming Pipeline Service
+// ============================================================================
+
+service StreamingPipelineService {
+  // Execute a pipeline with streaming data input/output
+  //
+  // This is a bidirectional streaming RPC:
+  // - Client sends: pipeline manifest (first message), then data chunks
+  // - Server sends: ready confirmation, then processing results per chunk
+  //
+  // Connection lifecycle:
+  // 1. Client sends manifest → Server validates and responds with StreamReady
+  // 2. Client sends data chunks → Server processes and responds with results
+  // 3. Client sends StreamControl::CLOSE → Server sends final metrics and closes
+  //
+  // Performance targets:
+  // - <50ms average latency per chunk (User Story 3)
+  // - Support 1000+ concurrent streaming sessions (SC-002)
+  // - <5% overhead vs audio-only protocol for audio pipelines (SC-008)
+  rpc StreamPipeline(stream StreamRequest) returns (stream StreamResponse);
+}
+
+// ============================================================================
+// Request Types (Client → Server)
+// ============================================================================
+
+// Client streaming request
+//
+// UPDATED: Generic data streaming
+message StreamRequest {
+  // Request type (only one field set per message)
+  oneof request {
+    // First message: pipeline initialization
+    // Must be sent before any data chunks
+    StreamInit init = 1;
+
+    // Generic data chunk (supports all data types)
+    DataChunk data_chunk = 2;
+
+    // Control commands (close, cancel)
+    StreamControl control = 4;
+  }
+}
+
+// Initialize streaming pipeline (first message)
+message StreamInit {
+  // Pipeline manifest
+  PipelineManifest manifest = 1;
+
+  // UPDATED: Generic initial data inputs (keyed by node ID)
+  // Replaces audio-only inputs from Feature 003
+  // Used for non-streaming initial state (e.g., config JSON)
+  map<string, DataBuffer> data_inputs = 2;
+
+  // Optional resource limits
+  ResourceLimits resource_limits = 3;
+
+  // Client protocol version
+  string client_version = 4;
+
+  // Expected chunk size hint
+  // For audio: samples per chunk
+  // For video: frames per chunk (usually 1)
+  // Helps service optimize buffer allocation
+  uint64 expected_chunk_size = 5;
+}
+
+// ============================================================================
+// Generic Data Chunk (NEW)
+// ============================================================================
+
+// Generic streaming message that replaces AudioChunk
+//
+// Carries any data type to any node. Supports both single-input and multi-input nodes.
+//
+// Usage patterns:
+//
+// Pattern 1: Single-input node (audio VAD)
+//   DataChunk {
+//     node_id: "vad",
+//     buffer: DataBuffer { audio: { ... } },
+//     sequence: 42,
+//     timestamp_ms: 1000
+//   }
+//
+// Pattern 2: Multi-input node (audio + JSON control)
+//   DataChunk {
+//     node_id: "dynamic_filter",
+//     named_buffers: {
+//       "audio": DataBuffer { audio: { ... } },
+//       "control": DataBuffer { json: { gain: 0.8 } }
+//     },
+//     sequence: 42,
+//     timestamp_ms: 1000
+//   }
+//
+// Validation:
+// - Exactly one of buffer OR named_buffers must be set (not both, not neither)
+// - Sequence numbers must be strictly monotonic increasing
+// - Timestamps should be non-decreasing (warnings for inversions)
+message DataChunk {
+  // Target node ID (must match manifest node)
+  // Must be a node that accepts streaming input
+  string node_id = 1;
+
+  // EITHER: Single unnamed buffer (for simple single-input nodes)
+  // Backward compatible with audio-only usage
+  DataBuffer buffer = 2;
+
+  // OR: Multiple named buffers (for multi-input nodes)
+  // Example: {"audio": audio_buffer, "control": json_buffer}
+  // Keys map to node input port names
+  map<string, DataBuffer> named_buffers = 3;
+
+  // Sequence number for ordering (0, 1, 2, ...)
+  // Client increments for each chunk
+  // Server validates strict monotonic increase, detects gaps
+  uint64 sequence = 4;
+
+  // Timestamp in milliseconds since stream start
+  // Used for synchronization and latency measurement
+  uint64 timestamp_ms = 5;
+}
+
+// ============================================================================
+// Legacy Audio Chunk (DEPRECATED)
+// ============================================================================
+
+// DEPRECATED: Audio-only chunk message
+
+// ============================================================================
+// Stream Control
+// ============================================================================
+
+// Stream control commands (unchanged from Feature 003)
+message StreamControl {
+  // Control command type
+  Command command = 1;
+
+  // Control command enumeration
+  enum Command {
+    COMMAND_UNSPECIFIED = 0;
+
+    // Graceful close: flush pending chunks, return final results
+    COMMAND_CLOSE = 1;
+
+    // Abort execution: cancel immediately, discard pending data
+    COMMAND_CANCEL = 2;
+  }
+}
+
+// ============================================================================
+// Response Types (Server → Client)
+// ============================================================================
+
+// Server streaming response
+//
+// UPDATED: ChunkResult now uses generic data outputs
+message StreamResponse {
+  // Response type (only one field set per message)
+  oneof response {
+    // First response: pipeline ready to receive chunks
+    StreamReady ready = 1;
+
+    // Processed chunk result (one per input chunk)
+    ChunkResult result = 2;
+
+    // Error occurred during streaming
+    ErrorResponse error = 3;
+
+    // Periodic metrics update
+    StreamMetrics metrics = 4;
+
+    // Stream closed gracefully
+    StreamClosed closed = 5;
+  }
+}
+
+// Pipeline initialized and ready to receive chunks
+message StreamReady {
+  // Unique session ID for this stream
+  // Client can use for correlation in logs
+  string session_id = 1;
+
+  // Server-recommended chunk size
+  // May differ from client's expected_chunk_size
+  uint64 recommended_chunk_size = 2;
+
+  // Maximum buffer latency (milliseconds)
+  // Server will buffer up to this duration before processing
+  uint64 max_buffer_latency_ms = 3;
+}
+
+// ============================================================================
+// Chunk Result (UPDATED)
+// ============================================================================
+
+// Result from processing a single chunk
+//
+// UPDATED: Uses generic data_outputs map (replaces audio_outputs + string data_outputs)
+message ChunkResult {
+  // Sequence number (matches input DataChunk.sequence)
+  uint64 sequence = 1;
+
+  // UPDATED: Generic data outputs (keyed by node ID)
+  // Replaces separate audio_outputs and string data_outputs from Feature 003
+  // All output types now use DataBuffer
+  //
+  // Example (audio VAD):
+  //   data_outputs: {
+  //     "vad": DataBuffer { json: { has_speech: true, confidence: 0.87 } }
+  //   }
+  //
+  // Example (audio filter):
+  //   data_outputs: {
+  //     "filter": DataBuffer { audio: { ... } }
+  //   }
+  map<string, DataBuffer> data_outputs = 2;
+
+  // Processing latency for this chunk (milliseconds)
+  // Measured from chunk receipt to result ready
+  double processing_time_ms = 3;
+
+  // UPDATED: Cumulative items processed in this stream
+  // Generic count: samples (audio), frames (video), tokens (text), etc.
+  // Was: total_samples_processed in Feature 003
+  uint64 total_items_processed = 4;
+}
+
+// ============================================================================
+// Stream Metrics (UPDATED)
+// ============================================================================
+
+// Periodic metrics update
+//
+// Server sends these periodically (e.g., every 10 chunks) to provide
+// real-time visibility into stream health.
+//
+// UPDATED: Uses generic item counting and type breakdown
+message StreamMetrics {
+  // Session ID
+  string session_id = 1;
+
+  // Total chunks processed so far
+  uint64 chunks_processed = 2;
+
+  // Average latency across all chunks (milliseconds)
+  double average_latency_ms = 3;
+
+  // UPDATED: Total items processed across all chunks
+  // Generic count: samples (audio), frames (video), tokens (text), etc.
+  // Was: total_samples in Feature 003
+  uint64 total_items = 4;
+
+  // Current buffer occupancy (items)
+  // For audio: samples
+  // For video: frames
+  uint64 buffer_items = 5;
+
+  // Number of chunks dropped (if any)
+  uint64 chunks_dropped = 6;
+
+  // Peak memory usage for this stream (bytes)
+  uint64 peak_memory_bytes = 7;
+
+  // NEW: Track data type distribution
+  // Keys: "audio", "video", "tensor", "json", "text", "binary"
+  // Values: Count of chunks processed per type
+  //
+  // Example:
+  //   data_type_breakdown: {
+  //     "audio": 80,  // 80 audio chunks
+  //     "json": 20    // 20 JSON chunks (control parameters)
+  //   }
+  map<string, uint64> data_type_breakdown = 8;
+
+  // Feature 005: Node cache metrics
+  // Total cache hits for this session
+  uint64 cache_hits = 9;
+
+  // Total cache misses for this session
+  uint64 cache_misses = 10;
+
+  // Number of nodes currently cached globally
+  uint64 cached_nodes_count = 11;
+
+  // Cache hit rate (0.0 - 1.0)
+  double cache_hit_rate = 12;
+}
+
+// ============================================================================
+// Stream Closed
+// ============================================================================
+
+// Stream closed gracefully (unchanged from Feature 003)
+message StreamClosed {
+  // Session ID
+  string session_id = 1;
+
+  // Final execution metrics
+  ExecutionMetrics final_metrics = 2;
+
+  // Reason for closure
+  string reason = 3;
+}
+
+// ============================================================================
+// Error Scenarios
+// ============================================================================
+
+// Streaming-specific error types (unchanged from Feature 003)
+enum StreamErrorType {
+  STREAM_ERROR_UNSPECIFIED = 0;
+
+  // Manifest not sent as first message
+  STREAM_ERROR_INIT_REQUIRED = 1;
+
+  // Invalid chunk sequence (gap or out-of-order)
+  STREAM_ERROR_INVALID_SEQUENCE = 2;
+
+  // Buffer overflow (client sending faster than server can process)
+  STREAM_ERROR_BUFFER_OVERFLOW = 3;
+
+  // Stream timeout (no chunks received for X seconds)
+  STREAM_ERROR_TIMEOUT = 4;
+
+  // Client disconnected unexpectedly
+  STREAM_ERROR_CLIENT_DISCONNECT = 5;
+
+  // Pipeline execution error during chunk processing
+  STREAM_ERROR_EXECUTION = 6;
+}
+
+// Extended error response for streaming (unchanged from Feature 003)
+message StreamErrorResponse {
+  // Base error information
+  ErrorResponse base_error = 1;
+
+  // Streaming-specific error type
+  StreamErrorType stream_error_type = 2;
+
+  // Sequence number where error occurred (if applicable)
+  uint64 failing_sequence = 3;
+
+  // Session ID
+  string session_id = 4;
+}

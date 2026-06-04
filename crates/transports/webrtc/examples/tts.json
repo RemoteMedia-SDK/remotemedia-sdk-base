@@ -1,0 +1,21 @@
+{
+  "version": "v1",
+  "metadata": {
+    "name": "simple-tts",
+    "description": "Simple text-to-speech pipeline with Kokoro TTS"
+  },
+  "nodes": [
+    {
+      "id": "kokoro_tts",
+      "node_type": "KokoroTTSNode",
+      "params": {
+        "model_id": "kokoro-v0_19",
+        "voice": "af_bella",
+        "speed": 1.0,
+        "device": "cuda"
+      },
+      "is_streaming": true
+    }
+  ],
+  "connections": []
+}

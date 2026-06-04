@@ -1,0 +1,214 @@
+// PipelineControl — control-plane RPC for the Session Control Bus.
+//
+// Clients open a long-lived bidirectional stream to observe, inject, and
+// edit data flowing through any node of a running pipeline session.
+//
+// See `docs/SESSION_CONTROL.md` for the semantic model. This file is the
+// wire encoding of the logical `ControlFrame` / `ControlEvent` enums
+// defined in `crates/core/src/transport/session_control.rs`.
+//
+// Design choices:
+//
+//   - Single bidi RPC (`Attach`). One RPC multiplexes tap / publish /
+//     intercept / node-state operations within a session. Matches the
+//     shape of `SessionControl::handle_frame` on the server.
+//
+//   - The **first** `ControlFrame` on an `Attach` stream MUST be a
+//     `Hello { session_id }`. The server looks the session up in the
+//     `SessionControlBus`; if missing, it closes the stream with
+//     `ControlEvent::Error { code = SESSION_NOT_FOUND }` and returns.
+//
+//   - All subsequent frames operate within the attached session. The
+//     server scopes every operation to the session the client named.
+//
+//   - When the session closes (normal or error), the server emits one
+//     final `ControlEvent::SessionClosed` and ends the response stream.
+//
+//   - RuntimeData payloads reuse `remotemedia.v1.DataBuffer` from
+//     `common.proto` so Tap/Publish/Intercept payloads speak the same
+//     wire type as the data plane.
+
+syntax = "proto3";
+
+package remotemedia.v1;
+
+import "common.proto";
+
+// ============================================================================
+// Service
+// ============================================================================
+
+service PipelineControl {
+  // Open a control-plane attach to an existing session. The first frame
+  // the client sends MUST be a `Hello`. The server streams `ControlEvent`s
+  // back until the session terminates or the client closes the stream.
+  rpc Attach(stream ControlFrame) returns (stream ControlEvent);
+}
+
+// ============================================================================
+// Address model
+// ============================================================================
+
+// Which side of a node the client is talking to.
+enum ControlDirection {
+  CONTROL_DIRECTION_UNSPECIFIED = 0;
+  CONTROL_DIRECTION_IN          = 1;  // publish / inject (client -> node input)
+  CONTROL_DIRECTION_OUT         = 2;  // subscribe / intercept (node output -> client)
+}
+
+// A point within the session's pipeline. Mirrors `ControlAddress` in Rust.
+message ControlAddress {
+  string node_id = 1;
+  // Optional named port. Empty string = the node's `main` rail.
+  string port = 2;
+  ControlDirection direction = 3;
+}
+
+// ============================================================================
+// Node-state operations
+// ============================================================================
+
+// Runtime execution state for a single node. Mirrors Rust `NodeState`.
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_ENABLED     = 1;
+  NODE_STATE_BYPASS      = 2;
+  NODE_STATE_DISABLED    = 3;
+}
+
+// ============================================================================
+// Intercept support
+// ============================================================================
+
+// Decision the client returns for an `InterceptRequest`.
+message InterceptDecision {
+  oneof decision {
+    // Forward the frame unchanged.
+    Empty   pass     = 1;
+    // Replace the frame with this data before forwarding.
+    DataBuffer replace = 2;
+    // Drop the frame entirely (downstream nodes don't see it).
+    Empty   drop     = 3;
+  }
+}
+
+// Empty placeholder (protobuf oneof can't have bare tag variants).
+message Empty {}
+
+// ============================================================================
+// Client -> Server frames
+// ============================================================================
+
+message ControlFrame {
+  oneof op {
+    Hello            hello            = 1;
+    Subscribe        subscribe        = 2;
+    Unsubscribe      unsubscribe      = 3;
+    Publish          publish          = 4;
+    Intercept        intercept        = 5;
+    RemoveIntercept  remove_intercept = 6;
+    InterceptReply   intercept_reply  = 7;
+    SetNodeState     set_node_state   = 8;
+    ClearNodeState   clear_node_state = 9;
+  }
+}
+
+// Identifies the session this attach is scoped to. MUST be the first frame.
+message Hello {
+  string session_id = 1;
+  // Optional: client-chosen identifier, echoed in every event for
+  // multi-attach scenarios where the same client attaches more than once.
+  string attach_id = 2;
+}
+
+message Subscribe       { ControlAddress addr = 1; }
+message Unsubscribe     { ControlAddress addr = 1; }
+message Publish         { ControlAddress addr = 1; DataBuffer data = 2; }
+message RemoveIntercept { ControlAddress addr = 1; }
+
+message Intercept {
+  ControlAddress addr = 1;
+  // Maximum time the router will wait for an `InterceptReply` before
+  // forwarding the original frame unchanged. 0 = server default (50 ms).
+  uint32 deadline_ms = 2;
+}
+
+message InterceptReply {
+  // Matches the `correlation_id` on the inbound `InterceptRequest` event.
+  uint64 correlation_id = 1;
+  InterceptDecision decision = 2;
+}
+
+message SetNodeState {
+  string node_id = 1;
+  NodeState state = 2;
+}
+
+message ClearNodeState { string node_id = 1; }
+
+// ============================================================================
+// Server -> Client events
+// ============================================================================
+
+message ControlEvent {
+  oneof event {
+    // Attach was accepted. Sent exactly once, in response to Hello.
+    Attached         attached          = 1;
+    // A tapped node output. `addr.direction` = OUT.
+    TapEvent         tap               = 2;
+    // An intercept needs a decision. Client must send
+    // `InterceptReply { correlation_id }` within the deadline.
+    InterceptRequest intercept_request = 3;
+    // A non-fatal error (bad address, unknown node, etc.) surfaced to
+    // the client without closing the stream.
+    ErrorEvent       error             = 4;
+    // Sent exactly once as the final frame when the session closes.
+    SessionClosed    session_closed    = 5;
+  }
+}
+
+message Attached {
+  string session_id = 1;
+  string attach_id = 2;
+}
+
+message TapEvent {
+  ControlAddress addr = 1;
+  DataBuffer data = 2;
+}
+
+message InterceptRequest {
+  ControlAddress addr = 1;
+  uint64 correlation_id = 2;
+  DataBuffer data = 3;
+}
+
+// Structured error codes. Granular for client-side pattern-matching.
+enum ControlErrorCode {
+  CONTROL_ERROR_CODE_UNSPECIFIED       = 0;
+  CONTROL_ERROR_CODE_SESSION_NOT_FOUND = 1;
+  CONTROL_ERROR_CODE_UNKNOWN_NODE      = 2;
+  CONTROL_ERROR_CODE_INVALID_ADDRESS   = 3;
+  CONTROL_ERROR_CODE_PROTOCOL          = 4;  // first frame wasn't Hello, etc.
+  CONTROL_ERROR_CODE_UNAUTHORIZED      = 5;
+  CONTROL_ERROR_CODE_INTERNAL          = 6;
+}
+
+message ErrorEvent {
+  ControlErrorCode code = 1;
+  string message = 2;
+  // Optional address context if the error relates to a specific operation.
+  ControlAddress addr = 3;
+}
+
+enum CloseReasonCode {
+  CLOSE_REASON_CODE_UNSPECIFIED = 0;
+  CLOSE_REASON_CODE_NORMAL      = 1;
+  CLOSE_REASON_CODE_ERROR       = 2;
+}
+
+message SessionClosed {
+  CloseReasonCode reason = 1;
+  // Free-form detail (e.g. the Error string for CloseReason::Error).
+  string detail = 2;
+}

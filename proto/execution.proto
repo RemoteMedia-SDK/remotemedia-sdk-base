@@ -1,0 +1,320 @@
+// Unary pipeline execution RPC (Generic Streaming Protocol)
+// Feature: 004-generic-streaming
+//
+// This file extends Feature 003's execution.proto to support universal data types.
+// Key changes:
+// - UPDATED: ExecuteRequest uses generic data_inputs map (replaces audio_inputs)
+// - UPDATED: ExecutionResult uses generic data_outputs map (replaces audio_outputs + string data_outputs)
+// - UPDATED: NodeManifest adds input_types and output_types for type validation
+//
+// Use this RPC for:
+// - Batch processing of any data type (audio, video, tensors, JSON, text, binary)
+// - Non-streaming transformations
+// - Pipelines with known input sizes
+//
+// Backward compatibility:
+// - All Feature 003 types maintained (PipelineManifest, CapabilityRequirements, etc.)
+// - Breaking change: audio_inputs removed (use data_inputs with audio variant)
+// - Migration: Update client code to use DataBuffer for all inputs/outputs
+
+syntax = "proto3";
+
+package remotemedia.v1;
+
+import "common.proto";
+
+// ============================================================================
+// Pipeline Execution Service
+// ============================================================================
+
+service PipelineExecutionService {
+  // Execute a pipeline with complete data input(s) and return all results
+  //
+  // This is a unary RPC: client sends one request, server sends one response.
+  // Suitable for batch processing and non-streaming use cases.
+  //
+  // Performance targets:
+  // - <5ms latency for simple operations (SC-001)
+  // - <10% serialization overhead (SC-003)
+  // - 10x faster than Python-based remote execution (SC-004)
+  // - <5% overhead vs audio-only protocol for audio pipelines (SC-008)
+  rpc ExecutePipeline(ExecuteRequest) returns (ExecuteResponse);
+
+  // Get service version and compatibility information
+  //
+  // Clients should call this on connection initialization to verify compatibility.
+  rpc GetVersion(VersionRequest) returns (VersionResponse);
+}
+
+// ============================================================================
+// Request Types
+// ============================================================================
+
+// Request to execute a pipeline
+//
+// UPDATED: Uses generic data_inputs map
+message ExecuteRequest {
+  // Pipeline manifest
+  PipelineManifest manifest = 1;
+
+  // UPDATED: Generic data inputs (keyed by node ID)
+  // Replaces separate audio_inputs and string data_inputs from Feature 003
+  //
+  // Example (audio processing):
+  //   data_inputs: {
+  //     "resample": DataBuffer { audio: { ... } }
+  //   }
+  //
+  // Example (mixed types):
+  //   data_inputs: {
+  //     "vad": DataBuffer { audio: { ... } },
+  //     "config": DataBuffer { json: { threshold: 0.5 } }
+  //   }
+  //
+  // Node IDs must match nodes in manifest that require input
+  map<string, DataBuffer> data_inputs = 2;
+
+  // Optional resource limits for this execution
+  // If not specified, service applies default limits
+  ResourceLimits resource_limits = 3;
+
+  // Client protocol version (e.g., "v1")
+  // Service validates compatibility and returns ERROR_TYPE_VERSION_MISMATCH if incompatible
+  string client_version = 4;
+}
+
+// Response from pipeline execution (unchanged from Feature 003)
+message ExecuteResponse {
+  // Either result or error (mutually exclusive)
+  oneof outcome {
+    // Execution result (if successful)
+    ExecutionResult result = 1;
+
+    // Error details (if execution failed)
+    ErrorResponse error = 2;
+  }
+}
+
+// ============================================================================
+// Pipeline Manifest Types (UPDATED)
+// ============================================================================
+
+// Pipeline manifest structure (v1)
+//
+// UPDATED: NodeManifest adds input_types and output_types for type validation
+message PipelineManifest {
+  // Schema version (e.g., "v1")
+  // Service validates this matches supported versions
+  string version = 1;
+
+  // Pipeline metadata
+  ManifestMetadata metadata = 2;
+
+  // List of processing nodes
+  // Must contain at least one node
+  // Node IDs must be unique
+  repeated NodeManifest nodes = 3;
+
+  // Connections between nodes (directed edges)
+  // Forms a directed acyclic graph (DAG)
+  repeated Connection connections = 4;
+}
+
+// Pipeline metadata (unchanged from Feature 003)
+message ManifestMetadata {
+  // Pipeline name (required)
+  // Used in logs and metrics
+  string name = 1;
+
+  // Optional human-readable description
+  string description = 2;
+
+  // ISO 8601 timestamp of creation
+  // Example: "2025-10-28T10:30:00Z"
+  string created_at = 3;
+}
+
+// Node manifest entry
+//
+// UPDATED: Added input_types and output_types for type validation
+message NodeManifest {
+  // Unique node ID within pipeline
+  string id = 1;
+
+  // Node type (class name)
+  // Example: "AudioResample", "VAD", "HFPipelineNode"
+  // Service validates against registered node types
+  string node_type = 2;
+
+  // Node-specific parameters (JSON encoded)
+  // Service deserializes into serde_json::Value
+  // Example: "{\"target_sample_rate\": 16000}"
+  string params = 3;
+
+  // Whether node uses streaming (async generator)
+  // If true, node's process() method is an async generator
+  bool is_streaming = 4;
+
+  // Optional capability requirements (GPU, CPU, memory)
+  CapabilityRequirements capabilities = 5;
+
+  // Optional execution host preference (reserved for future)
+  string host = 6;
+
+  // Optional runtime hint for Python nodes
+  RuntimeHint runtime_hint = 7;
+
+  // NEW: Declare expected input types
+  // Used for three-layer validation:
+  //   1. Compile-time: Client type checking
+  //   2. Manifest validation: Connection type compatibility at StreamInit/ExecuteRequest
+  //   3. Runtime: Chunk type validation
+  //
+  // Empty list = accept any type (untyped node, backward compatible)
+  // Contains DATA_TYPE_HINT_ANY = accept any type (polymorphic node)
+  //
+  // Example (VAD node: audio only):
+  //   input_types: [DATA_TYPE_HINT_AUDIO]
+  //
+  // Example (Multi-input filter: audio + JSON):
+  //   input_types: [DATA_TYPE_HINT_AUDIO, DATA_TYPE_HINT_JSON]
+  //
+  // Example (Polymorphic logger: any type):
+  //   input_types: [DATA_TYPE_HINT_ANY]
+  repeated DataTypeHint input_types = 8;
+
+  // NEW: Declare expected output types
+  // Used for manifest validation (connection type compatibility)
+  //
+  // Empty list = produces any type (untyped node, backward compatible)
+  //
+  // Example (VAD node: JSON output):
+  //   output_types: [DATA_TYPE_HINT_JSON]
+  //
+  // Example (Audio filter: audio output):
+  //   output_types: [DATA_TYPE_HINT_AUDIO]
+  repeated DataTypeHint output_types = 9;
+}
+
+// Connection between nodes (unchanged from Feature 003)
+message Connection {
+  // Source node ID (produces output)
+  string from = 1;
+
+  // Target node ID (consumes input)
+  string to = 2;
+}
+
+// ============================================================================
+// Capability Types (Unchanged from Feature 003)
+// ============================================================================
+
+// Hardware/resource requirements for node execution
+message CapabilityRequirements {
+  // GPU requirements
+  GpuRequirement gpu = 1;
+
+  // CPU requirements
+  CpuRequirement cpu = 2;
+
+  // Memory requirement (gigabytes)
+  double memory_gb = 3;
+}
+
+// GPU hardware requirements
+message GpuRequirement {
+  // GPU type: "cuda", "rocm", "metal"
+  string type = 1;
+
+  // Minimum GPU memory (GB)
+  double min_memory_gb = 2;
+
+  // Whether GPU is required or optional
+  bool required = 3;
+}
+
+// CPU requirements
+message CpuRequirement {
+  // Minimum number of cores
+  uint32 cores = 1;
+
+  // CPU architecture preference
+  // Example: "x86_64", "aarch64"
+  string arch = 2;
+}
+
+// Runtime hint for Python node execution
+enum RuntimeHint {
+  RUNTIME_HINT_UNSPECIFIED = 0;
+
+  // Use RustPython embedded interpreter (pure Rust, limited stdlib)
+  RUNTIME_HINT_RUSTPYTHON = 1;
+
+  // Use CPython via PyO3 in-process (full Python ecosystem, C-extensions)
+  RUNTIME_HINT_CPYTHON = 2;
+
+  // Use CPython compiled to WASM (sandboxed, Phase 3)
+  RUNTIME_HINT_CPYTHON_WASM = 3;
+
+  // Automatically select runtime based on node requirements
+  RUNTIME_HINT_AUTO = 4;
+}
+
+// ============================================================================
+// Result Types (UPDATED)
+// ============================================================================
+
+// Result of successful pipeline execution
+//
+// UPDATED: Uses generic data_outputs map
+message ExecutionResult {
+  // UPDATED: Generic data outputs (keyed by node ID)
+  // Replaces separate audio_outputs and string data_outputs from Feature 003
+  // All output types now use DataBuffer
+  //
+  // Example (audio processing):
+  //   data_outputs: {
+  //     "resample": DataBuffer { audio: { ... } }
+  //   }
+  //
+  // Example (VAD with audio and JSON outputs):
+  //   data_outputs: {
+  //     "vad_audio": DataBuffer { audio: { ... } },
+  //     "vad_result": DataBuffer { json: { has_speech: true } }
+  //   }
+  //
+  // Empty map for pipelines with no outputs
+  map<string, DataBuffer> data_outputs = 1;
+
+  // Execution performance metrics
+  ExecutionMetrics metrics = 2;
+
+  // Per-node execution results
+  repeated NodeResult node_results = 3;
+
+  // Overall execution status
+  ExecutionStatus status = 4;
+}
+
+// ============================================================================
+// Version Types (Unchanged from Feature 003)
+// ============================================================================
+
+// Request for version information
+message VersionRequest {
+  // Client version for compatibility check (e.g., "v1", "v1.2.0")
+  string client_version = 1;
+}
+
+// Response with version and compatibility information
+message VersionResponse {
+  // Service version details
+  VersionInfo version_info = 1;
+
+  // Whether client version is compatible
+  bool compatible = 2;
+
+  // Compatibility message (details if incompatible)
+  // Example: "Client v2 requires service v0.3.0+"
+  string compatibility_message = 3;
+}

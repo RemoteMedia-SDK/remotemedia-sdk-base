@@ -1,0 +1,749 @@
+// Common protocol buffer types for Generic Streaming Protocol
+// Feature: 004-generic-streaming
+//
+// This file extends Feature 003's common.proto to support universal data types.
+// It defines:
+// - DataBuffer: Universal container with oneof variants for all data types
+// - Data type variants: AudioBuffer, VideoFrame, TensorBuffer, JsonData, TextBuffer, BinaryBuffer
+// - DataTypeHint: Type validation enum for manifest declarations
+// - All existing common types from Feature 003 (ExecutionMetrics, ErrorResponse, etc.)
+//
+// Design principles:
+// - Backward compatible: All Feature 003 types unchanged
+// - Type-safe: Protobuf oneof ensures exactly one variant set
+// - Zero-copy: bytes fields for binary data (audio, video, tensors)
+// - Extensible: Metadata maps and optional fields support future additions
+
+syntax = "proto3";
+
+package remotemedia.v1;
+
+// ============================================================================
+// Universal Data Container
+// ============================================================================
+
+// Universal container for any protocol bufferable data type
+//
+// Uses protobuf oneof discriminator for type-safe variant selection.
+// Exactly one variant must be set.
+//
+// Usage:
+//   DataBuffer audio_buf = {
+//     audio: { samples: ..., sample_rate: 16000, ... }
+//   };
+//
+//   DataBuffer json_buf = {
+//     json: { json_payload: "{\"operation\": \"add\"}", ... }
+//   };
+message DataBuffer {
+  // Data type discriminator (exactly one must be set)
+  oneof data_type {
+    AudioBuffer audio = 1;
+    VideoFrame video = 2;
+    TensorBuffer tensor = 3;
+    JsonData json = 4;
+    TextBuffer text = 5;
+    BinaryBuffer binary = 6;
+    ControlMessage control = 7;  // Spec 007: Control messages for low-latency streaming
+    NumpyBuffer numpy = 8;  // Zero-copy numpy array passthrough
+    FileBuffer file = 9;  // Spec 001: File reference with metadata
+  }
+
+  // Optional metadata for extensibility
+  // Examples: compression="gzip", encoding="base64", custom_key="value"
+  // Convention: Use lowercase snake_case for keys
+  map<string, string> metadata = 10;
+}
+
+// ============================================================================
+// Audio Types (Unchanged from Feature 003)
+// ============================================================================
+
+// Multi-channel audio data with sample rate and format metadata
+//
+// Samples are stored in interleaved format for multi-channel audio.
+// For stereo: [L0, R0, L1, R1, L2, R2, ...]
+//
+// This type is unchanged from Feature 003 to maintain backward compatibility.
+message AudioBuffer {
+  // Raw audio samples (interleaved, little-endian)
+  // Size = num_samples * channels * format.bytes_per_sample()
+  bytes samples = 1;
+
+  // Sample rate in Hz (e.g., 8000, 16000, 44100, 48000)
+  uint32 sample_rate = 2;
+
+  // Number of channels (1=mono, 2=stereo, 6=5.1 surround)
+  uint32 channels = 3;
+
+  // Audio sample encoding format
+  AudioFormat format = 4;
+
+  // Total number of samples (including all channels)
+  // num_frames = num_samples / channels
+  // duration_seconds = num_frames / sample_rate
+  uint64 num_samples = 5;
+
+  // Optional extensible metadata as JSON bytes (UTF-8)
+  // Used for annotations like speaker diarization, confidence scores
+  optional bytes metadata_json = 6;
+}
+
+// Audio sample encoding format
+enum AudioFormat {
+  AUDIO_FORMAT_UNSPECIFIED = 0;
+
+  // 32-bit floating point, range [-1.0, 1.0]
+  // 4 bytes per sample
+  AUDIO_FORMAT_F32 = 1;
+
+  // 16-bit signed integer, range [-32768, 32767]
+  // 2 bytes per sample (most common format)
+  AUDIO_FORMAT_I16 = 2;
+
+  // 32-bit signed integer
+  // 4 bytes per sample
+  AUDIO_FORMAT_I32 = 3;
+}
+
+// ============================================================================
+// Video Types (NEW)
+// ============================================================================
+
+// Video frame data with pixel format and dimensions
+//
+// Supports both raw and encoded video frames (Spec 012: Video Codec Support).
+// For raw frames: codec=UNSPECIFIED, format indicates pixel layout
+// For encoded frames: codec specifies compression, pixel_data contains bitstream
+//
+// Validation:
+//   Raw: pixel_data.len() == width * height * format.bytes_per_pixel()
+//   Encoded: pixel_data.len() is variable (codec-dependent)
+message VideoFrame {
+  // Raw pixel data or encoded bitstream
+  // Layout determined by PixelFormat (raw) or VideoCodec (encoded)
+  bytes pixel_data = 1;
+
+  // Frame width in pixels (must be > 0)
+  uint32 width = 2;
+
+  // Frame height in pixels (must be > 0)
+  uint32 height = 3;
+
+  // Pixel format (for raw frames) or ENCODED (for compressed)
+  PixelFormat format = 4;
+
+  // Frame sequence number for ordering
+  uint64 frame_number = 5;
+
+  // Timestamp in microseconds (for synchronization)
+  uint64 timestamp_us = 6;
+
+  // Video codec (Spec 012: Video Codec Support)
+  // UNSPECIFIED for raw frames, or VP8/H264/AV1 for encoded frames
+  VideoCodec codec = 7;
+
+  // Keyframe indicator (Spec 012)
+  // True for I-frames (can be decoded independently)
+  // False for P/B-frames (require previous frames)
+  bool is_keyframe = 8;
+}
+
+// Pixel format enumeration
+enum PixelFormat {
+  PIXEL_FORMAT_UNSPECIFIED = 0;
+
+  // Packed RGB, 8-bit per channel (3 bytes/pixel)
+  // Layout: [R, G, B, R, G, B, ...]
+  PIXEL_FORMAT_RGB24 = 1;
+
+  // Packed RGBA, 8-bit per channel (4 bytes/pixel)
+  // Layout: [R, G, B, A, R, G, B, A, ...]
+  PIXEL_FORMAT_RGBA32 = 2;
+
+  // Planar YUV 4:2:0 (1.5 bytes/pixel)
+  // Y plane: width*height, U plane: (width/2)*(height/2), V plane: same as U
+  PIXEL_FORMAT_YUV420P = 3;
+
+  // Grayscale, 8-bit (1 byte/pixel)
+  PIXEL_FORMAT_GRAY8 = 4;
+
+  // I420 format (identical to YUV420P, WebRTC compatibility)
+  PIXEL_FORMAT_I420 = 5;
+
+  // NV12 semi-planar (Y plane + interleaved UV)
+  PIXEL_FORMAT_NV12 = 6;
+
+  // Encoded bitstream (not raw pixels)
+  PIXEL_FORMAT_ENCODED = 255;
+}
+
+// Video codec enumeration (Spec 012: Video Codec Support)
+enum VideoCodec {
+  VIDEO_CODEC_UNSPECIFIED = 0;
+
+  // VP8 (WebM, WebRTC standard, royalty-free)
+  // RFC 6386
+  VIDEO_CODEC_VP8 = 1;
+
+  // H.264/AVC (widely supported, hardware acceleration)
+  // ITU-T H.264
+  VIDEO_CODEC_H264 = 2;
+
+  // AV1 (next-gen royalty-free, superior compression)
+  VIDEO_CODEC_AV1 = 3;
+}
+
+// ============================================================================
+// Tensor Types (NEW)
+// ============================================================================
+
+// Multi-dimensional tensor data with shape and dtype
+//
+// Supports ML use cases: embeddings, image tensors, model inputs/outputs.
+// Data stored in row-major layout by default.
+//
+// Validation:
+//   data.len() == shape.product() * dtype.bytes_per_element()
+//
+// Example (512-dim embedding, F32):
+//   TensorBuffer {
+//     data: <2048 bytes>,
+//     shape: [512],
+//     dtype: TENSOR_DTYPE_F32
+//   }
+message TensorBuffer {
+  // Raw tensor data (row-major layout by default)
+  // Must match calculated size from shape and dtype
+  bytes data = 1;
+
+  // Shape array (e.g., [1, 3, 224, 224] for batch=1, channels=3, 224x224 image)
+  // Empty shape = scalar, [N] = vector, [N, M] = matrix
+  repeated uint64 shape = 2;
+
+  // Data type
+  TensorDtype dtype = 3;
+
+  // Optional layout hint ("NCHW", "NHWC", "row-major", etc.)
+  // Nodes document expected layout in capabilities
+  // No automatic conversion performed
+  string layout = 4;
+}
+
+// Tensor data type enumeration
+enum TensorDtype {
+  TENSOR_DTYPE_UNSPECIFIED = 0;
+
+  // 32-bit float (4 bytes per element)
+  TENSOR_DTYPE_F32 = 1;
+
+  // 16-bit float (2 bytes per element)
+  TENSOR_DTYPE_F16 = 2;
+
+  // 32-bit int (4 bytes per element)
+  TENSOR_DTYPE_I32 = 3;
+
+  // 8-bit int (1 byte per element, quantized models)
+  TENSOR_DTYPE_I8 = 4;
+
+  // 8-bit unsigned int (1 byte per element)
+  TENSOR_DTYPE_U8 = 5;
+}
+
+// ============================================================================
+// Numpy Array Types (NEW - Zero-Copy)
+// ============================================================================
+
+// Numpy array buffer for zero-copy passthrough
+//
+// Enables numpy arrays to flow through the pipeline without conversion
+// until the IPC boundary. Preserves array metadata (shape, strides, contiguity)
+// for correct reconstruction on the Python side.
+//
+// Example (960 float32 samples):
+//   NumpyBuffer {
+//     data: <3840 bytes>,
+//     shape: [960],
+//     dtype: "float32",
+//     strides: [4],
+//     c_contiguous: true,
+//     f_contiguous: false
+//   }
+message NumpyBuffer {
+  // Raw array data (bytes)
+  bytes data = 1;
+
+  // Array shape (dimensions)
+  // Example: [960] for 1D, [960, 2] for stereo audio
+  repeated uint64 shape = 2;
+
+  // Data type string
+  // Examples: "float32", "float64", "int16", "int32", "uint8"
+  string dtype = 3;
+
+  // Array strides (bytes to step in each dimension)
+  // Critical for memory layout reconstruction
+  repeated int64 strides = 4;
+
+  // Whether array is C-contiguous (row-major)
+  bool c_contiguous = 5;
+
+  // Whether array is Fortran-contiguous (column-major)
+  bool f_contiguous = 6;
+}
+
+// ============================================================================
+// JSON Types (NEW)
+// ============================================================================
+
+// JSON payload for structured data, control parameters, and metadata
+//
+// Server always parses JSON into serde_json::Value for validation.
+// Nodes work with structured data (easier than string manipulation).
+//
+// Example (Calculator request):
+//   JsonData {
+//     json_payload: "{\"operation\": \"add\", \"operands\": [10, 20]}",
+//     schema_type: "CalculatorRequest"
+//   }
+message JsonData {
+  // JSON payload as string (required, must be valid JSON)
+  string json_payload = 1;
+
+  // Optional schema type hint for validation
+  // Example: "CalculatorRequest", "VADConfig", "DetectionResult"
+  // Nodes can use this to validate structure
+  string schema_type = 2;
+}
+
+// ============================================================================
+// Text Types (NEW)
+// ============================================================================
+
+// UTF-8 text data with optional encoding and language metadata
+//
+// Validation: Server validates UTF-8 correctness
+//
+// Example:
+//   TextBuffer {
+//     text_data: "Hello, world!",  // UTF-8 bytes
+//     encoding: "utf-8",
+//     language: "en"
+//   }
+message TextBuffer {
+  // Text data as UTF-8 encoded bytes
+  // Server validates UTF-8 correctness
+  bytes text_data = 1;
+
+  // Text encoding (default: "utf-8")
+  // Other values: "ascii", "utf-16"
+  string encoding = 2;
+
+  // Optional language code (ISO 639-1, e.g., "en", "es", "zh")
+  // Used for NLP, tokenization, etc.
+  string language = 3;
+
+  // Routing channel for downstream consumers. Defaults to "tts" when
+  // empty (legacy producers / speakable content). Other in-tree values:
+  //   "ui"  — text meant for visual/markdown rendering; downstream TTS
+  //           nodes MUST skip synthesis and pass it through.
+  // Producers can set any string — unknown values should be treated as
+  // "tts" for conservative fallback.
+  string channel = 4;
+}
+
+// ============================================================================
+// Binary Types (NEW)
+// ============================================================================
+
+// Raw binary data with mime type hint
+//
+// No validation beyond size limits.
+// MIME type accuracy is client responsibility (not validated by protocol).
+//
+// Example (PNG image):
+//   BinaryBuffer {
+//     data: <PNG file bytes>,
+//     mime_type: "image/png"
+//   }
+message BinaryBuffer {
+  // Raw binary data
+  bytes data = 1;
+
+  // MIME type hint
+  // Examples: "application/octet-stream", "image/png", "application/protobuf"
+  // Not validated by protocol (client responsibility)
+  string mime_type = 2;
+}
+
+// ============================================================================
+// File Types (Spec 001: RuntimeData.File)
+// ============================================================================
+
+// File reference with metadata and byte range support
+//
+// Represents a reference to a file on the local filesystem.
+// Does NOT contain file contents - only metadata for referencing.
+//
+// Usage patterns:
+// 1. Simple reference: path only, metadata optional
+// 2. Byte range read: path + offset + length
+// 3. Output file: path + stream_id for multi-track routing
+//
+// Example (input file reference):
+//   FileBuffer {
+//     path: "/data/input/video.mp4",
+//     filename: "video.mp4",
+//     mime_type: "video/mp4",
+//     size: 104857600  // 100 MB
+//   }
+//
+// Example (byte range request):
+//   FileBuffer {
+//     path: "/data/input/video.mp4",
+//     offset: 1048576,  // 1 MB offset
+//     length: 65536     // 64 KB chunk
+//   }
+message FileBuffer {
+  // File path (required, UTF-8)
+  // May be absolute (/path/to/file) or relative (./file)
+  // Path resolution is responsibility of processing node
+  string path = 1;
+
+  // Original filename (optional)
+  // Preserved separately from path for cases where the filename
+  // should be maintained independent of storage location
+  // Empty string = not specified (use path basename)
+  string filename = 2;
+
+  // MIME type hint (optional)
+  // RFC 6838 format: type/subtype (e.g., "video/mp4", "image/png")
+  // Empty string = not specified (node may auto-detect)
+  string mime_type = 3;
+
+  // File size in bytes (optional)
+  // 0 = unknown (common for output files before writing)
+  uint64 size = 4;
+
+  // Byte offset for range read/write (optional)
+  // 0 = start of file (default behavior)
+  // Used for seeking to specific positions in media files
+  uint64 offset = 5;
+
+  // Length for range requests (optional)
+  // 0 = read/write to end of file (default behavior)
+  // Used with offset for partial file I/O
+  uint64 length = 6;
+
+  // Stream identifier for multi-track routing (optional)
+  // Follows same pattern as Audio/Video stream_id (spec 013)
+  // Empty string = default track
+  string stream_id = 7;
+}
+
+// ============================================================================
+// Control Message Types (Spec 007)
+// ============================================================================
+
+// Control message for pipeline flow control
+//
+// Enables low-latency optimizations:
+// - CancelSpeculation: Cancel processing of speculative audio segments
+// - BatchHint: Suggest batching parameters to downstream nodes
+// - DeadlineWarning: Signal approaching soft deadlines
+//
+// Example (Cancel speculation):
+//   ControlMessage {
+//     message_type: { cancel_speculation: { from_timestamp: 1000, to_timestamp: 2000 } },
+//     segment_id: "seg_abc123",
+//     timestamp_ms: 1500
+//   }
+message ControlMessage {
+  // Control message type (exactly one must be set)
+  oneof message_type {
+    CancelSpeculation cancel_speculation = 1;
+    BatchHint batch_hint = 2;
+    DeadlineWarning deadline_warning = 3;
+  }
+
+  // Optional target segment ID for cancellation
+  string segment_id = 4;
+
+  // Message creation timestamp (milliseconds since epoch)
+  uint64 timestamp_ms = 5;
+
+  // Extensible metadata (JSON encoded)
+  // Example: {"reason": "vad_false_positive", "confidence": 0.3}
+  string metadata = 6;
+}
+
+// Cancel a speculative segment (retroactive cancellation)
+message CancelSpeculation {
+  // Start timestamp of segment to cancel (sample index or microseconds)
+  uint64 from_timestamp = 1;
+
+  // End timestamp of segment to cancel
+  uint64 to_timestamp = 2;
+}
+
+// Hint to increase batch size for throughput
+message BatchHint {
+  // Suggested batch size for downstream nodes
+  uint32 suggested_batch_size = 1;
+}
+
+// Soft deadline approaching (not a hard timeout)
+message DeadlineWarning {
+  // Deadline in microseconds from now
+  uint64 deadline_us = 1;
+}
+
+// ============================================================================
+// Type System (NEW)
+// ============================================================================
+
+// Data type hint for compile-time and runtime type validation
+//
+// Used in NodeManifest to declare expected input/output types.
+// Enables three-layer validation:
+//   1. Compile-time: TypeScript/Python type checking
+//   2. Manifest validation: Connection type compatibility at StreamInit
+//   3. Runtime: Chunk type validation per chunk
+//
+// Example (VAD node: audio in, JSON out):
+//   NodeManifest {
+//     id: "vad",
+//     node_type: "RustVADNode",
+//     input_types: [DATA_TYPE_HINT_AUDIO],
+//     output_types: [DATA_TYPE_HINT_JSON]
+//   }
+enum DataTypeHint {
+  DATA_TYPE_HINT_UNSPECIFIED = 0;
+  DATA_TYPE_HINT_AUDIO = 1;
+  DATA_TYPE_HINT_VIDEO = 2;
+  DATA_TYPE_HINT_TENSOR = 3;
+  DATA_TYPE_HINT_JSON = 4;
+  DATA_TYPE_HINT_TEXT = 5;
+  DATA_TYPE_HINT_BINARY = 6;
+
+  // Accept any type (polymorphic node)
+  // Example: generic logger, passthrough, inspector
+  DATA_TYPE_HINT_ANY = 7;
+
+  // File reference (Spec 001: RuntimeData.File)
+  DATA_TYPE_HINT_FILE = 8;
+}
+
+// ============================================================================
+// Metrics Types (Updated)
+// ============================================================================
+
+// Performance metrics for pipeline execution
+//
+// UPDATED: Added serialization_time_ms and data_type_breakdown
+message ExecutionMetrics {
+  // Wall-clock time from request receipt to response ready (milliseconds)
+  // Target: <5ms for simple operations (SC-001)
+  double wall_time_ms = 1;
+
+  // Total CPU time consumed by all threads (milliseconds)
+  double cpu_time_ms = 2;
+
+  // Peak memory usage during execution (bytes)
+  // Target: <10MB per concurrent execution (SC-008)
+  uint64 memory_used_bytes = 3;
+
+  // Per-node execution statistics (keyed by node ID)
+  map<string, NodeMetrics> node_metrics = 4;
+
+  // Time spent serializing/deserializing protobuf messages (milliseconds)
+  // Target: <10% of wall_time_ms (SC-003)
+  double serialization_time_ms = 5;
+
+  // NEW: Proto ↔ Runtime conversion overhead
+  // Measures DataBuffer → RuntimeData → DataBuffer conversion time
+  double proto_to_runtime_ms = 6;
+  double runtime_to_proto_ms = 7;
+
+  // NEW: Track data type distribution
+  // Keys: "audio", "video", "tensor", "json", "text", "binary"
+  // Values: Count of chunks/buffers processed per type
+  map<string, uint64> data_type_breakdown = 8;
+}
+
+// Performance metrics for a single node execution
+message NodeMetrics {
+  // Time spent executing this node's process() method (milliseconds)
+  double execution_time_ms = 1;
+
+  // Memory allocated by this node (bytes)
+  uint64 memory_bytes = 2;
+
+  // UPDATED: Generic item count (was samples_processed)
+  // Audio: samples, Video: frames, Tensor: elements, JSON: objects, Text: characters
+  uint64 items_processed = 3;
+
+  // Node-specific metrics (JSON encoded)
+  // Example: {"vad_segments": 12, "silence_ratio": 0.45}
+  string custom_metrics = 4;
+}
+
+// ============================================================================
+// Error Types (Updated)
+// ============================================================================
+
+// Structured error information for debugging and diagnostics
+//
+// UPDATED: Added ERROR_TYPE_TYPE_VALIDATION for generic type errors
+message ErrorResponse {
+  // Error category for programmatic handling
+  ErrorType error_type = 1;
+
+  // Human-readable error message
+  string message = 2;
+
+  // Node ID where error occurred (empty for manifest validation errors)
+  string failing_node_id = 3;
+
+  // Execution context at time of error (JSON encoded)
+  // Example: {"expected_type": "AUDIO", "actual_type": "VIDEO"}
+  string context = 4;
+
+  // Rust panic stack trace (if available)
+  string stack_trace = 5;
+}
+
+// Error category enumeration
+//
+// UPDATED: Added ERROR_TYPE_TYPE_VALIDATION
+enum ErrorType {
+  ERROR_TYPE_UNSPECIFIED = 0;
+
+  // Manifest validation error (malformed JSON, invalid node IDs, cycles)
+  // Action: Fix manifest and retry
+  ERROR_TYPE_VALIDATION = 1;
+
+  // Node execution failure (invalid parameters, processing error)
+  // Action: Check node parameters and input data
+  ERROR_TYPE_NODE_EXECUTION = 2;
+
+  // Resource limit exceeded (memory, timeout, buffer size)
+  // Action: Reduce pipeline complexity or request higher limits
+  ERROR_TYPE_RESOURCE_LIMIT = 3;
+
+  // Authentication failed (invalid/missing API token)
+  // Action: Check API token configuration
+  ERROR_TYPE_AUTHENTICATION = 4;
+
+  // Protocol version mismatch (incompatible client/server versions)
+  // Action: Upgrade client library
+  ERROR_TYPE_VERSION_MISMATCH = 5;
+
+  // Service internal error (panic, unexpected state)
+  // Action: Retry with exponential backoff, contact support if persistent
+  ERROR_TYPE_INTERNAL = 6;
+
+  // NEW: Type validation error (type mismatch in manifest or runtime)
+  // Action: Fix type declarations or data types
+  // Example: Audio node receives video data
+  ERROR_TYPE_TYPE_VALIDATION = 7;
+}
+
+// ============================================================================
+// Version Types (Unchanged from Feature 003)
+// ============================================================================
+
+// Service version and protocol compatibility information
+//
+// Returned by GetVersion() RPC to enable client compatibility checks.
+message VersionInfo {
+  // Current protocol version (e.g., "v1")
+  string protocol_version = 1;
+
+  // Rust runtime version (e.g., "0.2.1")
+  string runtime_version = 2;
+
+  // List of supported node types registered in this service
+  // Example: ["AudioResample", "VAD", "HFPipelineNode"]
+  repeated string supported_node_types = 3;
+
+  // All protocol versions this service supports
+  // Example: ["v1"] initially, may expand to ["v1", "v2"]
+  repeated string supported_protocols = 4;
+
+  // Service build timestamp (ISO 8601)
+  // Example: "2025-10-28T10:30:00Z"
+  string build_timestamp = 5;
+}
+
+// ============================================================================
+// Resource Types (Unchanged from Feature 003)
+// ============================================================================
+
+// Configurable resource constraints for pipeline execution
+//
+// Clients can request custom limits within service-defined maximums.
+// Service applies defaults if not specified.
+message ResourceLimits {
+  // Maximum memory allocation (bytes)
+  // Default: 100MB, Max: 1GB (configurable per service)
+  uint64 max_memory_bytes = 1;
+
+  // Maximum execution timeout (milliseconds)
+  // Default: 5000ms, Max: 30000ms (configurable per service)
+  uint64 max_timeout_ms = 2;
+
+  // Maximum audio buffer size (samples, across all channels)
+  // Default: 10M samples (~200MB stereo F32)
+  // Prevents out-of-memory attacks
+  uint64 max_audio_samples = 3;
+}
+
+// ============================================================================
+// Execution Status Types (Unchanged from Feature 003)
+// ============================================================================
+
+// Overall pipeline execution status
+enum ExecutionStatus {
+  EXECUTION_STATUS_UNSPECIFIED = 0;
+
+  // All nodes executed successfully
+  EXECUTION_STATUS_SUCCESS = 1;
+
+  // Some nodes were skipped but pipeline completed
+  // (e.g., conditional nodes based on input data)
+  EXECUTION_STATUS_PARTIAL_SUCCESS = 2;
+
+  // Pipeline execution failed (see ErrorResponse for details)
+  EXECUTION_STATUS_FAILED = 3;
+}
+
+// Execution status for a single node
+enum NodeStatus {
+  NODE_STATUS_UNSPECIFIED = 0;
+
+  // Node executed successfully
+  NODE_STATUS_SUCCESS = 1;
+
+  // Node was skipped (conditional execution)
+  NODE_STATUS_SKIPPED = 2;
+
+  // Node execution failed (see ErrorResponse for details)
+  NODE_STATUS_FAILED = 3;
+}
+
+// Execution details for a single node
+message NodeResult {
+  // Node ID from manifest
+  string node_id = 1;
+
+  // Execution status
+  NodeStatus status = 2;
+
+  // Error details (only if status == NODE_STATUS_FAILED)
+  ErrorResponse error = 3;
+
+  // Node-specific output metadata (JSON encoded)
+  // Example: {"output_format": "f32", "channels": 2}
+  string output_metadata = 4;
+}

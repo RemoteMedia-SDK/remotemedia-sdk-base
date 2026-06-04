@@ -1,0 +1,3 @@
+[env]
+PKG_CONFIG_PATH = "/home/acidhax/dev/personal/remotemedia/remotemedia-sdk/vendor/libvpx/lib/pkgconfig"
+LIBRARY_PATH = "/home/acidhax/dev/personal/remotemedia/remotemedia-sdk/vendor/libvpx/lib"

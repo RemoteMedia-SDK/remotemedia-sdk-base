@@ -224,13 +224,7 @@ impl NodeProvider for CoreNodesProvider {
         // longer in the host workspace. Load via
         // `"plugins": ["llama-cpp@v0.1.0"]` in the pipeline manifest.
 
-        // Affect-aware agent runtime driver (spike-i Tier A).
-        // Wall-paced (5 Hz) node that consumes VAD/STT/prosody envelopes
-        // and publishes Channel A/B/D aux-port envelopes to a downstream
-        // language head. Gated behind `affect-sim` so workspaces that
-        // don't pull `affect-simulator` aren't burdened with the dep.
-        #[cfg(feature = "affect-sim")]
-        registry.register(Arc::new(crate::nodes::AffectSimulatorNodeFactory));
+
 
         // Activation-projection face node — consumes
         // `RuntimeData::Tensor` envelopes tagged

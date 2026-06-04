@@ -1,0 +1,437 @@
+// WebRTC Signaling Protocol over gRPC
+//
+// This protocol provides WebRTC signaling as a gRPC service, offering an
+// alternative to WebSocket-based JSON-RPC 2.0 signaling.
+//
+// Features:
+// - Bidirectional streaming for real-time signaling
+// - Type-safe protobuf messages
+// - Built-in authentication via gRPC metadata
+// - Compatible with existing gRPC infrastructure
+// - Peer discovery and management
+// - SDP offer/answer exchange
+// - ICE candidate exchange
+//
+// Design principles:
+// - Maintains parity with WebSocket JSON-RPC 2.0 protocol
+// - Leverages gRPC streaming for bidirectional communication
+// - Type-safe with compile-time validation
+// - Integrates with existing gRPC auth and middleware
+
+syntax = "proto3";
+
+package remotemedia.v1.webrtc;
+
+// ============================================================================
+// WebRTC Signaling Service
+// ============================================================================
+
+// WebRTC signaling service for peer discovery and connection establishment
+//
+// Provides bidirectional streaming for real-time signaling between peers.
+// Each peer maintains a single long-lived bidirectional stream.
+//
+// Typical flow:
+// 1. Client opens bidirectional stream with Signal()
+// 2. Client sends Announce message to register peer
+// 3. Server sends PeerJoined notifications for other peers
+// 4. Clients exchange Offer/Answer/ICE messages via server
+// 5. Stream remains open for duration of session
+service WebRtcSignaling {
+  // Bidirectional signaling stream
+  //
+  // Client → Server: SignalingRequest (Announce, Offer, Answer, ICE, Disconnect, ListPeers)
+  // Server → Client: SignalingResponse (Ack, PeerList, Notification)
+  //
+  // The stream remains open for the duration of the peer's session.
+  // When the stream closes, the peer is automatically removed.
+  rpc Signal(stream SignalingRequest) returns (stream SignalingResponse);
+
+  // Unary RPC to get list of connected peers (alternative to streaming)
+  //
+  // Useful for one-time queries without establishing a stream.
+  rpc GetPeers(GetPeersRequest) returns (GetPeersResponse);
+
+  // Health check for monitoring
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// ============================================================================
+// Request Messages
+// ============================================================================
+
+// Signaling request from client to server
+//
+// Uses oneof discriminator for type-safe message variants.
+// Exactly one variant must be set.
+message SignalingRequest {
+  // Request ID for matching responses (optional)
+  // Server echoes this in SignalingResponse
+  string request_id = 1;
+
+  // Request type (exactly one must be set)
+  oneof request {
+    AnnounceRequest announce = 10;
+    OfferRequest offer = 11;
+    AnswerRequest answer = 12;
+    IceCandidateRequest ice_candidate = 13;
+    DisconnectRequest disconnect = 14;
+    ListPeersRequest list_peers = 15;
+  }
+}
+
+// Announce peer to signaling server
+//
+// Must be the first message sent on a new stream.
+// Registers the peer and enables receiving notifications.
+message AnnounceRequest {
+  // Unique peer identifier
+  // Must be unique across all connected peers
+  string peer_id = 1;
+
+  // Peer capabilities (audio, video, data channels)
+  PeerCapabilities capabilities = 2;
+
+  // Optional peer metadata
+  // Examples: display_name="Alice", app_version="1.0.0"
+  map<string, string> metadata = 3;
+}
+
+// Send SDP offer to another peer
+message OfferRequest {
+  // Target peer ID
+  string to_peer_id = 1;
+
+  // SDP offer string
+  string sdp = 2;
+
+  // SDP type (should be "offer")
+  string type = 3;
+}
+
+// Send SDP answer to another peer
+message AnswerRequest {
+  // Target peer ID (who sent the offer)
+  string to_peer_id = 1;
+
+  // SDP answer string
+  string sdp = 2;
+
+  // SDP type (should be "answer")
+  string type = 3;
+}
+
+// Exchange ICE candidate with another peer
+message IceCandidateRequest {
+  // Target peer ID
+  string to_peer_id = 1;
+
+  // ICE candidate string
+  string candidate = 2;
+
+  // SDP media stream ID
+  string sdp_mid = 3;
+
+  // SDP media stream index
+  uint32 sdp_mline_index = 4;
+}
+
+// Notify server of peer disconnection
+message DisconnectRequest {
+  // Peer ID to disconnect from
+  string peer_id = 1;
+}
+
+// Request list of connected peers
+message ListPeersRequest {
+  // No fields - returns all connected peers
+}
+
+// Get peers request (unary RPC)
+message GetPeersRequest {
+  // No fields - returns all connected peers
+}
+
+// Health check request
+message HealthCheckRequest {
+  // No fields
+}
+
+// ============================================================================
+// Response Messages
+// ============================================================================
+
+// Signaling response from server to client
+//
+// Can be either:
+// - Acknowledgment of client request (with request_id)
+// - Notification of peer event (no request_id)
+message SignalingResponse {
+  // Request ID from SignalingRequest (empty for notifications)
+  string request_id = 1;
+
+  // Response type (exactly one must be set)
+  oneof response {
+    AckResponse ack = 10;
+    PeerListResponse peer_list = 11;
+    SignalingNotification notification = 12;
+    ErrorResponse error = 13;
+  }
+}
+
+// Acknowledgment of successful request
+message AckResponse {
+  // Success message
+  string message = 1;
+
+  // Additional response data (JSON encoded)
+  // Examples:
+  //   Announce: {"peers_count": 3, "other_peers": ["peer-1", "peer-2"]}
+  //   Offer: {"offer_id": "peer-1_peer-2_1234567890"}
+  string data = 2;
+}
+
+// List of connected peers
+message PeerListResponse {
+  // Connected peers
+  repeated PeerInfo peers = 1;
+
+  // Total peer count
+  uint32 count = 2;
+}
+
+// Signaling notification (server-initiated)
+//
+// Sent to clients without corresponding request.
+// Used for peer events and message forwarding.
+message SignalingNotification {
+  // Notification type (exactly one must be set)
+  oneof notification {
+    PeerJoinedNotification peer_joined = 1;
+    PeerLeftNotification peer_left = 2;
+    OfferNotification offer = 3;
+    AnswerNotification answer = 4;
+    IceCandidateNotification ice_candidate = 5;
+    PeerDisconnectedNotification peer_disconnected = 6;
+  }
+}
+
+// Notification: New peer joined
+message PeerJoinedNotification {
+  // Peer ID
+  string peer_id = 1;
+
+  // Peer capabilities
+  PeerCapabilities capabilities = 2;
+
+  // Peer metadata
+  map<string, string> metadata = 3;
+}
+
+// Notification: Peer left
+message PeerLeftNotification {
+  // Peer ID
+  string peer_id = 1;
+}
+
+// Notification: Offer received from peer
+message OfferNotification {
+  // Peer ID who sent the offer
+  string from_peer_id = 1;
+
+  // Offer ID for tracking
+  string offer_id = 2;
+
+  // SDP offer string
+  string sdp = 3;
+
+  // SDP type (should be "offer")
+  string type = 4;
+}
+
+// Notification: Answer received from peer
+message AnswerNotification {
+  // Peer ID who sent the answer
+  string from_peer_id = 1;
+
+  // SDP answer string
+  string sdp = 2;
+
+  // SDP type (should be "answer")
+  string type = 3;
+}
+
+// Notification: ICE candidate received from peer
+message IceCandidateNotification {
+  // Peer ID who sent the ICE candidate
+  string from_peer_id = 1;
+
+  // ICE candidate string
+  string candidate = 2;
+
+  // SDP media stream ID
+  string sdp_mid = 3;
+
+  // SDP media stream index
+  uint32 sdp_mline_index = 4;
+}
+
+// Notification: Peer disconnected
+message PeerDisconnectedNotification {
+  // Peer ID
+  string peer_id = 1;
+}
+
+// Error response
+message ErrorResponse {
+  // Error code (gRPC status code)
+  uint32 code = 1;
+
+  // Error message
+  string message = 2;
+
+  // Error details (JSON encoded)
+  string details = 3;
+}
+
+// Get peers response (unary RPC)
+message GetPeersResponse {
+  // Connected peers
+  repeated PeerInfo peers = 1;
+
+  // Total peer count
+  uint32 count = 2;
+}
+
+// Health check response
+message HealthCheckResponse {
+  // Service status ("healthy", "degraded", "unhealthy")
+  string status = 1;
+
+  // Server uptime in seconds
+  uint64 uptime_seconds = 2;
+
+  // Number of connected peers
+  uint32 connected_peers = 3;
+
+  // Additional metrics (JSON encoded)
+  string metrics = 4;
+}
+
+// ============================================================================
+// Common Types
+// ============================================================================
+
+// Peer information
+message PeerInfo {
+  // Unique peer identifier
+  string peer_id = 1;
+
+  // Peer capabilities
+  PeerCapabilities capabilities = 2;
+
+  // Peer state
+  PeerState state = 3;
+
+  // Peer metadata
+  map<string, string> metadata = 4;
+
+  // Timestamp when peer connected (Unix timestamp in seconds)
+  uint64 connected_at = 5;
+}
+
+// Peer capabilities
+message PeerCapabilities {
+  // Audio support
+  bool audio = 1;
+
+  // Video support
+  bool video = 2;
+
+  // Data channel support
+  bool data = 3;
+
+  // Additional capabilities (JSON encoded)
+  // Examples: {"screen_share": true, "h264": true}
+  string extensions = 4;
+}
+
+// Peer state enumeration
+enum PeerState {
+  PEER_STATE_UNSPECIFIED = 0;
+
+  // Peer is available for connections
+  PEER_STATE_AVAILABLE = 1;
+
+  // Peer is busy (in a call, etc.)
+  PEER_STATE_BUSY = 2;
+
+  // Peer is away
+  PEER_STATE_AWAY = 3;
+
+  // Peer is offline (disconnected)
+  PEER_STATE_OFFLINE = 4;
+}
+
+// ============================================================================
+// WebRTC Data Channel Envelope & Binary Protocol (T157-T158 Refactor)
+// ============================================================================
+
+enum FrameKind {
+  FRAME_KIND_UNSPECIFIED = 0;
+  FRAME_KIND_CONTROL = 1;
+  FRAME_KIND_TEXT = 2;
+  FRAME_KIND_BINARY = 3;
+  FRAME_KIND_RUNTIME_DATA = 4;
+  FRAME_KIND_CHUNK = 5;
+}
+
+message ControlJsonFrame {
+  bytes json = 1;
+}
+
+message TextFrame {
+  string text = 1;
+}
+
+message BinaryFrame {
+  bytes data = 1;
+  optional string content_type = 2;
+  optional string data_type_hint = 3;
+}
+
+message RuntimeDataFrame {
+  // Protobuf-encoded DataBuffer bytes.
+  bytes data_buffer = 1;
+  optional string content_type = 2;
+  optional string data_type_hint = 3;
+}
+
+message ChunkFrame {
+  string stream_id = 1;
+  string message_id = 2;
+  uint32 chunk_index = 3;
+  optional uint32 total_chunks = 4;
+  bool is_final = 5;
+  optional string content_type = 6;
+  optional string data_type_hint = 7;
+
+  // Raw chunk payload bytes. Must not be base64.
+  bytes data = 8;
+}
+
+message DataChannelEnvelope {
+  uint32 version = 1;
+  FrameKind kind = 2;
+  string action = 3;
+  map<string, string> headers = 4;
+
+  oneof payload {
+    ControlJsonFrame control_json = 10;
+    TextFrame text = 11;
+    BinaryFrame binary = 12;
+    RuntimeDataFrame runtime_data = 13;
+    ChunkFrame chunk = 14;
+  }
+}
+

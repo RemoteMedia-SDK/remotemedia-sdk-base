@@ -57,10 +57,10 @@ remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plu
 # `MultimodalLLMNode`. Core re-exports it from the historical module
 # paths (`crate::llm::history`, `crate::llm::tool_dispatch`,
 # `crate::nodes::tool_spec`) so existing imports keep working.
-remotemedia-modality = { path = "../remotemedia-plugin-sdk/crates/modality", features = ["llm"] }
+remotemedia-modality = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "f98ba9df8d57ecc8a7bcbaeb9a84299779a78722", features = ["llm"] }
 
 # Proc-macros for NodeConfig
-remotemedia-core-derive = { path = "../remotemedia-sdk/crates/core-derive" }
+remotemedia-core-derive = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "f98ba9df8d57ecc8a7bcbaeb9a84299779a78722" }
 
 # In-process loadable native plugins (gated behind `loadable` feature).
 # Plugin authors depend on `loadable-node-abi` directly so they don't
@@ -101,11 +101,7 @@ bytemuck = { version = "1.14", features = ["derive"] }
 # `zip` stays — still used by `activation-face` for NPZ archive loading.
 zip = { version = "2.2", default-features = false, features = ["deflate"], optional = true }
 
-# Affect simulator (Phase 1 deterministic affect-state model). Used
-# by `AffectSimulatorNode` to drive runtime Channel A/B/D updates
-# from VAD/STT/prosody events. Path dep — sibling crate in
-# `tools/affect_simulator/`. Gated behind the `affect-sim` feature.
-affect-simulator = { path = "../remotemedia-sdk/tools/affect_simulator", optional = true }
+
 
 # All renderer-stack deps moved out alongside the renderer nodes:
 #   - `cubism-core` + `wgpu` (workspace 22.1) → live2d-render plugin
@@ -273,12 +269,7 @@ python-source-plugin = ["dep:remotemedia-plugin-sdk", "remotemedia-plugin-sdk/bu
 # `affect-listener-face` now only gates `VadToFaceNode` (pure Rust);
 # `WhisperToVadNode` moved to RemoteMedia-SDK/whisper-to-vad.
 affect-listener-face = []
-# Affect simulator runtime driver: `AffectSimulatorNode`, a SourceWall(5)-
-# paced node that owns a per-session `affect_simulator::AffectState`,
-# ingests VAD/STT/prosody events, and emits Channel A/B/D aux-port
-# envelopes to the language-head node. See
-# `docs/references/activation-steering-audio-llm/notes/spike-i-affect-runtime-driver.md`.
-affect-sim = ["dep:affect-simulator", "avatar-lipsync"]
+
 # Avatar pipeline (spec 2026-04-27): emoji-tag extraction from text streams
 avatar-emotion = []
 # Avatar lip-sync — `LipSyncNode` trait, `BlendshapeFrame` envelope, and a
@@ -343,5 +334,45 @@ remotemedia-traits = { path = "../remotemedia-plugin-sdk/crates/traits" }
 remotemedia-py-env = { path = "../remotemedia-plugin-sdk/crates/py-env-manager" }
 remotemedia-plugin-sdk = { path = "../remotemedia-plugin-sdk/crates/plugin-sdk" }
 remotemedia-modality = { path = "../remotemedia-plugin-sdk/crates/modality" }
+remotemedia-core-derive = { path = "../remotemedia-plugin-sdk/crates/core-derive" }
 
+[workspace]
+members = [
+    ".",
+    "crates/transports/webrtc",
+    "crates/services/webrtc-server",
+]
 
+[workspace.package]
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["RemoteMedia SDK Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+homepage = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["sync", "macros", "io-util", "rt", "rt-multi-thread", "time", "fs", "process", "signal"] }
+tokio-stream = "0.1"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+parking_lot = "0.12"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "1.0"
+anyhow = "1.0.100"
+prost = "0.14"
+tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+tonic-web = "0.14.1"
+tonic-prost = "0.14"
+tower = "0.4"
+bollard = { version = "0.19.4", features = ["chrono"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tonic-prost-build = { version = "0.14" }
+protobuf-src = { version = "2" }
+num_cpus = "1.16"

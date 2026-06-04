@@ -1,0 +1,83 @@
+{
+  "version": "v1",
+  "metadata": {
+    "name": "speculative-vad-loopback",
+    "description": "Speculative VAD with confirmation - audio loopback at 48kHz",
+    "optimization": "speculative_vad_forwarding",
+    "expectedLatency": "<250ms P99"
+  },
+  "nodes": [
+    {
+      "id": "input_chunker",
+      "node_type": "AudioChunkerNode",
+      "params": {
+        "chunkSize": 960
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "audio_resampler",
+      "node_type": "FastResampleNode",
+      "params": {
+        "sourceRate": 48000,
+        "targetRate": 16000,
+        "quality": "Low",
+        "channels": 1
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "vad_chunker",
+      "node_type": "AudioChunkerNode",
+      "params": {
+        "chunkSize": 320
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "speculative_vad",
+      "node_type": "SpeculativeVADGate",
+      "params": {
+        "lookbackMs": 100,
+        "lookaheadMs": 25,
+        "vadThreshold": 0.5,
+        "sampleRate": 16000,
+        "minSpeechMs": 200,
+        "minSilenceMs": 300,
+        "padMs": 12
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "confirmation_vad",
+      "node_type": "SileroVADNode",
+      "params": {
+        "threshold": 0.5,
+        "samplingRate": 16000,
+        "minSpeechDurationMs": 250,
+        "minSilenceDurationMs": 100,
+        "speechPadMs": 30
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "output_resampler",
+      "node_type": "FastResampleNode",
+      "params": {
+        "sourceRate": 16000,
+        "targetRate": 48000,
+        "quality": "Low",
+        "channels": 1
+      },
+      "is_streaming": true
+    }
+  ],
+  "connections": [
+    { "from": "input_chunker", "to": "audio_resampler" },
+    { "from": "audio_resampler", "to": "vad_chunker" },
+    { "from": "vad_chunker", "to": "speculative_vad" },
+    { "from": "speculative_vad", "to": "output_resampler" },
+    { "from": "vad_chunker", "to": "confirmation_vad" },
+    { "from": "confirmation_vad", "to": "speculative_vad" }
+  ]
+}

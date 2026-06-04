@@ -1,0 +1,145 @@
+[package]
+name = "remotemedia-webrtc"
+version = "0.4.0"
+edition = "2021"
+rust-version.workspace = true
+authors = ["RemoteMedia SDK Contributors"]
+description = "WebRTC transport for RemoteMedia pipelines with multi-peer mesh networking"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+
+[lib]
+name = "remotemedia_webrtc"
+crate-type = ["rlib"]
+
+[dependencies]
+# Core runtime (with default features: multiprocess, silero-vad, docker).
+# `bundled-uv` enables the uv binary downloader so managed venvs can
+# provision their own Python 3.12 regardless of what's on PATH — needed
+# by the mlx-vlm / mlx-audio demo servers where the system interpreter
+# (e.g. miniconda 3.10) is too old to host the wheels.
+# `llama-cpp-cuda` feature removed from core (llama.cpp nodes moved to
+# RemoteMedia-SDK/llama-cpp plugin); load via
+# `"plugins": ["llama-cpp@v0.1.0"]` in pipeline manifests instead.
+remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv", "multiprocess", "video"] }
+
+# WebRTC peer connections, ICE, DTLS, SRTP
+webrtc = "0.14.0"
+
+# WebSocket signaling client
+tokio-tungstenite = "0.21"
+
+# Audio codec - pure Rust implementation via unsafe-libopus (always enabled for WebRTC)
+opus = { git = "https://github.com/DCNick3/opus-rs.git", branch = "unsafe-libopus", default-features = false, features = ["unsafe-libopus-backend"] }
+
+# Video codecs (optional until Phase 3 - requires native libs)
+media-codec-vpx = { version = "0.5", optional = true }
+openh264 = { version = "0.5", optional = true }
+
+# UUID generation for session/peer IDs
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+futures-util = "0.3"
+
+# Sync locks for media track state (encoder / decoder / sender / RTP
+# counters). Phase B2: swapped from `tokio::sync::RwLock` because no
+# `.await` is held across the lock; uncontended fast path is a CAS.
+parking_lot = { workspace = true }
+
+# Serialization (JSON-RPC 2.0)
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+base64 = "0.22"
+
+# Data types
+bytes = "1.5"
+
+# Async trait support
+async-trait = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Signaling
+tonic = { workspace = true, optional = true }
+tonic-web = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+prost = { workspace = true }
+tokio-stream = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+http = { version = "1.0", optional = true }
+
+# CLI argument parsing (optional)
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
+
+# Docker execution
+bollard = { workspace = true }
+
+[dev-dependencies]
+remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk" }
+tokio-test = "0.4"
+criterion = "0.5"
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = "0.21"
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protobuf-src = { workspace = true }
+
+[features]
+default = ["grpc-signaling"]
+codecs = ["dep:media-codec-vpx"]
+h264 = ["dep:openh264"]
+# Generic signaling feature for event bridge types (WebRtcEventBridge, etc.)
+signaling = ["ws-signaling"]
+# WebSocket signaling requires grpc-signaling because ServerPeer uses generated protobufs
+ws-signaling = ["grpc-signaling"]
+grpc-signaling = [
+    "dep:tonic",
+    "dep:tonic-web",
+    "dep:tonic-prost",
+    "dep:tokio-stream",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:http",
+]
+cli = ["dep:clap"]
+# Renderer-agnostic avatar deps from `remotemedia-core`. Audio2Face
+# lip-sync, emoji-tag emotion extraction, and the renderer state
+# machine. Combine with exactly one of `avatar-live2d` or `avatar-cc`
+# (or both, if you want a single binary that can switch at runtime).
+avatar-core = [
+    # `avatar-audio2face` removed — Audio2FaceLipSyncNode moved to
+    # standalone plugin (RemoteMedia-SDK/audio2face@v0.1.0). Consumers
+    # that need lip-sync now load it via
+    # `"plugins": ["audio2face@v0.1.0"]` in the pipeline manifest.
+    "remotemedia-core/avatar-emotion",
+    "remotemedia-core/avatar-lipsync",
+]
+# Live2D renderer moved to standalone plugin
+# (RemoteMedia-SDK/live2d-render@v0.1.0). Manifests that need Live2D
+# now request it at runtime via `"plugins": ["live2d-render@v0.1.0"]`;
+# no build-time Cubism SDK requirement on the host.
+avatar-live2d = ["avatar-core"]
+# CC5 / glTF avatar engine moved to standalone plugin
+# (RemoteMedia-SDK/cc-render@v0.1.0). Both Live2D and CC5 renderers
+# are now plugin-only. `avatar-cc` and `avatar-live2d` are kept as
+# empty aggregators for back-compat in build scripts that still pass
+# them; they just pull avatar-core (renderer-agnostic state machine).
+avatar-cc = ["avatar-core"]
+# Back-compat: `avatar` historically pulled a renderer; now just
+# avatar-core. Manifests that need an actual renderer load the
+# cc-render or live2d-render plugin at runtime.
+avatar = ["avatar-core"]
+full = ["codecs", "h264", "grpc-signaling", "ws-signaling"]
