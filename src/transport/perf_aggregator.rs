@@ -116,7 +116,7 @@ impl NodeBucket {
 
     /// Build a snapshot view **without** resetting. The histograms keep
     /// accumulating; subsequent `peek_into` calls return strictly more
-    /// data. Used by the benchmark harness to read end-of-run merged
+    /// data. Used by external tooling to read end-of-run merged
     /// percentiles without racing the periodic flush task.
     fn peek_into(&self) -> NodeStats {
         NodeStats {
@@ -307,13 +307,13 @@ impl PerfAggregator {
 
     /// Build a snapshot **without** resetting histograms. Unlike
     /// [`Self::flush_snapshot`], repeated calls return strictly more
-    /// data, so a harness can use this to capture an entire benchmark
+    /// data, so tooling can use this to capture an entire execution
     /// window in one merged HDR histogram instead of trying to combine
     /// percentile-of-percentiles across periodic flushes.
     ///
     /// Note: this does not interact with the periodic flush task — if
     /// the flush task is also running, it will continue to reset on
-    /// its own cadence. For deterministic bench measurements, either
+    /// its own cadence. For deterministic measurements, either
     /// disable the periodic flush (set window very large) or take the
     /// peek before the first periodic flush fires.
     pub fn peek_snapshot(&self) -> PerfSnapshot {
@@ -365,8 +365,8 @@ impl PerfAggregator {
 
     /// Read the snapshot window length (ms) from the environment.
     /// Clamped to `[100, 3_600_000]` (100 ms .. 1 hour). The upper
-    /// bound is generous on purpose: the benchmark harness
-    /// (`remotemedia bench`) sets 600_000 ms so a single
+    /// bound is generous on purpose: tooling can configure a large window
+    /// (e.g., 600_000 ms) so a single
     /// `peek_snapshot()` at end-of-run captures the whole run as one
     /// merged HDR histogram — silently clamping to 10 s drains the
     /// histograms mid-run and leaves the upstream nodes'
@@ -376,7 +376,7 @@ impl PerfAggregator {
     /// Default depends on the profile:
     /// - `REMOTEMEDIA_PERF_PROD=1` → 5000 ms (5× cheaper
     ///   serialization + broadcast cost; HUD still feels live).
-    /// - Otherwise → 1000 ms (interactive dev/bench default).
+    /// - Otherwise → 1000 ms (interactive dev default).
     pub fn window_ms_from_env() -> u32 {
         if let Ok(v) = std::env::var("REMOTEMEDIA_PERF_WINDOW_MS") {
             if let Ok(n) = v.parse::<u32>() {

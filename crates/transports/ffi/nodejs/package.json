@@ -94,7 +94,6 @@
     "test:webrtc-pipeline": "jest webrtc-pipeline.test.ts",
     "test:e2e": "node __tests__/e2e/run-e2e-server.js",
     "test:e2e-rpc": "node scripts/run-e2e-rpc.js",
-    "benchmark": "node benchmark-zero-copy.js",
     "clean": "rm -rf *.node node_modules"
   },
   "devDependencies": {

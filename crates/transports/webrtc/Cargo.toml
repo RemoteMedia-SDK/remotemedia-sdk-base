@@ -88,7 +88,6 @@ bollard = { workspace = true }
 [dev-dependencies]
 remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk" }
 tokio-test = "0.4"
-criterion = "0.5"
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 tokio-tungstenite = "0.21"

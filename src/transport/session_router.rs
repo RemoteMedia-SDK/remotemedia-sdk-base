@@ -574,9 +574,9 @@ impl SessionRouter {
         &self.graph.sinks
     }
 
-    /// Get the per-session performance aggregator. Lets a benchmark
-    /// harness call [`PerfAggregator::peek_snapshot`] at the end of a
-    /// run to capture an entire-bench window in one merged HDR
+    /// Get the per-session performance aggregator. Lets performance
+    /// tooling call [`PerfAggregator::peek_snapshot`] at the end of a
+    /// run to capture an entire execution window in one merged HDR
     /// histogram (instead of trying to combine percentile-of-percentiles
     /// across the periodic flush task's 1 s windows).
     pub fn perf_aggregator(&self) -> Arc<PerfAggregator> {
@@ -2036,7 +2036,7 @@ impl SessionRouter {
     /// Clone the router's probe handle.
     ///
     /// [`Self::start`] consumes the router, so anything that wants to
-    /// read probe state *after* the router is running (benches, admin
+    /// read probe state *after* the router is running (admin
     /// endpoints, test harnesses) needs the `Arc` before the `start`
     /// call. `probes().snapshot_all()` / `probes().operational_snapshot()`
     /// is the out-of-band equivalent of the `&self` accessors above.

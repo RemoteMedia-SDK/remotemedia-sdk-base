@@ -226,7 +226,6 @@ glob = { version = "0.3", optional = true }
 [dev-dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "." }
 tokio-test = { version = "0.4" }
-criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = { version = "3.8" }
 rand = { version = "0.8" }
 chrono = { version = "0.4", features = ["serde"] }
@@ -494,10 +493,6 @@ wasm-bindgen-futures = "0.4"
 
 [workspace.dependencies.tokio-test]
 version = "0.4"
-
-[workspace.dependencies.criterion]
-version = "0.5"
-features = ["async_tokio"]
 
 [workspace.dependencies.tempfile]
 version = "3.8"

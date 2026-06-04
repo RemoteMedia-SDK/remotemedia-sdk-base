@@ -106,7 +106,7 @@ pub struct SessionHandle {
     /// the writer finishes the JSONL file and the tap relays exit.
     _recorder: Option<crate::transport::session_recorder::SessionRecorder>,
     /// Per-session perf aggregator. `Some` whenever `REMOTEMEDIA_PERF_TAP`
-    /// was set at session-construction time. Benchmarks call
+    /// was set at session-construction time. External tooling calls
     /// [`PerfAggregator::peek_snapshot`] at end-of-run to read merged
     /// HDR-histogram percentiles without racing the periodic flush.
     perf_aggregator: Option<Arc<crate::transport::perf_aggregator::PerfAggregator>>,
@@ -259,7 +259,7 @@ impl SessionHandle {
     }
 
     /// Per-session perf aggregator, if `REMOTEMEDIA_PERF_TAP` was set
-    /// when this session was created. Bench harnesses use this to read
+    /// when this session was created. Performance tooling uses this to read
     /// merged HDR-histogram percentiles at end-of-run without racing
     /// the periodic 1 s flush task.
     pub fn perf_aggregator(
@@ -1157,7 +1157,7 @@ impl PipelineExecutor {
         // Get input sender before moving router
         let input_tx = router.get_input_sender();
         // Snapshot the perf aggregator handle before the router is
-        // moved into the spawned task — benchmark consumers read
+        // moved into the spawned task — performance tooling reads
         // merged HDR-histogram percentiles off this at end-of-run.
         let perf_aggregator =
             if crate::transport::perf_aggregator::PerfAggregator::enabled_from_env() {

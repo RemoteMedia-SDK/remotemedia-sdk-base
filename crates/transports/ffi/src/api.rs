@@ -300,8 +300,6 @@ pub fn execute_pipeline_with_instances<'py>(
     })
 }
 
-/// Run the reusable RemoteMedia benchmark harness from Python.
-///
 
 /// Get runtime version information
 #[pyfunction]

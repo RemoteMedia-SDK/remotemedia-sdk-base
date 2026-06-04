@@ -2,8 +2,8 @@
 //!
 //! Exposes a long-lived `SessionHandle` to Python: push inputs continuously,
 //! drain per-kind outputs (audio / video / data) on demand. Maps directly onto
-//! [`remotemedia_core::transport::SessionHandle`] — the same API the CLI bench
-//! and WebRTC transports use. Lets Python drive manifests with VAD +
+//! [`remotemedia_core::transport::SessionHandle`] — the same API other
+//! transports use. Lets Python drive manifests with VAD +
 //! Accumulator + LFM2-style streaming nodes that produce many outputs per
 //! input.
 //!
