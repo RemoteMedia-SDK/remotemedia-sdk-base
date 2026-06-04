@@ -57,7 +57,7 @@ remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plu
 # `MultimodalLLMNode`. Core re-exports it from the historical module
 # paths (`crate::llm::history`, `crate::llm::tool_dispatch`,
 # `crate::nodes::tool_spec`) so existing imports keep working.
-remotemedia-modality = { path = "../remotemedia-sdk/crates/modality", features = ["llm"] }
+remotemedia-modality = { path = "../remotemedia-plugin-sdk/crates/modality", features = ["llm"] }
 
 # Proc-macros for NodeConfig
 remotemedia-core-derive = { path = "../remotemedia-sdk/crates/core-derive" }
@@ -336,5 +336,12 @@ embedded-python = ["bundled-uv", "remotemedia-py-env/embedded-python"]
 
 # NOTE: grpc-client is for RemotePipelineNode client functionality only
 # Full transport implementations belong in separate transport crates
+
+[patch."https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk"]
+remotemedia-types = { path = "../remotemedia-plugin-sdk/crates/types" }
+remotemedia-traits = { path = "../remotemedia-plugin-sdk/crates/traits" }
+remotemedia-py-env = { path = "../remotemedia-plugin-sdk/crates/py-env-manager" }
+remotemedia-plugin-sdk = { path = "../remotemedia-plugin-sdk/crates/plugin-sdk" }
+remotemedia-modality = { path = "../remotemedia-plugin-sdk/crates/modality" }
 
 
