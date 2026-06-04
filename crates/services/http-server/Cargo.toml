@@ -1,0 +1,27 @@
+[package]
+name = "remotemedia-http-server"
+version = "0.4.0"
+edition = "2021"
+rust-version.workspace = true
+authors = ["RemoteMedia SDK Contributors"]
+description = "HTTP/REST server binary for RemoteMedia pipeline execution with SSE streaming"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+
+[[bin]]
+name = "http-server"
+path = "src/main.rs"
+
+[dependencies]
+# Transport library
+remotemedia-http = { path = "../../transports/http", default-features = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Server utilities
+num_cpus = { workspace = true }

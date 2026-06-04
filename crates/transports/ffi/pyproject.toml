@@ -1,0 +1,77 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "remotemedia-ffi"
+version = "0.4.4"
+description = "Python FFI transport for RemoteMedia pipelines - provides direct Python imports with zero-copy IPC via iceoryx2 shared memory"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "RemoteMedia SDK Contributors" }
+]
+keywords = [
+    "remotemedia",
+    "ffi",
+    "ipc",
+    "zero-copy",
+    "shared-memory",
+    "iceoryx2",
+    "pipeline",
+    "streaming",
+    "audio",
+    "video",
+    "machine-learning",
+    "rust"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/remotemedia/remotemedia-sdk"
+Documentation = "https://github.com/remotemedia/remotemedia-sdk#readme"
+Repository = "https://github.com/remotemedia/remotemedia-sdk.git"
+Issues = "https://github.com/remotemedia/remotemedia-sdk/issues"
+Changelog = "https://github.com/remotemedia/remotemedia-sdk/releases"
+
+[project.optional-dependencies]
+webrtc = []
+dev = [
+    "pytest>=7.0",
+    "numpy>=1.24",
+]
+
+[tool.maturin]
+# Build extension module with proper linking
+features = ["extension-module"]
+# Use abi3 for broad compatibility (Python 3.10+)
+# Install as remotemedia.runtime - the Rust execution runtime
+module-name = "remotemedia.runtime"
+# Include Python namespace package
+python-source = "python"
+# Strip debug symbols for smaller wheels
+strip = true
+# Include README in wheel
+include = [
+    { path = "README.md", format = "sdist" },
+    { path = "LICENSE", format = "sdist" },
+]

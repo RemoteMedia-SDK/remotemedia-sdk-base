@@ -1,0 +1,86 @@
+[package]
+name = "remotemedia-grpc"
+version = "0.4.0"
+edition = "2021"
+rust-version.workspace = true
+authors = ["RemoteMedia SDK Contributors"]
+description = "gRPC transport for RemoteMedia pipelines"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+
+[lib]
+name = "remotemedia_grpc"
+crate-type = ["rlib"]
+
+[dependencies]
+# Core runtime (NO transport dependencies)
+remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = true }
+
+# gRPC dependencies
+tonic = { workspace = true }
+tonic-web = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async trait support
+async-trait = { workspace = true }
+
+# Logging and metrics
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+prometheus = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono.workspace = true
+regex = "1.10"  # For executor_registry pattern matching
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+# Pulled in for the `control_bus_test_server` example so Python node
+# types (LFM2TextNode, KokoroTTSNode, ...) get inventory-registered
+# into the default streaming registry.
+remotemedia-python-nodes = { path = "../../python-nodes" }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+prost-build = { workspace = true }
+tonic-prost-build = { workspace = true }
+protobuf-src = { workspace = true }
+
+[features]
+# Default features: basic gRPC pipeline execution and streaming
+default = []
+
+# Forward executor features from runtime-core
+multiprocess = ["remotemedia-core/multiprocess"]
+
+# Per-node managed venvs backed by uv. When enabled, PythonEnvMode=Managed
+# uses the UvBackend (looks up `uv` on PATH) for much faster provisioning
+# than the SystemBackend's `python -m venv + pip install` fallback.
+bundled-uv = ["remotemedia-core/bundled-uv"]
+
+# CLI integration (clap argument parsing)
+cli = ["dep:clap"]
+
+# Placeholder for future wasmtime support (not yet in runtime-core)
+wasmtime-runtime = []

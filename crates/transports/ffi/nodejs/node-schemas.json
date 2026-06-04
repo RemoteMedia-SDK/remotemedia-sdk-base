@@ -1,0 +1,343 @@
+[
+  {
+    "nodeType": "AudioResample",
+    "description": "Resamples audio to target sample rate",
+    "category": "audio",
+    "accepts": [
+      "audio"
+    ],
+    "produces": [
+      "audio"
+    ],
+    "parameters": [
+      {
+        "name": "target_sample_rate",
+        "paramType": "integer",
+        "description": "Target sample rate in Hz",
+        "defaultValue": "16000",
+        "required": false,
+        "minimum": 8000,
+        "maximum": 48000
+      }
+    ],
+    "configSchema": "{\"properties\":{\"target_sample_rate\":{\"default\":16000,\"description\":\"Target sample rate in Hz\",\"maximum\":48000,\"minimum\":8000,\"type\":\"integer\"}},\"type\":\"object\"}",
+    "isPython": false,
+    "streaming": true,
+    "multiOutput": false,
+    "capabilities": {
+      "parallelizable": true,
+      "batchAware": false,
+      "supportsControl": false,
+      "latencyClass": 0
+    }
+  },
+  {
+    "nodeType": "SileroVAD",
+    "description": "Voice Activity Detection using Silero VAD model",
+    "category": "audio",
+    "accepts": [
+      "audio"
+    ],
+    "produces": [
+      "audio",
+      "controlmessage"
+    ],
+    "parameters": [
+      {
+        "name": "min_silence_duration_ms",
+        "paramType": "integer",
+        "description": "Minimum silence duration in ms",
+        "defaultValue": "100",
+        "required": false
+      },
+      {
+        "name": "min_speech_duration_ms",
+        "paramType": "integer",
+        "description": "Minimum speech duration in ms",
+        "defaultValue": "250",
+        "required": false
+      },
+      {
+        "name": "threshold",
+        "paramType": "number",
+        "description": "Speech probability threshold",
+        "defaultValue": "0.5",
+        "required": false,
+        "minimum": 0,
+        "maximum": 1
+      }
+    ],
+    "configSchema": "{\"properties\":{\"min_silence_duration_ms\":{\"default\":100,\"description\":\"Minimum silence duration in ms\",\"type\":\"integer\"},\"min_speech_duration_ms\":{\"default\":250,\"description\":\"Minimum speech duration in ms\",\"type\":\"integer\"},\"threshold\":{\"default\":0.5,\"description\":\"Speech probability threshold\",\"maximum\":1.0,\"minimum\":0.0,\"type\":\"number\"}},\"type\":\"object\"}",
+    "isPython": false,
+    "streaming": true,
+    "multiOutput": false,
+    "capabilities": {
+      "parallelizable": true,
+      "batchAware": false,
+      "supportsControl": true,
+      "latencyClass": 1
+    }
+  },
+  {
+    "nodeType": "TextCollector",
+    "description": "Collects text chunks into complete utterances",
+    "category": "text",
+    "accepts": [
+      "text"
+    ],
+    "produces": [
+      "text"
+    ],
+    "parameters": [
+      {
+        "name": "delimiter",
+        "paramType": "string",
+        "description": "Delimiter to split on",
+        "defaultValue": "\"\"",
+        "required": false
+      },
+      {
+        "name": "flush_on_silence",
+        "paramType": "boolean",
+        "description": "Flush buffer when silence detected",
+        "defaultValue": "true",
+        "required": false
+      }
+    ],
+    "configSchema": "{\"properties\":{\"delimiter\":{\"default\":\"\",\"description\":\"Delimiter to split on\",\"type\":\"string\"},\"flush_on_silence\":{\"default\":true,\"description\":\"Flush buffer when silence detected\",\"type\":\"boolean\"}},\"type\":\"object\"}",
+    "isPython": false,
+    "streaming": true,
+    "multiOutput": false
+  },
+  {
+    "nodeType": "AudioChunker",
+    "description": "Splits audio into fixed-size chunks",
+    "category": "audio",
+    "accepts": [
+      "audio"
+    ],
+    "produces": [
+      "audio"
+    ],
+    "parameters": [
+      {
+        "name": "chunk_size_ms",
+        "paramType": "integer",
+        "description": "Chunk duration in milliseconds",
+        "defaultValue": "20",
+        "required": false
+      }
+    ],
+    "configSchema": "{\"properties\":{\"chunk_size_ms\":{\"default\":20,\"description\":\"Chunk duration in milliseconds\",\"type\":\"integer\"}},\"type\":\"object\"}",
+    "isPython": false,
+    "streaming": true,
+    "multiOutput": true
+  },
+  {
+    "nodeType": "VideoFlip",
+    "description": "Flips video frames horizontally or vertically",
+    "category": "video",
+    "accepts": [
+      "video"
+    ],
+    "produces": [
+      "video"
+    ],
+    "parameters": [
+      {
+        "name": "horizontal",
+        "paramType": "boolean",
+        "description": "Flip horizontally",
+        "defaultValue": "true",
+        "required": false
+      },
+      {
+        "name": "vertical",
+        "paramType": "boolean",
+        "description": "Flip vertically",
+        "defaultValue": "false",
+        "required": false
+      }
+    ],
+    "configSchema": "{\"properties\":{\"horizontal\":{\"default\":true,\"description\":\"Flip horizontally\",\"type\":\"boolean\"},\"vertical\":{\"default\":false,\"description\":\"Flip vertically\",\"type\":\"boolean\"}},\"type\":\"object\"}",
+    "isPython": false,
+    "streaming": true,
+    "multiOutput": false
+  },
+  {
+    "nodeType": "PassThrough",
+    "description": "Passes input through unchanged",
+    "category": "utility",
+    "accepts": [
+      "audio",
+      "video",
+      "json",
+      "text",
+      "binary",
+      "tensor",
+      "numpy",
+      "controlmessage"
+    ],
+    "produces": [
+      "audio",
+      "video",
+      "json",
+      "text",
+      "binary",
+      "tensor",
+      "numpy",
+      "controlmessage"
+    ],
+    "parameters": [],
+    "isPython": false,
+    "streaming": true,
+    "multiOutput": false
+  },
+  {
+    "nodeType": "CalculatorNode",
+    "description": "Performs arithmetic operations on JSON input",
+    "category": "utility",
+    "accepts": [
+      "json"
+    ],
+    "produces": [
+      "json"
+    ],
+    "parameters": [
+      {
+        "name": "precision",
+        "paramType": "integer",
+        "description": "Decimal precision for results",
+        "defaultValue": "10",
+        "required": false
+      }
+    ],
+    "configSchema": "{\"properties\":{\"precision\":{\"default\":10,\"description\":\"Decimal precision for results\",\"type\":\"integer\"}},\"type\":\"object\"}",
+    "isPython": false,
+    "streaming": true,
+    "multiOutput": false
+  },
+  {
+    "nodeType": "Echo",
+    "description": "Passes input through unchanged (for testing)",
+    "category": "utility",
+    "accepts": [
+      "audio",
+      "video",
+      "json",
+      "text",
+      "binary",
+      "tensor",
+      "numpy",
+      "controlmessage"
+    ],
+    "produces": [
+      "audio",
+      "video",
+      "json",
+      "text",
+      "binary",
+      "tensor",
+      "numpy",
+      "controlmessage"
+    ],
+    "parameters": [],
+    "isPython": false,
+    "streaming": true,
+    "multiOutput": false
+  },
+  {
+    "nodeType": "WhisperNode",
+    "description": "Speech-to-text transcription using Whisper",
+    "category": "ml",
+    "accepts": [
+      "audio"
+    ],
+    "produces": [
+      "text",
+      "json"
+    ],
+    "parameters": [
+      {
+        "name": "language",
+        "paramType": "string",
+        "description": "Language code (null for auto-detect)",
+        "required": false
+      },
+      {
+        "name": "model",
+        "paramType": "string",
+        "description": "Whisper model size",
+        "defaultValue": "\"base\"",
+        "required": false,
+        "enumValues": "[\"tiny\",\"base\",\"small\",\"medium\",\"large\",\"large-v3\"]"
+      },
+      {
+        "name": "task",
+        "paramType": "string",
+        "description": "Task type",
+        "defaultValue": "\"transcribe\"",
+        "required": false,
+        "enumValues": "[\"transcribe\",\"translate\"]"
+      }
+    ],
+    "configSchema": "{\"properties\":{\"language\":{\"description\":\"Language code (null for auto-detect)\",\"type\":\"string\"},\"model\":{\"default\":\"base\",\"description\":\"Whisper model size\",\"enum\":[\"tiny\",\"base\",\"small\",\"medium\",\"large\",\"large-v3\"],\"type\":\"string\"},\"task\":{\"default\":\"transcribe\",\"description\":\"Task type\",\"enum\":[\"transcribe\",\"translate\"],\"type\":\"string\"}},\"type\":\"object\"}",
+    "isPython": true,
+    "streaming": true,
+    "multiOutput": false,
+    "capabilities": {
+      "parallelizable": false,
+      "batchAware": true,
+      "supportsControl": false,
+      "latencyClass": 4
+    }
+  },
+  {
+    "nodeType": "KokoroTTSNode",
+    "description": "Text-to-speech synthesis using Kokoro TTS",
+    "category": "ml",
+    "accepts": [
+      "text"
+    ],
+    "produces": [
+      "audio"
+    ],
+    "parameters": [
+      {
+        "name": "language",
+        "paramType": "string",
+        "description": "Language code",
+        "defaultValue": "\"en-us\"",
+        "required": false,
+        "enumValues": "[\"en-us\",\"en-gb\",\"es\",\"fr\",\"de\",\"it\",\"ja\",\"ko\",\"pt-br\",\"zh\"]"
+      },
+      {
+        "name": "speed",
+        "paramType": "number",
+        "description": "Speech speed multiplier",
+        "defaultValue": "1.0",
+        "required": false,
+        "minimum": 0.5,
+        "maximum": 2
+      },
+      {
+        "name": "voice",
+        "paramType": "string",
+        "description": "Voice ID to use",
+        "defaultValue": "\"af_bella\"",
+        "required": false,
+        "enumValues": "[\"af_bella\",\"af_nicole\",\"af_sarah\",\"af_sky\",\"am_adam\",\"am_michael\",\"bf_emma\",\"bf_isabella\",\"bm_george\",\"bm_lewis\"]"
+      }
+    ],
+    "configSchema": "{\"properties\":{\"language\":{\"default\":\"en-us\",\"description\":\"Language code\",\"enum\":[\"en-us\",\"en-gb\",\"es\",\"fr\",\"de\",\"it\",\"ja\",\"ko\",\"pt-br\",\"zh\"],\"type\":\"string\"},\"speed\":{\"default\":1.0,\"description\":\"Speech speed multiplier\",\"maximum\":2.0,\"minimum\":0.5,\"type\":\"number\"},\"voice\":{\"default\":\"af_bella\",\"description\":\"Voice ID to use\",\"enum\":[\"af_bella\",\"af_nicole\",\"af_sarah\",\"af_sky\",\"am_adam\",\"am_michael\",\"bf_emma\",\"bf_isabella\",\"bm_george\",\"bm_lewis\"],\"type\":\"string\"}},\"type\":\"object\"}",
+    "isPython": true,
+    "streaming": true,
+    "multiOutput": true,
+    "capabilities": {
+      "parallelizable": false,
+      "batchAware": true,
+      "supportsControl": false,
+      "latencyClass": 3
+    }
+  }
+]

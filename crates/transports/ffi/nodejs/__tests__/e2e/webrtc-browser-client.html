@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC E2E Test Client</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --surface: #161b22;
+            --text: #e6edf3;
+            --accent: #58a6ff;
+            --success: #3fb950;
+            --warning: #d29922;
+            --error: #f85149;
+        }
+        body {
+            font-family: 'SF Mono', 'Consolas', monospace;
+            background: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        h1 {
+            color: var(--accent);
+            font-size: 1.5rem;
+            margin-bottom: 20px;
+        }
+        .status-card {
+            background: var(--surface);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+            border-left: 4px solid var(--accent);
+        }
+        .status-card.success { border-left-color: var(--success); }
+        .status-card.error { border-left-color: var(--error); }
+        .status-card.warning { border-left-color: var(--warning); }
+        .status-label {
+            font-size: 0.875rem;
+            color: #8b949e;
+            margin-bottom: 4px;
+        }
+        .status-value {
+            font-size: 1.125rem;
+            font-weight: 600;
+        }
+        .log-container {
+            background: var(--surface);
+            border-radius: 8px;
+            padding: 16px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .log-entry {
+            font-size: 0.75rem;
+            padding: 4px 0;
+            border-bottom: 1px solid #21262d;
+        }
+        .log-entry:last-child { border-bottom: none; }
+        .log-time { color: #8b949e; margin-right: 8px; }
+        .log-msg { color: var(--text); }
+        .log-entry.error .log-msg { color: var(--error); }
+        .log-entry.success .log-msg { color: var(--success); }
+        .log-entry.info .log-msg { color: var(--accent); }
+        button {
+            background: var(--accent);
+            color: var(--bg);
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-right: 8px;
+            margin-bottom: 8px;
+        }
+        button:hover { filter: brightness(1.1); }
+        button:disabled {
+            background: #30363d;
+            color: #8b949e;
+            cursor: not-allowed;
+        }
+        .controls {
+            margin-bottom: 20px;
+        }
+        #test-results {
+            margin-top: 20px;
+            padding: 16px;
+            background: var(--surface);
+            border-radius: 8px;
+        }
+        .test-result {
+            display: flex;
+            align-items: center;
+            padding: 8px 0;
+        }
+        .test-result .icon {
+            width: 24px;
+            height: 24px;
+            margin-right: 12px;
+            font-size: 18px;
+        }
+        .test-result.pass .icon { color: var(--success); }
+        .test-result.fail .icon { color: var(--error); }
+        .test-result.pending .icon { color: var(--warning); }
+    </style>
+</head>
+<body>
+    <h1>🔌 WebRTC E2E Test Client</h1>
+    
+    <div class="controls">
+        <button id="connectBtn" onclick="connect()">Connect to Server</button>
+        <button id="disconnectBtn" onclick="disconnect()" disabled>Disconnect</button>
+        <button id="runTestsBtn" onclick="runAllTests()">Run All Tests</button>
+    </div>
+    
+    <div class="status-card" id="wsStatus">
+        <div class="status-label">WebSocket Status</div>
+        <div class="status-value" id="wsStatusValue">Disconnected</div>
+    </div>
+    
+    <div class="status-card" id="peerStatus">
+        <div class="status-label">Peer Status</div>
+        <div class="status-value" id="peerStatusValue">Not announced</div>
+    </div>
+    
+    <div class="status-card" id="rtcStatus">
+        <div class="status-label">RTCPeerConnection State</div>
+        <div class="status-value" id="rtcStatusValue">No connection</div>
+    </div>
+    
+    <div id="test-results">
+        <h3 style="margin-top: 0;">Test Results</h3>
+        <div id="testResultsList"></div>
+    </div>
+    
+    <div class="log-container">
+        <div id="log"></div>
+    </div>
+
+    <script>
+        // Configuration - will be set from query params or defaults
+        const config = {
+            signalingPort: new URLSearchParams(window.location.search).get('port') || 55000,
+            peerId: new URLSearchParams(window.location.search).get('peerId') || `browser-peer-${Date.now()}`,
+            stunServer: 'stun:stun.l.google.com:19302'
+        };
+
+        let ws = null;
+        let pc = null;
+        let dataChannel = null;
+        let requestId = 1;
+        const pendingRequests = new Map();
+        
+        // Test state
+        const testResults = {
+            wsConnect: { name: 'WebSocket Connection', status: 'pending' },
+            announce: { name: 'Peer Announcement', status: 'pending' },
+            offerAnswer: { name: 'Offer/Answer Exchange', status: 'pending' },
+            rtcConnection: { name: 'RTC Connection Established', status: 'pending' },
+            dataChannel: { name: 'Data Channel Open', status: 'pending' }
+        };
+
+        function log(msg, type = '') {
+            const logEl = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.innerHTML = `<span class="log-time">${time}</span><span class="log-msg">${msg}</span>`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+            console.log(`[${type || 'log'}] ${msg}`);
+        }
+
+        function updateStatus(id, value, type = '') {
+            const el = document.getElementById(id);
+            const valueEl = document.getElementById(id + 'Value');
+            if (valueEl) valueEl.textContent = value;
+            el.className = `status-card ${type}`;
+        }
+
+        function updateTestResult(testId, status) {
+            testResults[testId].status = status;
+            renderTestResults();
+        }
+
+        function renderTestResults() {
+            const container = document.getElementById('testResultsList');
+            container.innerHTML = Object.entries(testResults).map(([id, test]) => {
+                const icon = test.status === 'pass' ? '✅' : 
+                             test.status === 'fail' ? '❌' : '⏳';
+                return `<div class="test-result ${test.status}">
+                    <span class="icon">${icon}</span>
+                    <span>${test.name}</span>
+                </div>`;
+            }).join('');
+        }
+
+        async function connect() {
+            const wsUrl = `ws://127.0.0.1:${config.signalingPort}`;
+            log(`Connecting to ${wsUrl}...`, 'info');
+            updateStatus('wsStatus', 'Connecting...', 'warning');
+
+            try {
+                ws = new WebSocket(wsUrl);
+                
+                ws.onopen = () => {
+                    log('WebSocket connected!', 'success');
+                    updateStatus('wsStatus', 'Connected', 'success');
+                    updateTestResult('wsConnect', 'pass');
+                    document.getElementById('connectBtn').disabled = true;
+                    document.getElementById('disconnectBtn').disabled = false;
+                    
+                    // Announce peer automatically
+                    setTimeout(announcePeer, 100);
+                };
+
+                ws.onmessage = (event) => {
+                    handleMessage(JSON.parse(event.data));
+                };
+
+                ws.onerror = (error) => {
+                    log(`WebSocket error: ${error.message || 'Unknown error'}`, 'error');
+                    updateStatus('wsStatus', 'Error', 'error');
+                    updateTestResult('wsConnect', 'fail');
+                };
+
+                ws.onclose = () => {
+                    log('WebSocket closed', 'info');
+                    updateStatus('wsStatus', 'Disconnected', '');
+                    document.getElementById('connectBtn').disabled = false;
+                    document.getElementById('disconnectBtn').disabled = true;
+                };
+            } catch (err) {
+                log(`Failed to connect: ${err.message}`, 'error');
+                updateTestResult('wsConnect', 'fail');
+            }
+        }
+
+        function disconnect() {
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            updateStatus('peerStatus', 'Disconnected', '');
+            updateStatus('rtcStatus', 'No connection', '');
+        }
+
+        function handleMessage(msg) {
+            // Handle response to our request
+            if (msg.id && pendingRequests.has(msg.id)) {
+                const { method, resolve, reject } = pendingRequests.get(msg.id);
+                pendingRequests.delete(msg.id);
+                
+                if (msg.error) {
+                    log(`Error response to ${method}: ${msg.error.message}`, 'error');
+                    reject(new Error(msg.error.message));
+                } else {
+                    log(`Response to ${method}: ${JSON.stringify(msg.result).substring(0, 100)}...`, 'success');
+                    resolve(msg.result);
+                }
+                return;
+            }
+
+            // Handle notifications
+            if (msg.method) {
+                log(`Notification: ${msg.method}`, 'info');
+                
+                switch (msg.method) {
+                    case 'peer.ice_candidate':
+                        handleIceCandidate(msg.params);
+                        break;
+                    case 'peer.state_change':
+                        handleStateChange(msg.params);
+                        break;
+                    case 'peer_joined':
+                        log(`Peer joined: ${msg.params.peer_id}`, 'info');
+                        break;
+                    case 'peer_left':
+                        log(`Peer left: ${msg.params.peer_id}`, 'info');
+                        break;
+                }
+            }
+        }
+
+        function sendRequest(method, params) {
+            return new Promise((resolve, reject) => {
+                const id = `req-${requestId++}`;
+                const request = {
+                    jsonrpc: '2.0',
+                    method,
+                    params,
+                    id
+                };
+                
+                log(`Sending ${method}...`, 'info');
+                pendingRequests.set(id, { method, resolve, reject });
+                ws.send(JSON.stringify(request));
+                
+                // Timeout
+                setTimeout(() => {
+                    if (pendingRequests.has(id)) {
+                        pendingRequests.delete(id);
+                        reject(new Error(`Request ${method} timed out`));
+                    }
+                }, 10000);
+            });
+        }
+
+        async function announcePeer() {
+            try {
+                const result = await sendRequest('peer.announce', {
+                    peer_id: config.peerId,
+                    capabilities: ['audio', 'video', 'data'],
+                    user_data: { client: 'browser-e2e-test' }
+                });
+                
+                log(`Announced as ${config.peerId}, status: ${result.status}`, 'success');
+                updateStatus('peerStatus', `Announced: ${config.peerId}`, 'success');
+                updateTestResult('announce', 'pass');
+                
+                // Create RTCPeerConnection
+                await createPeerConnection();
+            } catch (err) {
+                log(`Announce failed: ${err.message}`, 'error');
+                updateTestResult('announce', 'fail');
+            }
+        }
+
+        async function createPeerConnection() {
+            pc = new RTCPeerConnection({
+                iceServers: [{ urls: config.stunServer }]
+            });
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    log(`Sending ICE candidate: ${event.candidate.candidate.substring(0, 50)}...`, 'info');
+                    sendRequest('peer.ice_candidate', {
+                        from: config.peerId,
+                        to: 'remotemedia-server',
+                        candidate: event.candidate.candidate,
+                        sdp_mid: event.candidate.sdpMid,
+                        sdp_m_line_index: event.candidate.sdpMLineIndex
+                    }).catch(err => log(`ICE candidate send failed: ${err.message}`, 'error'));
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                const state = pc.connectionState;
+                log(`Connection state: ${state}`, state === 'connected' ? 'success' : 'info');
+                updateStatus('rtcStatus', state, state === 'connected' ? 'success' : 
+                             state === 'failed' ? 'error' : 'warning');
+                
+                if (state === 'connected') {
+                    updateTestResult('rtcConnection', 'pass');
+                } else if (state === 'failed') {
+                    updateTestResult('rtcConnection', 'fail');
+                }
+            };
+
+            pc.ondatachannel = (event) => {
+                log(`Data channel received: ${event.channel.label}`, 'success');
+                setupDataChannel(event.channel);
+            };
+
+            // Add audio transceiver
+            pc.addTransceiver('audio', { direction: 'sendrecv' });
+            
+            // Create data channel
+            dataChannel = pc.createDataChannel('pipeline-data', { ordered: true });
+            setupDataChannel(dataChannel);
+
+            // Create and send offer
+            await createAndSendOffer();
+        }
+
+        function setupDataChannel(channel) {
+            channel.onopen = () => {
+                log(`Data channel '${channel.label}' opened`, 'success');
+                updateTestResult('dataChannel', 'pass');
+            };
+            
+            channel.onmessage = (event) => {
+                log(`Data channel message: ${event.data.substring(0, 100)}...`, 'info');
+            };
+            
+            channel.onerror = (error) => {
+                log(`Data channel error: ${error.message || 'Unknown'}`, 'error');
+            };
+            
+            channel.onclose = () => {
+                log(`Data channel '${channel.label}' closed`, 'info');
+            };
+        }
+
+        async function createAndSendOffer() {
+            try {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                
+                log('Created offer, sending to server...', 'info');
+                
+                const result = await sendRequest('peer.offer', {
+                    from: config.peerId,
+                    to: 'remotemedia-server',
+                    sdp: offer.sdp,
+                    can_trickle_ice_candidates: true
+                });
+                
+                if (result.type === 'answer' && result.sdp) {
+                    log('Received answer from server', 'success');
+                    const answer = new RTCSessionDescription({ type: 'answer', sdp: result.sdp });
+                    await pc.setRemoteDescription(answer);
+                    updateTestResult('offerAnswer', 'pass');
+                } else {
+                    throw new Error('Invalid answer response');
+                }
+            } catch (err) {
+                log(`Offer/answer failed: ${err.message}`, 'error');
+                updateTestResult('offerAnswer', 'fail');
+            }
+        }
+
+        async function handleIceCandidate(params) {
+            if (!pc) return;
+            
+            try {
+                if (params.candidate) {
+                    const candidate = new RTCIceCandidate({
+                        candidate: params.candidate,
+                        sdpMid: params.sdp_mid,
+                        sdpMLineIndex: params.sdp_m_line_index
+                    });
+                    await pc.addIceCandidate(candidate);
+                    log(`Added remote ICE candidate`, 'info');
+                }
+            } catch (err) {
+                log(`Failed to add ICE candidate: ${err.message}`, 'error');
+            }
+        }
+
+        function handleStateChange(params) {
+            log(`Server peer state change: ${params.connection_state}`, 'info');
+        }
+
+        async function runAllTests() {
+            // Reset all tests
+            Object.keys(testResults).forEach(k => {
+                testResults[k].status = 'pending';
+            });
+            renderTestResults();
+            
+            // Disconnect if connected
+            disconnect();
+            
+            // Wait a moment
+            await new Promise(r => setTimeout(r, 500));
+            
+            // Start connection which runs all tests
+            await connect();
+        }
+
+        // Initialize
+        renderTestResults();
+        log(`E2E Test Client initialized. Peer ID: ${config.peerId}`, 'info');
+        log(`Target signaling port: ${config.signalingPort}`, 'info');
+        
+        // Auto-connect if running in automated test mode
+        if (new URLSearchParams(window.location.search).get('autoConnect') === 'true') {
+            setTimeout(connect, 500);
+        }
+    </script>
+</body>
+</html>

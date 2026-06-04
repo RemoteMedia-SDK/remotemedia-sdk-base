@@ -1,0 +1,161 @@
+[package]
+name = "remotemedia-ffi"
+version = "0.4.1"
+edition = "2021"
+rust-version = "1.87"
+authors = ["RemoteMedia SDK Contributors"]
+description = "FFI bindings for RemoteMedia pipelines (Python and Node.js)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+
+[lib]
+name = "remotemedia_ffi"
+# When building with extension-module: cdylib only
+# When building without: defaults to rlib
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Core runtime (NO transport dependencies)
+# Enable multiprocess for ChannelRegistry access from napi bindings
+remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = true }
+
+# Python node metadata registry — used by `register_python_node_type` PyO3 binding
+# to insert dotted-path Python node configs that the multiprocess executor consumes.
+remotemedia-python-nodes = { path = "../../python-nodes" }
+
+# Inventory for inline-Python-node provider registration
+inventory = { workspace = true }
+
+# WebRTC transport (optional - enabled with webrtc feature)
+# Includes ws-signaling for WebSocket JSON-RPC 2.0 and grpc-signaling for gRPC
+remotemedia-webrtc = { git = "https://github.com/RemoteMedia-SDK/remotemedia-sdk-base.git", package = "remotemedia-webrtc", features = ["grpc-signaling", "ws-signaling"], optional = true }
+
+# Telephony transport (optional - enabled with telephony feature)
+remotemedia-telephony = { path = "../telephony", optional = true }
+
+# gRPC transport (optional - enabled with grpc feature)
+remotemedia-grpc = { path = "../grpc", optional = true }
+
+# Python FFI (optional - enabled with python feature)
+pyo3 = { version = "0.26", features = ["abi3-py310", "auto-initialize"], default-features = false, optional = true }
+pyo3-async-runtimes = { version = "0.26", features = ["tokio-runtime"], optional = true }
+numpy = { version = "0.26", optional = true }
+
+# Node.js FFI (optional - enabled with napi feature)
+napi = { version = "2", features = ["napi6", "async", "tokio_rt"], optional = true }
+napi-derive = { version = "2", optional = true }
+
+# IPC (required for both Python and Node.js IPC)
+iceoryx2 = { workspace = true }
+
+# UUID for server/peer IDs (required for webrtc)
+uuid = { version = "1.6", features = ["v4"], optional = true }
+
+# gRPC signaling server dependencies (required for webrtc embedded mode)
+tonic = { workspace = true, optional = true }
+tonic-web = { workspace = true, optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+http = { version = "1.0", optional = true }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async trait support
+async-trait = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+base64 = "0.22"
+
+[build-dependencies]
+napi-build = { version = "2", optional = true }
+
+[features]
+default = ["python", "native-numpy", "bundled-uv-embedded", "python-telephony"]
+# Python bindings (PyO3)
+python = ["dep:pyo3", "dep:pyo3-async-runtimes", "dep:numpy"]
+extension-module = ["pyo3/extension-module", "python"]
+native-numpy = ["python"]
+# Embed a `uv` binary into the Python wheel so `PYTHON_ENV_MODE=managed`
+# always has the uv backend available — without this feature, the
+# managed-mode env_manager silently falls back to system `python -m venv
+# + pip`, which resolves deps one-at-a-time and routinely produces
+# partial venvs (e.g. `transformers` + `huggingface-hub` version skew
+# that breaks `import transformers` and cascades into
+# "WhisperSTTNode requires transformers and torch" at runtime).
+# Adds ~30 MB to the wheel (the embedded uv binary). Opt out with
+# `--no-default-features --features python,native-numpy` if size
+# matters and the user is willing to install `uv` on PATH themselves.
+bundled-uv = ["remotemedia-core/bundled-uv"]
+bundled-uv-embedded = ["bundled-uv", "remotemedia-core/bundled-uv-embedded"]
+# Node.js bindings (napi-rs).
+#
+# Auto-pulls in `bundled-uv-embedded` because napi binaries that spawn
+# Python multiprocess nodes (LFM2 / Whisper / Kokoro family) need uv
+# at session-creation time to provision per-node venvs. Without uv,
+# `PYTHON_ENV_MODE=managed` silently falls back to
+# `python -m venv + pip`, which resolves deps one-at-a-time and
+# routinely produces partial venvs (e.g. transformers +
+# huggingface-hub version skew that breaks `import transformers`,
+# cascading into `ServiceInCorruptedState` on sibling nodes).
+#
+# `py-env-manager` looks up uv in this order (see uv_backend.rs):
+#   1. `UV_BINARY_PATH` env var
+#   2. `uv` on PATH                     ← typical dev / CI machines
+#   3. `~/.config/remotemedia/bin/uv`
+#   4. Embedded (feature: bundled-uv-embedded — currently a TODO stub)
+#   5. Download from GitHub (feature: bundled-uv — works today)
+#
+# Enabling `bundled-uv-embedded` here transitively enables `bundled-uv`,
+# so napi binaries gain the download fallback (#5) even on machines
+# without uv on PATH. Once #4 (true embedded extract) is implemented,
+# napi binaries will become fully self-contained without source-list
+# changes here. No measurable size impact today (the embedded extract
+# is unimplemented so no `include_bytes!` blob is linked).
+#
+# `native-numpy` is deliberately NOT pulled in: it gates a PyO3-only
+# numpy → JSON converter (`crate::marshal::numpy_to_json`), and the
+# `python` feature it depends on activates pyo3's `auto-initialize`,
+# which spins up CPython on module-load inside Node and deadlocks
+# against libuv. Numpy used inside a Python multiprocess node runs
+# inside the spawned Python subprocess (pure Python, no Rust feature
+# required).
+napi = ["dep:napi", "dep:napi-derive", "dep:napi-build", "bundled-uv-embedded"]
+# WebRTC core (shared types and signaling service wrapper)
+# Includes gRPC signaling server dependencies for embedded mode
+webrtc = [
+    "dep:remotemedia-webrtc",
+    "dep:uuid",
+    "dep:tonic",
+    "dep:tonic-web",
+    "dep:tower-http",
+    "dep:http",
+]
+# Node.js WebRTC bindings (requires both napi and webrtc)
+napi-webrtc = ["napi", "webrtc"]
+# Python WebRTC bindings (requires both python and webrtc)
+python-webrtc = ["python", "webrtc"]
+# Telephony bindings (requires both python and telephony)
+python-telephony = ["python", "telephony", "grpc"]
+telephony = ["dep:remotemedia-telephony", "dep:uuid"]
+grpc = [
+    "dep:remotemedia-grpc",
+    "dep:tonic",
+    "dep:tonic-web",
+    "dep:tower-http",
+    "dep:http",
+    "dep:uuid"
+]
+

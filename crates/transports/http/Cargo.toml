@@ -1,0 +1,55 @@
+[package]
+name = "remotemedia-http"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.87"
+authors = ["RemoteMedia SDK Contributors"]
+description = "HTTP/REST transport with SSE streaming for RemoteMedia pipelines"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+
+[lib]
+name = "remotemedia_http"
+crate-type = ["rlib"]
+
+[dependencies]
+# Core runtime (NO transport dependencies)
+remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = true }
+
+# HTTP client/server
+reqwest = { version = "0.12", features = ["json", "stream"] }
+axum = { version = "0.7", features = ["tokio", "json", "http2"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "trace"] }
+hyper = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+async-trait = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# CLI (optional)
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = { workspace = true }
+
+[features]
+# Default features: basic HTTP pipeline execution and streaming
+default = []
+cli = ["dep:clap"]

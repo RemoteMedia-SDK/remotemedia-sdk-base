@@ -1,0 +1,39 @@
+[package]
+name = "remotemedia-python-nodes"
+version = "0.4.0"
+edition = "2021"
+rust-version.workspace = true
+authors = ["RemoteMedia SDK Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+description = "Python wrapper nodes for RemoteMedia pipelines"
+
+[dependencies]
+# Core dependency for traits (needs multiprocess for PythonStreamingNode)
+remotemedia-core = { package = "remotemedia-sdk-base", path = "../..", default-features = false, features = ["multiprocess"] }
+
+# Async runtime
+tokio.workspace = true
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Auto-registration
+inventory.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true
+
+[features]
+default = []
+# Feature flags for specific Python node families
+whisper = []
+tts = []
+ml = []
+test-nodes = []
+all = ["whisper", "tts", "ml", "test-nodes"]

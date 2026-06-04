@@ -1,0 +1,26 @@
+[package]
+name = "remotemedia-grpc-server"
+version = "0.4.0"
+edition = "2021"
+rust-version.workspace = true
+authors = ["RemoteMedia SDK Contributors"]
+description = "gRPC server binary for RemoteMedia pipeline execution"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+
+[[bin]]
+name = "grpc-server"
+path = "src/main.rs"
+
+[dependencies]
+# Transport library
+remotemedia-grpc = { path = "../../transports/grpc", default-features = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Server utilities
+num_cpus = { workspace = true }
