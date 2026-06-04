@@ -143,7 +143,9 @@ impl ChannelRegistry {
     /// A `flock` check would always succeed (no one holds the lock), making it
     /// useless as a safety mechanism. The directory-existence check is the
     /// correct guard.
-    #[cfg(feature = "multiprocess")]
+    ///
+    /// Not available on Android — iceoryx2 is Linux-only and not used on Android.
+    #[cfg(all(feature = "multiprocess", not(target_os = "android")))]
     pub fn cleanup_stale_iceoryx2_state() {
         use std::fs;
 

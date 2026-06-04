@@ -9,8 +9,8 @@ repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
 description = "Python wrapper nodes for RemoteMedia pipelines"
 
 [dependencies]
-# Core dependency for traits (needs multiprocess for PythonStreamingNode)
-remotemedia-core = { package = "remotemedia-sdk-base", path = "../..", default-features = false, features = ["multiprocess"] }
+# Core dependency for traits
+remotemedia-core = { package = "remotemedia-sdk-base", path = "../../", default-features = false, features = ["multiprocess"] }
 
 # Async runtime
 tokio.workspace = true
@@ -22,6 +22,9 @@ serde_json.workspace = true
 
 # Logging
 tracing.workspace = true
+
+# Streaming
+futures.workspace = true
 
 # Auto-registration
 inventory.workspace = true
@@ -36,4 +39,6 @@ whisper = []
 tts = []
 ml = []
 test-nodes = []
+# In-process Python execution via PyO3 (Android, or opt-in on Linux/macOS)
+inprocess = ["remotemedia-core/inprocess-python"]
 all = ["whisper", "tts", "ml", "test-nodes"]

@@ -263,6 +263,9 @@ loadable-export = ["dep:remotemedia-plugin-sdk", "dep:abi_stable"]
 # `crates/core/src/loadable/source_python.rs` can reuse the subprocess +
 # IPC machinery already shipped for cdylib Python plugins.
 python-source-plugin = ["dep:remotemedia-plugin-sdk", "remotemedia-plugin-sdk/bundled-uv"]
+# In-process Python execution via PyO3 (Android, and opt-in for testing on Linux/macOS)
+# Requires both plugin-sdk's inprocess-python feature and PyO3 deps
+inprocess-python = ["dep:remotemedia-plugin-sdk", "remotemedia-plugin-sdk/inprocess-python"]
 # `silero-vad` feature removed — `SileroVADNode` lives in the
 # silero-vad plugin (RemoteMedia-SDK/silero-vad@v0.3.0).
 # `affect-listener-face` now only gates `VadToFaceNode` (pure Rust);
@@ -420,9 +423,9 @@ hyper = "1.1"
 axum = "0.7"
 
 # Python FFI (for FFI transport crate)
-pyo3 = { version = "0.26", features = ["abi3-py310", "auto-initialize"], default-features = false }
-pyo3-async-runtimes = { version = "0.26", features = ["tokio-runtime"] }
-numpy = "0.26"
+pyo3 = { version = "0.28", features = ["abi3-py310", "auto-initialize"], default-features = false }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+numpy = "0.28"
 
 # IPC for multiprocess
 iceoryx2 = "0.9.0"

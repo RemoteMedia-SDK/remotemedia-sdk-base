@@ -3,9 +3,8 @@
 //! This provider creates factories dynamically from the Python node registry,
 //! rather than hardcoding factory definitions.
 
-use crate::registry::{register_default_python_nodes, PythonNodeConfig, PYTHON_NODE_REGISTRY};
+use crate::registry::{register_default_python_nodes, PythonExecutionMode, PythonNodeConfig, PYTHON_NODE_REGISTRY};
 use remotemedia_core::nodes::provider::NodeProvider;
-use remotemedia_core::nodes::python_streaming::PythonStreamingNode;
 use remotemedia_core::nodes::schema::{NodeSchema, RuntimeDataType};
 use remotemedia_core::nodes::streaming_node::{
     AsyncNodeWrapper, StreamingNode, StreamingNodeFactory, StreamingNodeRegistry,
@@ -13,6 +12,9 @@ use remotemedia_core::nodes::streaming_node::{
 use remotemedia_core::Error;
 use serde_json::Value;
 use std::sync::Arc;
+
+#[cfg(feature = "inprocess")]
+use crate::inprocess_node::DynamicInProcessPythonNodeFactory;
 
 /// A dynamic factory that creates Python nodes based on registry configuration
 struct DynamicPythonNodeFactory {
@@ -33,9 +35,18 @@ impl StreamingNodeFactory for DynamicPythonNodeFactory {
         session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
         let node = if let Some(sid) = session_id {
-            PythonStreamingNode::with_session(node_id, &self.config.python_class, params, sid)?
+            remotemedia_core::nodes::python_streaming::PythonStreamingNode::with_session(
+                node_id,
+                &self.config.python_class,
+                params,
+                sid,
+            )?
         } else {
-            PythonStreamingNode::new(node_id, &self.config.python_class, params)?
+            remotemedia_core::nodes::python_streaming::PythonStreamingNode::new(
+                node_id,
+                &self.config.python_class,
+                params,
+            )?
         };
         Ok(Box::new(AsyncNodeWrapper(Arc::new(node))))
     }
@@ -130,8 +141,18 @@ impl NodeProvider for PythonNodesProvider {
         let nodes = PYTHON_NODE_REGISTRY.get_all();
         for config in nodes {
             let node_type = config.node_type.clone();
+            
+            // Select factory based on execution mode
+            #[cfg(feature = "inprocess")]
+            if config.execution_mode.is_inprocess() {
+                registry.register(Arc::new(DynamicInProcessPythonNodeFactory::new(config)));
+                tracing::debug!(node_type = %node_type, "Registered dynamic IN PROCESS Python node factory");
+                continue;
+            }
+            
+            // Default to multiprocess
             registry.register(Arc::new(DynamicPythonNodeFactory::new(config)));
-            tracing::debug!(node_type = %node_type, "Registered dynamic Python node factory");
+            tracing::debug!(node_type = %node_type, "Registered dynamic MULTIPROCESS Python node factory");
         }
     }
 

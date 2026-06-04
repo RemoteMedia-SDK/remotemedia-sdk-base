@@ -37,9 +37,9 @@ remotemedia-telephony = { path = "../telephony", optional = true }
 remotemedia-grpc = { path = "../grpc", optional = true }
 
 # Python FFI (optional - enabled with python feature)
-pyo3 = { version = "0.26", features = ["abi3-py310", "auto-initialize"], default-features = false, optional = true }
-pyo3-async-runtimes = { version = "0.26", features = ["tokio-runtime"], optional = true }
-numpy = { version = "0.26", optional = true }
+pyo3 = { version = "0.28", features = ["abi3-py310", "auto-initialize"], default-features = false, optional = true }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"], optional = true }
+numpy = { version = "0.28", optional = true }
 
 # Node.js FFI (optional - enabled with napi feature)
 napi = { version = "2", features = ["napi6", "async", "tokio_rt"], optional = true }

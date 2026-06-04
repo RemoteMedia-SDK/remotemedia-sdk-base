@@ -9,6 +9,9 @@ pub mod ipc_channel;
 pub mod multiprocess_executor;
 #[cfg(feature = "multiprocess")]
 pub mod process_manager;
+// In-process channel for Android (and opt-in on Linux/macOS)
+#[cfg(feature = "inprocess-python")]
+pub mod inprocess_channel;
 
 #[cfg(feature = "docker")]
 pub mod docker_support;
@@ -37,6 +40,9 @@ pub enum ExecutionMode {
     /// Process with IPC (existing)
     Multiprocess,
 
+    /// In-process execution via PyO3 (Android, and opt-in on Linux/macOS)
+    InProcess,
+
     /// Docker container execution (NEW)
     #[cfg(feature = "docker")]
     Docker {
@@ -52,6 +58,7 @@ impl PartialEq for ExecutionMode {
         match (self, other) {
             (ExecutionMode::Native, ExecutionMode::Native) => true,
             (ExecutionMode::Multiprocess, ExecutionMode::Multiprocess) => true,
+            (ExecutionMode::InProcess, ExecutionMode::InProcess) => true,
             #[cfg(feature = "docker")]
             (
                 ExecutionMode::Docker {

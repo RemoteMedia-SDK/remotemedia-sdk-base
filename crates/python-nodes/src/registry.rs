@@ -7,6 +7,28 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
+/// Execution mode for Python nodes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PythonExecutionMode {
+    /// Run in a separate process with iceoryx2 IPC (default, Linux/macOS)
+    #[default]
+    Multiprocess,
+    /// Run in-process via PyO3 (Android, or opt-in on Linux/macOS)
+    InProcess,
+}
+
+impl PythonExecutionMode {
+    /// Check if this is in-process mode
+    pub fn is_inprocess(&self) -> bool {
+        matches!(self, PythonExecutionMode::InProcess)
+    }
+    
+    /// Check if this is multiprocess mode
+    pub fn is_multiprocess(&self) -> bool {
+        matches!(self, PythonExecutionMode::Multiprocess)
+    }
+}
+
 /// Configuration for a Python node
 #[derive(Debug, Clone)]
 pub struct PythonNodeConfig {
@@ -34,6 +56,9 @@ pub struct PythonNodeConfig {
 
     /// Output data types this node produces (e.g., ["audio", "json"])
     pub produces: Vec<String>,
+
+    /// Execution mode: "multiprocess" (default) or "inprocess" (PyO3)
+    pub execution_mode: PythonExecutionMode,
 }
 
 impl Default for PythonNodeConfig {
@@ -47,6 +72,7 @@ impl Default for PythonNodeConfig {
             category: None,
             accepts: Vec::new(),
             produces: Vec::new(),
+            execution_mode: PythonExecutionMode::default(),
         }
     }
 }
@@ -95,6 +121,16 @@ impl PythonNodeConfig {
     /// Set produced output types
     pub fn produces(mut self, types: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.produces = types.into_iter().map(|t| t.into()).collect();
+        self
+    }
+
+    /// Set execution mode to in-process (PyO3)
+    pub fn with_inprocess(mut self, inprocess: bool) -> Self {
+        self.execution_mode = if inprocess {
+            PythonExecutionMode::InProcess
+        } else {
+            PythonExecutionMode::Multiprocess
+        };
         self
     }
 }

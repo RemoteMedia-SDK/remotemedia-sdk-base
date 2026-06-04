@@ -63,10 +63,12 @@
 
 mod provider;
 mod registry;
+#[cfg(feature = "inprocess")]
+mod inprocess_node;
 
 pub use provider::PythonNodesProvider;
 pub use registry::{
-    clear_registry, get_registered_nodes, register_python_node, PythonNodeConfig,
+    clear_registry, get_registered_nodes, register_python_node, PythonExecutionMode, PythonNodeConfig,
     PythonNodeRegistry, PYTHON_NODE_REGISTRY,
 };
 
