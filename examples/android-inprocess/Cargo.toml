@@ -1,0 +1,52 @@
+[package]
+name = "remotemedia-android-inprocess"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+description = "Android in-process Python execution example"
+
+[lib]
+name = "remotemedia_android_inprocess"
+crate-type = ["cdylib"]
+
+[dependencies]
+# SDK dependencies
+remotemedia-core = { package = "remotemedia-sdk-base", path = "../../", default-features = false, features = ["inprocess-python"] }
+remotemedia-python-nodes = { path = "../../crates/python-nodes", features = ["inprocess"] }
+
+# JNI support
+jni = { version = "0.21", default-features = false }
+android_logger = "0.15"
+log = "0.4"
+
+# Async runtime
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+[features]
+default = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[package.metadata.android]
+package = "com.remotemedia.inprocess"
+activity = "com.remotemedia.inprocess.MainActivity"
+min_sdk_version = 24
+debuggable = true
+
+[workspace]
