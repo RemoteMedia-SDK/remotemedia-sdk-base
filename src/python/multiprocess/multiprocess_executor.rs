@@ -2492,7 +2492,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
         // InternalError when a new Python process tries to create its
         // IPC node. We clean before creating channels so the runtime
         // starts in a known-good state.
-        #[cfg(feature = "multiprocess")]
+        #[cfg(all(feature = "multiprocess", not(target_os = "android")))]
         {
             ChannelRegistry::cleanup_stale_iceoryx2_state();
         }
