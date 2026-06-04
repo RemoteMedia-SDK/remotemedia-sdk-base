@@ -1,0 +1,340 @@
+[package]
+name = "remotemedia-sdk-base"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["RemoteMedia SDK Contributors"]
+description = "Base SDK for RemoteMedia - public, open-core execution engine"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+
+[lib]
+name = "remotemedia_sdk_base"
+crate-type = ["rlib"]
+
+[dependencies]
+# Async runtime
+tokio = {  version = "1.35", features = ["sync", "macros", "io-util", "rt", "rt-multi-thread", "time", "fs", "process", "signal"]  }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = {  version = "1.0", features = ["derive"]  }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
+schemars = "0.8"
+inventory = "0.3"
+jsonschema = "0.29"
+
+# Skinny wire-format types (RuntimeData, AudioSamples, PixelFormat,
+# VideoCodec, ImageFormat, ControlMessageType, …). Defined in the
+# `remotemedia-types` crate and re-exported from core so existing
+# `use remotemedia_core::data::RuntimeData` call sites keep working.
+# The `schemars` feature opts the wire enums into JsonSchema for the
+# manifest validator.
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "f98ba9df8d57ecc8a7bcbaeb9a84299779a78722", features = ["schemars"] }
+
+# Python venv provisioning. Extracted from `crates/core/src/python/env_manager/`
+# into its own crate so loadable-node plugins (dlopen'd cdylibs) can call
+# `ensure_env(&deps)` without dragging all of `remotemedia-core` through the
+# ABI boundary. The old import path (`remotemedia_core::python::env_manager`)
+# continues to work via a thin re-export shim at `src/python/env_manager.rs`.
+remotemedia-py-env = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "f98ba9df8d57ecc8a7bcbaeb9a84299779a78722" }
+
+# Skinny trait surface that loadable-node plugins implement against.
+# Owns the leaf types (NodeSchema, MediaCapabilities, capability
+# constraints, snapshot ports, Tick/PacingNature/NodeStatus,
+# AnySessionState). Core re-exports them from their original module
+# paths so existing callers (`use remotemedia_core::nodes::Tick`) keep
+# working.
+remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "f98ba9df8d57ecc8a7bcbaeb9a84299779a78722" }
+
+# Skinny LLM primitives (per-session history, ToolSpec, streaming
+# tool-call accumulation + dispatch). Lives in its own crate so
+# loadable cdylib plugins (which cannot link `remotemedia-core`) can
+# share one source of truth with the in-tree `OpenAIChatNode` /
+# `MultimodalLLMNode`. Core re-exports it from the historical module
+# paths (`crate::llm::history`, `crate::llm::tool_dispatch`,
+# `crate::nodes::tool_spec`) so existing imports keep working.
+remotemedia-modality = { path = "../remotemedia-sdk/crates/modality", features = ["llm"] }
+
+# Proc-macros for NodeConfig
+remotemedia-core-derive = { path = "../remotemedia-sdk/crates/core-derive" }
+
+# In-process loadable native plugins (gated behind `loadable` feature).
+# Plugin authors depend on `loadable-node-abi` directly so they don't
+# pull all of core; core depends on it (optionally) for the host-side
+# `LoadableNodeBundle` adapter.
+loadable-node-abi = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "f98ba9df8d57ecc8a7bcbaeb9a84299779a78722", optional = true }
+abi_stable = { version = "0.11", optional = true }
+async-ffi = { version = "0.5", features = ["abi_stable"], optional = true }
+# Self-describing binary serializer for the loadable wire format —
+# unlike bincode 1.x, rmp-serde supports `deserialize_any` so it
+# round-trips RuntimeData variants that hold `serde_json::Value`
+# (Json, ControlMessage metadata, Audio metadata, etc.).
+rmp-serde = { version = "1" }
+# Phase B / Path 2 — pulled in only when the `loadable-export`
+# feature is on. Lets the `#[node]` macro's conditional FFI emission
+# resolve `::remotemedia_plugin_sdk::...` paths so a wrapper cdylib
+# (see `examples/silero-vad-loadable/`) can re-export in-tree nodes
+# through `plugin_export!()`.
+remotemedia-plugin-sdk = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "f98ba9df8d57ecc8a7bcbaeb9a84299779a78722", optional = true }
+
+# Async trait support
+async-trait = "0.1"
+
+# StreamingScheduler drift metrics (spec 026)
+bitflags = "2.4"
+
+# Snapshot ports (Reactive→Clocked seam) — atomic publish/load for
+# tick-driven consumers reading state-like inputs.
+arc-swap = "1.8"
+
+# Audio processing (for native nodes)
+rubato = "0.15"
+bytemuck = {  version = "1.14", features = ["derive"]  }
+# `ort`, `ndarray`, `rustfft`, `tokenizers`, `half` were pulled out
+# alongside the heavy ONNX nodes (SileroVAD, WhisperToVad, LFM25Audio,
+# VogentTurn, Audio2FaceLipSync) when they moved to standalone plugins.
+# Core no longer carries any ONNX inference deps.
+# `zip` stays — still used by `activation-face` for NPZ archive loading.
+zip = {  version = "2.2", default-features = false, features = ["deflate"] , optional = true }
+
+# Affect simulator (Phase 1 deterministic affect-state model). Used
+# by `AffectSimulatorNode` to drive runtime Channel A/B/D updates
+# from VAD/STT/prosody events. Path dep — sibling crate in
+# `tools/affect_simulator/`. Gated behind the `affect-sim` feature.
+affect-simulator = { path = "../remotemedia-sdk/tools/affect_simulator", optional = true }
+
+# All renderer-stack deps moved out alongside the renderer nodes:
+#   - `cubism-core` + `wgpu` (workspace 22.1) → live2d-render plugin
+#     (RemoteMedia-SDK/live2d-render@v0.1.0)
+#   - `bevy` + `bevy_rapier3d` + `wgpu_pin` (=23.0.1) + `image`
+#     + `pollster` + `crossbeam-channel` → cc-render plugin
+#     (RemoteMedia-SDK/cc-render@v0.1.0)
+#
+# Host no longer compiles Bevy, wgpu, or the Live2D Cubism SDK at all.
+
+base64 = "0.22"
+
+# `pyannote-rs` (matbeedotcom fork for ort 2.0.0-rc.12 + ndarray 0.17)
+# moved with `SpeakerDiarizationNode` to the speaker-diarization
+# plugin (RemoteMedia-SDK/speaker-diarization@v0.1.0). Host workspace
+# is now clean of the fork pin AND of the ort runtime entirely.
+
+# Video codec support (spec 012)
+ac-ffmpeg = { version = "0.19", optional = true }
+
+# llama.cpp + minijinja + encoding_rs all moved with the 4 llama.cpp
+# nodes to the llama-cpp plugin (RemoteMedia-SDK/llama-cpp@v0.1.0).
+# Host workspace no longer compiles llama-cpp-sys (which means no more
+# multi-minute CUDA C++ build in the default workspace cargo build).
+
+# IPC for multiprocess
+iceoryx2 = "0.9.0"
+iceoryx2-log = "0.9.0"
+
+# Note: Python wrapper nodes are in a separate crate (remotemedia-nodes-python).
+# Users should add that crate as a dependency to get Python nodes.
+# The inventory system will automatically register them when the crate is linked.
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = {  version = "0.3", features = ["env-filter", "json"]  }
+anyhow = "1.0.100"
+bollard = {  version = "0.19.4", features = ["chrono"]  }
+hex.workspace = true
+num_cpus.workspace = true
+rand.workspace = true
+glob.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+tar.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
+regex.workspace = true
+histogram = "0.11.3"
+crossbeam.workspace = true
+sha2.workspace = true
+hdrhistogram.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+hyper = "1.1"
+http-body-util = { version = "0.1", optional = true }
+
+# Force vendored OpenSSL to avoid system version mismatch (OPENSSL_API_COMPAT error)
+openssl = { version = "0.10", features = ["vendored"] }
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
+# Plugin resolver deps (Phase 1C). flate2 for Python source-load
+# tarball decompression. `tar`/`toml` are already declared above
+# unconditionally. Declared BEFORE the
+# `[target.'cfg(windows)'.dependencies]` section because the legacy
+# missing-header in this Cargo.toml accidentally scopes anything
+# declared AFTER that section to Windows-only — see the note above
+# `crossbeam = ...` later in this file.
+flate2 = "1"
+
+# Platform-specific
+[target.'cfg(unix)'.dependencies]
+nix = {  version = "0.30.1", features = ["signal", "process"]  }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = {  version = "0.52", features = ["Win32_System_ProcessStatus", "Win32_Foundation"]  }
+
+# Error handling
+anyhow = "1.0.100"
+thiserror = "1.0"
+
+# gRPC client (for remote pipeline nodes)
+tonic = {  version = "0.14", features = ["transport", "tls-ring"] , optional = true }
+prost = "0.14"
+prost-types = "0.14"
+
+# Utilities
+uuid = {  version = "1.6", features = ["v4", "serde"]  }
+sha2 = "0.10"
+hex = "0.4"
+num_cpus = "1.16"
+regex = "1.10"
+ctrlc = "3.4"
+reqwest = {  version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"]  }
+rand = { workspace = true }
+url = "2.5"
+# (tar / flate2 / toml moved above the windows-target section to avoid
+# the accidental cfg(windows) scoping — see note near openssl above.)
+
+# Low-latency streaming optimizations (spec 007)
+# NOTE: These appear to be duplicated under the `[target.'cfg(windows)'.dependencies]`
+# scope above due to a missing section header in the original file. The real
+# declarations are in the main `[dependencies]` block near `histogram = ...`.
+crossbeam = "0.8"
+hdrhistogram = "7.5"
+
+# Docker executor (spec 009)
+bollard = {  version = "0.19.4", features = ["chrono"] , optional = true }
+rusqlite = {  version = "0.32", features = ["bundled"] , optional = true }
+# tar is unconditional (declared above for the plugin resolver) — docker
+# feature reuses it without re-declaration.
+chrono = { workspace = true, optional = true }
+bytes = "1.0"
+# hyper and http-body-util are transitive deps from bollard, add them directly
+hyper = "1.1"
+http-body-util = { version = "0.1", optional = true }
+glob = "0.3"
+
+[dev-dependencies]
+remotemedia-core = { path = "../remotemedia-sdk/crates/core" }
+tokio-test = { workspace = true }
+criterion = { workspace = true }
+tempfile = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+hound = { workspace = true }
+anyhow = "1.0.100"
+# Mel-spectrogram parity fixtures (vogent_turn). 0.8 matches workspace
+# ndarray 0.15; ndarray-npy 0.9 requires ndarray 0.16.
+ndarray-npy = "0.8"
+remotemedia-grpc = { path = "../remotemedia-sdk/crates/transports/grpc" }
+# Force-linked by integration tests that drive Python multiprocess
+# nodes (e.g. KokoroTTSNode) through SessionRouter — pulls
+# `inventory::submit!` registrations into the default streaming
+# registry. Same shape as the qwen_s2s_webrtc_server.rs example.
+remotemedia-python-nodes = { path = "../remotemedia-sdk/crates/python-nodes" }
+axum = "0.7"
+tokio-stream = "0.1"
+tonic = {  version = "0.14", features = ["transport", "tls-ring"]  }
+
+[features]
+default = []
+multiprocess = ["iceoryx2", "iceoryx2-log"]
+# In-process compiled native plugins via abi_stable + dlopen. Shares the
+# `multiprocess::data_transfer` binary wire format so plugins look the
+# same on the wire whether they're loaded in-process or run as a
+# separate process.
+loadable = ["dep:loadable-node-abi", "dep:abi_stable", "dep:async-ffi"]
+# Phase B / Path 2 — flips the `#[node]` macro's conditional FFI
+# emission for in-tree nodes. Pulled in by wrapper cdylib crates
+# (e.g. `examples/silero-vad-loadable/`) that re-export an in-tree
+# node through `plugin_export!()`.
+loadable-export = ["dep:remotemedia-plugin-sdk", "dep:abi_stable"]
+# Source-load Python plugins resolved from `plugin.toml` + extracted
+# tarball source — the resolver's Phase 1C path. Pulls in plugin-sdk's
+# python-plugin feature (iceoryx2 + include_dir + py-env-manager) so
+# `crates/core/src/loadable/source_python.rs` can reuse the subprocess +
+# IPC machinery already shipped for cdylib Python plugins.
+python-source-plugin = ["dep:remotemedia-plugin-sdk", "remotemedia-plugin-sdk/bundled-uv"]
+# `silero-vad` feature removed — `SileroVADNode` lives in the
+# silero-vad plugin (RemoteMedia-SDK/silero-vad@v0.3.0).
+# `affect-listener-face` now only gates `VadToFaceNode` (pure Rust);
+# `WhisperToVadNode` moved to RemoteMedia-SDK/whisper-to-vad.
+affect-listener-face = []
+# Affect simulator runtime driver: `AffectSimulatorNode`, a SourceWall(5)-
+# paced node that owns a per-session `affect_simulator::AffectState`,
+# ingests VAD/STT/prosody events, and emits Channel A/B/D aux-port
+# envelopes to the language-head node. See
+# `docs/references/activation-steering-audio-llm/notes/spike-i-affect-runtime-driver.md`.
+affect-sim = ["dep:affect-simulator", "avatar-lipsync"]
+# Avatar pipeline (spec 2026-04-27): emoji-tag extraction from text streams
+avatar-emotion = []
+# Avatar lip-sync — `LipSyncNode` trait, `BlendshapeFrame` envelope, and a
+# synthetic deterministic impl. Real Audio2Face ONNX impl is a follow-up
+# (gated on AUDIO2FACE_TEST_ONNX env var when it lands).
+avatar-lipsync = ["avatar-emotion"]
+# `avatar-audio2face` feature removed — `Audio2FaceLipSyncNode` and
+# the full audio2face/ subdirectory (BVLS/PGD solvers, NPZ I/O,
+# inference, identity tables) moved to standalone plugin
+# RemoteMedia-SDK/audio2face@v0.1.0.
+# `avatar-render` previously gated the `live2d_render` module
+# (renderer state machine + backend trait). With the Live2D path
+# extracted to the live2d-render plugin, the feature is now a
+# placeholder — kept for back-compat in consumer manifests that still
+# pass `avatar-render` alongside `avatar-render-cc`. The renderer
+# state machine + wgpu backend live in the plugin now.
+avatar-render = ["avatar-lipsync"]
+# `avatar-render-test-support` + `avatar-render-wgpu` features
+# removed — Live2DRenderNode and its MockBackend / wgpu backend moved
+# to the live2d-render plugin.
+# `avatar-render-cc`, `avatar-render-cc-test-support`, and
+# `avatar-render-cc-physics` features removed — CcRenderNode and the
+# whole bevy_app/ subdirectory (including physics, capture, gpu_select)
+# moved to the cc-render plugin (RemoteMedia-SDK/cc-render@v0.1.0).
+# The plugin ships physics on by default with runtime opt-out via
+# `CC_PHYSICS_DISABLE=1`.
+# `speaker-diarization` feature removed — node moved to plugin
+# (RemoteMedia-SDK/speaker-diarization@v0.1.0).
+grpc-client = ["tonic", "prost", "prost-types"]
+# Docker support integrated into multiprocess system
+docker = ["dep:bollard", "dep:chrono", "dep:bytes", "dep:hyper", "dep:http-body-util", "dep:glob", "dep:rusqlite"]
+# Video codec support (spec 012)
+video = ["dep:ac-ffmpeg"]
+# `llama-cpp` + `llama-cpp-cuda` features removed — the 4 llama.cpp
+# inference nodes moved to standalone plugin
+# (RemoteMedia-SDK/llama-cpp@v0.1.0).
+# Activation-projection avatar face track: reads LLM hidden states at
+# the steering layer (sourced from any in-plugin LLM that exposes them
+# — typically the llama-cpp plugin), projects onto calibrated emotion
+# direction vectors (NPZ artifacts produced by
+# tools/affect_calibration), and emits BlendshapeFrame envelopes.
+# Pulls in zip for NPZ archive reading. The NPZ + projection math
+# (`activation_projection` module) is pure Rust and stays in core.
+activation-face = ["avatar-lipsync", "dep:zip"]
+# Managed Python environments via uv. The implementation lives in
+# `remotemedia-py-env`; these feature flags forward to it so existing
+# `cargo build --features bundled-uv` invocations against core keep
+# working.
+bundled-uv = ["remotemedia-py-env/bundled-uv"]
+bundled-uv-embedded = ["bundled-uv", "remotemedia-py-env/bundled-uv-embedded"]
+embedded-python = ["bundled-uv", "remotemedia-py-env/embedded-python"]
+
+# Note: To get Python nodes, add remotemedia-nodes-python as a dependency.
+# The inventory system will auto-register the provider.
+
+# NOTE: grpc-client is for RemotePipelineNode client functionality only
+# Full transport implementations belong in separate transport crates
+
+
