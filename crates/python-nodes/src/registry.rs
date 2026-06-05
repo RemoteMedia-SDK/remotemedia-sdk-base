@@ -22,7 +22,7 @@ impl PythonExecutionMode {
     pub fn is_inprocess(&self) -> bool {
         matches!(self, PythonExecutionMode::InProcess)
     }
-    
+
     /// Check if this is multiprocess mode
     pub fn is_multiprocess(&self) -> bool {
         matches!(self, PythonExecutionMode::Multiprocess)

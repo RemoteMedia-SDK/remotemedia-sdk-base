@@ -1,101 +1,89 @@
 package com.remotemedia.inprocess
 
 import android.util.Log
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonArray
 
-/**
- * JNI interface for RemoteMedia native library.
+/** JNI interface for RemoteMedia native library.
  * All methods correspond to native functions in lib.rs
  */
 object NativeInterface {
-    
+
     private const val TAG = "NativeInterface"
-    
-    // Opaque handle type for executor
-    typealias ExecutorHandle = Long
-    typealias SessionHandle = Long
-    
+    private const val LIB_NAME = "remotemedia_android_inprocess"
+
     // Initialize Android logger
     @JvmStatic
     external fun initLogger()
-    
+
     // Create a pipeline executor (unary)
     @JvmStatic
-    external fun nativeCreateExecutor(): ExecutorHandle
-    
+    external fun nativeCreateExecutor(): Long
+
     // Execute a simple pipeline (unary)
     @JvmStatic
-    external fun nativeRunPipeline(handle: ExecutorHandle, manifestJson: String): String
-    
+    external fun nativeRunPipeline(handle: Long, manifestJson: String): String
+
     // Destroy executor
     @JvmStatic
-    external fun nativeDestroyExecutor(handle: ExecutorHandle)
-    
+    external fun nativeDestroyExecutor(handle: Long)
+
     // Test Python node directly
     @JvmStatic
     external fun nativeTestPythonNode(): String
-    
+
     // Create a streaming session
     @JvmStatic
-    external fun nativeCreateSession(handle: ExecutorHandle, manifestJson: String): SessionHandle
-    
+    external fun nativeCreateSession(handle: Long, manifestJson: String): Long
+
     // Send text input to session
     @JvmStatic
-    external fun nativeSendInputText(session: SessionHandle, text: String): Boolean
-    
+    external fun nativeSendInputText(session: Long, text: String): Boolean
+
     // Send audio samples (PCM 16-bit) to session
     @JvmStatic
     external fun nativeSendInputAudio(
-        session: SessionHandle,
+        session: Long,
         pcmData: ByteArray,
         sampleRate: Int,
         channels: Int
     ): Boolean
-    
+
     // Receive output from session (blocking)
     @JvmStatic
-    external fun nativeRecvOutput(session: SessionHandle): String
-    
+    external fun nativeRecvOutput(session: Long): String
+
     // Close and destroy session
     @JvmStatic
-    external fun nativeCloseSession(session: SessionHandle)
-    
+    external fun nativeCloseSession(session: Long)
+
     // Get available nodes for UI
     @JvmStatic
     external fun nativeGetAvailableNodes(): String
-    
+
     // Start streaming mode
     @JvmStatic
-    external fun nativeStartStreaming(handle: ExecutorHandle): Boolean
-    
+    external fun nativeStartStreaming(handle: Long): Boolean
+
     // Stop streaming
     @JvmStatic
-    external fun nativeStopStreaming(handle: ExecutorHandle): Boolean
-
-    companion object {
-        private const val LIB_NAME = "remotemedia_android_inprocess"
-        
-        init {
-            // Library is loaded in Application.onCreate()
-        }
-    }
+    external fun nativeStopStreaming(handle: Long): Boolean
 }
 
-/**
- * Exception thrown by native operations
- */
+/** Exception thrown by native operations */
 class NativeException(message: String) : RuntimeException(message)
 
-/**
- * Pipeline execution modes
- */
+/** Pipeline execution modes */
 enum class PipelineMode {
     UNARY,
     STREAMING
 }
 
-/**
- * Pipeline node information for UI
- */
+/** Pipeline node information for UI */
 data class NodeInfo(
     val name: String,
     val description: String,
@@ -105,28 +93,26 @@ data class NodeInfo(
     val parameters: Map<String, Any>
 )
 
-/**
- * Parses node list from native JSON
- */
+/** Parses node list from native JSON */
 fun parseAvailableNodes(json: String): List<NodeInfo> {
     return try {
-        kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        Json { ignoreUnknownKeys = true }
             .decodeFromString(
-                kotlinx.serialization.json.JsonElement.serializer().listType(),
+                JsonArray.serializer(),
                 json
             ).map { element ->
-                val obj = element.jsonObject
+                val obj = element as JsonObject
                 NodeInfo(
-                    name = obj["name"]?.jsonPrimitive?.content ?: "",
-                    description = obj["description"]?.jsonPrimitive?.content ?: "",
-                    category = obj["category"]?.jsonPrimitive?.content ?: "UNKNOWN",
-                    inputTypes = (obj["input_types"]?.jsonArray?.map { it.jsonPrimitive?.content ?: "" } ?: emptyList()),
-                    outputTypes = (obj["output_types"]?.jsonArray?.map { it.jsonPrimitive?.content ?: "" } ?: emptyList()),
-                    parameters = obj["parameters"]?.jsonObject?.mapValues { (_, v) -> v.jsonPrimitive?.content ?: "" } ?: emptyMap()
+                    name = obj["name"]?.let { (it as JsonPrimitive).content } ?: "",
+                    description = obj["description"]?.let { (it as JsonPrimitive).content } ?: "",
+                    category = obj["category"]?.let { (it as JsonPrimitive).content } ?: "UNKNOWN",
+                    inputTypes = (obj["input_types"]?.let { it as JsonArray }?.map { (it as JsonPrimitive).content ?: "" } ?: emptyList()),
+                    outputTypes = (obj["output_types"]?.let { it as JsonArray }?.map { (it as JsonPrimitive).content ?: "" } ?: emptyList()),
+                    parameters = obj["parameters"]?.let { it as JsonObject }?.mapValues { (_, v) -> (v as JsonPrimitive).content ?: "" } ?: emptyMap()
                 )
             }
     } catch (e: Exception) {
-        Log.e(TAG, "Failed to parse available nodes: ${e.message}")
+        Log.e("NativeInterface", "Failed to parse available nodes: ${e.message}")
         emptyList()
     }
 }

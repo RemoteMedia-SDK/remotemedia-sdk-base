@@ -6,6 +6,7 @@ plugins {
 android {
     namespace = "com.remotemedia.inprocess"
     compileSdk = 34
+    ndkVersion = "25.2.9519653"
 
     defaultConfig {
         applicationId = "com.remotemedia.inprocess"
@@ -19,7 +20,6 @@ android {
         // External native build with CMake
         externalNativeBuild {
             cmake {
-                version "3.22.1"
                 arguments("-DANDROID_STL=c++_shared")
                 abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
             }
@@ -33,6 +33,7 @@ android {
 
     buildTypes {
         release {
+            isDebuggable = true
             isMinifyEnabled = false
             isShrinkResources = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -56,30 +57,20 @@ android {
 
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
 
-    // Packaging options
+    // Packaging options - using modern API
     packagingOptions {
+        // Don't strip debug symbols from native libraries
         jniLibs {
             useLegacyPackaging = true
         }
-        // Don't compress model files and shared libraries
-        doNotStrip.add("**/libremotemedia_android_inprocess.so")
-        doNotStrip.add("**/libpython3.11.so")
-        doNotStrip.add("**/libcandle*.so")
     }
 
     externalNativeBuild {
         cmake {
-            path("CMakeLists.txt")
-        }
-    }
-
-    // Source sets
-    sourceSets {
-        main {
-            jniLibs.srcDirs("src/main/jniLibs")
-            assets.srcDirs("src/main/assets")
+            path("../CMakeLists.txt")
         }
     }
 }
@@ -106,15 +97,7 @@ dependencies {
     // Logging
     implementation("com.jakewharton.timber:timber:5.0.1")
 
-    // Room for settings persistence (optional)
-    implementation("androidx.room:room-runtime:2.6.1")
-    kapt("androidx.room:room-compiler:2.6.1")
-
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
-}
-
-kapt {
-    correctErrorTypes = true
 }

@@ -5,7 +5,7 @@ import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
 import java.io.File
-import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -13,30 +13,33 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Handles both unary and streaming modes.
  */
 class PipelineManager(private val context: Context) {
-    
-    private const val TAG = "PipelineManager"
-    
+
+    companion object {
+        private const val TAG = "PipelineManager"
+    }
+
     // State
-    private var executorHandle: NativeInterface.ExecutorHandle = 0
-    private var sessionHandle: NativeInterface.SessionHandle = 0
+    private var executorHandle: Long = 0
+    private var sessionHandle: Long = 0
     private val isRunning = AtomicBoolean(false)
     private val isStreaming = AtomicBoolean(false)
-    
+    private var pluginLoaded = false
+
     // Coroutine scope for background operations
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    
+
     // Audio configuration
     private val sampleRate = 16000
     private val channels = 1
-    
+
     // Callbacks
     var onOutput: ((String) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
     var onStateChange: ((PipelineState) -> Unit)? = null
-    
+
     // Pipeline configuration
     private var currentManifest: String? = null
-    
+
     /**
      * Pipeline execution state
      */
@@ -49,30 +52,56 @@ class PipelineManager(private val context: Context) {
         ERROR,
         DESTROYED
     }
-    
+
     /**
      * Initialize the pipeline executor
      */
-    fun initialize(): Boolean = scope.await {
-        try {
-            updateState(PipelineState.INITIALIZING)
-            
-            executorHandle = NativeInterface.nativeCreateExecutor()
-            if (executorHandle == 0L) {
-                throw NativeException("Failed to create executor")
+    fun initialize(): Boolean {
+        return runBlocking {
+            try {
+                updateState(PipelineState.INITIALIZING)
+
+                // Ensure LiteRT-LM plugin is extracted to files directory
+                if (!pluginLoaded) {
+                    loadLitertLmPlugin()
+                }
+
+                executorHandle = NativeInterface.nativeCreateExecutor()
+                if (executorHandle == 0L) {
+                    throw NativeException("Failed to create executor")
+                }
+
+                Log.i(TAG, "Executor created: $executorHandle")
+                updateState(PipelineState.READY)
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Initialization failed", e)
+                updateState(PipelineState.ERROR)
+                onError?.invoke(e.message ?: "Unknown error")
+                false
             }
-            
-            Log.i(TAG, "Executor created: $executorHandle")
-            updateState(PipelineState.READY)
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Initialization failed", e)
-            updateState(PipelineState.ERROR)
-            onError?.invoke(e.message ?: "Unknown error")
-            false
         }
     }
-    
+
+    /**
+     * Load LiteRT-LM plugin from assets to private files directory
+     */
+    private fun loadLitertLmPlugin() {
+        try {
+            val pluginFile = File(context.filesDir, "liblitert_lm_loadable_plugin.so")
+            Log.i(TAG, "Extracting LiteRT-LM plugin from assets...")
+            context.assets.open("plugins/liblitert_lm_loadable_plugin.so").use { inputStream ->
+                FileOutputStream(pluginFile).use { outputStream ->
+                    inputStream.copyTo(outputStream)
+                }
+            }
+            Log.i(TAG, "Plugin extracted to: ${pluginFile.absolutePath}")
+            pluginLoaded = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to extract plugin", e)
+        }
+    }
+
     /**
      * Load a pipeline manifest from assets
      */
@@ -89,35 +118,33 @@ class PipelineManager(private val context: Context) {
             false
         }
     }
-    
+
     /**
      * Load a pipeline manifest from a JSON string
      */
     fun loadManifestJson(manifestJson: String): Boolean {
         currentManifest = manifestJson
-        true
+        return true
     }
-    
+
     /**
      * Execute a unary (single request/response) pipeline
      */
     fun executeUnary(inputText: String): String? {
-        return scope.await {
+        return runBlocking {
             if (executorHandle == 0L) {
                 onError?.invoke("Executor not initialized")
-                return@await null
+                return@runBlocking null
             }
-            
+
             if (currentManifest == null) {
                 onError?.invoke("No manifest loaded")
-                return@await null
+                return@runBlocking null
             }
-            
+
             updateState(PipelineState.RUNNING)
-            
+
             try {
-                // Create a temporary manifest with the input embedded
-                // or just run with the manifest and pass input via JNI
                 val result = NativeInterface.nativeRunPipeline(executorHandle, currentManifest!!)
                 updateState(PipelineState.READY)
                 result
@@ -129,55 +156,57 @@ class PipelineManager(private val context: Context) {
             }
         }
     }
-    
+
     /**
      * Start a streaming session
      */
-    fun startStreaming(): Boolean = scope.await {
-        if (executorHandle == 0L) {
-            onError?.invoke("Executor not initialized")
-            return@await false
-        }
-        
-        if (currentManifest == null) {
-            onError?.invoke("No manifest loaded")
-            return@await false
-        }
-        
-        if (isStreaming.get()) {
-            Log.w(TAG, "Already streaming")
-            return@await true
-        }
-        
-        try {
-            updateState(PipelineState.STREAMING)
-            
-            sessionHandle = NativeInterface.nativeCreateSession(executorHandle, currentManifest!!)
-            if (sessionHandle == 0L) {
-                throw NativeException("Failed to create session")
+    fun startStreaming(): Boolean {
+        return runBlocking {
+            if (executorHandle == 0L) {
+                onError?.invoke("Executor not initialized")
+                return@runBlocking false
             }
-            
-            isStreaming.set(true)
-            isRunning.set(true)
-            
-            Log.i(TAG, "Streaming session started: $sessionHandle")
-            updateState(PipelineState.STREAMING)
-            
-            // Start output receiver coroutine
-            scope.launch {
-                receiveLoop()
+
+            if (currentManifest == null) {
+                onError?.invoke("No manifest loaded")
+                return@runBlocking false
             }
-            
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start streaming", e)
-            isStreaming.set(false)
-            updateState(PipelineState.ERROR)
-            onError?.invoke(e.message ?: "Failed to start streaming")
-            false
+
+            if (isStreaming.get()) {
+                Log.w(TAG, "Already streaming")
+                return@runBlocking true
+            }
+
+            try {
+                updateState(PipelineState.STREAMING)
+
+                sessionHandle = NativeInterface.nativeCreateSession(executorHandle, currentManifest!!)
+                if (sessionHandle == 0L) {
+                    throw NativeException("Failed to create session")
+                }
+
+                isStreaming.set(true)
+                isRunning.set(true)
+
+                Log.i(TAG, "Streaming session started: $sessionHandle")
+                updateState(PipelineState.STREAMING)
+
+                // Start output receiver coroutine
+                scope.launch {
+                    receiveLoop()
+                }
+
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start streaming", e)
+                isStreaming.set(false)
+                updateState(PipelineState.ERROR)
+                onError?.invoke(e.message ?: "Failed to start streaming")
+                false
+            }
         }
     }
-    
+
     /**
      * Send text input to the streaming session
      */
@@ -186,10 +215,10 @@ class PipelineManager(private val context: Context) {
             onError?.invoke("Not streaming")
             return false
         }
-        
+
         return NativeInterface.nativeSendInputText(sessionHandle, text)
     }
-    
+
     /**
      * Send audio input (PCM 16-bit) to the streaming session
      */
@@ -198,24 +227,24 @@ class PipelineManager(private val context: Context) {
             onError?.invoke("Not streaming")
             return false
         }
-        
+
         return NativeInterface.nativeSendInputAudio(sessionHandle, pcmData, sampleRate, channels)
     }
-    
+
     /**
      * Receive loop for streaming output
      */
-    private fun receiveLoop() {
+    private suspend fun receiveLoop() {
         while (isStreaming.get()) {
             try {
                 val output = NativeInterface.nativeRecvOutput(sessionHandle)
-                
+
                 if (output.isEmpty()) {
                     // End of stream
                     Log.i(TAG, "End of stream received")
                     break
                 }
-                
+
                 // Callback on main thread
                 withContext(Dispatchers.Main) {
                     onOutput?.invoke(output)
@@ -228,38 +257,38 @@ class PipelineManager(private val context: Context) {
                 break
             }
         }
-        
+
         isStreaming.set(false)
         isRunning.set(false)
         withContext(Dispatchers.Main) {
             updateState(PipelineState.READY)
         }
     }
-    
+
     /**
      * Stop the streaming session
      */
-    fun stopStreaming() = scope.await {
+    fun stopStreaming() = runBlocking {
         if (!isStreaming.get()) {
-            return@await
+            return@runBlocking
         }
-        
+
         isStreaming.set(false)
         isRunning.set(false)
-        
+
         if (sessionHandle != 0L) {
             NativeInterface.nativeCloseSession(sessionHandle)
             sessionHandle = 0
         }
-        
+
         Log.i(TAG, "Streaming stopped")
         updateState(PipelineState.READY)
     }
-    
+
     /**
      * Get available nodes for UI
      */
-    fun getAvailableNodes(): List<NodeInfo> = scope.await {
+    fun getAvailableNodes(): List<NodeInfo> = runBlocking {
         try {
             val json = NativeInterface.nativeGetAvailableNodes()
             parseAvailableNodes(json)
@@ -268,36 +297,38 @@ class PipelineManager(private val context: Context) {
             emptyList()
         }
     }
-    
+
     /**
      * Clean up all resources
      */
-    fun destroy() = scope.await {
+    fun destroy() = runBlocking {
         stopStreaming()
-        
+
         if (executorHandle != 0L) {
             NativeInterface.nativeDestroyExecutor(executorHandle)
             executorHandle = 0
         }
-        
+
         scope.coroutineContext.cancelChildren()
         updateState(PipelineState.DESTROYED)
-        
+
         Log.i(TAG, "Pipeline manager destroyed")
     }
-    
+
     /**
      * Check if currently streaming
      */
     fun isStreamingActive(): Boolean = isStreaming.get()
-    
+
     /**
      * Check if executor is initialized
      */
     fun isInitialized(): Boolean = executorHandle != 0L
-    
+
     private fun updateState(state: PipelineState) {
-        withContext(Dispatchers.Main) {
+        // Already on main thread if called from runBlocking context
+        // Use launch to ensure it runs on main thread
+        scope.launch(Dispatchers.Main) {
             onStateChange?.invoke(state)
         }
     }

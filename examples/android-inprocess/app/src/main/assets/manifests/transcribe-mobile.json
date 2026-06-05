@@ -1,0 +1,58 @@
+{
+  "version": "1",
+  "metadata": {
+    "name": "transcribe-mobile",
+    "description": "Speech-to-text only with VAD",
+    "auto_negotiate": true,
+    "strict_capabilities": false
+  },
+  "nodes": [
+    {
+      "id": "vad",
+      "node_type": "SileroVADNode",
+      "params": {
+        "threshold": 0.5,
+        "min_speech_duration_ms": 250,
+        "min_silence_duration_ms": 1000,
+        "sample_rate": 16000,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "stt",
+      "node_type": "WhisperSTTNode",
+      "params": {
+        "model_size": "base",
+        "language": "auto",
+        "task": "transcribe",
+        "temperature": 0.0,
+        "beam_size": 5,
+        "patience": 1.0,
+        "word_timestamps": true,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "formatter",
+      "node_type": "TextFormatterNode",
+      "params": {
+        "include_timestamps": true,
+        "segment_duration_threshold": 0.5,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true
+    }
+  ],
+  "connections": [
+    {
+      "from": "vad",
+      "to": "stt"
+    },
+    {
+      "from": "stt",
+      "to": "formatter"
+    }
+  ]
+}

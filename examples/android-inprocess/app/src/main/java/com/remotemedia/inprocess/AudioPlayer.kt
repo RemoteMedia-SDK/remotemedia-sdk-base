@@ -12,13 +12,14 @@ import kotlinx.coroutines.channels.SendChannel
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-/**
- * Low-latency audio player using AudioTrack.
+/** Low-latency audio player using AudioTrack.
  * Plays 48kHz mono PCM16, handles resampling from 24kHz (Kokoro) or 16kHz.
  */
 class AudioPlayer(private val context: Context) {
     
-    private const val TAG = "AudioPlayer"
+    companion object {
+        private const val TAG = "AudioPlayer"
+    }
     
     // Audio configuration
     private val outputSampleRate = 48000  // Device playback rate
@@ -162,11 +163,11 @@ class AudioPlayer(private val context: Context) {
             }
             
             // Non-blocking offer
-            return audioChannel.trySend(outputData) ?: false
+            return audioChannel.trySend(outputData).isSuccess
         } catch (e: Exception) {
             Log.e(TAG, "Failed to queue audio", e)
             onError?.invoke("Queue audio error: ${e.message}")
-            false
+            return false
         }
     }
     
@@ -178,7 +179,7 @@ class AudioPlayer(private val context: Context) {
     /**
      * Playback loop - reads from channel and writes to AudioTrack
      */
-    private fun playbackLoop() {
+    private suspend fun playbackLoop() {
         val writeBuffer = ByteArray(outputFrameSize * 2)
         
         while (isPlaying && scope.coroutineContext.isActive) {
@@ -236,7 +237,7 @@ class AudioPlayer(private val context: Context) {
             if (srcIndex + 1 < inLen) {
                 val s0 = inSamples[srcIndex].toDouble()
                 val s1 = inSamples[srcIndex + 1].toDouble()
-                outSamples[i] = (s0 + (s1 - s0) * frac).toShort()
+                outSamples[i] = (s0 + (s1 - s0) * frac).toInt().toShort()
             } else if (srcIndex < inLen) {
                 outSamples[i] = inSamples[srcIndex]
             }

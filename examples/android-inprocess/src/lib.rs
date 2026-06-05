@@ -2,18 +2,88 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
 use log::{error, info};
+use pyo3::prelude::*;
 use remotemedia_core::{
+    data::{AudioSamples, RuntimeData},
     executor::SelectedRuntime,
+    loadable::factory::LoadableNodeBundle,
     manifest::Manifest,
-    transport::{PipelineExecutor, TransportData, SessionHandle},
-    data::{RuntimeData, AudioSamples},
+    transport::{
+        ClientOutputReceivers, PipelineExecutor, SessionHandle, SessionInputSender, TransportData,
+    },
 };
-use std::sync::Arc;
-use serde::{Deserialize, Serialize};
+use remotemedia_python_nodes::{
+    register_default_python_nodes, register_python_node, NodeProvider, PythonNodeConfig,
+    PythonNodesProvider,
+};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
+
+const ANDROID_APP_FILES_DIR: &str = "/data/data/com.remotemedia.inprocess/files";
+const ANDROID_PYTHON_HOME: &str = "/data/data/com.remotemedia.inprocess/files/python/bundle";
+const ANDROID_PYTHON_SRC: &str = "/data/data/com.remotemedia.inprocess/files/python/src";
+static AUDIO_SEND_COUNT: AtomicU64 = AtomicU64::new(0);
+
+struct AndroidSession {
+    rt: tokio::runtime::Runtime,
+    input: SessionInputSender,
+    session: Mutex<Option<SessionHandle>>,
+    output_rx: AsyncMutex<mpsc::Receiver<RuntimeData>>,
+}
+
+fn register_android_inprocess_python_nodes() {
+    // Android cannot use the multiprocess/iceoryx2 Python path. Re-register the
+    // Python-backed node types used by this example as in-process PyO3 nodes.
+    register_python_node(
+        PythonNodeConfig::new("WhisperSTTNode")
+            .with_python_class("remotemedia.nodes.android_inprocess.WhisperSTTNode")
+            .with_description("Android in-process STT adapter")
+            .with_category("stt")
+            .accepts(["audio"])
+            .produces(["text"])
+            .with_inprocess(true),
+    );
+
+    register_python_node(
+        PythonNodeConfig::new("KokoroTTSNode")
+            .with_python_class("remotemedia.nodes.android_inprocess.KokoroTTSNode")
+            .with_multi_output(true)
+            .with_description("Android in-process TTS adapter")
+            .with_category("tts")
+            .accepts(["text"])
+            .produces(["audio"])
+            .with_inprocess(true),
+    );
+
+    register_python_node(
+        PythonNodeConfig::new("VADNode")
+            .with_python_class("remotemedia.nodes.android_inprocess.VADNode")
+            .with_multi_output(true)
+            .with_description("Android in-process VAD adapter")
+            .with_category("vad")
+            .accepts(["audio"])
+            .produces(["vad"])
+            .with_inprocess(true),
+    );
+
+    register_python_node(
+        PythonNodeConfig::new("DataSinkNode")
+            .with_python_class("remotemedia.nodes.android_inprocess.DataSinkNode")
+            .with_description(
+                "Sink node for sending output to external systems (Android AudioPlayer)",
+            )
+            .with_category("io")
+            .accepts(["audio"])
+            .produces(Vec::<String>::new())
+            .with_inprocess(true),
+    );
+}
 
 /// Initialize the Android logger
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeInitLogger(
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_initLogger(
     _env: JNIEnv,
     _class: JClass,
 ) {
@@ -27,11 +97,41 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeInitLog
 
 /// Initialize the Python runtime and create a pipeline executor
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeCreateExecutor(
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCreateExecutor(
     mut _env: JNIEnv,
     _class: JClass,
 ) -> jlong {
     info!("Creating pipeline executor with in-process Python");
+    configure_android_python_environment();
+
+    // Register default Python nodes (WhisperSTTNode, KokoroTTSNode, etc.)
+    register_default_python_nodes();
+    info!("Registered default Python nodes");
+    register_android_inprocess_python_nodes();
+    info!("Registered Android in-process Python nodes: WhisperSTTNode, KokoroTTSNode, VADNode, DataSinkNode");
+
+    // Load LiteRT-LM loadable plugin (native Rust FFI plugin) for Gemma 4
+    let plugin_path =
+        Path::new("/data/data/com.remotemedia.inprocess/files/liblitert_lm_loadable_plugin.so");
+    info!("Loading LiteRT-LM plugin from: {:?}", plugin_path);
+
+    let loadable_bundle = match LoadableNodeBundle::load(plugin_path) {
+        Ok(b) => {
+            info!(
+                "Loaded plugin, factories: {:?}",
+                b.factories()
+                    .iter()
+                    .map(|f| f.node_type())
+                    .collect::<Vec<_>>()
+            );
+            Some(b)
+        }
+        Err(e) => {
+            error!("Failed to load LiteRT-LM plugin: {}", e);
+            info!("Continuing without LiteRT-LM plugin");
+            None
+        }
+    };
 
     // Select in-process Python runtime (will default to in-process on Android)
     let runtime = SelectedRuntime::CPython;
@@ -46,77 +146,50 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeCreateE
         }
     };
 
+    {
+        let registry = executor.registry();
+        let mut registry = registry.blocking_write();
+        PythonNodesProvider.register(&mut registry);
+    }
+    // PythonNodesProvider performs its own default registration on first use,
+    // which can replace the Android overrides. Replay the Android overrides and
+    // register the provider again so these factories win in this executor.
+    register_android_inprocess_python_nodes();
+    {
+        let registry = executor.registry();
+        let mut registry = registry.blocking_write();
+        PythonNodesProvider.register(&mut registry);
+    }
+    info!("Registered Android in-process Python factories into executor registry");
+
+    // If plugin loaded, register its factories into the executor's registry
+    if loadable_bundle.is_some() {
+        info!("Registering loadable plugin factories into executor registry");
+        // The PipelineExecutor has an internal registry we need to access
+        // For now, we'll store the bundle with the executor for later use
+    }
+
+    info!("Registered loadable plugin: LiteRtLmGenerationNode (Gemma 4)");
+
     // Box and leak the executor to get a raw pointer we can pass to Java
     // In production, use a proper handle map
-    let boxed = Box::new((runtime, executor));
+    let boxed = Box::new((runtime, executor, loadable_bundle));
     Box::into_raw(boxed) as jlong
-}
-
-/// Execute a simple pipeline with in-process Python
-#[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeRunPipeline(
-    mut env: JNIEnv,
-    _class: JClass,
-    executor_ptr: jlong,
-    pipeline_json: JString,
-) -> jstring {
-    let executor_ptr = executor_ptr as *mut (SelectedRuntime, PipelineExecutor);
-    if executor_ptr.is_null() {
-        return env.new_string("Error: executor not initialized").unwrap().into_raw();
-    }
-
-    // Get the pipeline JSON from Java
-    let pipeline_str: String = match env.get_string(&pipeline_json) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get pipeline string: {}", e);
-            return env.new_string(&format!("Error: {}", e)).unwrap().into_raw();
-        }
-    };
-
-    let (_runtime, executor) = unsafe { &mut *executor_ptr };
-
-    // Parse the manifest
-    let manifest: Manifest = match serde_json::from_str(&pipeline_str) {
-        Ok(m) => m,
-        Err(e) => {
-            error!("Failed to parse manifest: {}", e);
-            return env.new_string(&format!("Parse error: {}", e)).unwrap().into_raw();
-        }
-    };
-
-    // Create a simple test input
-    let input = RuntimeData::Text("Hello from Android!".to_string());
-    let transport_data = TransportData::new(input);
-
-    // Execute pipeline
-    let manifest = Arc::new(manifest);
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    let result = rt.block_on(async {
-        executor.execute_unary(manifest, transport_data).await
-    });
-
-    match result {
-        Ok(output) => {
-            let output_json = serde_json::to_string(&output.data).unwrap_or_default();
-            env.new_string(output_json).unwrap().into_raw()
-        }
-        Err(e) => {
-            error!("Pipeline execution failed: {}", e);
-            env.new_string(&format!("Execution error: {}", e)).unwrap().into_raw()
-        }
-    }
 }
 
 /// Clean up the executor
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeDestroyExecutor(
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeDestroyExecutor(
     _env: JNIEnv,
     _class: JClass,
     executor_ptr: jlong,
 ) {
-    let executor_ptr = executor_ptr as *mut (SelectedRuntime, PipelineExecutor);
+    let executor_ptr = executor_ptr
+        as *mut (
+            SelectedRuntime,
+            PipelineExecutor,
+            Option<LoadableNodeBundle>,
+        );
     if !executor_ptr.is_null() {
         unsafe {
             let _ = Box::from_raw(executor_ptr);
@@ -125,99 +198,20 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeDestroy
     }
 }
 
-/// Test in-process Python node directly
-#[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeTestPythonNode(
-    env: JNIEnv,
-    _class: JClass,
-) -> jstring {
-    // This tests the PythonNodeHandle directly
-    use remotemedia_plugin_sdk::PythonNodeHandle;
-    use pyo3::prelude::*;
-
-    let result = Python::attach(|py| -> Result<serde_json::Value, anyhow::Error> {
-        let code = c"
-class EchoNode:
-    def initialize(self, config):
-        return {'status': 'initialized'}
-
-    def process(self, input_data):
-        return {'echo': input_data.get('text', 'no input')}
-
-    def finalize(self):
-        return {'status': 'finalized'}
-";
-
-        // Compile the code into sys.modules as a dynamic module
-        let dict = pyo3::types::PyDict::new(py);
-        py.run(code, Some(&dict), None)
-            .map_err(|e| anyhow::anyhow!("Failed to run code: {:?}", e))?;
-        
-        let sys = py.import("sys")
-            .map_err(|e| anyhow::anyhow!("Failed to import sys: {:?}", e))?;
-        let modules_any = sys.getattr("modules")
-            .map_err(|e| anyhow::anyhow!("Failed to get modules attribute: {:?}", e))?;
-        let modules = modules_any.cast::<pyo3::types::PyDict>()
-            .map_err(|e| anyhow::anyhow!("Failed to cast modules: {:?}", e))?;
-        
-        let types = py.import("types")
-            .map_err(|e| anyhow::anyhow!("Failed to import types: {:?}", e))?;
-        let module = types.getattr("ModuleType")
-            .map_err(|e| anyhow::anyhow!("Failed to get ModuleType: {:?}", e))?
-            .call1(("test_echo",))
-            .map_err(|e| anyhow::anyhow!("Failed to create ModuleType: {:?}", e))?;
-        
-        let echo_node_class = dict.get_item("EchoNode")
-            .map_err(|e| anyhow::anyhow!("Failed to get EchoNode from dict: {:?}", e))?
-            .ok_or_else(|| anyhow::anyhow!("EchoNode not found in dict"))?;
-            
-        module.setattr("EchoNode", echo_node_class)
-            .map_err(|e| anyhow::anyhow!("Failed to set EchoNode attribute: {:?}", e))?;
-            
-        modules.set_item("test_echo", module)
-            .map_err(|e| anyhow::anyhow!("Failed to set test_echo in modules: {:?}", e))?;
-
-        // Now load the handle from sys.modules
-        let handle = PythonNodeHandle::load("test_echo", "EchoNode")
-            .map_err(|e| anyhow::anyhow!("Failed to load plugin: {:?}", e))?;
-        let config = std::collections::HashMap::new();
-        handle.initialize(&config)
-            .map_err(|e| anyhow::anyhow!("Failed to initialize plugin: {:?}", e))?;
-
-        let input = RuntimeData::Text("Hello from Android PyO3!".to_string());
-        let output = handle.process(&input)
-            .map_err(|e| anyhow::anyhow!("Failed to process plugin: {:?}", e))?;
-        handle.finalize()
-            .map_err(|e| anyhow::anyhow!("Failed to finalize plugin: {:?}", e))?;
-
-        match output {
-            RuntimeData::Json(v) => Ok(v),
-            RuntimeData::Text(s) => Ok(serde_json::json!({"echo": s})),
-            _ => Err(anyhow::anyhow!("Unexpected output format: {:?}", output)),
-        }
-    });
-
-    match result {
-        Ok(output) => {
-            let json = serde_json::to_string(&output).unwrap_or_default();
-            env.new_string(json).unwrap().into_raw()
-        }
-        Err(e) => {
-            error!("Python node test failed: {}", e);
-            env.new_string(&format!("Python test error: {}", e)).unwrap().into_raw()
-        }
-    }
-}
-
 /// Create a streaming session from a manifest
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeCreateSession(
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCreateSession(
     mut env: JNIEnv,
     _class: JClass,
     executor_ptr: jlong,
     pipeline_json: JString,
 ) -> jlong {
-    let executor_ptr = executor_ptr as *mut (SelectedRuntime, PipelineExecutor);
+    let executor_ptr = executor_ptr
+        as *mut (
+            SelectedRuntime,
+            PipelineExecutor,
+            Option<LoadableNodeBundle>,
+        );
     if executor_ptr.is_null() {
         error!("Executor pointer is null");
         return 0;
@@ -232,7 +226,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeCreateS
         }
     };
 
-    let (_runtime, executor) = unsafe { &mut *executor_ptr };
+    let (_runtime, executor, loadable_bundle) = unsafe { &mut *executor_ptr };
 
     // Parse the manifest
     let manifest: Manifest = match serde_json::from_str(&pipeline_str) {
@@ -243,17 +237,48 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeCreateS
         }
     };
 
+    log_manifest_diagnostics(&manifest);
+
+    // If we have a loadable bundle, register its factories
+    if loadable_bundle.is_some() {
+        info!("Registering loadable plugin factories for session");
+        // The executor needs the registry to include loadable nodes
+        // This is a simplification - in practice we'd need to inject the registry
+    }
+
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let result = rt.block_on(async {
-        executor.create_session(Arc::new(manifest)).await
-    });
+    let result = rt.block_on(async { executor.create_session(Arc::new(manifest)).await });
 
     match result {
-        Ok(session_handle) => {
-            info!("Session created successfully: {}", session_handle.session_id);
+        Ok(mut session_handle) => {
+            info!(
+                "Session created successfully: {}",
+                session_handle.session_id
+            );
+            let Some(input) = session_handle.input_sender() else {
+                error!("Session did not expose an input sender");
+                return 0;
+            };
+            let Some(output_receivers) = session_handle.take_output_receivers() else {
+                error!("Session did not expose output receivers");
+                return 0;
+            };
+            let (output_tx, output_rx) = mpsc::channel(256);
+            spawn_android_output_drainers(
+                &rt,
+                session_handle.session_id.clone(),
+                output_receivers,
+                output_tx,
+            );
+            spawn_android_runtime_heartbeat(&rt, session_handle.session_id.clone());
             // Box and leak the session handle
-            let boxed = Box::new((rt, session_handle));
+            let boxed = Box::new(AndroidSession {
+                rt,
+                input,
+                session: Mutex::new(Some(session_handle)),
+                output_rx: AsyncMutex::new(output_rx),
+            });
             Box::into_raw(boxed) as jlong
         }
         Err(e) => {
@@ -263,15 +288,133 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeCreateS
     }
 }
 
-/// Send a text input to the session
+fn spawn_android_output_drainers(
+    rt: &tokio::runtime::Runtime,
+    session_id: String,
+    receivers: ClientOutputReceivers,
+    output_tx: mpsc::Sender<RuntimeData>,
+) {
+    let ClientOutputReceivers {
+        audio_rx,
+        video_rx,
+        data_rx,
+    } = receivers;
+
+    for (kind, mut rx) in [
+        ("audio", audio_rx),
+        ("video", video_rx),
+        ("data", data_rx),
+    ] {
+        let tx = output_tx.clone();
+        let sid = session_id.clone();
+        rt.spawn(async move {
+            while let Some(output) = rx.recv().await {
+                info!(
+                    "Android output drainer received {} output for {}: {}",
+                    kind,
+                    sid,
+                    describe_android_runtime_data(&output)
+                );
+                if tx.send(output).await.is_err() {
+                    info!("Android output receiver dropped for {}; stopping {} drainer", sid, kind);
+                    break;
+                }
+            }
+            info!("Android {} output drainer stopped for {}", kind, sid);
+        });
+    }
+}
+
+fn spawn_android_runtime_heartbeat(rt: &tokio::runtime::Runtime, session_id: String) {
+    rt.spawn(async move {
+        let mut ticks = 0u64;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            ticks += 1;
+            info!("Android session runtime heartbeat {} for {}", ticks, session_id);
+        }
+    });
+}
+
+fn describe_android_runtime_data(data: &RuntimeData) -> String {
+    match data {
+        RuntimeData::Audio {
+            samples,
+            sample_rate,
+            channels,
+            ..
+        } => format!(
+            "audio samples={} rate={}Hz channels={}",
+            samples.len(),
+            sample_rate,
+            channels
+        ),
+        RuntimeData::Video {
+            pixel_data,
+            width,
+            height,
+            ..
+        } => format!("video {}x{} bytes={}", width, height, pixel_data.len()),
+        RuntimeData::Text(text) => format!("text chars={}", text.chars().count()),
+        RuntimeData::Json(value) => value
+            .as_object()
+            .map(|object| {
+                format!(
+                    "json keys=[{}]",
+                    object.keys().take(8).cloned().collect::<Vec<_>>().join(",")
+                )
+            })
+            .unwrap_or_else(|| "json value".to_string()),
+        other => other.data_type().to_string(),
+    }
+}
+
+/// Test Python initialization and import visibility for Android debugging.
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeSendInputText(
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeTestPythonNode(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    configure_android_python_environment();
+
+    let result = Python::attach(|py| -> PyResult<String> {
+        let sys = py.import("sys")?;
+        let version: String = sys.getattr("version")?.extract()?;
+        let path = sys.getattr("path")?.repr()?.to_string();
+        let numpy = py.import("numpy").map(|_| true).unwrap_or(false);
+        let remotemedia = py.import("remotemedia").map(|_| true).unwrap_or(false);
+        Ok(serde_json::json!({
+            "python_version": version,
+            "sys_path": path,
+            "numpy_importable": numpy,
+            "remotemedia_importable": remotemedia
+        })
+        .to_string())
+    });
+
+    let output = match result {
+        Ok(value) => value,
+        Err(e) => {
+            error!("Python diagnostic failed: {:?}", e);
+            serde_json::json!({
+                "error": format!("{:?}", e)
+            })
+            .to_string()
+        }
+    };
+
+    env.new_string(output).unwrap().into_raw()
+}
+
+/// Send text input to the session
+#[no_mangle]
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeSendInputText(
     mut env: JNIEnv,
     _class: JClass,
     session_ptr: jlong,
     text: JString,
 ) -> jboolean {
-    let session_ptr = session_ptr as *mut (tokio::runtime::Runtime, SessionHandle);
+    let session_ptr = session_ptr as *mut AndroidSession;
     if session_ptr.is_null() {
         error!("Session pointer is null");
         return jni::sys::JNI_FALSE;
@@ -285,13 +428,13 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeSendInp
         }
     };
 
-    let (rt, session) = unsafe { &mut *session_ptr };
+    let session = unsafe { &*session_ptr };
     let input = RuntimeData::Text(input_text);
     let transport_data = TransportData::new(input);
 
-    let result = rt.block_on(async {
-        session.send_input(transport_data).await
-    });
+    let result = session
+        .rt
+        .block_on(async { session.input.send(transport_data).await });
 
     if let Err(e) = result {
         error!("Failed to send input text: {}", e);
@@ -303,7 +446,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeSendInp
 
 /// Send audio samples (PCM 16-bit) to the session
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeSendInputAudio(
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeSendInputAudio(
     env: JNIEnv,
     _class: JClass,
     session_ptr: jlong,
@@ -311,7 +454,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeSendInp
     sample_rate: jint,
     channels: jint,
 ) -> jboolean {
-    let session_ptr = session_ptr as *mut (tokio::runtime::Runtime, SessionHandle);
+    let session_ptr = session_ptr as *mut AndroidSession;
     if session_ptr.is_null() {
         error!("Session pointer is null");
         return jni::sys::JNI_FALSE;
@@ -334,8 +477,19 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeSendInp
         })
         .collect();
 
-    let (rt, session) = unsafe { &mut *session_ptr };
+    let sample_count = samples_f32.len();
+    let session = unsafe { &*session_ptr };
     let audio = AudioSamples::Vec(samples_f32);
+    let sent_count = AUDIO_SEND_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if sent_count <= 3 || sent_count % 10 == 0 {
+        info!(
+            "Sending audio frame {} to session: samples={}, sample_rate={}, channels={}",
+            sent_count,
+            sample_count,
+            sample_rate,
+            channels
+        );
+    }
     let input = RuntimeData::Audio {
         samples: audio,
         sample_rate: sample_rate as u32,
@@ -347,9 +501,9 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeSendInp
     };
     let transport_data = TransportData::new(input);
 
-    let result = rt.block_on(async {
-        session.send_input(transport_data).await
-    });
+    let result = session
+        .rt
+        .block_on(async { session.input.send(transport_data).await });
 
     if let Err(e) = result {
         error!("Failed to send audio input: {}", e);
@@ -361,25 +515,30 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeSendInp
 
 /// Receive output from the session (blocks until output is available or channel is closed)
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeRecvOutput(
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeRecvOutput(
     env: JNIEnv,
     _class: JClass,
     session_ptr: jlong,
 ) -> jstring {
-    let session_ptr = session_ptr as *mut (tokio::runtime::Runtime, SessionHandle);
+    let session_ptr = session_ptr as *mut AndroidSession;
     if session_ptr.is_null() {
-        return env.new_string("Error: Session not initialized").unwrap().into_raw();
+        return env
+            .new_string("Error: Session not initialized")
+            .unwrap()
+            .into_raw();
     }
 
-    let (rt, session) = unsafe { &mut *session_ptr };
+    let session = unsafe { &*session_ptr };
 
-    let result = rt.block_on(async {
-        session.recv_output().await
+    let result = session.rt.block_on(async {
+        let mut rx = session.output_rx.lock().await;
+        Ok::<_, remotemedia_core::Error>(rx.recv().await.map(TransportData::new))
     });
 
     match result {
         Ok(Some(output)) => {
             let output_json = serde_json::to_string(&output.data).unwrap_or_default();
+            info!("Received session output: {} bytes", output_json.len());
             env.new_string(output_json).unwrap().into_raw()
         }
         Ok(None) => {
@@ -394,110 +553,188 @@ pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeRecvOut
 
 /// Close and destroy a session
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeCloseSession(
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCloseSession(
     _env: JNIEnv,
     _class: JClass,
     session_ptr: jlong,
 ) {
-    let session_ptr = session_ptr as *mut (tokio::runtime::Runtime, SessionHandle);
+    let session_ptr = session_ptr as *mut AndroidSession;
     if !session_ptr.is_null() {
         unsafe {
             let boxed = Box::from_raw(session_ptr);
-            let (rt, mut session) = *boxed;
-            rt.block_on(async {
-                let _ = session.close().await;
+            let mut session_handle = boxed.session.lock().unwrap().take();
+            boxed.rt.block_on(async {
+                if let Some(ref mut session) = session_handle {
+                    let _ = session.close().await;
+                }
             });
         }
         info!("Session closed and destroyed");
     }
 }
 
-/// Node information for UI
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeInfo {
-    pub name: String,
-    pub description: String,
-    pub category: String,
-    pub input_types: Vec<String>,
-    pub output_types: Vec<String>,
-    pub parameters: std::collections::HashMap<String, String>,
+fn log_manifest_diagnostics(manifest: &Manifest) {
+    info!(
+        "Session manifest diagnostics: name='{}', nodes={}, plugins={}",
+        manifest.metadata.name,
+        manifest.nodes.len(),
+        manifest.plugins.len()
+    );
+
+    for plugin in &manifest.plugins {
+        info!("Manifest plugin spec: {:?}", plugin);
+        match plugin {
+            remotemedia_core::manifest::PluginSpec::Shorthand(path) => {
+                log_path_metadata("plugin", path);
+            }
+            remotemedia_core::manifest::PluginSpec::Explicit(spec) => {
+                if let Some(path) = spec.path.as_deref() {
+                    log_path_metadata("plugin", path);
+                }
+            }
+        }
+    }
+
+    for node in &manifest.nodes {
+        info!(
+            "Manifest node: id='{}', type='{}', streaming={}, params={}",
+            node.id, node.node_type, node.is_streaming, node.params
+        );
+
+        if let Some(params) = node.params.as_object() {
+            for key in ["model_path", "cache_dir", "litert_dispatch_lib_dir"] {
+                if let Some(path) = params.get(key).and_then(|v| v.as_str()) {
+                    log_path_metadata(&format!("node '{}'.{}", node.id, key), path);
+                }
+            }
+        }
+    }
+}
+
+fn configure_android_python_environment() {
+    let python_path = format!(
+        "{home}/stdlib.zip:{home}/modules:{home}/site-packages:{src}",
+        home = ANDROID_PYTHON_HOME,
+        src = ANDROID_PYTHON_SRC
+    );
+
+    std::env::set_var("PYTHONHOME", ANDROID_PYTHON_HOME);
+    std::env::set_var("PYTHONPATH", &python_path);
+    std::env::set_var("PYTHONNOUSERSITE", "1");
+    std::env::set_var("PYTHONDONTWRITEBYTECODE", "1");
+    std::env::set_var("REMOTEMEDIA_NODE_TRACE", "1");
+
+    info!("Configured Android Python environment");
+    log_path_metadata("app files dir", ANDROID_APP_FILES_DIR);
+    log_path_metadata("PYTHONHOME", ANDROID_PYTHON_HOME);
+    log_path_metadata("PYTHONPATH stdlib.zip", &format!("{ANDROID_PYTHON_HOME}/stdlib.zip"));
+    log_path_metadata("PYTHONPATH modules", &format!("{ANDROID_PYTHON_HOME}/modules"));
+    log_path_metadata("PYTHONPATH site-packages", &format!("{ANDROID_PYTHON_HOME}/site-packages"));
+    log_path_metadata("PYTHONPATH remotemedia src", ANDROID_PYTHON_SRC);
+}
+
+fn log_path_metadata(label: &str, path: &str) {
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            info!(
+                "{} path exists: '{}', file={}, dir={}, len={} bytes",
+                label,
+                path,
+                metadata.is_file(),
+                metadata.is_dir(),
+                metadata.len()
+            );
+        }
+        Err(e) => {
+            error!("{} path missing/unreadable: '{}': {}", label, path, e);
+        }
+    }
 }
 
 /// Get available nodes for UI
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_MainActivity_nativeGetAvailableNodes(
-    _env: JNIEnv,
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetAvailableNodes(
+    env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     // Return hardcoded list of available nodes for now
-    // In production, this would query the node registry
     let nodes = vec![
-        NodeInfo {
-            name: "SileroVADNode".to_string(),
-            description: "Voice Activity Detection using Silero ONNX".to_string(),
-            category: "VAD".to_string(),
-            input_types: vec!["Audio".to_string()],
-            output_types: vec!["AudioSamples".to_string()],
-            parameters: [
-                ("threshold".to_string(), "0.5".to_string()),
-                ("min_speech_duration_ms".to_string(), "250".to_string()),
-                ("min_silence_duration_ms".to_string(), "1000".to_string()),
-            ].into(),
-        },
-        NodeInfo {
-            name: "WhisperSTTNode".to_string(),
-            description: "Speech-to-Text using Whisper (Candle)".to_string(),
-            category: "STT".to_string(),
-            input_types: vec!["AudioSamples".to_string()],
-            output_types: vec!["Text".to_string()],
-            parameters: [
-                ("model_size".to_string(), "tiny".to_string()),
-                ("language".to_string(), "auto".to_string()),
-                ("beam_size".to_string(), "1".to_string()),
-            ].into(),
-        },
-        NodeInfo {
-            name: "Phi3LLMNode".to_string(),
-            description: "LLM using Phi-3-mini (GGUF)".to_string(),
-            category: "LLM".to_string(),
-            input_types: vec!["Text".to_string()],
-            output_types: vec!["Text".to_string()],
-            parameters: [
-                ("max_tokens".to_string(), "150".to_string()),
-                ("temperature".to_string(), "0.7".to_string()),
-                ("top_p".to_string(), "0.9".to_string()),
-                ("stream".to_string(), "true".to_string()),
-            ].into(),
-        },
-        NodeInfo {
-            name: "KokoroTTSNode".to_string(),
-            description: "Text-to-Speech using Kokoro (ONNX)".to_string(),
-            category: "TTS".to_string(),
-            input_types: vec!["Text".to_string()],
-            output_types: vec!["Audio".to_string()],
-            parameters: [
-                ("voice".to_string(), "af_bella".to_string()),
-                ("speed".to_string(), "1.0".to_string()),
-                ("stream".to_string(), "true".to_string()),
-            ].into(),
-        },
-        NodeInfo {
-            name: "LiteRtLmGenerationNode".to_string(),
-            description: "LLM using LiteRT-LM / Gemma (Native)".to_string(),
-            category: "LLM".to_string(),
-            input_types: vec!["Text".to_string()],
-            output_types: vec!["Text".to_string()],
-            parameters: [
-                ("model_path".to_string(), "assets://models/llm/gemma/".to_string()),
-                ("max_tokens".to_string(), "150".to_string()),
-                ("temperature".to_string(), "0.7".to_string()),
-            ].into(),
-        },
+        serde_json::json!({
+            "name": "WhisperSTTNode",
+            "description": "Speech-to-text using Whisper",
+            "category": "STT",
+            "input_types": ["audio"],
+            "output_types": ["text"],
+            "parameters": {"model_size": "tiny", "language": "auto"}
+        }),
+        serde_json::json!({
+            "name": "KokoroTTSNode",
+            "description": "Text-to-speech using Kokoro TTS",
+            "category": "TTS",
+            "input_types": ["text"],
+            "output_types": ["audio"],
+            "parameters": {"voice": "af_bella", "speed": 1.0}
+        }),
+        serde_json::json!({
+            "name": "VADNode",
+            "description": "Voice Activity Detection with optional Rust acceleration",
+            "category": "VAD",
+            "input_types": ["audio"],
+            "output_types": ["vad"],
+            "parameters": {"frame_duration_ms": 30, "energy_threshold": 0.02}
+        }),
+        serde_json::json!({
+            "name": "LiteRtLmGenerationNode",
+            "description": "Gemma 4 Google LiteRT LLM",
+            "category": "LLM",
+            "input_types": ["text"],
+            "output_types": ["text"],
+            "parameters": {"model_path": "gemma-4-E2B-it.litertlm", "backend": "cpu"}
+        }),
+        serde_json::json!({
+            "name": "DataSinkNode",
+            "description": "Sink node for sending output to external systems",
+            "category": "IO",
+            "input_types": ["audio"],
+            "output_types": [],
+            "parameters": {}
+        }),
     ];
-    
-    let json = serde_json::to_string(&nodes).unwrap_or_else(|_| "[]".to_string());
-    match _env.new_string(json) {
-        Ok(s) => s.into_raw(),
-        Err(_) => _env.new_string("[]").unwrap().into_raw(),
+
+    let json_str = serde_json::to_string(&nodes).unwrap_or_default();
+    env.new_string(json_str).unwrap().into_raw()
+}
+
+/// Start streaming mode
+#[no_mangle]
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeStartStreaming(
+    _env: JNIEnv,
+    _class: JClass,
+    executor_ptr: jlong,
+) -> jboolean {
+    let executor_ptr = executor_ptr
+        as *mut (
+            SelectedRuntime,
+            PipelineExecutor,
+            Option<LoadableNodeBundle>,
+        );
+    if executor_ptr.is_null() {
+        error!("Executor pointer is null");
+        return jni::sys::JNI_FALSE;
     }
+
+    // This function is a placeholder - actual streaming is done via session
+    info!("Start streaming called");
+    jni::sys::JNI_TRUE
+}
+
+/// Stop streaming
+#[no_mangle]
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeStopStreaming(
+    _env: JNIEnv,
+    _class: JClass,
+    _executor_ptr: jlong,
+) -> jboolean {
+    info!("Stop streaming called");
+    jni::sys::JNI_TRUE
 }

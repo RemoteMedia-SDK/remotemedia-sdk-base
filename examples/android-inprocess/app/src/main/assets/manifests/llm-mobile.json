@@ -1,0 +1,31 @@
+{
+  "version": "1",
+  "metadata": {
+    "name": "llm-mobile",
+    "description": "LiteRT LLM loadable plugin debug pipeline",
+    "auto_negotiate": true,
+    "strict_capabilities": false
+  },
+  "plugins": [
+    {
+      "path": "/data/data/com.remotemedia.inprocess/files/liblitert_lm_loadable_plugin.so"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "llm",
+      "node_type": "LiteRtLmGenerationNode",
+      "params": {
+        "model_path": "/data/data/com.remotemedia.inprocess/files/models/gemma-4-E2B-it.litertlm",
+        "backend": "cpu",
+        "cache_dir": "/data/data/com.remotemedia.inprocess/files/cache/litert-lm",
+        "max_num_tokens": 2048,
+        "parallel_file_section_loading": true,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true,
+      "is_output_node": true
+    }
+  ],
+  "connections": []
+}

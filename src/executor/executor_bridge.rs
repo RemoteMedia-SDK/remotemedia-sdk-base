@@ -14,9 +14,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[cfg(feature = "inprocess-python")]
-use remotemedia_plugin_sdk::PythonNodeHandle;
-#[cfg(feature = "inprocess-python")]
 use crate::python::multiprocess::data_transfer;
+#[cfg(feature = "inprocess-python")]
+use remotemedia_plugin_sdk::PythonNodeHandle;
 
 /// Unified interface for node execution across different executor types
 #[async_trait]
@@ -96,7 +96,9 @@ impl ExecutorBridge for NativeExecutorBridge {
         _input_data: Vec<u8>,
         _params: &Value,
     ) -> Result<Box<dyn futures::Stream<Item = Result<RuntimeData>> + Send + Unpin>> {
-        Err(Error::Execution("NativeExecutorBridge streaming not implemented".into()))
+        Err(Error::Execution(
+            "NativeExecutorBridge streaming not implemented".into(),
+        ))
     }
 
     async fn initialize_node(&self, node_id: &str, node_type: &str, _params: &Value) -> Result<()> {
@@ -184,7 +186,9 @@ impl ExecutorBridge for MultiprocessExecutorBridge {
         _input_data: Vec<u8>,
         _params: &Value,
     ) -> Result<Box<dyn futures::Stream<Item = Result<RuntimeData>> + Send + Unpin>> {
-        Err(Error::Execution("MultiprocessExecutorBridge streaming not implemented".into()))
+        Err(Error::Execution(
+            "MultiprocessExecutorBridge streaming not implemented".into(),
+        ))
     }
 
     async fn initialize_node(&self, node_id: &str, node_type: &str, _params: &Value) -> Result<()> {
@@ -279,7 +283,8 @@ impl ExecutorBridge for InProcessExecutorBridge {
             .map_err(|e| Error::Execution(format!("Failed to deserialize input: {}", e)))?;
 
         // Execute the Python node
-        let output_data = handle.process(&runtime_data)
+        let output_data = handle
+            .process(&runtime_data)
             .map_err(|e| Error::Execution(format!("Python node process failed: {:?}", e)))?;
 
         // Serialize output
@@ -308,8 +313,9 @@ impl ExecutorBridge for InProcessExecutorBridge {
         let handle = PythonNodeHandle::load(&module_path, &class_name)
             .map_err(|e| Error::Execution(format!("Failed to load Python plugin: {:?}", e)))?;
 
-        handle.initialize(&config)
-            .map_err(|e| Error::Execution(format!("Failed to initialize Python plugin: {:?}", e)))?;
+        handle.initialize(&config).map_err(|e| {
+            Error::Execution(format!("Failed to initialize Python plugin: {:?}", e))
+        })?;
 
         // Store the handle
         let mut handles = self.node_handles.write().await;
@@ -319,15 +325,13 @@ impl ExecutorBridge for InProcessExecutorBridge {
     }
 
     async fn cleanup_node(&self, node_id: &str) -> Result<()> {
-        tracing::debug!(
-            "InProcessExecutorBridge: Cleaning up node {}",
-            node_id
-        );
+        tracing::debug!("InProcessExecutorBridge: Cleaning up node {}", node_id);
 
         let mut handles = self.node_handles.write().await;
         if let Some(handle) = handles.remove(node_id) {
-            handle.finalize()
-                .map_err(|e| Error::Execution(format!("Failed to finalize Python plugin: {:?}", e)))?;
+            handle.finalize().map_err(|e| {
+                Error::Execution(format!("Failed to finalize Python plugin: {:?}", e))
+            })?;
         }
 
         Ok(())
@@ -361,11 +365,13 @@ impl ExecutorBridge for InProcessExecutorBridge {
             .map_err(|e| Error::Execution(format!("Failed to deserialize input: {}", e)))?;
 
         // Execute streaming
-        let outputs = handle.process_streaming(&runtime_data)
+        let outputs = handle
+            .process_streaming(&runtime_data)
             .map_err(|e| Error::Execution(format!("Python node streaming failed: {:?}", e)))?;
 
         // Convert to stream
-        let stream = futures::stream::iter(outputs.into_iter().map(|o| Ok::<RuntimeData, Error>(o)));
+        let stream =
+            futures::stream::iter(outputs.into_iter().map(|o| Ok::<RuntimeData, Error>(o)));
         Ok(Box::new(stream))
     }
 }
@@ -373,7 +379,10 @@ impl ExecutorBridge for InProcessExecutorBridge {
 #[cfg(feature = "inprocess-python")]
 impl InProcessExecutorBridge {
     /// Set control bus for progress reporting during initialization
-    pub fn set_control(&mut self, _control: Arc<crate::transport::session_control::SessionControl>) {
+    pub fn set_control(
+        &mut self,
+        _control: Arc<crate::transport::session_control::SessionControl>,
+    ) {
         // Control bus integration would go here if needed
         // For now, we don't use it for in-process execution since
         // there's no separate process to send progress from
@@ -382,8 +391,17 @@ impl InProcessExecutorBridge {
     /// Resolve node type to Python module and class
     /// This can be extended to read from params for full configurability
     fn resolve_python_plugin(node_type: &str) -> (String, String) {
+        if let Some((module, class)) = node_type.rsplit_once('.') {
+            if !module.is_empty() && !class.is_empty() {
+                return (module.to_string(), class.to_string());
+            }
+        }
+
         match node_type {
-            "python_whisper" => ("remotemedia_nodes.whisper".to_string(), "WhisperSTTNode".to_string()),
+            "python_whisper" => (
+                "remotemedia_nodes.whisper".to_string(),
+                "WhisperSTTNode".to_string(),
+            ),
             "python_llm" => ("remotemedia_nodes.llm".to_string(), "LLMNode".to_string()),
             "python_tts" => ("remotemedia_nodes.tts".to_string(), "TTSNode".to_string()),
             _ => {

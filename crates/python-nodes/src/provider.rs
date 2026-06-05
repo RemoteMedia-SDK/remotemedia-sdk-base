@@ -3,7 +3,7 @@
 //! This provider creates factories dynamically from the Python node registry,
 //! rather than hardcoding factory definitions.
 
-use crate::registry::{register_default_python_nodes, PythonExecutionMode, PythonNodeConfig, PYTHON_NODE_REGISTRY};
+use crate::registry::{register_default_python_nodes, PythonNodeConfig, PYTHON_NODE_REGISTRY};
 use remotemedia_core::nodes::provider::NodeProvider;
 use remotemedia_core::nodes::schema::{NodeSchema, RuntimeDataType};
 use remotemedia_core::nodes::streaming_node::{
@@ -141,7 +141,7 @@ impl NodeProvider for PythonNodesProvider {
         let nodes = PYTHON_NODE_REGISTRY.get_all();
         for config in nodes {
             let node_type = config.node_type.clone();
-            
+
             // Select factory based on execution mode
             #[cfg(feature = "inprocess")]
             if config.execution_mode.is_inprocess() {
@@ -149,7 +149,7 @@ impl NodeProvider for PythonNodesProvider {
                 tracing::debug!(node_type = %node_type, "Registered dynamic IN PROCESS Python node factory");
                 continue;
             }
-            
+
             // Default to multiprocess
             registry.register(Arc::new(DynamicPythonNodeFactory::new(config)));
             tracing::debug!(node_type = %node_type, "Registered dynamic MULTIPROCESS Python node factory");

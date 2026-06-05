@@ -17,7 +17,9 @@ import java.nio.ByteOrder
  */
 class AudioRecorder(private val context: Context) {
     
-    private const val TAG = "AudioRecorder"
+    companion object {
+        private const val TAG = "AudioRecorder"
+    }
     
     // Audio configuration
     private val sourceSampleRate = 48000  // Device capture rate
@@ -139,11 +141,11 @@ class AudioRecorder(private val context: Context) {
     /**
      * Recording loop - reads from AudioRecord and resamples
      */
-    private fun recordingLoop() {
+    private suspend fun recordingLoop() {
         val buffer = ByteArray(sourceFrameSize * 2) // 16-bit = 2 bytes
         val tempBuffer = ShortArray(sourceFrameSize)
         
-        while (isRecording && !scope.coroutineContext.isActive) {
+        while (isRecording && scope.coroutineContext.isActive) {
             try {
                 val readResult = audioRecord?.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
                 

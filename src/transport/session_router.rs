@@ -47,7 +47,7 @@ use crate::transport::perf_aggregator::{spawn_flush_task, PerfAggregator};
 use crate::transport::session_control::{
     aux_port_of, CloseReason, SessionControl, BARGE_IN_PORT, PERF_PORT,
 };
-use crate::Result;
+use crate::{Error, Result};
 use parking_lot::RwLock as DriftRwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -730,7 +730,10 @@ impl SessionRouter {
                     &id,
                     &format!("Node '{}' ({}) failed to initialize: {}", id, ty, e),
                 );
-                return Err(e);
+                return Err(Error::Execution(format!(
+                    "Node '{}' ({}) failed to initialize: {}",
+                    id, ty, e
+                )));
             }
         };
 
@@ -1049,6 +1052,14 @@ impl SessionRouter {
             "Session {}: Router running, waiting for input...",
             self.session_id
         );
+        if node_trace_enabled() {
+            log::info!(
+                "Session {}: Router running, sources={:?}, sinks={:?}",
+                self.session_id,
+                self.graph.sources,
+                self.graph.sinks
+            );
+        }
 
         // Single-threaded ingress loop. We no longer spawn per-packet tasks
         // because work is performed by per-node tasks; the router's only
@@ -1344,6 +1355,12 @@ impl SessionRouter {
                             output = %desc,
                             "node output forwarded to successor"
                         );
+                        log::info!(
+                            "Session {}: node '{}' output forwarded to successor: {}",
+                            fan_session_id,
+                            fan_node_id,
+                            desc
+                        );
                     }
                     if tx.send(kept.clone()).await.is_err() {
                         tracing::debug!(
@@ -1364,6 +1381,12 @@ impl SessionRouter {
                             node_id = %fan_node_id,
                             output = %desc,
                             "sink output forwarded to client"
+                        );
+                        log::info!(
+                            "Session {}: sink '{}' output forwarded to client: {}",
+                            fan_session_id,
+                            fan_node_id,
+                            desc
                         );
                     }
                     let egress_start = std::time::Instant::now();
@@ -1627,6 +1650,12 @@ impl SessionRouter {
                         input = %describe_runtime_data(&input),
                         "node input received"
                     );
+                    log::info!(
+                        "Session {}: node '{}' input received: {}",
+                        main_session_id,
+                        main_node_id,
+                        describe_runtime_data(&input)
+                    );
                 }
                 // Barge-in dispatch. The filter task forwards barge
                 // envelopes here in addition to firing
@@ -1717,6 +1746,14 @@ impl SessionRouter {
                             latency_us = lat_us,
                             output = %describe_runtime_data(&out),
                             "node output emitted"
+                        );
+                        log::info!(
+                            "Session {}: node '{}' output #{} emitted after {}us: {}",
+                            cb_session_id,
+                            cb_node_id,
+                            emit_index,
+                            lat_us,
+                            describe_runtime_data(&out)
                         );
                     }
 
@@ -1904,6 +1941,14 @@ impl SessionRouter {
                                 main_node_id,
                                 e
                             );
+                            if node_trace_enabled() {
+                                log::error!(
+                                    "Session {}: node '{}' execution error: {}",
+                                    main_session_id,
+                                    main_node_id,
+                                    e
+                                );
+                            }
                         }
                         false
                     }
@@ -1916,6 +1961,14 @@ impl SessionRouter {
                         outputs = output_count.load(std::sync::atomic::Ordering::Relaxed),
                         elapsed_ms = node_dispatch_start.elapsed().as_millis(),
                         "node execution finished"
+                    );
+                    log::info!(
+                        "Session {}: node '{}' execution finished: cancelled={}, outputs={}, elapsed_ms={}",
+                        main_session_id,
+                        main_node_id,
+                        cancelled,
+                        output_count.load(std::sync::atomic::Ordering::Relaxed),
+                        node_dispatch_start.elapsed().as_millis()
                     );
                 }
                 let _ = cancelled;
@@ -1991,6 +2044,12 @@ impl SessionRouter {
                     target_node = %target,
                     input = %describe_runtime_data(&input_data),
                     "router input routed to source"
+                );
+                log::info!(
+                    "Session {}: router routed input to '{}': {}",
+                    self.session_id,
+                    target,
+                    describe_runtime_data(&input_data)
                 );
             }
             if tx.send(input_data.clone()).await.is_err() {

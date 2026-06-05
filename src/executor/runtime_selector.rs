@@ -208,7 +208,10 @@ impl RuntimeSelector {
     fn auto_detect_runtime(&self, node: &NodeManifest) -> SelectedRuntime {
         // Check for Android target first (compile-time or runtime)
         if cfg!(target_os = "android") || std::env::consts::OS == "android" {
-            tracing::info!("Android target detected, defaulting to CPython (in-process only) for node {}", node.id);
+            tracing::info!(
+                "Android target detected, defaulting to CPython (in-process only) for node {}",
+                node.id
+            );
             return SelectedRuntime::CPython;
         }
 

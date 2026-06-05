@@ -14,6 +14,9 @@ project(remotemedia_android_inprocess LANGUAGES CXX)
 set(RUST_CRATE_NAME "remotemedia_android_inprocess")
 set(RUST_TARGET_DIR "${CMAKE_SOURCE_DIR}/../target")
 
+# Define copy_rust_libs target FIRST so dependencies can reference it
+add_custom_target(copy_rust_libs)
+
 function(add_rust_library arch)
     set(rust_lib_path "${RUST_TARGET_DIR}/${arch}/release/lib${RUST_CRATE_NAME}.so")
     set(jni_libs_dir "${CMAKE_SOURCE_DIR}/src/main/jniLibs/${arch}")
@@ -39,8 +42,6 @@ endfunction()
 # Add targets for supported architectures
 add_rust_library("aarch64-linux-android")
 add_rust_library("x86_64-linux-android")
-
-add_custom_target(copy_rust_libs)
 
 # Also copy python shared library if available
 # This should be provided by python-for-android or built separately

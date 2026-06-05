@@ -14,40 +14,56 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 
 class AudioProcessingService : Service() {
-    
-    private const val TAG = "AudioProcessingService"
-    private const val NOTIFICATION_ID = 1
-    private const val CHANNEL_ID = "RemoteMediaAudioChannel"
-    
+
+    companion object {
+        private const val TAG = "AudioProcessingService"
+        private const val NOTIFICATION_ID = 1
+        private const val CHANNEL_ID = "RemoteMediaAudioChannel"
+
+        fun startService(context: Context) {
+            val intent = Intent(context, AudioProcessingService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun stopService(context: Context) {
+            val intent = Intent(context, AudioProcessingService::class.java)
+            context.stopService(intent)
+        }
+    }
+
     private var audioManager: AudioManager? = null
     private var focusListener: AudioManager.OnAudioFocusChangeListener? = null
-    
+
     override fun onCreate() {
         super.onCreate()
-        
+
         // Create notification channel
         createNotificationChannel()
-        
+
         // Start foreground service
         val notification = createNotification()
         startForeground(NOTIFICATION_ID, notification)
-        
+
         // Request audio focus
         requestAudioFocus()
     }
-    
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         return START_STICKY
     }
-    
+
     override fun onBind(intent: Intent?): IBinder? = null
-    
+
     override fun onDestroy() {
         super.onDestroy()
         abandonAudioFocus()
         stopForeground(true)
     }
-    
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -59,12 +75,12 @@ class AudioProcessingService : Service() {
                 enableVibration(false)
                 setSound(null, null)
             }
-            
+
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
         }
     }
-    
+
     private fun createNotification(): Notification {
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -73,11 +89,11 @@ class AudioProcessingService : Service() {
             this, 0, intent,
             PendingIntent.FLAG_IMMUTABLE
         )
-        
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("RemoteMedia Voice Assistant")
             .setContentText("Listening for voice input...")
-            .setSmallIcon(R.drawable.ic_mic)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -85,10 +101,10 @@ class AudioProcessingService : Service() {
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .build()
     }
-    
+
     private fun requestAudioFocus() {
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        
+
         focusListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
             when (focusChange) {
                 AudioManager.AUDIOFOCUS_LOSS -> {
@@ -109,36 +125,20 @@ class AudioProcessingService : Service() {
                 }
             }
         }
-        
+
         val result = audioManager?.requestAudioFocus(
             focusListener!!,
             AudioManager.STREAM_VOICE_CALL,
             AudioManager.AUDIOFOCUS_GAIN
         )
-        
+
         if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
             Log.w(TAG, "Audio focus not granted")
         }
     }
-    
+
     private fun abandonAudioFocus() {
         audioManager?.abandonAudioFocus(focusListener!!)
         focusListener = null
-    }
-    
-    companion object {
-        fun startService(context: Context) {
-            val intent = Intent(context, AudioProcessingService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
-        }
-        
-        fun stopService(context: Context) {
-            val intent = Intent(context, AudioProcessingService::class.java)
-            context.stopService(intent)
-        }
     }
 }

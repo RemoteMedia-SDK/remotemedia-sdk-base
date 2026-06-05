@@ -61,15 +61,15 @@
 //! );
 //! ```
 
-mod provider;
-mod registry;
 #[cfg(feature = "inprocess")]
 mod inprocess_node;
+mod provider;
+mod registry;
 
 pub use provider::PythonNodesProvider;
 pub use registry::{
-    clear_registry, get_registered_nodes, register_python_node, PythonExecutionMode, PythonNodeConfig,
-    PythonNodeRegistry, PYTHON_NODE_REGISTRY,
+    clear_registry, get_registered_nodes, register_default_python_nodes, register_python_node,
+    PythonExecutionMode, PythonNodeConfig, PythonNodeRegistry, PYTHON_NODE_REGISTRY,
 };
 
 // Re-export the provider trait for convenience

@@ -36,7 +36,7 @@
     
     <!-- Button styles -->
     <style name="Widget.RemoteMedia.MicButton" parent="Widget.MaterialComponents.Button">
-        <item name="cornerRadius">50%</item>
+        <item name="cornerRadius">28dp</item>
         <item name="android:insetTop">0dp</item>
         <item name="android:insetBottom">0dp</item>
         <item name="iconGravity">textTop</item>

@@ -1,0 +1,59 @@
+{
+  "version": "1",
+  "metadata": {
+    "name": "tts-mobile",
+    "description": "Text-to-speech with LLM",
+    "auto_negotiate": true,
+    "strict_capabilities": false
+  },
+  "nodes": [
+    {
+      "id": "llm",
+      "node_type": "Phi3LLMNode",
+      "params": {
+        "model": "phi-3-mini-4k-instruct",
+        "max_tokens": 200,
+        "temperature": 0.8,
+        "top_p": 0.9,
+        "top_k": 50,
+        "system_prompt": "You are a helpful assistant. Generate natural, conversational responses suitable for speech synthesis.",
+        "stream": true,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "tts",
+      "node_type": "KokoroTTSNode",
+      "params": {
+        "voice": "af_bella",
+        "speed": 1.0,
+        "sample_rate": 24000,
+        "stream": true,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "audio_output",
+      "node_type": "AudioOutputNode",
+      "params": {
+        "sample_rate": 48000,
+        "channels": 1,
+        "buffer_size_ms": 100,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true
+    }
+  ],
+  "connections": [
+    {
+      "from": "llm",
+      "to": "tts"
+    },
+    {
+      "from": "tts",
+      "to": "audio_output"
+    }
+  ]
+}

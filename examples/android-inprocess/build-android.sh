@@ -187,7 +187,7 @@ build_rust() {
     
     cd "$RUST_CRATE_DIR"
     
-    local cargo_args=("build" "--features" "inprocess-python")
+    local cargo_args=("build")
     
     if [[ "$BUILD_TYPE" == "release" ]]; then
         cargo_args+=("--release")
@@ -207,7 +207,7 @@ build_rust() {
     local lib_name="libremotemedia_android_inprocess.so"
     if [[ "$TARGET_ARCH" == "both" ]]; then
         for arch in aarch64-linux-android x86_64-linux-android; do
-            local lib_path="../target/${arch}/$(echo $BUILD_TYPE | tr '[:upper:]' '[:lower:]')/${lib_name}"
+            local lib_path="target/${arch}/$(echo $BUILD_TYPE | tr '[:upper:]' '[:lower:]')/${lib_name}"
             if [[ ! -f "$lib_path" ]]; then
                 log_error "Rust library not found at $lib_path"
                 exit 1
@@ -215,7 +215,7 @@ build_rust() {
             log_success "Found $lib_path"
         done
     else
-        local lib_path="../target/${TARGET_ARCH}/$(echo $BUILD_TYPE | tr '[:upper:]' '[:lower:]')/${lib_name}"
+        local lib_path="target/${TARGET_ARCH}/$(echo $BUILD_TYPE | tr '[:upper:]' '[:lower:]')/${lib_name}"
         if [[ ! -f "$lib_path" ]]; then
             log_error "Rust library not found at $lib_path"
             exit 1

@@ -1,2 +1,15 @@
 target/
 Cargo.lock
+examples/android-inprocess/gradle
+examples/android-inprocess/app/build/
+examples/android-inprocess/app/.cxx/
+examples/android-inprocess/.gradle/
+
+# Android in-process generated outputs
+examples/android-inprocess/.cargo/
+examples/android-inprocess/local.properties
+examples/android-inprocess/gradlew
+examples/android-inprocess/gradlew.bat
+examples/android-inprocess/*.apk
+examples/android-inprocess/app/src/main/assets/plugins/
+examples/android-inprocess/app/src/main/jniLibs/

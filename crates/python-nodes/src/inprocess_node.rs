@@ -4,11 +4,8 @@
 //! via the PyO3 bridge, avoiding the overhead of multiprocess IPC.
 //!
 //! Requires the `inprocess` feature which enables PyO3 integration.
-use crate::registry::PythonExecutionMode;
 use remotemedia_core::data::RuntimeData;
-use remotemedia_core::nodes::{
-    AsyncStreamingNode, InitializeContextRead,
-};
+use remotemedia_core::nodes::{AsyncStreamingNode, InitializeContextRead};
 use remotemedia_core::python::multiprocess::data_transfer;
 use remotemedia_core::Error;
 use serde_json::Value;
@@ -80,11 +77,9 @@ impl InProcessPythonNode {
             };
 
             // Initialize the bridge using initialize_node
-            bridge.initialize_node(
-                &self.node_id,
-                &self.node_type,
-                &self.params,
-            ).await?;
+            bridge
+                .initialize_node(&self.node_id, &self.node_type, &self.params)
+                .await?;
 
             *executor_guard = Some(Box::new(bridge));
         }
@@ -117,7 +112,9 @@ impl AsyncStreamingNode for InProcessPythonNode {
 
         let executor_guard = self.executor.lock().await;
         let Some(executor) = executor_guard.as_ref() else {
-            return Err(Error::Execution("InProcessExecutorBridge not initialized".into()));
+            return Err(Error::Execution(
+                "InProcessExecutorBridge not initialized".into(),
+            ));
         };
 
         // Serialize input data for the bridge
@@ -125,7 +122,9 @@ impl AsyncStreamingNode for InProcessPythonNode {
             .map_err(|e| Error::Execution(format!("Failed to serialize input: {}", e)))?;
 
         // Execute via the bridge
-        let output_bytes = executor.execute_node(&self.node_id, &self.node_type, input_bytes, &self.params).await?;
+        let output_bytes = executor
+            .execute_node(&self.node_id, &self.node_type, input_bytes, &self.params)
+            .await?;
 
         // Deserialize output
         let output = data_transfer::from_bytes(&output_bytes)
@@ -147,7 +146,9 @@ impl AsyncStreamingNode for InProcessPythonNode {
 
         let executor_guard = self.executor.lock().await;
         let Some(executor) = executor_guard.as_ref() else {
-            return Err(Error::Execution("InProcessExecutorBridge not initialized".into()));
+            return Err(Error::Execution(
+                "InProcessExecutorBridge not initialized".into(),
+            ));
         };
 
         // Serialize input data for the bridge
@@ -155,7 +156,9 @@ impl AsyncStreamingNode for InProcessPythonNode {
             .map_err(|e| Error::Execution(format!("Failed to serialize input: {}", e)))?;
 
         // Get streaming output
-        let mut stream = executor.execute_node_streaming(&self.node_id, &self.node_type, input_bytes, &self.params).await?;
+        let mut stream = executor
+            .execute_node_streaming(&self.node_id, &self.node_type, input_bytes, &self.params)
+            .await?;
 
         let mut count = 0;
         while let Some(result) = futures::StreamExt::next(&mut stream).await {
@@ -169,8 +172,7 @@ impl AsyncStreamingNode for InProcessPythonNode {
         }
         Ok(count)
     }
-
-    }
+}
 
 /// Factory for in-process Python nodes
 #[cfg(feature = "inprocess")]
@@ -198,9 +200,9 @@ impl remotemedia_core::nodes::StreamingNodeFactory for DynamicInProcessPythonNod
         } else {
             InProcessPythonNode::new(node_id, &self.config.python_class, params)?
         };
-        Ok(Box::new(
-            remotemedia_core::nodes::AsyncNodeWrapper(Arc::new(node)),
-        ))
+        Ok(Box::new(remotemedia_core::nodes::AsyncNodeWrapper(
+            Arc::new(node),
+        )))
     }
 
     fn node_type(&self) -> &str {
@@ -236,7 +238,9 @@ impl remotemedia_core::nodes::StreamingNodeFactory for DynamicInProcessPythonNod
                 "text" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Text),
                 "json" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Json),
                 "video" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Video),
-                "binary" | "bytes" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Binary),
+                "binary" | "bytes" => {
+                    Some(remotemedia_core::nodes::schema::RuntimeDataType::Binary)
+                }
                 "tensor" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Tensor),
                 "numpy" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Numpy),
                 _ => None,
@@ -252,7 +256,9 @@ impl remotemedia_core::nodes::StreamingNodeFactory for DynamicInProcessPythonNod
                 "text" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Text),
                 "json" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Json),
                 "video" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Video),
-                "binary" | "bytes" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Binary),
+                "binary" | "bytes" => {
+                    Some(remotemedia_core::nodes::schema::RuntimeDataType::Binary)
+                }
                 "tensor" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Tensor),
                 "numpy" => Some(remotemedia_core::nodes::schema::RuntimeDataType::Numpy),
                 _ => None,
