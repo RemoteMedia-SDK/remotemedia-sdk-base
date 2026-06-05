@@ -52,8 +52,8 @@ pub use control_transport::{
 };
 pub use data::{Participant, TransportData};
 pub use executor::{
-    ExecutorConfig, ParticipantSessionHandle, PipelineExecutor, SessionHandle, SessionInputSender,
-    PipelineSessionHost,
+    ExecutorConfig, ParticipantSessionHandle, PipelineExecutor, PipelineSessionHost, SessionHandle,
+    SessionInputSender,
 };
 pub use plugin_registry::TransportPluginRegistry;
 pub use session::{StreamSession, StreamSessionHandle};

@@ -224,8 +224,6 @@ impl NodeProvider for CoreNodesProvider {
         // longer in the host workspace. Load via
         // `"plugins": ["llama-cpp@v0.1.0"]` in the pipeline manifest.
 
-
-
         // Activation-projection face node — consumes
         // `RuntimeData::Tensor` envelopes tagged
         // `metadata.kind == "activation_tap"` (emitted by the Rust

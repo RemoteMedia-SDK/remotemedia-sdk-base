@@ -54,7 +54,7 @@ impl PyGrpcServer {
                 ))
             })?;
 
-            # [cfg(feature = "python")]
+            #[cfg(feature = "python")]
             // Register all custom Python nodes and FFI dynamic library factories
             for factory in crate::plugins::collect_registered_factories() {
                 executor.register_factory(factory).await;
@@ -101,7 +101,6 @@ impl PyGrpcServer {
             Ok(())
         })
     }
-
 
     /// Context manager support: async with GrpcServer(...)
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {

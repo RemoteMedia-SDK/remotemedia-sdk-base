@@ -27,9 +27,8 @@ use remotemedia_core::{
     manifest::Manifest,
     transport::{
         data::participant, session_control::SessionControl, Participant, ParticipantSessionHandle,
-        SharedPipelineOutputReceivers,
+        PipelineSessionHost, SharedPipelineOutputReceivers,
         SharedPipelineSession as CoreSharedPipelineSession, TransportData,
-        PipelineSessionHost,
     },
 };
 use std::collections::HashMap;

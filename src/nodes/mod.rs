@@ -67,7 +67,6 @@ pub mod emotion_extractor;
 #[cfg(feature = "avatar-emotion")]
 pub use emotion_extractor::{EmotionExtractorConfig, EmotionExtractorNode};
 
-
 // Activation-projection face track (proposal:
 // `openspec/changes/add-activation-projection-face/`). Reads LLM
 // hidden states out via `llama_cpp::ActivationProjector`, routes them

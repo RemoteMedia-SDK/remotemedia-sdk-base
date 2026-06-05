@@ -300,7 +300,6 @@ pub fn execute_pipeline_with_instances<'py>(
     })
 }
 
-
 /// Get runtime version information
 #[pyfunction]
 pub fn get_runtime_version() -> String {

@@ -413,7 +413,11 @@ pub fn runtime_data_to_python(py: Python<'_>, data: &RuntimeData) -> PyResult<Py
             let mut has_metadata = false;
 
             if let Some(obj) = clean_v.as_object_mut() {
-                let keys: Vec<String> = obj.keys().filter(|k| k.starts_with("participant.")).cloned().collect();
+                let keys: Vec<String> = obj
+                    .keys()
+                    .filter(|k| k.starts_with("participant."))
+                    .cloned()
+                    .collect();
                 for k in keys {
                     if let Some(serde_json::Value::String(s)) = obj.remove(&k) {
                         metadata_dict.set_item(&k, s)?;

@@ -9,7 +9,8 @@ use crate::session::{
     ParticipantRole,
 };
 use crate::sip::{
-    build_method_not_allowed, build_options_ok, build_response, extract_raw_method, parse_request, SipMethod, SipRequest, SipTransactionResponse, SUPPORTED_METHODS,
+    build_method_not_allowed, build_options_ok, build_response, extract_raw_method, parse_request,
+    SipMethod, SipRequest, SipTransactionResponse, SUPPORTED_METHODS,
 };
 use crate::CallMetrics;
 use crate::{Error, Result, SipAccessMode, TelephonyTransportConfig};
@@ -304,18 +305,24 @@ impl TelephonyTransport {
                 if self.config.allowed_peers.is_empty() {
                     return PeerAccess::Rejected;
                 }
-                if self.config.allowed_peers.iter().any(|entry| {
-                    peer_allowed_by_entry(entry, peer)
-                }) {
+                if self
+                    .config
+                    .allowed_peers
+                    .iter()
+                    .any(|entry| peer_allowed_by_entry(entry, peer))
+                {
                     PeerAccess::Allowed
                 } else {
                     PeerAccess::Rejected
                 }
             }
             SipAccessMode::DenyList => {
-                if self.config.blocked_peers.iter().any(|entry| {
-                    peer_allowed_by_entry(entry, peer)
-                }) {
+                if self
+                    .config
+                    .blocked_peers
+                    .iter()
+                    .any(|entry| peer_allowed_by_entry(entry, peer))
+                {
                     PeerAccess::Rejected
                 } else {
                     PeerAccess::Allowed
@@ -359,7 +366,8 @@ impl TelephonyTransport {
 
         // Check rate
         if entry.timestamps.len() >= config.max_requests_per_window as usize {
-            entry.banned_until = Some(now + std::time::Duration::from_secs(config.ban_duration_seconds));
+            entry.banned_until =
+                Some(now + std::time::Duration::from_secs(config.ban_duration_seconds));
             let mut resp = String::from("SIP/2.0 503 Service Unavailable\r\n");
             resp.push_str("Server: RemoteMedia Telephony\r\n");
             resp.push_str("Content-Length: 0\r\n\r\n");
@@ -379,7 +387,8 @@ impl TelephonyTransport {
         }
 
         let now = std::time::Instant::now();
-        let ban_duration = std::time::Duration::from_secs(self.config.rate_limit.ban_duration_seconds);
+        let ban_duration =
+            std::time::Duration::from_secs(self.config.rate_limit.ban_duration_seconds);
         let window_duration = std::time::Duration::from_secs(self.config.rate_limit.window_seconds);
 
         self.rate_limits.retain(|_, entry| {

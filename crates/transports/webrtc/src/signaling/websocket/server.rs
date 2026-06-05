@@ -9,7 +9,10 @@
 use super::events::WebRtcEventBridge;
 use super::handler::{handle_connection, SharedState};
 use crate::config::WebRtcTransportConfig;
-use remotemedia_core::{manifest::Manifest, transport::{PipelineExecutor, PipelineSessionHost}};
+use remotemedia_core::{
+    manifest::Manifest,
+    transport::{PipelineExecutor, PipelineSessionHost},
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;

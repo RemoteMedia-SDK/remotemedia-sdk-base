@@ -593,8 +593,8 @@ mod tests {
 // Pipeline Host Facade
 // ============================================================================
 
-use std::sync::Arc;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Consolidated public entry point for local pipeline execution.
@@ -613,9 +613,7 @@ impl PipelineHost {
 
     /// Create a new session for the pipeline manifest.
     pub async fn create_session(&self) -> Result<transport::SessionHandle> {
-        self.executor
-            .create_session(self.manifest.clone())
-            .await
+        self.executor.create_session(self.manifest.clone()).await
     }
 
     /// Access the underlying PipelineExecutor.
@@ -642,11 +640,10 @@ impl transport::PipelineSessionHost for PipelineHost {
         &self,
         key: String,
         manifest: Arc<Manifest>,
-    ) -> futures::future::BoxFuture<'_, Result<Arc<transport::shared_session::SharedPipelineSession>>> {
+    ) -> futures::future::BoxFuture<'_, Result<Arc<transport::shared_session::SharedPipelineSession>>>
+    {
         let executor = self.executor.clone();
-        Box::pin(async move {
-            executor.get_or_create_shared_session(key, manifest).await
-        })
+        Box::pin(async move { executor.get_or_create_shared_session(key, manifest).await })
     }
 
     fn control_bus(&self) -> Arc<transport::session_control::SessionControlBus> {
@@ -693,10 +690,21 @@ impl PipelineHostBuilder {
         // Read and parse manifest
         let manifest_content = tokio::fs::read_to_string(&self.manifest_path)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to read manifest file at {:?}: {}", self.manifest_path, e))?;
-        
-        let manifest: Manifest = serde_yaml::from_str(&manifest_content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse YAML manifest from {:?}: {}", self.manifest_path, e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read manifest file at {:?}: {}",
+                    self.manifest_path,
+                    e
+                )
+            })?;
+
+        let manifest: Manifest = serde_yaml::from_str(&manifest_content).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse YAML manifest from {:?}: {}",
+                self.manifest_path,
+                e
+            )
+        })?;
         let manifest = Arc::new(manifest);
 
         // Configure executor with the parent directory of the manifest

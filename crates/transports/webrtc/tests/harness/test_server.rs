@@ -62,9 +62,10 @@ impl TestServer {
         let running_clone = Arc::clone(&running);
 
         // Create pipeline runner
-        let runner: Arc<dyn PipelineSessionHost> = Arc::new(PipelineExecutor::new().map_err(|e| {
-            HarnessError::ServerError(format!("Failed to create PipelineExecutor: {}", e))
-        })?);
+        let runner: Arc<dyn PipelineSessionHost> =
+            Arc::new(PipelineExecutor::new().map_err(|e| {
+                HarnessError::ServerError(format!("Failed to create PipelineExecutor: {}", e))
+            })?);
 
         // Create WebRTC config
         let config = Arc::new(WebRtcTransportConfig {

@@ -1531,8 +1531,12 @@ sys.stdout.flush()
 
                     tokio::spawn(async move {
                         // Upgrade Weak pointers to break memory cycles
-                        let Some(sessions) = sessions_weak.upgrade() else { return; };
-                        let Some(process_manager_clone) = process_manager_weak.upgrade() else { return; };
+                        let Some(sessions) = sessions_weak.upgrade() else {
+                            return;
+                        };
+                        let Some(process_manager_clone) = process_manager_weak.upgrade() else {
+                            return;
+                        };
 
                         // Find which session this process belongs to
                         let session_info = {

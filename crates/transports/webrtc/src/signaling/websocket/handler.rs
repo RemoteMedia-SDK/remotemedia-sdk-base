@@ -12,7 +12,10 @@ use crate::signaling::protocol::{
     PeerStateChangeParams,
 };
 use futures_util::{SinkExt, StreamExt};
-use remotemedia_core::{manifest::Manifest, transport::{PipelineExecutor, PipelineSessionHost}};
+use remotemedia_core::{
+    manifest::Manifest,
+    transport::{PipelineExecutor, PipelineSessionHost},
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -359,7 +359,11 @@ fn build_openai_s2s_manifest() -> Manifest {
         } else {
             c.from
         };
-        connections.push(Connection { from, to: c.to, ..Default::default() });
+        connections.push(Connection {
+            from,
+            to: c.to,
+            ..Default::default()
+        });
     }
 
     Manifest {
@@ -907,7 +911,9 @@ async fn test_openai_chat_node_with_mock_server() {
         session_id: "test-session".into(),
         node_id: "openai-chat".into(),
     };
-    node.initialize(&ctx).await.expect("initialize should succeed");
+    node.initialize(&ctx)
+        .await
+        .expect("initialize should succeed");
 
     // Process a text message
     let input = RuntimeData::Text("Hello".to_string());
@@ -960,7 +966,9 @@ async fn test_openai_chat_node_invalid_api_key() {
         session_id: "test-session".into(),
         node_id: "openai-chat".into(),
     };
-    node.initialize(&ctx).await.expect("initialize should succeed");
+    node.initialize(&ctx)
+        .await
+        .expect("initialize should succeed");
 
     // This should fail because the server doesn't exist
     let input = RuntimeData::Text("Hello".to_string());

@@ -53,9 +53,7 @@ impl InProcessChannelRegistry {
     /// Get or create the global shared channel registry
     pub fn global() -> Arc<Self> {
         GLOBAL_REGISTRY
-            .get_or_init(|| {
-                Arc::new(Self::new_internal())
-            })
+            .get_or_init(|| Arc::new(Self::new_internal()))
             .clone()
     }
 
@@ -146,7 +144,7 @@ impl InProcessChannelRegistry {
     /// Create a publisher for a channel
     pub async fn create_publisher(&self, channel_name: &str) -> Result<InProcessPublisher> {
         let buffer = self.get_buffer(channel_name).await?;
-        
+
         let handles = self.handles.read().await;
         let handle = handles.get(channel_name).ok_or_else(|| {
             Error::IpcError(format!("Channel handle not found: {}", channel_name))
@@ -163,7 +161,7 @@ impl InProcessChannelRegistry {
     /// Create a subscriber for a channel
     pub async fn create_subscriber(&self, channel_name: &str) -> Result<InProcessSubscriber> {
         let buffer = self.get_buffer(channel_name).await?;
-        
+
         let handles = self.handles.read().await;
         let handle = handles.get(channel_name).ok_or_else(|| {
             Error::IpcError(format!("Channel handle not found: {}", channel_name))
@@ -264,12 +262,12 @@ impl InProcessSubscriber {
     /// Receive data from the channel
     pub fn receive(&mut self) -> Result<Option<RuntimeData>> {
         let mut buf = self.buffer.lock().unwrap();
-        
+
         // Check if there's data available from our cursor position
         if self.cursor < buf.len() {
             // Try to deserialize from cursor position
             let data_slice = &buf[self.cursor..];
-            
+
             // Try to deserialize a single RuntimeData
             match super::data_transfer::from_bytes(data_slice) {
                 Ok(data) => {
@@ -281,10 +279,10 @@ impl InProcessSubscriber {
                         // This is a simplification - in a real impl we'd track precisely
                         0
                     };
-                    
+
                     // Simple approach: clear and set cursor to end
                     self.cursor = buf.len();
-                    
+
                     // Update stats
                     if let Ok(mut stats) = self.stats.try_write() {
                         stats.messages_received += 1;
@@ -300,25 +298,25 @@ impl InProcessSubscriber {
                 }
             }
         }
-        
+
         Ok(None)
     }
 
     /// Receive raw bytes without deserialization
     pub fn receive_bytes(&mut self) -> Result<Option<Vec<u8>>> {
         let mut buf = self.buffer.lock().unwrap();
-        
+
         if self.cursor < buf.len() {
             let data = buf[self.cursor..].to_vec();
             self.cursor = buf.len();
-            
+
             // Update stats
             if let Ok(mut stats) = self.stats.try_write() {
                 stats.messages_received += 1;
                 stats.bytes_transferred += data.len() as u64;
                 stats.last_activity = Some(std::time::Instant::now());
             }
-            
+
             Ok(Some(data))
         } else {
             Ok(None)
@@ -333,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn test_inprocess_channel_creation() {
         let registry = InProcessChannelRegistry::global();
-        
+
         let channel_name = format!("test/channel/create/{}", std::process::id());
         let channel = registry
             .create_channel(&channel_name, 100, true)
@@ -350,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn test_inprocess_publish_subscribe() {
         let registry = InProcessChannelRegistry::global();
-        
+
         let channel_name = format!(
             "test/channel/pubsub/{}/{}",
             std::process::id(),
@@ -379,7 +377,7 @@ mod tests {
         // Receive data
         let received = subscriber.receive().unwrap();
         assert!(received.is_some());
-        
+
         let received_data = received.unwrap();
         match &received_data {
             RuntimeData::Text(s) => assert_eq!(s.as_str(), "Hello, InProcess!"),

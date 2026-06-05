@@ -89,7 +89,11 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
         RuntimeData::Json(value) => {
             let mut val = value.clone();
             if let Some(obj) = val.as_object_mut() {
-                let keys: Vec<String> = obj.keys().filter(|k| k.starts_with("participant.")).cloned().collect();
+                let keys: Vec<String> = obj
+                    .keys()
+                    .filter(|k| k.starts_with("participant."))
+                    .cloned()
+                    .collect();
                 for k in keys {
                     if let Some(serde_json::Value::String(s)) = obj.remove(&k) {
                         metadata_map.insert(k, s);

@@ -182,7 +182,11 @@ fn build_openai_s2s_manifest() -> Manifest {
         } else {
             c.from
         };
-        connections.push(Connection { from, to: c.to, ..Default::default() });
+        connections.push(Connection {
+            from,
+            to: c.to,
+            ..Default::default()
+        });
     }
 
     Manifest {

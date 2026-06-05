@@ -269,7 +269,6 @@ impl WebRtcServerConfig {
     }
 }
 
-
 /// Configuration validation errors
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ConfigValidationError {

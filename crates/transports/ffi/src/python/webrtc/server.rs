@@ -621,7 +621,6 @@ async fn run_event_loop(
     tracing::debug!("Python WebRTC event loop stopped");
 }
 
-
 async fn invoke_callbacks<T>(callbacks: &[Py<PyAny>], event: T)
 where
     T: for<'a> IntoPyObjectExt<'a> + Clone + Send + 'static,
