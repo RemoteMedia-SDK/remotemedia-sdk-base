@@ -16,6 +16,8 @@ crate-type = ["cdylib"]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../", default-features = false, features = ["inprocess-python", "loadable"] }
 remotemedia-python-nodes = { path = "../../crates/python-nodes", features = ["inprocess"] }
 remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk", features = ["inprocess-python"] }
+remotemedia-litert-nodes = { path = "../../../remotemedia-litert-nodes", default-features = false, features = ["whisper"] }
+litert-lm-loadable-plugin = { path = "../../../litert-lm-loadable-plugin", default-features = false }
 
 # JNI support
 jni = { version = "0.21", default-features = false }
@@ -58,5 +60,12 @@ remotemedia-py-env = { path = "../../../remotemedia-plugin-sdk/crates/py-env-man
 remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk" }
 remotemedia-modality = { path = "../../../remotemedia-plugin-sdk/crates/modality" }
 remotemedia-core-derive = { path = "../../../remotemedia-plugin-sdk/crates/core-derive" }
+loadable-node-abi = { path = "../../../remotemedia-plugin-sdk/crates/loadable-node-abi" }
+
+[patch.crates-io]
+remotemedia-types = { path = "../../../remotemedia-plugin-sdk/crates/types" }
+remotemedia-traits = { path = "../../../remotemedia-plugin-sdk/crates/traits" }
+remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk" }
+loadable-node-abi = { path = "../../../remotemedia-plugin-sdk/crates/loadable-node-abi" }
 
 [workspace]

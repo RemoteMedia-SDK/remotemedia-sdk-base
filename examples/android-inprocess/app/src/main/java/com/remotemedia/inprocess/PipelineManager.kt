@@ -61,9 +61,9 @@ class PipelineManager(private val context: Context) {
             try {
                 updateState(PipelineState.INITIALIZING)
 
-                // Ensure LiteRT-LM plugin is extracted to files directory
+                // Ensure native loadable plugins are extracted to files directory
                 if (!pluginLoaded) {
-                    loadLitertLmPlugin()
+                    loadNativePlugins()
                 }
 
                 executorHandle = NativeInterface.nativeCreateExecutor()
@@ -84,21 +84,26 @@ class PipelineManager(private val context: Context) {
     }
 
     /**
-     * Load LiteRT-LM plugin from assets to private files directory
+     * Load native plugins from assets to private files directory
      */
-    private fun loadLitertLmPlugin() {
+    private fun loadNativePlugins() {
+        loadNativePlugin("plugins/libwhisper_loadable_plugin.so", "libwhisper_loadable_plugin.so")
+        loadNativePlugin("plugins/liblitert_lm_loadable_plugin.so", "liblitert_lm_loadable_plugin.so")
+        pluginLoaded = true
+    }
+
+    private fun loadNativePlugin(assetPath: String, fileName: String) {
         try {
-            val pluginFile = File(context.filesDir, "liblitert_lm_loadable_plugin.so")
-            Log.i(TAG, "Extracting LiteRT-LM plugin from assets...")
-            context.assets.open("plugins/liblitert_lm_loadable_plugin.so").use { inputStream ->
+            val pluginFile = File(context.filesDir, fileName)
+            Log.i(TAG, "Extracting native plugin from assets: $assetPath")
+            context.assets.open(assetPath).use { inputStream ->
                 FileOutputStream(pluginFile).use { outputStream ->
                     inputStream.copyTo(outputStream)
                 }
             }
             Log.i(TAG, "Plugin extracted to: ${pluginFile.absolutePath}")
-            pluginLoaded = true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to extract plugin", e)
+            Log.e(TAG, "Failed to extract native plugin: $assetPath", e)
         }
     }
 

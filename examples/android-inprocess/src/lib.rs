@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 use remotemedia_core::{
     data::{AudioSamples, RuntimeData},
     executor::SelectedRuntime,
-    loadable::factory::LoadableNodeBundle,
+    loadable::factory::{wrap_ffi_factory, LoadableNodeBundle},
     manifest::Manifest,
     transport::{
         ClientOutputReceivers, PipelineExecutor, SessionHandle, SessionInputSender, TransportData,
@@ -25,6 +25,8 @@ const ANDROID_APP_FILES_DIR: &str = "/data/data/com.remotemedia.inprocess/files"
 const ANDROID_PYTHON_HOME: &str = "/data/data/com.remotemedia.inprocess/files/python/bundle";
 const ANDROID_PYTHON_SRC: &str = "/data/data/com.remotemedia.inprocess/files/python/src";
 static AUDIO_SEND_COUNT: AtomicU64 = AtomicU64::new(0);
+
+type AndroidExecutor = (SelectedRuntime, PipelineExecutor, Vec<LoadableNodeBundle>);
 
 struct AndroidSession {
     rt: tokio::runtime::Runtime,
@@ -104,34 +106,13 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
     info!("Creating pipeline executor with in-process Python");
     configure_android_python_environment();
 
-    // Register default Python nodes (WhisperSTTNode, KokoroTTSNode, etc.)
+    // Register default Python nodes (VADNode, KokoroTTSNode, etc.)
     register_default_python_nodes();
     info!("Registered default Python nodes");
     register_android_inprocess_python_nodes();
-    info!("Registered Android in-process Python nodes: WhisperSTTNode, KokoroTTSNode, VADNode, DataSinkNode");
+    info!("Registered Android in-process Python nodes: WhisperSTTNode alias, KokoroTTSNode, VADNode, DataSinkNode");
 
-    // Load LiteRT-LM loadable plugin (native Rust FFI plugin) for Gemma 4
-    let plugin_path =
-        Path::new("/data/data/com.remotemedia.inprocess/files/liblitert_lm_loadable_plugin.so");
-    info!("Loading LiteRT-LM plugin from: {:?}", plugin_path);
-
-    let loadable_bundle = match LoadableNodeBundle::load(plugin_path) {
-        Ok(b) => {
-            info!(
-                "Loaded plugin, factories: {:?}",
-                b.factories()
-                    .iter()
-                    .map(|f| f.node_type())
-                    .collect::<Vec<_>>()
-            );
-            Some(b)
-        }
-        Err(e) => {
-            error!("Failed to load LiteRT-LM plugin: {}", e);
-            info!("Continuing without LiteRT-LM plugin");
-            None
-        }
-    };
+    let loadable_bundles = load_android_loadable_plugins();
 
     // Select in-process Python runtime (will default to in-process on Android)
     let runtime = SelectedRuntime::CPython;
@@ -162,19 +143,60 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
     }
     info!("Registered Android in-process Python factories into executor registry");
 
-    // If plugin loaded, register its factories into the executor's registry
-    if loadable_bundle.is_some() {
+    if !loadable_bundles.is_empty() {
         info!("Registering loadable plugin factories into executor registry");
-        // The PipelineExecutor has an internal registry we need to access
-        // For now, we'll store the bundle with the executor for later use
+        let registry = executor.registry();
+        let mut registry = registry.blocking_write();
+        for bundle in &loadable_bundles {
+            bundle.register_into(&mut registry);
+        }
     }
+    {
+        let registry = executor.registry();
+        let mut registry = registry.blocking_write();
+        registry.register(wrap_ffi_factory(
+            litert_lm_loadable_plugin::LiteRtLmGenerationNodeFactory,
+        ));
+    }
+    info!("Registered linked LiteRT-LM factory into executor registry");
 
-    info!("Registered loadable plugin: LiteRtLmGenerationNode (Gemma 4)");
+    info!("Registered Android loadable plugin factories");
 
     // Box and leak the executor to get a raw pointer we can pass to Java
     // In production, use a proper handle map
-    let boxed = Box::new((runtime, executor, loadable_bundle));
+    let boxed = Box::new((runtime, executor, loadable_bundles));
     Box::into_raw(boxed) as jlong
+}
+
+fn load_android_loadable_plugins() -> Vec<LoadableNodeBundle> {
+    let plugin_paths = [(
+        "Whisper LiteRT",
+        "/data/data/com.remotemedia.inprocess/files/libwhisper_loadable_plugin.so",
+    )];
+    let mut bundles = Vec::new();
+    for (label, path) in plugin_paths {
+        let plugin_path = Path::new(path);
+        info!("Loading {} plugin from: {:?}", label, plugin_path);
+        match LoadableNodeBundle::load(plugin_path) {
+            Ok(bundle) => {
+                info!(
+                    "Loaded {} plugin, factories: {:?}",
+                    label,
+                    bundle
+                        .factories()
+                        .iter()
+                        .map(|f| f.node_type())
+                        .collect::<Vec<_>>()
+                );
+                bundles.push(bundle);
+            }
+            Err(e) => {
+                error!("Failed to load {} plugin: {}", label, e);
+                info!("Continuing without {} plugin", label);
+            }
+        }
+    }
+    bundles
 }
 
 /// Clean up the executor
@@ -184,12 +206,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeDest
     _class: JClass,
     executor_ptr: jlong,
 ) {
-    let executor_ptr = executor_ptr
-        as *mut (
-            SelectedRuntime,
-            PipelineExecutor,
-            Option<LoadableNodeBundle>,
-        );
+    let executor_ptr = executor_ptr as *mut AndroidExecutor;
     if !executor_ptr.is_null() {
         unsafe {
             let _ = Box::from_raw(executor_ptr);
@@ -206,12 +223,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
     executor_ptr: jlong,
     pipeline_json: JString,
 ) -> jlong {
-    let executor_ptr = executor_ptr
-        as *mut (
-            SelectedRuntime,
-            PipelineExecutor,
-            Option<LoadableNodeBundle>,
-        );
+    let executor_ptr = executor_ptr as *mut AndroidExecutor;
     if executor_ptr.is_null() {
         error!("Executor pointer is null");
         return 0;
@@ -226,7 +238,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
         }
     };
 
-    let (_runtime, executor, loadable_bundle) = unsafe { &mut *executor_ptr };
+    let (_runtime, executor, loadable_bundles) = unsafe { &mut *executor_ptr };
 
     // Parse the manifest
     let manifest: Manifest = match serde_json::from_str(&pipeline_str) {
@@ -239,11 +251,11 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
 
     log_manifest_diagnostics(&manifest);
 
-    // If we have a loadable bundle, register its factories
-    if loadable_bundle.is_some() {
-        info!("Registering loadable plugin factories for session");
-        // The executor needs the registry to include loadable nodes
-        // This is a simplification - in practice we'd need to inject the registry
+    if !loadable_bundles.is_empty() {
+        info!(
+            "Executor has {} loadable plugin bundle(s) retained for session",
+            loadable_bundles.len()
+        );
     }
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -300,11 +312,7 @@ fn spawn_android_output_drainers(
         data_rx,
     } = receivers;
 
-    for (kind, mut rx) in [
-        ("audio", audio_rx),
-        ("video", video_rx),
-        ("data", data_rx),
-    ] {
+    for (kind, mut rx) in [("audio", audio_rx), ("video", video_rx), ("data", data_rx)] {
         let tx = output_tx.clone();
         let sid = session_id.clone();
         rt.spawn(async move {
@@ -316,7 +324,10 @@ fn spawn_android_output_drainers(
                     describe_android_runtime_data(&output)
                 );
                 if tx.send(output).await.is_err() {
-                    info!("Android output receiver dropped for {}; stopping {} drainer", sid, kind);
+                    info!(
+                        "Android output receiver dropped for {}; stopping {} drainer",
+                        sid, kind
+                    );
                     break;
                 }
             }
@@ -331,7 +342,10 @@ fn spawn_android_runtime_heartbeat(rt: &tokio::runtime::Runtime, session_id: Str
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             ticks += 1;
-            info!("Android session runtime heartbeat {} for {}", ticks, session_id);
+            info!(
+                "Android session runtime heartbeat {} for {}",
+                ticks, session_id
+            );
         }
     });
 }
@@ -484,10 +498,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeSend
     if sent_count <= 3 || sent_count % 10 == 0 {
         info!(
             "Sending audio frame {} to session: samples={}, sample_rate={}, channels={}",
-            sent_count,
-            sample_count,
-            sample_rate,
-            channels
+            sent_count, sample_count, sample_rate, channels
         );
     }
     let input = RuntimeData::Audio {
@@ -602,7 +613,13 @@ fn log_manifest_diagnostics(manifest: &Manifest) {
         );
 
         if let Some(params) = node.params.as_object() {
-            for key in ["model_path", "cache_dir", "litert_dispatch_lib_dir"] {
+            for key in [
+                "model_path",
+                "tokenizer_path",
+                "config_path",
+                "cache_dir",
+                "litert_dispatch_lib_dir",
+            ] {
                 if let Some(path) = params.get(key).and_then(|v| v.as_str()) {
                     log_path_metadata(&format!("node '{}'.{}", node.id, key), path);
                 }
@@ -627,9 +644,18 @@ fn configure_android_python_environment() {
     info!("Configured Android Python environment");
     log_path_metadata("app files dir", ANDROID_APP_FILES_DIR);
     log_path_metadata("PYTHONHOME", ANDROID_PYTHON_HOME);
-    log_path_metadata("PYTHONPATH stdlib.zip", &format!("{ANDROID_PYTHON_HOME}/stdlib.zip"));
-    log_path_metadata("PYTHONPATH modules", &format!("{ANDROID_PYTHON_HOME}/modules"));
-    log_path_metadata("PYTHONPATH site-packages", &format!("{ANDROID_PYTHON_HOME}/site-packages"));
+    log_path_metadata(
+        "PYTHONPATH stdlib.zip",
+        &format!("{ANDROID_PYTHON_HOME}/stdlib.zip"),
+    );
+    log_path_metadata(
+        "PYTHONPATH modules",
+        &format!("{ANDROID_PYTHON_HOME}/modules"),
+    );
+    log_path_metadata(
+        "PYTHONPATH site-packages",
+        &format!("{ANDROID_PYTHON_HOME}/site-packages"),
+    );
     log_path_metadata("PYTHONPATH remotemedia src", ANDROID_PYTHON_SRC);
 }
 
@@ -660,12 +686,19 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetA
     // Return hardcoded list of available nodes for now
     let nodes = vec![
         serde_json::json!({
-            "name": "WhisperSTTNode",
-            "description": "Speech-to-text using Whisper",
+            "name": "WhisperNode",
+            "description": "Speech-to-text using LiteRT Whisper",
             "category": "STT",
             "input_types": ["audio"],
             "output_types": ["text"],
-            "parameters": {"model_size": "tiny", "language": "auto"}
+            "parameters": {
+                "model": "tiny",
+                "backend": "litert",
+                "model_path": "models/whisper/whisper_tiny_30s_f32.tflite",
+                "tokenizer_path": "models/whisper/tokenizer.json",
+                "language": "en",
+                "task": "transcribe"
+            }
         }),
         serde_json::json!({
             "name": "KokoroTTSNode",
@@ -712,12 +745,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeStar
     _class: JClass,
     executor_ptr: jlong,
 ) -> jboolean {
-    let executor_ptr = executor_ptr
-        as *mut (
-            SelectedRuntime,
-            PipelineExecutor,
-            Option<LoadableNodeBundle>,
-        );
+    let executor_ptr = executor_ptr as *mut AndroidExecutor;
     if executor_ptr.is_null() {
         error!("Executor pointer is null");
         return jni::sys::JNI_FALSE;

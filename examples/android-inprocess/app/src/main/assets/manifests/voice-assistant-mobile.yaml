@@ -1,121 +1,68 @@
 # voice-assistant-mobile.yaml
-# Mobile-optimized voice assistant pipeline: VAD → STT → LLM → TTS
-# All Python nodes use InProcess execution mode for Android
+# Mobile-optimized voice assistant pipeline: VAD -> LiteRT Whisper -> LLM -> TTS
 
-pipeline:
+version: "1"
+metadata:
   name: "voice-assistant-mobile"
-  version: "1.0.0"
-  description: "Offline voice assistant with VAD, STT, LLM, and TTS"
-  execution_mode: "InProcess"  # Android requirement
+  description: "Offline voice assistant with VAD, LiteRT Whisper, LLM, and TTS"
+  auto_negotiate: true
+  strict_capabilities: false
+
+plugins:
+  - path: "/data/data/com.remotemedia.inprocess/files/libwhisper_loadable_plugin.so"
+  - path: "/data/data/com.remotemedia.inprocess/files/liblitert_lm_loadable_plugin.so"
 
 nodes:
-  # Voice Activity Detection - Silero VAD (ONNX)
   - id: "vad"
-    type: "PythonNode"
-    class: "SileroVADNode"
-    module_path: "assets://models/vad/silero_vad.onnx"
-    execution_mode: "InProcess"
-    config:
-      threshold: 0.5
-      min_speech_duration_ms: 250
-      min_silence_duration_ms: 1000
-      sample_rate: 16000
-    inputs:
-      - "audio_in"
-    outputs:
-      - "vad_out"
-
-  # Speech-to-Text - Whisper tiny/base (Candle)
+    node_type: "VADNode"
+    params:
+      frame_duration_ms: 30
+      energy_threshold: 0.02
+      execution_mode: "InProcess"
+    is_streaming: true
   - id: "stt"
-    type: "PythonNode"
-    class: "WhisperSTTNode"
-    module_path: "assets://models/whisper/base.pt"
-    execution_mode: "InProcess"
-    config:
-      model_size: "tiny"  # or "base" for better accuracy
-      language: "auto"  # auto-detect
+    node_type: "WhisperNode"
+    params:
+      model: "tiny"
+      backend: "litert"
+      model_path: "/data/data/com.remotemedia.inprocess/files/models/whisper/whisper_tiny_30s_f32.tflite"
+      tokenizer_path: "/data/data/com.remotemedia.inprocess/files/models/whisper/tokenizer.json"
+      config_path: "/data/data/com.remotemedia.inprocess/files/models/whisper/config.json"
+      language: "en"
       task: "transcribe"
-      temperature: 0.0
-      beam_size: 1
-      patience: 1.0
-    inputs:
-      - "vad_out"
-    outputs:
-      - "stt_out"
-
-  # LLM - Phi-3-mini-4k-instruct (Candle/GGUF)
+      max_tokens: 224
+      execution_mode: "InProcess"
+    is_streaming: true
   - id: "llm"
-    type: "PythonNode"
-    class: "Phi3LLMNode"
-    module_path: "assets://models/llm/phi3_mini/"
-    execution_mode: "InProcess"
-    config:
-      model: "phi-3-mini-4k-instruct"
-      max_tokens: 150
-      temperature: 0.7
-      top_p: 0.9
-      top_k: 50
-      system_prompt: "You are a concise voice assistant. Keep responses brief and natural for speech."
-      stream: true
-    inputs:
-      - "stt_out"
-    outputs:
-      - "llm_out"
-
-  # Text-to-Speech - Kokoro (ONNX)
+    node_type: "LiteRtLmGenerationNode"
+    params:
+      model_path: "/data/data/com.remotemedia.inprocess/files/models/gemma-4-E2B-it.litertlm"
+      backend: "cpu"
+      cache_dir: "/data/data/com.remotemedia.inprocess/files/cache/litert-lm"
+      max_num_tokens: 2048
+      parallel_file_section_loading: true
+      execution_mode: "InProcess"
+    is_streaming: true
   - id: "tts"
-    type: "PythonNode"
-    class: "KokoroTTSNode"
-    module_path: "assets://models/tts/kokoro/"
-    execution_mode: "InProcess"
-    config:
+    node_type: "KokoroTTSNode"
+    params:
       voice: "af_bella"
       speed: 1.0
       sample_rate: 24000
       stream: true
-    inputs:
-      - "llm_out"
-    outputs:
-      - "audio_out"
-
-  # Audio output node
+      execution_mode: "InProcess"
+    is_streaming: true
   - id: "audio_output"
-    type: "AudioOutputNode"
-    execution_mode: "InProcess"
-    config:
-      sample_rate: 48000
-      channels: 1
-      buffer_size_ms: 100
-    inputs:
-      - "audio_out"
-    outputs: []
+    node_type: "DataSinkNode"
+    params: {}
+    is_streaming: true
 
 connections:
-  - from: "vad.vad_out"
-    to: "stt.audio_in"
-  - from: "stt.stt_out"
-    to: "llm.text_in"
-  - from: "llm.llm_out"
-    to: "tts.text_in"
-  - from: "tts.audio_out"
-    to: "audio_output.audio_in"
-
-# Runtime configuration
-runtime:
-  python:
-    interpreter: "cpython"
-    version: "3.11"
-    site_packages: "assets://site-packages/"
-  audio:
-    input_sample_rate: 48000
-    processing_sample_rate: 16000
-    output_sample_rate: 48000
-  memory_limit_mb: 512
-  
-# Android-specific
-android:
-  foreground_service: true
-  wake_lock: true
-  audio_focus: true
-  model_cache_dir: "cache/models/"
-  extract_on_first_run: true
+  - from: "vad"
+    to: "stt"
+  - from: "stt"
+    to: "llm"
+  - from: "llm"
+    to: "tts"
+  - from: "tts"
+    to: "audio_output"

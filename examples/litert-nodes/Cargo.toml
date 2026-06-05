@@ -1,0 +1,61 @@
+[package]
+name = "remotemedia-litert-nodes"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+description = "LiteRT/TFLite-backed RemoteMedia nodes for Android and mobile targets"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+whisper = []
+loadable-export = ["remotemedia-plugin-sdk/loadable-export"]
+
+[dependencies]
+# RemoteMedia SDK dependencies
+remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk" }
+remotemedia-core = { path = "../../../", default-features = false, features = ["inprocess-python", "loadable"] }
+remotemedia-traits = { path = "../../../remotemedia-plugin-sdk/crates/traits" }
+remotemedia-types = { path = "../../../remotemedia-plugin-sdk/crates/types" }
+
+# Audio processing
+rubato = { workspace = true }
+rustfft = { workspace = true }
+bytemuck = { workspace = true }
+ndarray = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+log = { version = "0.4", features = ["std"] }
+
+# Platform-specific
+libc = { workspace = true }
+
+# Android logging (optional, only for Android target)
+android_logger = { version = "0.15", optional = true }
+
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.69"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+hound = { workspace = true }

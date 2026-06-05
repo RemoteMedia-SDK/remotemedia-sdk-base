@@ -38,6 +38,11 @@ TEST_PIPELINE="${TEST_PIPELINE:-voice-assistant-mobile.json}"
 MODEL_SRC="${MODEL_SRC:-${WORKSPACE_ROOT}/litert-lm-loadable-plugin/gemma-4-E2B-it.litertlm}"
 MODEL_STAGING_PATH="${MODEL_STAGING_PATH:-/data/local/tmp/gemma-4-E2B-it.litertlm}"
 MODEL_DEVICE_PATH="${MODEL_DEVICE_PATH:-/data/data/com.remotemedia.inprocess/files/models/gemma-4-E2B-it.litertlm}"
+WHISPER_MODEL_SRC="${WHISPER_MODEL_SRC:-${WORKSPACE_ROOT}/models/whisper/whisper_tiny_30s_f32.tflite}"
+WHISPER_BASE_MODEL_SRC="${WHISPER_BASE_MODEL_SRC:-${WORKSPACE_ROOT}/models/whisper/whisper_base_30s_f32.tflite}"
+WHISPER_TOKENIZER_SRC="${WHISPER_TOKENIZER_SRC:-${WORKSPACE_ROOT}/models/whisper/tokenizer.json}"
+WHISPER_CONFIG_SRC="${WHISPER_CONFIG_SRC:-${WORKSPACE_ROOT}/models/whisper/config.json}"
+WHISPER_STAGING_DIR="${WHISPER_STAGING_DIR:-/data/local/tmp/remotemedia-whisper}"
 LOG_OUTPUT="${LOG_OUTPUT:-${ANDROID_PROJECT}/android-inprocess-logcat.txt}"
 PYTHON_FOR_ANDROID_ROOT="${PYTHON_FOR_ANDROID_ROOT:-${HOME}/.local/share/python-for-android/dists}"
 PYTHON_BUNDLE_SRC="${PYTHON_BUNDLE_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_numpy/_python_bundle__arm64-v8a/_python_bundle}"
@@ -146,7 +151,13 @@ setup_python_symlink() {
 build_rust() {
     log "Building Rust cdylib for arm64-v8a..."
     cd "$ANDROID_PROJECT"
-    
+
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
+    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+    LITERT_LM_LIB_DIR="${WORKSPACE_ROOT}/litert-lm-loadable-plugin/lib/aarch64-linux-android" \
     cargo build --release --target aarch64-linux-android 2>&1 | tail -20
 
     SO_FILE="target/aarch64-linux-android/release/libremotemedia_android_inprocess.so"
@@ -161,12 +172,32 @@ build_rust() {
     install -m 0644 "$SO_FILE" app/src/main/jniLibs/arm64-v8a/
     success "Copied to jniLibs/arm64-v8a/"
 
+    log "Building Whisper loadable plugin for arm64-v8a (LiteRT backend)..."
+    cd "${WORKSPACE_ROOT}/whisper"
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
+    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+    cargo build --target aarch64-linux-android 2>&1 | tail -40
+    cd "$ANDROID_PROJECT"
+
+    WHISPER_PLUGIN="${WORKSPACE_ROOT}/whisper/target/aarch64-linux-android/debug/libwhisper_loadable_plugin.so"
+    if [[ ! -f "$WHISPER_PLUGIN" ]]; then
+        error "Whisper loadable plugin not found: $WHISPER_PLUGIN"
+        exit 1
+    fi
+    mkdir -p app/src/main/assets/plugins
+    install -m 0644 "$WHISPER_PLUGIN" app/src/main/assets/plugins/
+    success "Copied Whisper loadable plugin to assets/plugins/"
+
     log "Building LiteRT-LM loadable plugin for arm64-v8a..."
     cd "${WORKSPACE_ROOT}/litert-lm-loadable-plugin"
     CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
     CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
     CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
     AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
     LITERT_LM_LIB_DIR="${WORKSPACE_ROOT}/litert-lm-loadable-plugin/lib/aarch64-linux-android" \
     cargo build --target aarch64-linux-android 2>&1 | tail -40
     cd "$ANDROID_PROJECT"
@@ -235,6 +266,7 @@ verify_apk_contents() {
     log "Verifying APK embeds required manifests and native libraries..."
 
     local required_entries=(
+        "assets/plugins/libwhisper_loadable_plugin.so"
         "assets/plugins/liblitert_lm_loadable_plugin.so"
         "assets/manifests/llm-mobile.json"
         "assets/manifests/voice-assistant-mobile.json"
@@ -288,6 +320,7 @@ deploy_to_device() {
     
     success "Plugin is embedded in APK assets; PipelineManager will extract it to app files dir"
     copy_model_to_device
+    copy_whisper_assets_to_device
     copy_python_to_device
 }
 
@@ -337,6 +370,63 @@ copy_model_to_device() {
     fi
 
     success "Model copied to device"
+}
+
+copy_one_whisper_asset() {
+    local src="$1"
+    local dst_name="$2"
+    local required="$3"
+
+    if [[ ! -f "$src" ]]; then
+        if [[ "$required" == "true" ]]; then
+            error "Whisper asset not found: $src"
+            exit 1
+        fi
+        warn "Optional Whisper asset not found: $src"
+        return
+    fi
+
+    local src_size
+    src_size="$(stat -c%s "$src")"
+    local staged_path="${WHISPER_STAGING_DIR}/${dst_name}"
+
+    log "Staging Whisper asset $dst_name (${src_size} bytes)"
+    adb -s "$DEVICE_ADDRESS" shell "mkdir -p '$WHISPER_STAGING_DIR'"
+    local staging_size
+    staging_size="$(adb -s "$DEVICE_ADDRESS" shell "stat -c%s '$staged_path' 2>/dev/null || echo 0" | tr -d '\r')"
+    if [[ "$staging_size" != "$src_size" ]]; then
+        adb -s "$DEVICE_ADDRESS" push "$src" "$staged_path"
+    else
+        success "Staged Whisper asset already present: $dst_name"
+    fi
+
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp "$staged_path" "files/models/whisper/$dst_name"
+
+    local device_size
+    device_size="$(adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess stat -c%s "files/models/whisper/$dst_name" 2>/dev/null | tr -d '\r' || true)"
+    device_size="${device_size:-0}"
+    if [[ "$device_size" != "$src_size" ]]; then
+        error "Whisper asset copy failed or size mismatch for $dst_name: local=${src_size}, device=${device_size}"
+        exit 1
+    fi
+    success "Whisper asset copied: $dst_name"
+}
+
+copy_whisper_assets_to_device() {
+    log "Ensuring LiteRT Whisper assets are present in app-private files"
+    if ! adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess id >/dev/null 2>&1; then
+        error "run-as failed. Release build must be debuggable to copy Whisper assets into app-private files."
+        exit 1
+    fi
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess mkdir -p files/models/whisper
+
+    copy_one_whisper_asset "$WHISPER_MODEL_SRC" "whisper_tiny_30s_f32.tflite" "true"
+    copy_one_whisper_asset "$WHISPER_BASE_MODEL_SRC" "whisper_base_30s_f32.tflite" "false"
+    copy_one_whisper_asset "$WHISPER_TOKENIZER_SRC" "tokenizer.json" "true"
+    copy_one_whisper_asset "$WHISPER_CONFIG_SRC" "config.json" "false"
+
+    log "Whisper asset diagnostics:"
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/whisper || true
 }
 
 copy_python_to_device() {
@@ -517,9 +607,8 @@ class WhisperSTTNode:
         self.config = dict(config or {})
         self.frames_seen = 0
         print(
-            "AndroidInProcess WhisperSTTNode debug adapter initialized. "
-            "Desktop WhisperSTTNode requires async execution plus torch/transformers "
-            "and is not directly runnable by the current PyO3 bridge.",
+            "AndroidInProcess WhisperSTTNode compatibility adapter initialized. "
+            "Use native WhisperNode from libwhisper_loadable_plugin.so for LiteRT ASR.",
             flush=True,
         )
 
@@ -527,15 +616,11 @@ class WhisperSTTNode:
         self.frames_seen += 1
         sample_count, sample_rate, channels, energy = _audio_stats(data)
         print(
-            "AndroidInProcess WhisperSTTNode process "
+            "AndroidInProcess WhisperSTTNode compatibility adapter suppressed "
             f"frame={self.frames_seen} samples={sample_count} energy={energy:.5f}",
             flush=True,
         )
-        if sample_count == 0:
-            return ""
-        if self.frames_seen > 1:
-            return ""
-        return "Reply with five words."
+        return ""
 
     def process_streaming(self, data):
         output = self.process(data)
@@ -636,6 +721,8 @@ run_and_test() {
 
     log "Verifying app-private model before launch..."
     adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/gemma-4-E2B-it.litertlm files/cache/litert-lm || true
+    log "Verifying app-private Whisper assets before launch..."
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/whisper || true
     log "Verifying app-private Python runtime before launch..."
     adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'ls -lh files/python/bundle/stdlib.zip && ls -ld files/python/bundle/modules files/python/bundle/site-packages files/python/bundle/site-packages/numpy files/python/src/remotemedia/nodes'" || true
     
@@ -655,7 +742,7 @@ run_and_test() {
         | tail -20 || true
 
     log "Focused debug logs:"
-    grep -E "RemoteMedia|PipelineManager|MainActivity|NativeInterface|AudioRecorder|AudioPlayer|AndroidRuntime|libc|DEBUG|crash_dump|tombstone|LiteRT|litert|Gemma|Python|InProcess|Manifest|model|Node initialization|Failed|Fatal|FORTIFY|autoStart|Auto-start|Starting listening|Session manifest diagnostics" "$LOG_OUTPUT" \
+    grep -E "RemoteMedia|PipelineManager|MainActivity|NativeInterface|AudioRecorder|AudioPlayer|AndroidRuntime|libc|DEBUG|crash_dump|tombstone|LiteRT|litert|Whisper|Gemma|Python|InProcess|Manifest|model|tokenizer|Node initialization|Failed|Fatal|FORTIFY|autoStart|Auto-start|Starting listening|Session manifest diagnostics" "$LOG_OUTPUT" \
         | tail -300 || true
 
     if grep -Fq "Session manifest diagnostics" "$LOG_OUTPUT"; then

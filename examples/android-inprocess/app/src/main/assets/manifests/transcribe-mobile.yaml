@@ -1,79 +1,44 @@
 # transcribe-mobile.yaml
-# Transcription-only pipeline: VAD → STT → Text output
-# Optimized for fast, accurate speech-to-text on mobile
+# Transcription-only pipeline: VAD -> LiteRT Whisper -> text output
 
-pipeline:
+version: "1"
+metadata:
   name: "transcribe-mobile"
-  version: "1.0.0"
-  description: "Offline speech transcription with VAD and Whisper"
-  execution_mode: "InProcess"
+  description: "Offline speech transcription with VAD and LiteRT Whisper"
+  auto_negotiate: true
+  strict_capabilities: false
+
+plugins:
+  - path: "/data/data/com.remotemedia.inprocess/files/libwhisper_loadable_plugin.so"
 
 nodes:
-  # Voice Activity Detection - Silero VAD (ONNX)
   - id: "vad"
-    type: "PythonNode"
-    class: "SileroVADNode"
-    module_path: "assets://models/vad/silero_vad.onnx"
-    execution_mode: "InProcess"
-    config:
-      threshold: 0.5
-      min_speech_duration_ms: 250
-      min_silence_duration_ms: 1000
-      sample_rate: 16000
-    inputs:
-      - "audio_in"
-    outputs:
-      - "vad_out"
-
-  # Speech-to-Text - Whisper base (Candle)
+    node_type: "VADNode"
+    params:
+      frame_duration_ms: 30
+      energy_threshold: 0.02
+      execution_mode: "InProcess"
+    is_streaming: true
   - id: "stt"
-    type: "PythonNode"
-    class: "WhisperSTTNode"
-    module_path: "assets://models/whisper/base.pt"
-    execution_mode: "InProcess"
-    config:
-      model_size: "base"  # Better accuracy for transcription
-      language: "auto"
+    node_type: "WhisperNode"
+    params:
+      model: "tiny"
+      backend: "litert"
+      model_path: "/data/data/com.remotemedia.inprocess/files/models/whisper/whisper_tiny_30s_f32.tflite"
+      tokenizer_path: "/data/data/com.remotemedia.inprocess/files/models/whisper/tokenizer.json"
+      config_path: "/data/data/com.remotemedia.inprocess/files/models/whisper/config.json"
+      language: "en"
       task: "transcribe"
-      temperature: 0.0
-      beam_size: 5
-      patience: 1.0
-      word_timestamps: true
-    inputs:
-      - "vad_out"
-    outputs:
-      - "text_out"
-
-  # Text output formatter
-  - id: "formatter"
-    type: "PythonNode"
-    class: "TextFormatterNode"
-    module_path: "assets://nodes/text_formatter.py"
-    execution_mode: "InProcess"
-    config:
-      include_timestamps: true
-      segment_duration_threshold: 0.5
-    inputs:
-      - "text_out"
-    outputs:
-      - "formatted_text"
+      max_tokens: 224
+      execution_mode: "InProcess"
+    is_streaming: true
+  - id: "text_output"
+    node_type: "DataSinkNode"
+    params: {}
+    is_streaming: true
 
 connections:
-  - from: "vad.vad_out"
-    to: "stt.audio_in"
-  - from: "stt.text_out"
-    to: "formatter.text_in"
-
-runtime:
-  python:
-    interpreter: "cpython"
-    version: "3.11"
-  audio:
-    input_sample_rate: 48000
-    processing_sample_rate: 16000
-  memory_limit_mb: 256
-
-android:
-  foreground_service: true
-  wake_lock: true
-  model_cache_dir: "cache/models/"
+  - from: "vad"
+    to: "stt"
+  - from: "stt"
+    to: "text_output"
