@@ -179,6 +179,7 @@ build_rust() {
     CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
     AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
     RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+    LITERT_LM_LIB_DIR="${WORKSPACE_ROOT}/litert-lm-loadable-plugin/lib/aarch64-linux-android" \
     cargo build --target aarch64-linux-android 2>&1 | tail -40
     cd "$ANDROID_PROJECT"
 
@@ -272,6 +273,7 @@ verify_apk_contents() {
         "assets/manifests/voice-assistant-mobile.json"
         "assets/manifests/tts-mobile.json"
         "assets/manifests/transcribe-mobile.json"
+        "assets/have_a_wonderful_day.wav"
         "lib/arm64-v8a/libremotemedia_android_inprocess.so"
         "lib/arm64-v8a/libc++_shared.so"
         "lib/arm64-v8a/libGemmaModelConstraintProvider.so"
@@ -727,7 +729,7 @@ run_and_test() {
     adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'ls -lh files/python/bundle/stdlib.zip && ls -ld files/python/bundle/modules files/python/bundle/site-packages files/python/bundle/site-packages/numpy files/python/src/remotemedia/nodes'" || true
     
     # Start MainActivity and ask it to start streaming as soon as the manifest is ready.
-    adb -s "$DEVICE_ADDRESS" shell am start -n com.remotemedia.inprocess/.MainActivity --ez auto_start true --es pipeline "$TEST_PIPELINE"
+    adb -s "$DEVICE_ADDRESS" shell am start -n com.remotemedia.inprocess/.MainActivity --ez auto_start true --ez simulate_speech true --es pipeline "$TEST_PIPELINE"
     
     log "Waiting for auto-started pipeline execution (45s)..."
     sleep 45

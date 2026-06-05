@@ -2,7 +2,7 @@
     <string name="app_name">RemoteMedia Voice Assistant</string>
     <string name="btn_start_listening">Tap to Listen</string>
     <string name="btn_stop">Stop</string>
-    <string name="btn_test_python">Test Python</string>
+    <string name="btn_test_python">Simulate Audio</string>
     <string name="label_transcript">Conversation</string>
     <string name="ready">Ready - Tap mic to start</string>
     <string name="listening">Listening... Speak now</string>

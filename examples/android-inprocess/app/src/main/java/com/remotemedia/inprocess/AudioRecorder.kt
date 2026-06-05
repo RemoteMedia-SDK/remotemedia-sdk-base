@@ -37,7 +37,7 @@ class AudioRecorder(private val context: Context) {
     private var recordJob: Job? = null
     
     // Output channel for captured audio (target rate 16kHz)
-    private val audioChannel = Channel<ByteArray>(capacity = 100)
+    private var audioChannel = Channel<ByteArray>(capacity = 100)
     
     // Callbacks
     var onAudioData: ((ByteArray) -> Unit)? = null
@@ -62,6 +62,7 @@ class AudioRecorder(private val context: Context) {
             return true
         }
         
+        audioChannel = Channel(capacity = 100)
         updateState(RecordingState.STARTING)
         
         return try {

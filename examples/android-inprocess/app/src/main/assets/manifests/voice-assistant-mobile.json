@@ -39,7 +39,8 @@
         "max_tokens": 224,
         "execution_mode": "InProcess"
       },
-      "is_streaming": true
+      "is_streaming": true,
+      "is_output_node": true
     },
     {
       "id": "llm",
@@ -52,7 +53,8 @@
         "parallel_file_section_loading": true,
         "execution_mode": "InProcess"
       },
-      "is_streaming": true
+      "is_streaming": true,
+      "is_output_node": true
     },
     {
       "id": "tts",

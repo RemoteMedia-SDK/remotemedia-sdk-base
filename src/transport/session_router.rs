@@ -1270,6 +1270,7 @@ impl SessionRouter {
             let succ_txs = stream_successors.remove(&node_id).unwrap_or_default();
             let snap_inputs = snapshot_inputs.remove(&node_id).unwrap_or_default();
             let is_sink = sinks.contains(&node_id);
+            let is_output_node = self.manifest.nodes.iter().any(|n| n.id == node_id && n.is_output_node);
 
             let (main_handle, fan_handle) = Self::spawn_node_pipeline(
                 node_id,
@@ -1277,7 +1278,7 @@ impl SessionRouter {
                 input_rx,
                 succ_txs,
                 snap_inputs,
-                if is_sink {
+                if is_sink || is_output_node {
                     Some(self.output_router.clone())
                 } else {
                     None

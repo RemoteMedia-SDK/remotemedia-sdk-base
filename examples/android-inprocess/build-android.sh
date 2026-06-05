@@ -193,14 +193,47 @@ build_rust() {
         cargo_args+=("--release")
     fi
     
+    local workspace_root
+    workspace_root=$(cd "${PROJECT_ROOT}/../.." && pwd)
+    
     if [[ "$TARGET_ARCH" == "both" ]]; then
         log_info "Building for aarch64-linux-android..."
+        CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+        CC_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+        CXX_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
+        AR_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+        RANLIB_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+        LITERT_LM_LIB_DIR="${workspace_root}/litert-lm-loadable-plugin/lib/aarch64-linux-android" \
         cargo "${cargo_args[@]}" --target aarch64-linux-android
         
         log_info "Building for x86_64-linux-android..."
+        CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang" \
+        CC_x86_64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang" \
+        CXX_x86_64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang++" \
+        AR_x86_64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+        RANLIB_x86_64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
         cargo "${cargo_args[@]}" --target x86_64-linux-android
     else
-        cargo "${cargo_args[@]}" --target "$TARGET_ARCH"
+        if [[ "$TARGET_ARCH" == "aarch64-linux-android" ]]; then
+            log_info "Building for aarch64-linux-android..."
+            CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+            CC_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+            CXX_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
+            AR_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+            RANLIB_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+            LITERT_LM_LIB_DIR="${workspace_root}/litert-lm-loadable-plugin/lib/aarch64-linux-android" \
+            cargo "${cargo_args[@]}" --target "$TARGET_ARCH"
+        elif [[ "$TARGET_ARCH" == "x86_64-linux-android" ]]; then
+            log_info "Building for x86_64-linux-android..."
+            CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang" \
+            CC_x86_64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang" \
+            CXX_x86_64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang++" \
+            AR_x86_64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+            RANLIB_x86_64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+            cargo "${cargo_args[@]}" --target "$TARGET_ARCH"
+        else
+            cargo "${cargo_args[@]}" --target "$TARGET_ARCH"
+        fi
     fi
     
     # Verify the library was built
@@ -221,6 +254,56 @@ build_rust() {
             exit 1
         fi
         log_success "Found $lib_path"
+    fi
+    
+    # Now build and embed the loadable plugins (only for aarch64-linux-android as x86_64 has no prebuilt liblitert_lm.so)
+    if [[ "$TARGET_ARCH" == "aarch64-linux-android" || "$TARGET_ARCH" == "both" ]]; then
+        log_info "Building loadable plugins for aarch64-linux-android..."
+        local workspace_root
+        workspace_root=$(cd "${PROJECT_ROOT}/../.." && pwd)
+        
+        # Build whisper-loadable-plugin
+        log_info "Building whisper-loadable-plugin..."
+        cd "${workspace_root}/whisper"
+        CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+        CC_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+        CXX_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
+        AR_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+        RANLIB_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+        LITERT_LM_LIB_DIR="${workspace_root}/litert-lm-loadable-plugin/lib/aarch64-linux-android" \
+        cargo "${cargo_args[@]}" --target aarch64-linux-android
+        
+        # Build litert-lm-loadable-plugin
+        log_info "Building litert-lm-loadable-plugin..."
+        cd "${workspace_root}/litert-lm-loadable-plugin"
+        CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+        CC_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+        CXX_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
+        AR_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+        RANLIB_aarch64_linux_android="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+        LITERT_LM_LIB_DIR="${workspace_root}/litert-lm-loadable-plugin/lib/aarch64-linux-android" \
+        cargo "${cargo_args[@]}" --target aarch64-linux-android
+        
+        # Go back to example directory
+        cd "$EXAMPLE_DIR"
+        
+        # Create directories in app if they don't exist
+        mkdir -p app/src/main/assets/plugins
+        mkdir -p app/src/main/jniLibs/arm64-v8a
+        
+        local build_mode_dir=$(echo "$BUILD_TYPE" | tr '[:upper:]' '[:lower:]')
+        
+        # Copy built loadable plugins
+        cp "${workspace_root}/whisper/target/aarch64-linux-android/${build_mode_dir}/libwhisper_loadable_plugin.so" app/src/main/assets/plugins/
+        cp "${workspace_root}/litert-lm-loadable-plugin/target/aarch64-linux-android/${build_mode_dir}/liblitert_lm_loadable_plugin.so" app/src/main/assets/plugins/
+        log_success "Copied loadable plugins to assets/plugins/"
+        
+        # Copy dependency libraries
+        cp "${workspace_root}/litert-lm-loadable-plugin/lib/aarch64-linux-android/liblitert_lm.so" app/src/main/jniLibs/arm64-v8a/
+        cp "${workspace_root}/LiteRT-LM/prebuilt/android_arm64/libGemmaModelConstraintProvider.so" app/src/main/jniLibs/arm64-v8a/
+        log_success "Copied prebuilt LiteRT dependency libraries to jniLibs/arm64-v8a/"
+    else
+        log_warn "Skipping loadable plugin embedding for non-arm64 architecture ($TARGET_ARCH)"
     fi
     
     log_success "Rust build complete"

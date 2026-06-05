@@ -2,6 +2,7 @@ package com.remotemedia.inprocess
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.media.AudioManager
 import android.os.Bundle
 import android.util.Log
@@ -21,6 +22,9 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.JsonArray
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlinx.coroutines.delay
 
 class MainActivity : AppCompatActivity() {
 
@@ -37,17 +41,21 @@ class MainActivity : AppCompatActivity() {
     private var pipelineInitialized = false
     private var autoStartRequested = false
     private var autoStartConsumed = false
+    private var simulateSpeechRequested = false
     private var audioFramesSeen = 0
+    private var isTransitioning = false
+    private var lastSpeaker: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding?.root)
         autoStartRequested = intent.getBooleanExtra("auto_start", false)
+        simulateSpeechRequested = intent.getBooleanExtra("simulate_speech", false)
         intent.getStringExtra("pipeline")?.takeIf { it.isNotBlank() }?.let {
             currentPipeline = it
         }
-        Log.i(TAG, "MainActivity created: autoStartRequested=$autoStartRequested, currentPipeline=$currentPipeline")
+        Log.i(TAG, "MainActivity created: autoStartRequested=$autoStartRequested, simulateSpeechRequested=$simulateSpeechRequested, currentPipeline=$currentPipeline")
 
         setupToolbar()
         setupCallbacks()
@@ -148,7 +156,7 @@ class MainActivity : AppCompatActivity() {
                 Log.i(TAG, "Pipeline manifest loaded: $currentPipeline")
                 binding?.statusText?.text = "Ready - Tap mic to start"
                 binding?.progressBar?.visibility = View.GONE
-                binding?.micButton?.isEnabled = true
+                updateUIForState(PipelineManager.PipelineState.READY)
                 maybeAutoStart()
             } else {
                 binding?.progressBar?.visibility = View.GONE
@@ -182,8 +190,8 @@ class MainActivity : AppCompatActivity() {
             audioFramesSeen += 1
             if (audioFramesSeen % 50 == 0) {
                 Log.i(TAG, "Forwarding audio frame $audioFramesSeen (${pcmData.size} bytes)")
-                pipelineManager.sendAudio(pcmData)
             }
+            pipelineManager.sendAudio(pcmData)
         }
 
         audioRecorder.onError = { error ->
@@ -229,7 +237,7 @@ class MainActivity : AppCompatActivity() {
 
         // Test button
         binding?.testButton?.setOnClickListener {
-            testPythonNode()
+            simulateSpeech()
         }
     }
 
@@ -242,28 +250,46 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startListening() {
+        if (isTransitioning) return
+        isTransitioning = true
         Log.i(TAG, "Starting listening flow")
-        lifecycleScope.launch {
-            binding?.statusText?.text = "Starting..."
+        lastSpeaker = null
 
-            val started = pipelineManager.startStreaming()
-            if (started) {
-                Log.i(TAG, "Pipeline streaming started; starting recorder/player")
-                val recording = audioRecorder.start()
-                if (recording) {
-                    val playing = audioPlayer.start(24000) // Kokoro default sample rate
-                    if (!playing) {
-                        showError("Failed to start audio playback")
-                        audioRecorder.stop()
+        binding?.micButton?.isEnabled = false
+        binding?.stopButton?.isEnabled = false
+        binding?.micButton?.text = "Starting..."
+        binding?.statusText?.text = "Starting..."
+        binding?.progressBar?.visibility = View.VISIBLE
+
+        lifecycleScope.launch {
+            try {
+                val started = pipelineManager.startStreaming()
+                if (started) {
+                    Log.i(TAG, "Pipeline streaming started; starting recorder/player")
+                    val recording = audioRecorder.start()
+                    if (recording) {
+                        val playing = audioPlayer.start(24000) // Kokoro default sample rate
+                        if (!playing) {
+                            showError("Failed to start audio playback")
+                            audioRecorder.stop()
+                            pipelineManager.stopStreaming()
+                        }
+                    } else {
+                        Log.e(TAG, "Failed to start audio recording")
                         pipelineManager.stopStreaming()
                     }
                 } else {
-                    Log.e(TAG, "Failed to start audio recording")
-                    pipelineManager.stopStreaming()
+                    Log.e(TAG, "Pipeline streaming failed to start")
+                    binding?.statusText?.text = "Failed to start"
                 }
-            } else {
-                Log.e(TAG, "Pipeline streaming failed to start")
-                binding?.statusText?.text = "Failed to start"
+            } catch (e: Exception) {
+                Log.e(TAG, "Error starting listening", e)
+                showError("Start failed: ${e.message}")
+            } finally {
+                binding?.progressBar?.visibility = View.GONE
+                isTransitioning = false
+                val isStreaming = pipelineManager.isStreamingActive()
+                updateUIForState(if (isStreaming) PipelineManager.PipelineState.STREAMING else PipelineManager.PipelineState.READY)
             }
         }
     }
@@ -279,40 +305,137 @@ class MainActivity : AppCompatActivity() {
         }
 
         autoStartConsumed = true
-        Log.i(TAG, "Auto-start requested; starting pipeline")
-        startListening()
+        if (simulateSpeechRequested) {
+            Log.i(TAG, "Auto-start requested with simulate_speech; starting simulation")
+            simulateSpeech()
+        } else {
+            Log.i(TAG, "Auto-start requested; starting pipeline")
+            startListening()
+        }
     }
 
     private fun stopListening() {
-        audioRecorder.stop()
-        audioPlayer.stop()
-        pipelineManager.stopStreaming()
+        if (isTransitioning) return
+        isTransitioning = true
+        Log.i(TAG, "Stopping listening flow")
+
+        binding?.micButton?.isEnabled = false
+        binding?.stopButton?.isEnabled = false
+        binding?.micButton?.text = "Stopping..."
+        binding?.statusText?.text = "Stopping..."
+        binding?.progressBar?.visibility = View.VISIBLE
+
+        lifecycleScope.launch {
+            try {
+                audioRecorder.stop()
+                audioPlayer.stop()
+                pipelineManager.stopStreaming()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping listening", e)
+            } finally {
+                binding?.progressBar?.visibility = View.GONE
+                isTransitioning = false
+                val isStreaming = pipelineManager.isStreamingActive()
+                updateUIForState(if (isStreaming) PipelineManager.PipelineState.STREAMING else PipelineManager.PipelineState.READY)
+            }
+        }
     }
 
     private fun stopAll() {
         stopListening()
-        binding?.statusText?.text = "Stopped"
-        binding?.micButton?.icon = ContextCompat.getDrawable(this, android.R.drawable.ic_media_play)
     }
 
-    private fun testPythonNode() {
+    private fun simulateSpeech() {
+        lastSpeaker = null
         lifecycleScope.launch {
             binding?.progressBar?.visibility = View.VISIBLE
-            binding?.statusText?.text = "Testing Python node..."
+            binding?.statusText?.text = "Simulating speech..."
 
             try {
-                val result = NativeInterface.nativeTestPythonNode()
-                Log.i(TAG, "Python test result: $result")
-                runOnUiThread {
-                    binding?.progressBar?.visibility = View.GONE
-                    binding?.statusText?.text = "Python node test passed"
-                    Toast.makeText(this@MainActivity, "Python node working!", Toast.LENGTH_SHORT).show()
+                // 1. Ensure pipeline is streaming
+                if (!pipelineManager.isStreamingActive()) {
+                    Log.i(TAG, "Starting pipeline for speech simulation")
+                    val started = pipelineManager.startStreaming()
+                    if (!started) {
+                        showError("Failed to start pipeline for simulation")
+                        return@launch
+                    }
+                    audioPlayer.start(24000)
+                    updateUIForState(PipelineManager.PipelineState.STREAMING)
+                } else {
+                    // Stop the physical mic recorder so they don't fight
+                    audioRecorder.stop()
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Python test failed", e)
+
+                // 2. Load WAV file from assets
+                val inputStream = assets.open("have_a_wonderful_day.wav")
+                val allBytes = inputStream.readBytes()
+                inputStream.close()
+
+                if (allBytes.size <= 44) {
+                    showError("WAV file is too small or invalid")
+                    return@launch
+                }
+
+                // Discard 44-byte WAV header
+                val pcmBytes = allBytes.copyOfRange(44, allBytes.size)
+                val numSamples = pcmBytes.size / 2
+                val inputSamples = ShortArray(numSamples)
+                ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(inputSamples)
+
+                // 3. Resample from 24kHz to 16kHz
+                val targetRatio = 1.5
+                val targetSize = (numSamples / targetRatio).toInt()
+                val resampledSamples = ShortArray(targetSize)
+                for (i in 0 until targetSize) {
+                    val inputIdx = i * targetRatio
+                    val floorIdx = inputIdx.toInt()
+                    val frac = inputIdx - floorIdx
+                    if (floorIdx + 1 < numSamples) {
+                        resampledSamples[i] = ((1.0 - frac) * inputSamples[floorIdx] + frac * inputSamples[floorIdx + 1]).toInt().toShort()
+                    } else if (floorIdx < numSamples) {
+                        resampledSamples[i] = inputSamples[floorIdx]
+                    }
+                }
+
+                // 4. Stream chunks of 20ms (320 samples = 640 bytes)
+                val chunkSize = 320 // samples
+                var offset = 0
+                Log.i(TAG, "Starting to stream simulated audio chunks: total ${resampledSamples.size} samples")
+
                 runOnUiThread {
                     binding?.progressBar?.visibility = View.GONE
-                    showError("Python test failed: ${e.message}")
+                }
+
+                while (offset < resampledSamples.size && pipelineManager.isStreamingActive()) {
+                    val actualChunkSize = minOf(chunkSize, resampledSamples.size - offset)
+                    val chunk = ShortArray(actualChunkSize)
+                    System.arraycopy(resampledSamples, offset, chunk, 0, actualChunkSize)
+
+                    // Convert ShortArray to ByteArray (little endian)
+                    val byteBuffer = ByteBuffer.allocate(actualChunkSize * 2).order(ByteOrder.LITTLE_ENDIAN)
+                    for (sample in chunk) {
+                        byteBuffer.putShort(sample)
+                    }
+
+                    pipelineManager.sendAudio(byteBuffer.array())
+                    offset += actualChunkSize
+
+                    // 20ms delay
+                    delay(20)
+                }
+
+                Log.i(TAG, "Finished streaming simulated audio")
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Simulation completed!", Toast.LENGTH_SHORT).show()
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Simulation failed", e)
+                showError("Simulation failed: ${e.message}")
+            } finally {
+                runOnUiThread {
+                    binding?.progressBar?.visibility = View.GONE
                 }
             }
         }
@@ -320,59 +443,178 @@ class MainActivity : AppCompatActivity() {
 
     private fun handlePipelineOutput(outputJson: String) {
         if (outputJson.isEmpty()) return
+        Log.i(TAG, "Received pipeline output JSON: $outputJson")
 
         try {
             val jsonElement = Json { ignoreUnknownKeys = true }.parseToJsonElement(outputJson)
-            val obj = jsonElement as JsonObject
+            val obj = jsonElement as? JsonObject ?: return
 
-            // Handle different output types
-            if (obj.containsKey("text")) {
-                val text = obj["text"]?.let { (it as JsonPrimitive).content } ?: ""
-                appendTranscript(text)
-            } else if (obj.containsKey("audio")) {
-                // Audio output will be handled by AudioPlayer callback
-                // This is for metadata
-            } else if (obj.containsKey("tokens")) {
-                // Handle streaming tokens
-                val tokens = obj["tokens"]?.let { it as JsonArray }?.map { (it as JsonPrimitive).content ?: "" } ?: emptyList()
-                updateStreamingTokens(tokens)
+            // 1. Handle Audio variant (e.g. RuntimeData::Audio)
+            val audioObj = (obj["Audio"] ?: obj["audio"]) as? JsonObject
+            if (audioObj != null) {
+                playAudioFromJsonObject(audioObj)
+                return
             }
+
+            // 2. Handle Json variant (e.g. RuntimeData::Json)
+            val jsonVal = obj["Json"] ?: obj["json"]
+            if (jsonVal != null) {
+                if (jsonVal is JsonObject) {
+                    val dataType = jsonVal["data_type"]?.let { (it as? JsonPrimitive)?.content }
+                    if (dataType == "audio") {
+                        playAudioFromJsonObject(jsonVal)
+                        return
+                    }
+
+                    val textVal = jsonVal["text"]?.let { (it as? JsonPrimitive)?.content }
+                    if (textVal != null && textVal.isNotEmpty()) {
+                        // User STT input text
+                        appendUserTranscript(textVal)
+                        return
+                    }
+                }
+
+                // Generic JSON output (e.g. VAD or other data)
+                appendTranscript("[JSON]: $jsonVal")
+                return
+            }
+
+            // 3. Handle Text variant (e.g. RuntimeData::Text)
+            val textVal = (obj["Text"] ?: obj["text"])?.let { (it as? JsonPrimitive)?.content }
+            if (textVal != null) {
+                if (textVal.isNotEmpty()) {
+                    appendAssistantTranscript(textVal)
+                }
+
+                val tokensArray = (obj["tokens"] ?: obj["Tokens"]) as? JsonArray
+                val tokens = tokensArray?.mapNotNull { (it as? JsonPrimitive)?.content }
+                tokens?.takeIf { it.isNotEmpty() }?.let {
+                    updateStreamingTokens(it)
+                }
+                return
+            }
+
+            // Fallback for generic untagged objects
+            appendTranscript("[Output]: $outputJson")
+
         } catch (e: Exception) {
             Log.w(TAG, "Failed to parse output: ${e.message}")
         }
     }
 
+    private fun appendUserTranscript(text: String) {
+        lastSpeaker = "User"
+        val current = binding?.transcriptText?.text ?: ""
+        binding?.transcriptText?.text = if (current.isEmpty()) "User: $text" else "$current\nUser: $text"
+        binding?.transcriptScroll?.post {
+            binding?.transcriptScroll?.fullScroll(View.FOCUS_DOWN)
+        }
+    }
+
+    private fun appendAssistantTranscript(text: String) {
+        if (lastSpeaker != "Assistant") {
+            lastSpeaker = "Assistant"
+            val current = binding?.transcriptText?.text ?: ""
+            binding?.transcriptText?.text = if (current.isEmpty()) "Assistant: $text" else "$current\nAssistant: $text"
+        } else {
+            binding?.transcriptText?.append(text)
+        }
+        binding?.transcriptScroll?.post {
+            binding?.transcriptScroll?.fullScroll(View.FOCUS_DOWN)
+        }
+    }
+
+    private fun playAudioFromJsonObject(obj: JsonObject) {
+        try {
+            val samplesArray = obj["samples"] as? JsonArray ?: return
+            val sampleRate = obj["sample_rate"]?.let { (it as? JsonPrimitive)?.content?.toIntOrNull() } ?: 24000
+            
+            // Extract floats
+            val floatSamples = FloatArray(samplesArray.size)
+            for (i in 0 until samplesArray.size) {
+                floatSamples[i] = (samplesArray[i] as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0.0f
+            }
+            
+            // Convert float PCM [-1.0, 1.0] to short PCM16 little-endian bytes
+            val byteBuffer = ByteBuffer.allocate(floatSamples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+            for (fSample in floatSamples) {
+                val clamped = maxOf(-1.0f, minOf(1.0f, fSample))
+                val shortVal = (clamped * 32767.0f).toInt().toShort()
+                byteBuffer.putShort(shortVal)
+            }
+            val pcmBytes = byteBuffer.array()
+            
+            // Start audio player if not playing
+            if (!audioPlayer.isPlaying()) {
+                audioPlayer.start(sampleRate)
+            }
+            
+            audioPlayer.queueAudio(pcmBytes)
+            Log.i(TAG, "Queued ${floatSamples.size} audio samples for playback at ${sampleRate}Hz")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse/play audio from JSON: ${e.message}")
+        }
+    }
+
     private fun updateUIForState(state: PipelineManager.PipelineState) {
+        val button = binding?.micButton ?: return
+        val stopBtn = binding?.stopButton
         when (state) {
             PipelineManager.PipelineState.IDLE -> {
                 binding?.statusText?.text = "Idle"
-                binding?.micButton?.isEnabled = false
+                button.isEnabled = false
+                button.text = "Idle"
+                button.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, R.color.disabled_text))
+                stopBtn?.isEnabled = false
             }
             PipelineManager.PipelineState.INITIALIZING -> {
                 binding?.statusText?.text = "Initializing..."
                 binding?.progressBar?.visibility = View.VISIBLE
+                button.isEnabled = false
+                button.text = "Starting..."
+                button.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, R.color.disabled_text))
+                stopBtn?.isEnabled = false
             }
             PipelineManager.PipelineState.READY -> {
                 binding?.statusText?.text = "Ready - Tap mic to start"
                 binding?.progressBar?.visibility = View.GONE
-                binding?.micButton?.isEnabled = true
+                button.isEnabled = true
+                button.text = "Tap to Listen"
+                button.icon = ContextCompat.getDrawable(this, android.R.drawable.ic_media_play)
+                button.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, R.color.mic_active))
+                stopBtn?.isEnabled = false
             }
             PipelineManager.PipelineState.RUNNING -> {
                 binding?.statusText?.text = "Processing..."
+                button.isEnabled = false
+                button.text = "Processing..."
+                button.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, R.color.disabled_text))
+                stopBtn?.isEnabled = false
             }
             PipelineManager.PipelineState.STREAMING -> {
                 binding?.statusText?.text = "Listening... Speak now"
-                binding?.micButton?.icon = ContextCompat.getDrawable(this, android.R.drawable.ic_media_pause)
+                binding?.progressBar?.visibility = View.GONE
+                button.isEnabled = true
+                button.text = "Stop"
+                button.icon = ContextCompat.getDrawable(this, android.R.drawable.ic_media_pause)
+                button.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, R.color.mic_inactive))
+                stopBtn?.isEnabled = true
             }
             PipelineManager.PipelineState.ERROR -> {
                 binding?.statusText?.text = "Error"
                 binding?.progressBar?.visibility = View.GONE
-                binding?.micButton?.isEnabled = true
-                binding?.micButton?.icon = ContextCompat.getDrawable(this, android.R.drawable.ic_media_play)
+                button.isEnabled = true
+                button.text = "Tap to Listen"
+                button.icon = ContextCompat.getDrawable(this, android.R.drawable.ic_media_play)
+                button.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, R.color.mic_active))
+                stopBtn?.isEnabled = false
             }
             PipelineManager.PipelineState.DESTROYED -> {
                 binding?.statusText?.text = "Destroyed"
-                binding?.micButton?.isEnabled = false
+                button.isEnabled = false
+                button.text = "Destroyed"
+                button.backgroundTintList = ColorStateList.valueOf(ContextCompat.getColor(this, R.color.disabled_text))
+                stopBtn?.isEnabled = false
             }
         }
     }
@@ -387,9 +629,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun appendTranscript(text: String) {
         val current = binding?.transcriptText?.text ?: ""
-        binding?.transcriptText?.text = "$current\n$text"
-        // Scroll to bottom
-        binding?.transcriptScroll?.fullScroll(View.FOCUS_DOWN)
+        binding?.transcriptText?.text = if (current.isEmpty()) text else "$current\n$text"
+        // Scroll to bottom after layout pass
+        binding?.transcriptScroll?.post {
+            binding?.transcriptScroll?.fullScroll(View.FOCUS_DOWN)
+        }
     }
 
     private fun updateStreamingTokens(tokens: List<String>) {

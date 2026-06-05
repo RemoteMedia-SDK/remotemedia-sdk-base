@@ -16,6 +16,7 @@ class PipelineManager(private val context: Context) {
 
     companion object {
         private const val TAG = "PipelineManager"
+        private var pluginLoaded = false
     }
 
     // State
@@ -23,7 +24,6 @@ class PipelineManager(private val context: Context) {
     private var sessionHandle: Long = 0
     private val isRunning = AtomicBoolean(false)
     private val isStreaming = AtomicBoolean(false)
-    private var pluginLoaded = false
 
     // Coroutine scope for background operations
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())

@@ -35,7 +35,7 @@ class AudioPlayer(private val context: Context) {
     private var playJob: Job? = null
     
     // Input channel for audio data to play
-    private val audioChannel = Channel<ByteArray>(capacity = 100)
+    private var audioChannel = Channel<ByteArray>(capacity = 100)
     
     // Resample ratios
     private var inputSampleRate = 24000  // Default Kokoro sample rate
@@ -63,6 +63,7 @@ class AudioPlayer(private val context: Context) {
             return true
         }
         
+        audioChannel = Channel(capacity = 100)
         this.inputSampleRate = inputSampleRate
         updateState(PlaybackState.STARTING)
         
@@ -221,7 +222,8 @@ class AudioPlayer(private val context: Context) {
      */
     private fun resample(input: ByteArray, inRate: Int, outRate: Int): ByteArray {
         val inBuffer = ByteBuffer.wrap(input).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
-        val inSamples = inBuffer.array()
+        val inSamples = ShortArray(inBuffer.remaining())
+        inBuffer.get(inSamples)
         val inLen = input.size / 2
         
         val ratio = outRate.toDouble() / inRate
