@@ -9,13 +9,15 @@ use remotemedia_core::{
     loadable::factory::{wrap_ffi_factory, LoadableNodeBundle},
     manifest::Manifest,
     transport::{
-        ClientOutputReceivers, PipelineExecutor, SessionHandle, SessionInputSender, TransportData,
+        session_control::ControlAddress, ClientOutputReceivers, PipelineExecutor, SessionHandle,
+        SessionInputSender, TransportData,
     },
 };
 use remotemedia_python_nodes::{
     register_default_python_nodes, register_python_node, NodeProvider, PythonNodeConfig,
     PythonNodesProvider,
 };
+use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,7 +34,13 @@ struct AndroidSession {
     rt: tokio::runtime::Runtime,
     input: SessionInputSender,
     session: Mutex<Option<SessionHandle>>,
-    output_rx: AsyncMutex<mpsc::Receiver<RuntimeData>>,
+    output_rx: AsyncMutex<mpsc::Receiver<AndroidOutput>>,
+}
+
+#[derive(Debug, Serialize)]
+struct AndroidOutput {
+    source: String,
+    data: RuntimeData,
 }
 
 fn register_android_inprocess_python_nodes() {
@@ -270,6 +278,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
             loadable_bundles.len()
         );
     }
+    let node_ids: Vec<String> = manifest.nodes.iter().map(|node| node.id.clone()).collect();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -294,8 +303,17 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
                 &rt,
                 session_handle.session_id.clone(),
                 output_receivers,
-                output_tx,
+                output_tx.clone(),
             );
+            if let Some(control) = executor.control_bus().get(&session_handle.session_id) {
+                spawn_android_node_tap_drainers(
+                    &rt,
+                    session_handle.session_id.clone(),
+                    control,
+                    &node_ids,
+                    output_tx,
+                );
+            }
             spawn_android_runtime_heartbeat(&rt, session_handle.session_id.clone());
             // Box and leak the session handle
             let boxed = Box::new(AndroidSession {
@@ -317,7 +335,7 @@ fn spawn_android_output_drainers(
     rt: &tokio::runtime::Runtime,
     session_id: String,
     receivers: ClientOutputReceivers,
-    output_tx: mpsc::Sender<RuntimeData>,
+    output_tx: mpsc::Sender<AndroidOutput>,
 ) {
     let ClientOutputReceivers {
         audio_rx,
@@ -336,7 +354,14 @@ fn spawn_android_output_drainers(
                     sid,
                     describe_android_runtime_data(&output)
                 );
-                if tx.send(output).await.is_err() {
+                if tx
+                    .send(AndroidOutput {
+                        source: kind.to_string(),
+                        data: output,
+                    })
+                    .await
+                    .is_err()
+                {
                     info!(
                         "Android output receiver dropped for {}; stopping {} drainer",
                         sid, kind
@@ -345,6 +370,69 @@ fn spawn_android_output_drainers(
                 }
             }
             info!("Android {} output drainer stopped for {}", kind, sid);
+        });
+    }
+}
+
+fn spawn_android_node_tap_drainers(
+    rt: &tokio::runtime::Runtime,
+    session_id: String,
+    control: Arc<remotemedia_core::transport::session_control::SessionControl>,
+    node_ids: &[String],
+    output_tx: mpsc::Sender<AndroidOutput>,
+) {
+    for node_id in ["stt", "llm"] {
+        if !node_ids.iter().any(|id| id == node_id) {
+            continue;
+        }
+        let mut rx = match control.subscribe(&ControlAddress::node_out(node_id)) {
+            Ok(rx) => rx,
+            Err(e) => {
+                error!(
+                    "Failed to subscribe Android Conversation tap for {} in {}: {}",
+                    node_id, session_id, e
+                );
+                continue;
+            }
+        };
+        let tx = output_tx.clone();
+        let sid = session_id.clone();
+        let source = node_id.to_string();
+        rt.spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(output) => {
+                        info!(
+                            "Android Conversation tap received {} output for {}: {}",
+                            source,
+                            sid,
+                            describe_android_runtime_data(&output)
+                        );
+                        if tx
+                            .send(AndroidOutput {
+                                source: source.clone(),
+                                data: output,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            info!(
+                                "Android output receiver dropped for {}; stopping {} tap drainer",
+                                sid, source
+                            );
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        info!(
+                            "Android Conversation tap for {} in {} lagged by {} message(s)",
+                            source, sid, skipped
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            info!("Android {} tap drainer stopped for {}", source, sid);
         });
     }
 }
@@ -565,12 +653,12 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeRecv
 
     let result = session.rt.block_on(async {
         let mut rx = session.output_rx.lock().await;
-        Ok::<_, remotemedia_core::Error>(rx.recv().await.map(TransportData::new))
+        Ok::<_, remotemedia_core::Error>(rx.recv().await)
     });
 
     match result {
         Ok(Some(output)) => {
-            let output_json = serde_json::to_string(&output.data).unwrap_or_default();
+            let output_json = serde_json::to_string(&output).unwrap_or_default();
             info!("Received session output: {} bytes", output_json.len());
             env.new_string(output_json).unwrap().into_raw()
         }

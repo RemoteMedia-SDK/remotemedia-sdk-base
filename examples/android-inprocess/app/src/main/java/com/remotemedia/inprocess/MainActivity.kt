@@ -329,6 +329,9 @@ class MainActivity : AppCompatActivity() {
             try {
                 audioRecorder.stop()
                 audioPlayer.stop()
+                if (pipelineManager.isStreamingActive()) {
+                    flushTrailingSilence()
+                }
                 pipelineManager.stopStreaming()
             } catch (e: Exception) {
                 Log.e(TAG, "Error stopping listening", e)
@@ -338,6 +341,18 @@ class MainActivity : AppCompatActivity() {
                 val isStreaming = pipelineManager.isStreamingActive()
                 updateUIForState(if (isStreaming) PipelineManager.PipelineState.STREAMING else PipelineManager.PipelineState.READY)
             }
+        }
+    }
+
+    private suspend fun flushTrailingSilence(durationMs: Int = 400) {
+        val frameSamples = 320 // 20ms at 16kHz mono
+        val silentFrame = ByteArray(frameSamples * 2)
+        val frameCount = maxOf(1, durationMs / 20)
+        Log.i(TAG, "Flushing $frameCount trailing silence frame(s) before shutdown")
+        repeat(frameCount) {
+            if (!pipelineManager.isStreamingActive()) return
+            pipelineManager.sendAudio(silentFrame)
+            delay(20)
         }
     }
 
@@ -463,64 +478,95 @@ class MainActivity : AppCompatActivity() {
         try {
             val jsonElement = Json { ignoreUnknownKeys = true }.parseToJsonElement(outputJson)
             val obj = jsonElement as? JsonObject ?: return
-
-            // 1. Handle Audio variant (e.g. RuntimeData::Audio)
-            val audioObj = (obj["Audio"] ?: obj["audio"]) as? JsonObject
-            if (audioObj != null) {
-                playAudioFromJsonObject(audioObj)
+            val source = obj["source"]?.let { (it as? JsonPrimitive)?.content }
+            val dataObj = obj["data"] as? JsonObject
+            if (source != null && dataObj != null) {
+                handleRuntimeDataOutput(dataObj, source)
                 return
             }
 
-            // 2. Handle Json variant (e.g. RuntimeData::Json)
-            val jsonVal = obj["Json"] ?: obj["json"]
-            if (jsonVal != null) {
-                if (jsonVal is JsonObject) {
-                    val dataType = jsonVal["data_type"]?.let { (it as? JsonPrimitive)?.content }
-                    if (dataType == "audio") {
-                        playAudioFromJsonObject(jsonVal)
-                        return
-                    }
-
-                    val textVal = jsonVal["text"]?.let { (it as? JsonPrimitive)?.content }
-                    if (textVal != null && textVal.isNotEmpty()) {
-                        // User STT input text
-                        appendUserTranscript(textVal)
-                        return
-                    }
-                }
-
-                // Generic JSON output (e.g. VAD or other data)
-                appendTranscript("[JSON]: $jsonVal")
-                return
-            }
-
-            // 3. Handle Text variant (e.g. RuntimeData::Text)
-            val textVal = (obj["Text"] ?: obj["text"])?.let { (it as? JsonPrimitive)?.content }
-            if (textVal != null) {
-                if (textVal.isNotEmpty()) {
-                    appendAssistantTranscript(textVal)
-                }
-
-                val tokensArray = (obj["tokens"] ?: obj["Tokens"]) as? JsonArray
-                val tokens = tokensArray?.mapNotNull { (it as? JsonPrimitive)?.content }
-                tokens?.takeIf { it.isNotEmpty() }?.let {
-                    updateStreamingTokens(it)
-                }
-                return
-            }
-
-            // Fallback for generic untagged objects
-            appendTranscript("[Output]: $outputJson")
+            handleRuntimeDataOutput(obj, null)
 
         } catch (e: Exception) {
             Log.w(TAG, "Failed to parse output: ${e.message}")
         }
     }
 
+    private fun handleRuntimeDataOutput(obj: JsonObject, source: String?) {
+        // 1. Handle Audio variant (e.g. RuntimeData::Audio)
+        val audioObj = (obj["Audio"] ?: obj["audio"]) as? JsonObject
+        if (audioObj != null) {
+            playAudioFromJsonObject(audioObj)
+            return
+        }
+
+        // 2. Handle Json variant (e.g. RuntimeData::Json)
+        val jsonVal = obj["Json"] ?: obj["json"]
+        if (jsonVal != null) {
+            if (jsonVal is JsonObject) {
+                val dataType = jsonVal["data_type"]?.let { (it as? JsonPrimitive)?.content }
+                if (dataType == "audio") {
+                    playAudioFromJsonObject(jsonVal)
+                    return
+                }
+
+                val textVal = jsonVal["text"]?.let { (it as? JsonPrimitive)?.content }
+                if (textVal != null && textVal.isNotEmpty()) {
+                    appendTextForSource(source, textVal)
+                    return
+                }
+            }
+
+            // Generic JSON output (e.g. VAD or other data)
+            if (source != "stt" && source != "llm") {
+                appendTranscript("[${source ?: "JSON"}]: $jsonVal")
+            }
+            return
+        }
+
+        // 3. Handle Text variant (e.g. RuntimeData::Text)
+        val textVal = (obj["Text"] ?: obj["text"])?.let { (it as? JsonPrimitive)?.content }
+        if (textVal != null) {
+            if (textVal.isNotEmpty()) {
+                appendTextForSource(source, textVal)
+            }
+
+            val tokensArray = (obj["tokens"] ?: obj["Tokens"]) as? JsonArray
+            val tokens = tokensArray?.mapNotNull { (it as? JsonPrimitive)?.content }
+            tokens?.takeIf { it.isNotEmpty() }?.let {
+                updateStreamingTokens(it)
+            }
+            return
+        }
+
+        // Fallback for generic untagged objects
+        appendTranscript("[${source ?: "Output"}]: $obj")
+    }
+
+    private fun appendTextForSource(source: String?, text: String) {
+        when (source) {
+            "stt" -> appendUserTranscript(text)
+            "llm" -> appendAssistantTranscript(text)
+            "data" -> {
+                if (currentPipeline == "transcribe-mobile.json") {
+                    appendUserTranscript(text)
+                } else {
+                    appendAssistantTranscript(text)
+                }
+            }
+            else -> appendAssistantTranscript(text)
+        }
+    }
+
     private fun appendUserTranscript(text: String) {
-        lastSpeaker = "User"
-        val current = binding?.transcriptText?.text ?: ""
-        binding?.transcriptText?.text = if (current.isEmpty()) "User: $text" else "$current\nUser: $text"
+        if (lastSpeaker != "User") {
+            lastSpeaker = "User"
+            val current = binding?.transcriptText?.text ?: ""
+            binding?.transcriptText?.text = if (current.isEmpty()) "User: $text" else "$current\nUser: $text"
+        } else {
+            val needsSpace = binding?.transcriptText?.text?.lastOrNull()?.isWhitespace() == false
+            binding?.transcriptText?.append(if (needsSpace) " $text" else text)
+        }
         binding?.transcriptScroll?.post {
             binding?.transcriptScroll?.fullScroll(View.FOCUS_DOWN)
         }

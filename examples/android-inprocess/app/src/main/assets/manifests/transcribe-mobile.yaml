@@ -30,6 +30,7 @@ nodes:
       language: "en"
       task: "transcribe"
       max_tokens: 224
+      max_window_ms: 2000
       execution_mode: "InProcess"
     is_streaming: true
   - id: "text_output"

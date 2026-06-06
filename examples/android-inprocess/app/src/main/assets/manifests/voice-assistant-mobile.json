@@ -43,10 +43,10 @@
         "language": "en",
         "task": "transcribe",
         "max_tokens": 224,
+        "max_window_ms": 2000,
         "execution_mode": "InProcess"
       },
-      "is_streaming": true,
-      "is_output_node": true
+      "is_streaming": true
     },
     {
       "id": "llm",
@@ -59,8 +59,7 @@
         "parallel_file_section_loading": true,
         "execution_mode": "InProcess"
       },
-      "is_streaming": true,
-      "is_output_node": true
+      "is_streaming": true
     },
     {
       "id": "text_collector",
