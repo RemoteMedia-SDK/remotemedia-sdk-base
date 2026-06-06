@@ -74,14 +74,14 @@ stream: true
 
 ### Kokoro (Text-to-Speech)
 
-**Source**: [Kokoro TTS](https://huggingface.co/hexgrad/Kokoro-82M)
+**Source**: [Kokoro ONNX](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX)
 
-**Model**: `kokoro` (82 MB base + ~4 MB per voice)
+**Model**: `kokoro` (ONNX model + tokenizer + per-voice embedding)
 
 **Format**: ONNX
-- Main model: `kokoro-v0_19.onnx`
-- Voices: `voices/{voice_name}.pt` (PyTorch tensors)
-- Config: `config.json`
+- Main model: `model_q8f16.onnx`
+- Tokenizer: `tokenizer.json`
+- Voices: `voices/{voice_name}.bin` (256-float style rows)
 
 **Available Voices**:
 | Voice | Language | Gender | Description |
@@ -93,15 +93,40 @@ stream: true
 
 **Configuration**:
 ```yaml
+backend: "onnx"
+model_dir: "/data/data/com.remotemedia.inprocess/files/models/kokoro"
+model: "model_q8f16.onnx"
+tokenizer_path: "/data/data/com.remotemedia.inprocess/files/models/kokoro/tokenizer.json"
 voice: "af_bella"
 speed: 1.0
-sample_rate: 24000
-stream: true
+input_mode: "phonemes"
 ```
 
 **Precision**: int8 quantized ONNX
 
 **License**: Apache-2.0
+
+### Misaki G2P (Text Frontend)
+
+**Source**: [MisakiSwift reference](https://github.com/mlalma/MisakiSwift)
+
+**Purpose**: Converts assistant text into Kokoro-compatible phoneme text before `KokoroTTSNode`.
+
+**Required app-private layout**:
+
+```text
+/data/data/com.remotemedia.inprocess/files/models/misaki-g2p/
+├── en-US/
+│   ├── gold.json
+│   └── silver.json
+└── en-GB/
+    ├── gold.json
+    └── silver.json
+```
+
+The deploy script accepts production dictionaries at `${WORKSPACE_ROOT}/models/misaki-g2p`.
+If absent, it stages the tiny fixture dictionaries from `${WORKSPACE_ROOT}/misaki-g2p/resources`
+for development smoke tests.
 
 ### Silero VAD (Voice Activity Detection)
 
@@ -142,15 +167,19 @@ assets/
     ├── llm/
     │   └── phi3_mini/
     │       └── Phi-3-mini-4k-instruct-q4.gguf
-    ├── tts/
-    │   └── kokoro/
-    │       ├── kokoro-v0_19.onnx
-    │       ├── config.json
-    │       └── voices/
-    │           ├── af_bella.pt
-    │           ├── af_sarah.pt
-    │           ├── am_michael.pt
-    │           └── am_adam.pt
+    ├── kokoro/
+    │   ├── tokenizer.json
+    │   ├── onnx/
+    │   │   └── model_q8f16.onnx
+    │   └── voices/
+    │       └── af_bella.bin
+    ├── misaki-g2p/
+    │   ├── en-US/
+    │   │   ├── gold.json
+    │   │   └── silver.json
+    │   └── en-GB/
+    │       ├── gold.json
+    │       └── silver.json
     └── vad/
         └── silero_vad/
             └── silero_vad.onnx

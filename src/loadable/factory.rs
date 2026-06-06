@@ -48,7 +48,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use abi_stable::library::RootModule;
+use abi_stable::library::{lib_header_from_raw_library, RawLibrary, RootModule};
 use abi_stable::sabi_trait::TD_Opaque;
 use abi_stable::std_types::{RErr, ROk, RResult, RString, RVec};
 use async_trait::async_trait;
@@ -131,9 +131,7 @@ impl LoadableNodeBundle {
     /// Load a plugin from disk. Validates abi_stable layout and
     /// version on the way in — mismatches return a typed error.
     pub fn load(path: &Path) -> Result<Self, Error> {
-        let plugin = NodePluginRef::load_from_file(path).map_err(|e| {
-            Error::Execution(format!("loadable plugin load {}: {e:?}", path.display()))
-        })?;
+        let plugin = load_node_plugin(path)?;
 
         let raw_factories = plugin.list_factories()();
         let factories: Vec<Arc<dyn StreamingNodeFactory>> = raw_factories
@@ -166,6 +164,25 @@ impl LoadableNodeBundle {
             registry.register(Arc::clone(f));
         }
     }
+}
+
+fn load_node_plugin(path: &Path) -> Result<NodePluginRef, Error> {
+    let raw_library = RawLibrary::load_at(path)
+        .map_err(|e| Error::Execution(format!("loadable plugin load {}: {e:?}", path.display())))?;
+
+    // `abi_stable::RootModule::load_from_file` caches by root module type.
+    // Every RemoteMedia node plugin exports the same `NodePluginRef` type, so
+    // that cache returns the first plugin for all later paths. Load the raw
+    // library ourselves and initialize the root module from that handle instead.
+    let raw_library = Box::leak(Box::new(raw_library));
+    let header = unsafe { lib_header_from_raw_library(raw_library) }
+        .map_err(|e| Error::Execution(format!("loadable plugin load {}: {e:?}", path.display())))?;
+    let plugin = header
+        .init_root_module::<NodePluginRef>()
+        .map_err(|e| Error::Execution(format!("loadable plugin load {}: {e:?}", path.display())))?;
+    plugin
+        .initialization()
+        .map_err(|e| Error::Execution(format!("loadable plugin load {}: {e:?}", path.display())))
 }
 
 /// Wrap a plugin factory (no dlopen) so it can be registered into a

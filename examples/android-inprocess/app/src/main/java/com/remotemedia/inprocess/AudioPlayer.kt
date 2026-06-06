@@ -164,7 +164,11 @@ class AudioPlayer(private val context: Context) {
             }
             
             // Non-blocking offer
-            return audioChannel.trySend(outputData).isSuccess
+            val result = audioChannel.trySend(outputData)
+            if (!result.isSuccess) {
+                Log.w(TAG, "Audio queue rejected ${outputData.size} bytes: ${result.exceptionOrNull()?.message}")
+            }
+            return result.isSuccess
         } catch (e: Exception) {
             Log.e(TAG, "Failed to queue audio", e)
             onError?.invoke("Queue audio error: ${e.message}")

@@ -38,6 +38,12 @@ pub struct TextCollectorConfig {
     /// Yield partial sentences when <|text_end|> or <|audio_end|> is received
     #[serde(alias = "yieldPartialOnEnd")]
     pub yield_partial_on_end: bool,
+
+    /// Emit a word-boundary partial when the buffered text reaches this many
+    /// characters without sentence punctuation. Zero disables partial flushing.
+    #[serde(alias = "partialFlushChars")]
+    #[schemars(range(min = 0, max = 1000))]
+    pub partial_flush_chars: usize,
 }
 
 impl Default for TextCollectorConfig {
@@ -46,6 +52,7 @@ impl Default for TextCollectorConfig {
             split_pattern: None,
             min_sentence_length: 3,
             yield_partial_on_end: true,
+            partial_flush_chars: 0,
         }
     }
 }
@@ -79,6 +86,9 @@ pub struct TextCollectorNode {
     /// Yield partial sentences when <|text_end|> is received
     yield_partial_on_end: bool,
 
+    /// Yield word-boundary partials after this many buffered characters.
+    partial_flush_chars: usize,
+
     /// Buffer states per session
     states: Arc<Mutex<std::collections::HashMap<String, TextBufferState>>>,
 }
@@ -92,6 +102,7 @@ impl TextCollectorNode {
             boundary_chars,
             min_sentence_length: config.min_sentence_length,
             yield_partial_on_end: config.yield_partial_on_end,
+            partial_flush_chars: config.partial_flush_chars,
             states: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -106,11 +117,16 @@ impl TextCollectorNode {
             split_pattern,
             min_sentence_length: min_sentence_length.unwrap_or(3),
             yield_partial_on_end: yield_partial_on_end.unwrap_or(true),
+            partial_flush_chars: 0,
         }))
     }
 
     fn extract_complete_sentences(&self, buffer: &str) -> (Vec<String>, String) {
         extract_sentences(buffer, &self.boundary_chars, self.min_sentence_length)
+    }
+
+    fn extract_partial_flush(&self, buffer: &str) -> Option<(String, String)> {
+        extract_partial_at_word_boundary(buffer, self.partial_flush_chars, self.min_sentence_length)
     }
 }
 
@@ -157,6 +173,37 @@ pub(crate) fn extract_sentences(
 
     let remainder = current_sentence;
     (sentences, remainder)
+}
+
+fn extract_partial_at_word_boundary(
+    buffer: &str,
+    partial_flush_chars: usize,
+    min_sentence_length: usize,
+) -> Option<(String, String)> {
+    if partial_flush_chars == 0 || buffer.chars().count() < partial_flush_chars {
+        return None;
+    }
+
+    let max_byte = buffer
+        .char_indices()
+        .nth(partial_flush_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(buffer.len());
+    let prefix = &buffer[..max_byte];
+    let split_byte = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .unwrap_or(max_byte);
+
+    let partial = buffer[..split_byte].trim().to_string();
+    if partial.chars().count() < min_sentence_length {
+        return None;
+    }
+
+    let remainder = buffer[split_byte..].trim_start().to_string();
+    Some((partial, remainder))
 }
 
 /// Parse a split-pattern string like `"[.!?;\\n]+"` into the set of
@@ -277,6 +324,18 @@ impl SyncStreamingNode for TextCollectorNode {
             }
             state.accumulated_text = remainder;
 
+            while let Some((partial, remainder)) =
+                self.extract_partial_flush(&state.accumulated_text)
+            {
+                tracing::debug!(
+                    "[TextCollector] Session {}: Yielding partial flush: '{}'",
+                    session_key,
+                    partial
+                );
+                pending.push(RuntimeData::Text(partial));
+                state.accumulated_text = remainder;
+            }
+
             if has_text_end || has_audio_end {
                 if self.yield_partial_on_end && !state.accumulated_text.is_empty() {
                     tracing::debug!(
@@ -304,5 +363,34 @@ impl SyncStreamingNode for TextCollectorNode {
         }
 
         Ok(output_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_flush_emits_at_word_boundary() {
+        let (partial, remainder) =
+            extract_partial_at_word_boundary("Please provide the answer", 16, 8)
+                .expect("expected a partial flush");
+
+        assert_eq!(partial, "Please provide");
+        assert_eq!(remainder, "the answer");
+    }
+
+    #[test]
+    fn partial_flush_waits_until_threshold() {
+        assert!(extract_partial_at_word_boundary("Please provide", 24, 8).is_none());
+    }
+
+    #[test]
+    fn partial_flush_keeps_long_words_moving() {
+        let (partial, remainder) = extract_partial_at_word_boundary("Supercalifragilistic", 8, 3)
+            .expect("expected a hard partial flush");
+
+        assert_eq!(partial, "Supercal");
+        assert_eq!(remainder, "ifragilistic");
     }
 }

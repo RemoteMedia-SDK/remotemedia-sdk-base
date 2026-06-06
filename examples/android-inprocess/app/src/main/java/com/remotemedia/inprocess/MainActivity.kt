@@ -367,6 +367,21 @@ class MainActivity : AppCompatActivity() {
                     audioRecorder.stop()
                 }
 
+                if (currentPipeline == "tts-mobile.json") {
+                    val text = "Have a wonderful day."
+                    Log.i(TAG, "Sending simulated TTS text input: $text")
+                    runOnUiThread {
+                        binding?.progressBar?.visibility = View.GONE
+                        appendUserTranscript(text)
+                    }
+                    if (!pipelineManager.sendText(text)) {
+                        showError("Failed to send simulated TTS text")
+                        return@launch
+                    }
+                    Toast.makeText(this@MainActivity, "TTS simulation submitted!", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+
                 // 2. Load WAV file from assets
                 val inputStream = assets.open("have_a_wonderful_day.wav")
                 val allBytes = inputStream.readBytes()
@@ -531,9 +546,25 @@ class MainActivity : AppCompatActivity() {
             
             // Extract floats
             val floatSamples = FloatArray(samplesArray.size)
+            var peakAbs = 0.0f
+            var sumSquares = 0.0
+            var leadingSilenceSamples = 0
+            var inLeadingSilence = true
             for (i in 0 until samplesArray.size) {
-                floatSamples[i] = (samplesArray[i] as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0.0f
+                val sample = (samplesArray[i] as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0.0f
+                floatSamples[i] = sample
+                val abs = kotlin.math.abs(sample)
+                peakAbs = maxOf(peakAbs, abs)
+                sumSquares += (sample * sample).toDouble()
+                if (inLeadingSilence) {
+                    if (abs <= 1.0e-4f) {
+                        leadingSilenceSamples += 1
+                    } else {
+                        inLeadingSilence = false
+                    }
+                }
             }
+            val rms = if (floatSamples.isEmpty()) 0.0 else kotlin.math.sqrt(sumSquares / floatSamples.size)
             
             // Convert float PCM [-1.0, 1.0] to short PCM16 little-endian bytes
             val byteBuffer = ByteBuffer.allocate(floatSamples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
@@ -549,8 +580,14 @@ class MainActivity : AppCompatActivity() {
                 audioPlayer.start(sampleRate)
             }
             
-            audioPlayer.queueAudio(pcmBytes)
-            Log.i(TAG, "Queued ${floatSamples.size} audio samples for playback at ${sampleRate}Hz")
+            val queued = audioPlayer.queueAudio(pcmBytes)
+            val metadata = obj["metadata"]?.toString()
+            Log.i(
+                TAG,
+                "Audio playback buffer samples=${floatSamples.size} rate=${sampleRate}Hz " +
+                    "peakAbs=$peakAbs rms=$rms leadingSilenceSamples=$leadingSilenceSamples queued=$queued " +
+                    "metadata=$metadata"
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to parse/play audio from JSON: ${e.message}")
         }

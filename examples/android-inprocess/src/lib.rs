@@ -49,10 +49,10 @@ fn register_android_inprocess_python_nodes() {
     );
 
     register_python_node(
-        PythonNodeConfig::new("KokoroTTSNode")
-            .with_python_class("remotemedia.nodes.android_inprocess.KokoroTTSNode")
+        PythonNodeConfig::new("DebugKokoroTTSNode")
+            .with_python_class("remotemedia.nodes.android_inprocess.DebugKokoroTTSNode")
             .with_multi_output(true)
-            .with_description("Android in-process TTS adapter")
+            .with_description("Android in-process debug TTS sine adapter")
             .with_category("tts")
             .accepts(["text"])
             .produces(["audio"])
@@ -106,11 +106,11 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
     info!("Creating pipeline executor with in-process Python");
     configure_android_python_environment();
 
-    // Register default Python nodes (VADNode, KokoroTTSNode, etc.)
+    // Register default Python nodes, then Android-only aliases/debug adapters.
     register_default_python_nodes();
     info!("Registered default Python nodes");
     register_android_inprocess_python_nodes();
-    info!("Registered Android in-process Python nodes: WhisperSTTNode alias, KokoroTTSNode, VADNode, DataSinkNode");
+    info!("Registered Android in-process Python nodes: WhisperSTTNode alias, DebugKokoroTTSNode, VADNode, DataSinkNode");
 
     let loadable_bundles = load_android_loadable_plugins();
 
@@ -169,10 +169,20 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
 }
 
 fn load_android_loadable_plugins() -> Vec<LoadableNodeBundle> {
-    let plugin_paths = [(
-        "Whisper LiteRT",
-        "/data/data/com.remotemedia.inprocess/files/libwhisper_loadable_plugin.so",
-    )];
+    let plugin_paths = [
+        (
+            "Whisper LiteRT",
+            "/data/data/com.remotemedia.inprocess/files/libwhisper_loadable_plugin.so",
+        ),
+        (
+            "Misaki G2P",
+            "/data/data/com.remotemedia.inprocess/files/libmisaki_g2p_plugin.so",
+        ),
+        (
+            "Kokoro ONNX",
+            "/data/data/com.remotemedia.inprocess/files/libkokoro_onnx_plugin.so",
+        ),
+    ];
     let mut bundles = Vec::new();
     for (label, path) in plugin_paths {
         let plugin_path = Path::new(path);
@@ -196,6 +206,9 @@ fn load_android_loadable_plugins() -> Vec<LoadableNodeBundle> {
             }
         }
     }
+    info!(
+        "Android TTS backend diagnostics: production KokoroTTSNode is expected from libkokoro_onnx_plugin.so; Python debug adapter is registered only as DebugKokoroTTSNode"
+    );
     bundles
 }
 
@@ -356,13 +369,22 @@ fn describe_android_runtime_data(data: &RuntimeData) -> String {
             samples,
             sample_rate,
             channels,
+            metadata,
             ..
-        } => format!(
-            "audio samples={} rate={}Hz channels={}",
-            samples.len(),
-            sample_rate,
-            channels
-        ),
+        } => {
+            let kokoro = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("kokoro_onnx"))
+                .map(|kokoro| format!(" metadata={kokoro}"))
+                .unwrap_or_default();
+            format!(
+                "audio samples={} rate={}Hz channels={}{}",
+                samples.len(),
+                sample_rate,
+                channels,
+                kokoro
+            )
+        }
         RuntimeData::Video {
             pixel_data,
             width,
@@ -640,6 +662,9 @@ fn configure_android_python_environment() {
     std::env::set_var("PYTHONNOUSERSITE", "1");
     std::env::set_var("PYTHONDONTWRITEBYTECODE", "1");
     std::env::set_var("REMOTEMEDIA_NODE_TRACE", "1");
+    if std::env::var_os("REMOTEMEDIA_NODE_TIMEOUT_MS").is_none() {
+        std::env::set_var("REMOTEMEDIA_NODE_TIMEOUT_MS", "120000");
+    }
 
     info!("Configured Android Python environment");
     log_path_metadata("app files dir", ANDROID_APP_FILES_DIR);

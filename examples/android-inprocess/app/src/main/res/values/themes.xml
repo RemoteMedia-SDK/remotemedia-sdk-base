@@ -16,6 +16,7 @@
         
         <!-- Background -->
         <item name="android:windowBackground">@color/background</item>
+        <item name="android:forceDarkAllowed">false</item>
         
         <!-- Text -->
         <item name="android:textColorPrimary">@color/primary_text</item>
@@ -41,5 +42,28 @@
         <item name="android:insetBottom">0dp</item>
         <item name="iconGravity">textTop</item>
         <item name="iconSize">64dp</item>
+    </style>
+
+    <style name="TextAppearance.RemoteMedia.Label" parent="TextAppearance.MaterialComponents.Body1">
+        <item name="android:textColor">@color/primary_text</item>
+        <item name="android:textSize">16sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="TextAppearance.RemoteMedia.Status" parent="TextAppearance.MaterialComponents.Body1">
+        <item name="android:textColor">@color/secondary_text</item>
+        <item name="android:textSize">16sp</item>
+    </style>
+
+    <style name="TextAppearance.RemoteMedia.Transcript" parent="TextAppearance.MaterialComponents.Body2">
+        <item name="android:textColor">@color/primary_text</item>
+        <item name="android:textColorHighlight">#332196F3</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:lineSpacingExtra">2dp</item>
+    </style>
+
+    <style name="TextAppearance.RemoteMedia.Streaming" parent="TextAppearance.MaterialComponents.Caption">
+        <item name="android:textColor">@color/secondary_text</item>
+        <item name="android:textSize">12sp</item>
     </style>
 </resources>

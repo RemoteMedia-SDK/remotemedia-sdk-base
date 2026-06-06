@@ -15,8 +15,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="Pipeline:"
-        android:textSize="16sp"
-        android:textStyle="bold"
+        android:textAppearance="@style/TextAppearance.RemoteMedia.Label"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent" />
 
@@ -36,8 +35,7 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="16dp"
         android:text="Initializing..."
-        android:textSize="16sp"
-        android:textColor="@color/secondary_text"
+        android:textAppearance="@style/TextAppearance.RemoteMedia.Status"
         app:layout_constraintTop_toBottomOf="@id/pipelineSpinner"
         app:layout_constraintStart_toStartOf="parent" />
 
@@ -110,8 +108,7 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="24dp"
         android:text="@string/label_transcript"
-        android:textSize="16sp"
-        android:textStyle="bold"
+        android:textAppearance="@style/TextAppearance.RemoteMedia.Label"
         app:layout_constraintTop_toBottomOf="@id/controlButtons"
         app:layout_constraintStart_toStartOf="parent" />
 
@@ -120,6 +117,7 @@
         android:layout_width="0dp"
         android:layout_height="0dp"
         android:layout_marginTop="8dp"
+        android:background="@color/surface"
         android:fillViewport="true"
         app:layout_constraintTop_toBottomOf="@id/transcriptLabel"
         app:layout_constraintBottom_toBottomOf="parent"
@@ -130,8 +128,9 @@
             android:id="@+id/transcriptText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textSize="14sp"
             android:padding="8dp"
+            android:textAppearance="@style/TextAppearance.RemoteMedia.Transcript"
+            android:textColor="@color/primary_text"
             android:textIsSelectable="true"
             tools:text="Voice assistant transcript will appear here..." />
     </ScrollView>
@@ -144,8 +143,7 @@
         android:layout_marginTop="8dp"
         android:layout_marginBottom="8dp"
         android:gravity="center"
-        android:textSize="12sp"
-        android:textColor="@color/secondary_text"
+        android:textAppearance="@style/TextAppearance.RemoteMedia.Streaming"
         android:maxLines="2"
         android:ellipsize="end"
         android:visibility="gone"

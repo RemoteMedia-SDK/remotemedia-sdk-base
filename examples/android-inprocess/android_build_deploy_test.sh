@@ -43,6 +43,14 @@ WHISPER_BASE_MODEL_SRC="${WHISPER_BASE_MODEL_SRC:-${WORKSPACE_ROOT}/models/whisp
 WHISPER_TOKENIZER_SRC="${WHISPER_TOKENIZER_SRC:-${WORKSPACE_ROOT}/models/whisper/tokenizer.json}"
 WHISPER_CONFIG_SRC="${WHISPER_CONFIG_SRC:-${WORKSPACE_ROOT}/models/whisper/config.json}"
 WHISPER_STAGING_DIR="${WHISPER_STAGING_DIR:-/data/local/tmp/remotemedia-whisper}"
+KOKORO_MODEL_SRC="${KOKORO_MODEL_SRC:-${WORKSPACE_ROOT}/models/kokoro/onnx/model_fp16.onnx}"
+KOKORO_MODEL_NAME="${KOKORO_MODEL_NAME:-$(basename "$KOKORO_MODEL_SRC")}"
+KOKORO_TOKENIZER_SRC="${KOKORO_TOKENIZER_SRC:-${WORKSPACE_ROOT}/models/kokoro/tokenizer.json}"
+KOKORO_VOICE_SRC="${KOKORO_VOICE_SRC:-${WORKSPACE_ROOT}/models/kokoro/voices/af_bella.bin}"
+KOKORO_STAGING_DIR="${KOKORO_STAGING_DIR:-/data/local/tmp/remotemedia-kokoro}"
+MISAKI_G2P_RESOURCE_SRC="${MISAKI_G2P_RESOURCE_SRC:-${WORKSPACE_ROOT}/models/misaki-g2p}"
+MISAKI_G2P_RESOURCE_FALLBACK_SRC="${MISAKI_G2P_RESOURCE_FALLBACK_SRC:-${WORKSPACE_ROOT}/misaki-g2p/resources}"
+MISAKI_G2P_STAGING_DIR="${MISAKI_G2P_STAGING_DIR:-/data/local/tmp/remotemedia-misaki-g2p}"
 LOG_OUTPUT="${LOG_OUTPUT:-${ANDROID_PROJECT}/android-inprocess-logcat.txt}"
 PYTHON_FOR_ANDROID_ROOT="${PYTHON_FOR_ANDROID_ROOT:-${HOME}/.local/share/python-for-android/dists}"
 PYTHON_BUNDLE_SRC="${PYTHON_BUNDLE_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_numpy/_python_bundle__arm64-v8a/_python_bundle}"
@@ -192,6 +200,44 @@ build_rust() {
     install -m 0644 "$WHISPER_PLUGIN" app/src/main/assets/plugins/
     success "Copied Whisper loadable plugin to assets/plugins/"
 
+    log "Building Kokoro ONNX loadable plugin for arm64-v8a..."
+    cd "${WORKSPACE_ROOT}/kokoro-onnx"
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
+    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+    cargo build --target aarch64-linux-android 2>&1 | tail -40
+    cd "$ANDROID_PROJECT"
+
+    KOKORO_PLUGIN="${WORKSPACE_ROOT}/kokoro-onnx/target/aarch64-linux-android/debug/libkokoro_onnx_plugin.so"
+    if [[ ! -f "$KOKORO_PLUGIN" ]]; then
+        error "Kokoro ONNX loadable plugin not found: $KOKORO_PLUGIN"
+        exit 1
+    fi
+    mkdir -p app/src/main/assets/plugins
+    install -m 0644 "$KOKORO_PLUGIN" app/src/main/assets/plugins/
+    success "Copied Kokoro ONNX loadable plugin to assets/plugins/"
+
+    log "Building Misaki G2P loadable plugin for arm64-v8a..."
+    cd "${WORKSPACE_ROOT}/misaki-g2p"
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
+    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+    cargo build --target aarch64-linux-android 2>&1 | tail -40
+    cd "$ANDROID_PROJECT"
+
+    MISAKI_PLUGIN="${WORKSPACE_ROOT}/misaki-g2p/target/aarch64-linux-android/debug/libmisaki_g2p_plugin.so"
+    if [[ ! -f "$MISAKI_PLUGIN" ]]; then
+        error "Misaki G2P loadable plugin not found: $MISAKI_PLUGIN"
+        exit 1
+    fi
+    mkdir -p app/src/main/assets/plugins
+    install -m 0644 "$MISAKI_PLUGIN" app/src/main/assets/plugins/
+    success "Copied Misaki G2P loadable plugin to assets/plugins/"
+
     log "Building LiteRT-LM loadable plugin for arm64-v8a..."
     cd "${WORKSPACE_ROOT}/litert-lm-loadable-plugin"
     CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
@@ -231,6 +277,14 @@ build_rust() {
     install -m 0644 "$GEMMA_PROVIDER" app/src/main/jniLibs/arm64-v8a/
     success "Copied LiteRT-LM dependency to jniLibs/arm64-v8a/"
 
+    NDK_CXX_SHARED="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+    if [[ ! -f "$NDK_CXX_SHARED" ]]; then
+        error "NDK libc++ runtime not found: $NDK_CXX_SHARED"
+        exit 1
+    fi
+    install -m 0644 "$NDK_CXX_SHARED" app/src/main/jniLibs/arm64-v8a/
+    success "Copied NDK libc++ runtime to jniLibs/arm64-v8a/"
+
     LOADABLE_PLUGIN="${WORKSPACE_ROOT}/litert-lm-loadable-plugin/target/aarch64-linux-android/debug/liblitert_lm_loadable_plugin.so"
     if [[ ! -f "$LOADABLE_PLUGIN" ]]; then
         error "RemoteMedia loadable plugin not found: $LOADABLE_PLUGIN"
@@ -269,6 +323,8 @@ verify_apk_contents() {
     local required_entries=(
         "assets/plugins/libwhisper_loadable_plugin.so"
         "assets/plugins/liblitert_lm_loadable_plugin.so"
+        "assets/plugins/libkokoro_onnx_plugin.so"
+        "assets/plugins/libmisaki_g2p_plugin.so"
         "assets/manifests/llm-mobile.json"
         "assets/manifests/voice-assistant-mobile.json"
         "assets/manifests/tts-mobile.json"
@@ -323,6 +379,8 @@ deploy_to_device() {
     success "Plugin is embedded in APK assets; PipelineManager will extract it to app files dir"
     copy_model_to_device
     copy_whisper_assets_to_device
+    copy_kokoro_assets_to_device
+    copy_misaki_g2p_assets_to_device
     copy_python_to_device
 }
 
@@ -429,6 +487,97 @@ copy_whisper_assets_to_device() {
 
     log "Whisper asset diagnostics:"
     adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/whisper || true
+}
+
+copy_one_model_asset() {
+    local src="$1"
+    local staged_dir="$2"
+    local device_dir="$3"
+    local dst_name="$4"
+    local label="$5"
+    local required="$6"
+
+    if [[ ! -f "$src" ]]; then
+        if [[ "$required" == "true" ]]; then
+            error "$label asset not found: $src"
+            warn "Provide it at the path above or override the corresponding *_SRC environment variable."
+            exit 1
+        fi
+        warn "Optional $label asset not found: $src"
+        return
+    fi
+
+    local src_size
+    src_size="$(stat -c%s "$src")"
+    local staged_path="${staged_dir}/${dst_name}"
+
+    log "Staging $label asset $dst_name (${src_size} bytes)"
+    adb -s "$DEVICE_ADDRESS" shell "mkdir -p '$staged_dir'"
+    local staging_size
+    staging_size="$(adb -s "$DEVICE_ADDRESS" shell "stat -c%s '$staged_path' 2>/dev/null || echo 0" | tr -d '\r')"
+    if [[ "$staging_size" != "$src_size" ]]; then
+        adb -s "$DEVICE_ADDRESS" push "$src" "$staged_path"
+    else
+        success "Staged $label asset already present: $dst_name"
+    fi
+
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess mkdir -p "$device_dir"
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp "$staged_path" "${device_dir}/${dst_name}"
+
+    local device_size
+    device_size="$(adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess stat -c%s "${device_dir}/${dst_name}" 2>/dev/null | tr -d '\r' || true)"
+    device_size="${device_size:-0}"
+    if [[ "$device_size" != "$src_size" ]]; then
+        error "$label asset copy failed or size mismatch for $dst_name: local=${src_size}, device=${device_size}"
+        exit 1
+    fi
+    success "$label asset copied: $dst_name"
+}
+
+copy_kokoro_assets_to_device() {
+    log "Ensuring Kokoro ONNX assets are present in app-private files"
+    if ! adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess id >/dev/null 2>&1; then
+        error "run-as failed. Release build must be debuggable to copy Kokoro assets into app-private files."
+        exit 1
+    fi
+
+    copy_one_model_asset "$KOKORO_MODEL_SRC" "$KOKORO_STAGING_DIR/onnx" "files/models/kokoro/onnx" "$KOKORO_MODEL_NAME" "Kokoro" "true"
+    copy_one_model_asset "$KOKORO_TOKENIZER_SRC" "$KOKORO_STAGING_DIR" "files/models/kokoro" "tokenizer.json" "Kokoro" "true"
+    copy_one_model_asset "$KOKORO_VOICE_SRC" "$KOKORO_STAGING_DIR/voices" "files/models/kokoro/voices" "af_bella.bin" "Kokoro" "true"
+
+    log "Kokoro asset diagnostics:"
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/kokoro files/models/kokoro/onnx files/models/kokoro/voices || true
+}
+
+resolve_misaki_resource_src() {
+    if [[ -d "$MISAKI_G2P_RESOURCE_SRC" ]]; then
+        echo "$MISAKI_G2P_RESOURCE_SRC"
+    elif [[ -d "$MISAKI_G2P_RESOURCE_FALLBACK_SRC" ]]; then
+        warn "Using bundled Misaki G2P fixture resources: $MISAKI_G2P_RESOURCE_FALLBACK_SRC" >&2
+        echo "$MISAKI_G2P_RESOURCE_FALLBACK_SRC"
+    else
+        error "Misaki G2P resources not found: $MISAKI_G2P_RESOURCE_SRC"
+        warn "Provide production resources there or set MISAKI_G2P_RESOURCE_SRC."
+        exit 1
+    fi
+}
+
+copy_misaki_g2p_assets_to_device() {
+    log "Ensuring Misaki G2P resources are present in app-private files"
+    if ! adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess id >/dev/null 2>&1; then
+        error "run-as failed. Release build must be debuggable to copy Misaki G2P assets into app-private files."
+        exit 1
+    fi
+
+    local src_root
+    src_root="$(resolve_misaki_resource_src)"
+    copy_one_model_asset "${src_root}/en-US/gold.json" "$MISAKI_G2P_STAGING_DIR/en-US" "files/models/misaki-g2p/en-US" "gold.json" "Misaki G2P" "true"
+    copy_one_model_asset "${src_root}/en-US/silver.json" "$MISAKI_G2P_STAGING_DIR/en-US" "files/models/misaki-g2p/en-US" "silver.json" "Misaki G2P" "true"
+    copy_one_model_asset "${src_root}/en-GB/gold.json" "$MISAKI_G2P_STAGING_DIR/en-GB" "files/models/misaki-g2p/en-GB" "gold.json" "Misaki G2P" "false"
+    copy_one_model_asset "${src_root}/en-GB/silver.json" "$MISAKI_G2P_STAGING_DIR/en-GB" "files/models/misaki-g2p/en-GB" "silver.json" "Misaki G2P" "false"
+
+    log "Misaki G2P asset diagnostics:"
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/misaki-g2p files/models/misaki-g2p/en-US || true
 }
 
 copy_python_to_device() {
@@ -630,12 +779,12 @@ class WhisperSTTNode:
             yield output
 
 
-class KokoroTTSNode:
+class DebugKokoroTTSNode:
     def initialize(self, config):
         self.config = dict(config or {})
         self.sample_rate = int(self.config.get("sample_rate", 24000))
         print(
-            "AndroidInProcess KokoroTTSNode debug adapter initialized. "
+            "AndroidInProcess DebugKokoroTTSNode debug adapter initialized. "
             "Desktop KokoroTTSNode requires async execution plus kokoro/soundfile "
             "and is not directly runnable by the current PyO3 bridge.",
             flush=True,
@@ -644,7 +793,7 @@ class KokoroTTSNode:
     def process(self, data):
         text = data if isinstance(data, str) else str(data)
         print(
-            "AndroidInProcess KokoroTTSNode process "
+            "AndroidInProcess DebugKokoroTTSNode process "
             f"text_preview={text[:80]!r}",
             flush=True,
         )
@@ -725,14 +874,20 @@ run_and_test() {
     adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/gemma-4-E2B-it.litertlm files/cache/litert-lm || true
     log "Verifying app-private Whisper assets before launch..."
     adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/whisper || true
+    log "Verifying app-private Kokoro and Misaki G2P assets before launch..."
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/kokoro files/models/kokoro/onnx files/models/kokoro/voices files/models/misaki-g2p files/models/misaki-g2p/en-US || true
     log "Verifying app-private Python runtime before launch..."
     adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'ls -lh files/python/bundle/stdlib.zip && ls -ld files/python/bundle/modules files/python/bundle/site-packages files/python/bundle/site-packages/numpy files/python/src/remotemedia/nodes'" || true
     
     # Start MainActivity and ask it to start streaming as soon as the manifest is ready.
     adb -s "$DEVICE_ADDRESS" shell am start -n com.remotemedia.inprocess/.MainActivity --ez auto_start true --ez simulate_speech true --es pipeline "$TEST_PIPELINE"
     
-    log "Waiting for auto-started pipeline execution (45s)..."
-    sleep 45
+    local wait_seconds="${TEST_WAIT_SECONDS:-45}"
+    if [[ -z "${TEST_WAIT_SECONDS:-}" && "$TEST_PIPELINE" == "tts-mobile.json" ]]; then
+        wait_seconds=130
+    fi
+    log "Waiting for auto-started pipeline execution (${wait_seconds}s)..."
+    sleep "$wait_seconds"
     
     # Capture logs
     log "Capturing full logcat to $LOG_OUTPUT"
@@ -744,7 +899,7 @@ run_and_test() {
         | tail -20 || true
 
     log "Focused debug logs:"
-    grep -E "RemoteMedia|PipelineManager|MainActivity|NativeInterface|AudioRecorder|AudioPlayer|AndroidRuntime|libc|DEBUG|crash_dump|tombstone|LiteRT|litert|Whisper|Gemma|Python|InProcess|Manifest|model|tokenizer|Node initialization|Failed|Fatal|FORTIFY|autoStart|Auto-start|Starting listening|Session manifest diagnostics" "$LOG_OUTPUT" \
+    grep -E "RemoteMedia|PipelineManager|MainActivity|NativeInterface|AudioRecorder|AudioPlayer|AndroidRuntime|libc|DEBUG|crash_dump|tombstone|LiteRT|litert|Whisper|Gemma|Kokoro|Misaki|G2P|Python|InProcess|Manifest|model|tokenizer|Node initialization|Failed|Fatal|FORTIFY|autoStart|Auto-start|Starting listening|Session manifest diagnostics" "$LOG_OUTPUT" \
         | tail -300 || true
 
     if grep -Fq "Session manifest diagnostics" "$LOG_OUTPUT"; then

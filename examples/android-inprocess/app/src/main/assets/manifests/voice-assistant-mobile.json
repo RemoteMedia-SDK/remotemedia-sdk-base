@@ -12,6 +12,12 @@
     },
     {
       "path": "/data/data/com.remotemedia.inprocess/files/liblitert_lm_loadable_plugin.so"
+    },
+    {
+      "path": "/data/data/com.remotemedia.inprocess/files/libmisaki_g2p_plugin.so"
+    },
+    {
+      "path": "/data/data/com.remotemedia.inprocess/files/libkokoro_onnx_plugin.so"
     }
   ],
   "nodes": [
@@ -57,14 +63,43 @@
       "is_output_node": true
     },
     {
+      "id": "text_collector",
+      "node_type": "TextCollectorNode",
+      "params": {
+        "split_pattern": "[.!?;\\n]+",
+        "min_sentence_length": 8,
+        "yield_partial_on_end": true
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "g2p",
+      "node_type": "MisakiG2PNode",
+      "params": {
+        "resource_dir": "/data/data/com.remotemedia.inprocess/files/models/misaki-g2p",
+        "dialect": "en-US",
+        "unknown_policy": "spell",
+        "emit_token_metadata": false,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true
+    },
+    {
       "id": "tts",
       "node_type": "KokoroTTSNode",
       "params": {
+        "backend": "onnx",
+        "model_dir": "/data/data/com.remotemedia.inprocess/files/models/kokoro",
+        "model": "model_fp16.onnx",
+        "tokenizer_path": "/data/data/com.remotemedia.inprocess/files/models/kokoro/tokenizer.json",
         "voice": "af_bella",
         "speed": 1.0,
-        "sample_rate": 24000,
-        "stream": true,
-        "execution_mode": "InProcess"
+        "input_mode": "phonemes",
+        "execution_provider": "cpu",
+        "nnapi_use_fp16": false,
+        "nnapi_disable_cpu": false,
+        "intra_threads": 4,
+        "inter_threads": 1
       },
       "is_streaming": true
     },
@@ -86,6 +121,14 @@
     },
     {
       "from": "llm",
+      "to": "text_collector"
+    },
+    {
+      "from": "text_collector",
+      "to": "g2p"
+    },
+    {
+      "from": "g2p",
       "to": "tts"
     },
     {
