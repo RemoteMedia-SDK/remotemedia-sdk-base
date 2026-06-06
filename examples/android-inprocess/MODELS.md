@@ -108,7 +108,7 @@ input_mode: "phonemes"
 
 ### Misaki G2P (Text Frontend)
 
-**Source**: [MisakiSwift reference](https://github.com/mlalma/MisakiSwift)
+**Source**: [hexgrad/misaki dictionaries](https://github.com/hexgrad/misaki) with [MisakiSwift](https://github.com/mlalma/MisakiSwift) used as the native-port reference.
 
 **Purpose**: Converts assistant text into Kokoro-compatible phoneme text before `KokoroTTSNode`.
 
@@ -124,9 +124,9 @@ input_mode: "phonemes"
     └── silver.json
 ```
 
-The deploy script accepts production dictionaries at `${WORKSPACE_ROOT}/models/misaki-g2p`.
-If absent, it stages the tiny fixture dictionaries from `${WORKSPACE_ROOT}/misaki-g2p/resources`
-for development smoke tests.
+The deploy script stages production dictionaries from `${WORKSPACE_ROOT}/models/misaki-g2p`.
+If absent, it falls back to the tiny fixture dictionaries from
+`${WORKSPACE_ROOT}/misaki-g2p/resources` for development smoke tests only.
 
 ### Silero VAD (Voice Activity Detection)
 
