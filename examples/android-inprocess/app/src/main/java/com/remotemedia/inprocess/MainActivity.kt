@@ -45,6 +45,9 @@ class MainActivity : AppCompatActivity() {
     private var audioFramesSeen = 0
     private var isTransitioning = false
     private var lastSpeaker: String? = null
+    private var vadSpeechActive = false
+    private var vadBargeInActiveUntilMs = 0L
+    private var assistantActivityUntilMs = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -431,7 +434,11 @@ class MainActivity : AppCompatActivity() {
                 // 4. Stream chunks of 20ms (320 samples = 640 bytes)
                 val chunkSize = 320 // samples
                 var offset = 0
-                Log.i(TAG, "Starting to stream simulated audio chunks: total ${resampledSamples.size} samples")
+                Log.i(
+                    TAG,
+                    "Starting to stream simulated audio chunks: total ${resampledSamples.size} samples " +
+                        "(20ms chunks, no pre-trim)"
+                )
 
                 runOnUiThread {
                     binding?.progressBar?.visibility = View.GONE
@@ -439,11 +446,11 @@ class MainActivity : AppCompatActivity() {
 
                 while (offset < resampledSamples.size && pipelineManager.isStreamingActive()) {
                     val actualChunkSize = minOf(chunkSize, resampledSamples.size - offset)
-                    val chunk = ShortArray(actualChunkSize)
+                    val chunk = ShortArray(chunkSize)
                     System.arraycopy(resampledSamples, offset, chunk, 0, actualChunkSize)
 
                     // Convert ShortArray to ByteArray (little endian)
-                    val byteBuffer = ByteBuffer.allocate(actualChunkSize * 2).order(ByteOrder.LITTLE_ENDIAN)
+                    val byteBuffer = ByteBuffer.allocate(chunkSize * 2).order(ByteOrder.LITTLE_ENDIAN)
                     for (sample in chunk) {
                         byteBuffer.putShort(sample)
                     }
@@ -454,6 +461,8 @@ class MainActivity : AppCompatActivity() {
                     // 20ms delay
                     delay(20)
                 }
+
+                flushTrailingSilence(durationMs = 900)
 
                 Log.i(TAG, "Finished streaming simulated audio")
                 runOnUiThread {
@@ -493,6 +502,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleRuntimeDataOutput(obj: JsonObject, source: String?) {
+        if (source == "vad") {
+            val vadJson = (obj["Json"] ?: obj["json"]) as? JsonObject
+            if (vadJson != null) {
+                updateVadDebug(vadJson)
+            }
+            return
+        }
+
         // 1. Handle Audio variant (e.g. RuntimeData::Audio)
         val audioObj = (obj["Audio"] ?: obj["audio"]) as? JsonObject
         if (audioObj != null) {
@@ -546,11 +563,15 @@ class MainActivity : AppCompatActivity() {
     private fun appendTextForSource(source: String?, text: String) {
         when (source) {
             "stt" -> appendUserTranscript(text)
-            "llm" -> appendAssistantTranscript(text)
+            "llm" -> {
+                markAssistantActive(3000)
+                appendAssistantTranscript(text)
+            }
             "data" -> {
                 if (currentPipeline == "transcribe-mobile.json") {
                     appendUserTranscript(text)
                 } else {
+                    markAssistantActive(2000)
                     appendAssistantTranscript(text)
                 }
             }
@@ -611,6 +632,12 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             val rms = if (floatSamples.isEmpty()) 0.0 else kotlin.math.sqrt(sumSquares / floatSamples.size)
+            val durationMs = if (sampleRate > 0) {
+                ((floatSamples.size.toDouble() / sampleRate.toDouble()) * 1000.0).toLong()
+            } else {
+                0L
+            }
+            markAssistantActive(durationMs + 1000)
             
             // Convert float PCM [-1.0, 1.0] to short PCM16 little-endian bytes
             val byteBuffer = ByteBuffer.allocate(floatSamples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
@@ -638,6 +665,78 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Failed to parse/play audio from JSON: ${e.message}")
         }
     }
+
+    private fun updateVadDebug(vadJson: JsonObject) {
+        val hasSpeech = vadJson.booleanValue("has_speech")
+        val isSpeechStart = vadJson.booleanValue("is_speech_start")
+        val isSpeechEnd = vadJson.booleanValue("is_speech_end")
+        val probability = vadJson.doubleValue("speech_probability")
+        val rms = vadJson.doubleValue("rms")
+        val peak = vadJson.doubleValue("peak")
+        val samples = vadJson.intValue("samples")
+        val sampleRate = vadJson.intValue("sample_rate")
+        val now = System.currentTimeMillis()
+
+        if (isSpeechStart) {
+            vadSpeechActive = true
+            if (now < assistantActivityUntilMs) {
+                vadBargeInActiveUntilMs = now + 2500
+                Log.i(TAG, "VAD barge-in detected: user speech started while assistant output was active")
+            }
+        } else if (isSpeechEnd) {
+            vadSpeechActive = false
+        } else if (!hasSpeech && !vadSpeechActive) {
+            vadSpeechActive = false
+        }
+
+        val stateLabel = when {
+            now < vadBargeInActiveUntilMs -> "VAD: barge-in"
+            isSpeechStart -> "VAD: speech start"
+            isSpeechEnd -> "VAD: speech end"
+            vadSpeechActive || hasSpeech -> "VAD: speech"
+            else -> "VAD: idle"
+        }
+        val stateColor = when {
+            now < vadBargeInActiveUntilMs -> R.color.vad_barge_in
+            vadSpeechActive || hasSpeech -> R.color.vad_speech
+            else -> R.color.vad_idle
+        }
+        val bargeText = if (now < vadBargeInActiveUntilMs) {
+            "Barge-in: detected"
+        } else if (now < assistantActivityUntilMs) {
+            "Barge-in: armed"
+        } else {
+            "Barge-in: clear"
+        }
+        val bargeColor = if (now < vadBargeInActiveUntilMs) R.color.vad_barge_in else R.color.secondary_text
+
+        binding?.vadStateText?.text = stateLabel
+        binding?.vadStateText?.setTextColor(ContextCompat.getColor(this, stateColor))
+        binding?.vadBargeInText?.text = bargeText
+        binding?.vadBargeInText?.setTextColor(ContextCompat.getColor(this, bargeColor))
+        binding?.vadProbabilityBar?.progress = (probability.coerceIn(0.0, 1.0) * 100.0).toInt()
+        binding?.vadMetricsText?.text =
+            "p ${probability.format(2)} · rms ${rms.format(4)} · peak ${peak.format(4)} · samples $samples · ${sampleRate}Hz"
+    }
+
+    private fun markAssistantActive(durationMs: Long) {
+        val until = System.currentTimeMillis() + durationMs.coerceAtLeast(0L)
+        if (until > assistantActivityUntilMs) {
+            assistantActivityUntilMs = until
+        }
+    }
+
+    private fun JsonObject.booleanValue(key: String): Boolean =
+        (this[key] as? JsonPrimitive)?.content?.toBooleanStrictOrNull() ?: false
+
+    private fun JsonObject.doubleValue(key: String): Double =
+        (this[key] as? JsonPrimitive)?.content?.toDoubleOrNull() ?: 0.0
+
+    private fun JsonObject.intValue(key: String): Int =
+        (this[key] as? JsonPrimitive)?.content?.toIntOrNull() ?: 0
+
+    private fun Double.format(decimals: Int): String =
+        "%.${decimals}f".format(java.util.Locale.US, this)
 
     private fun updateUIForState(state: PipelineManager.PipelineState) {
         val button = binding?.micButton ?: return

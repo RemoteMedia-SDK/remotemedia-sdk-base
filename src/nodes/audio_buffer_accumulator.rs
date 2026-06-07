@@ -67,6 +67,9 @@ pub struct AudioBufferAccumulatorNode {
     /// Maximum buffer duration in ms (safety limit)
     max_utterance_duration_ms: u32,
 
+    /// Emit a CancelSpeculation control message when speech starts.
+    emit_cancel_on_speech_start: bool,
+
     /// Buffer states per session
     states: Arc<Mutex<std::collections::HashMap<String, BufferState>>>,
 
@@ -96,10 +99,12 @@ impl AudioBufferAccumulatorNode {
     pub fn new(
         min_utterance_duration_ms: Option<u32>,
         max_utterance_duration_ms: Option<u32>,
+        emit_cancel_on_speech_start: Option<bool>,
     ) -> Self {
         Self {
             min_utterance_duration_ms: min_utterance_duration_ms.unwrap_or(250),
             max_utterance_duration_ms: max_utterance_duration_ms.unwrap_or(30000),
+            emit_cancel_on_speech_start: emit_cancel_on_speech_start.unwrap_or(true),
             states: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_audio: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
@@ -360,15 +365,19 @@ impl AudioBufferAccumulatorNode {
                 );
             }
 
-            Ok(Some(RuntimeData::ControlMessage {
-                message_type: ControlMessageType::CancelSpeculation {
-                    from_timestamp: 0,
-                    to_timestamp: 0,
-                },
-                segment_id: None,
-                timestamp_ms: 0,
-                metadata: serde_json::Value::Null,
-            }))
+            if self.emit_cancel_on_speech_start {
+                Ok(Some(RuntimeData::ControlMessage {
+                    message_type: ControlMessageType::CancelSpeculation {
+                        from_timestamp: 0,
+                        to_timestamp: 0,
+                    },
+                    segment_id: None,
+                    timestamp_ms: 0,
+                    metadata: serde_json::Value::Null,
+                }))
+            } else {
+                Ok(None)
+            }
         } else if is_speech_end {
             // Always clear pending on speech_end, whether or not
             // `state.is_speaking` happens to be true. If the two go

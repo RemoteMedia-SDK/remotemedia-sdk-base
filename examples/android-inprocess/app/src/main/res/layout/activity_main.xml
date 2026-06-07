@@ -49,6 +49,63 @@
         app:layout_constraintStart_toEndOf="@id/statusText"
         app:layout_constraintBottom_toBottomOf="@id/statusText" />
 
+    <LinearLayout
+        android:id="@+id/vadDebugPanel"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="@color/debug_panel"
+        android:orientation="vertical"
+        android:padding="10dp"
+        app:layout_constraintTop_toBottomOf="@id/statusText"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/vadStateText"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="VAD: idle"
+                android:textAppearance="@style/TextAppearance.RemoteMedia.Label"
+                android:textColor="@color/vad_idle" />
+
+            <TextView
+                android:id="@+id/vadBargeInText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Barge-in: clear"
+                android:textAppearance="@style/TextAppearance.RemoteMedia.Streaming"
+                android:textColor="@color/secondary_text" />
+        </LinearLayout>
+
+        <ProgressBar
+            android:id="@+id/vadProbabilityBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="6dp"
+            android:layout_marginTop="8dp"
+            android:max="100"
+            android:progress="0"
+            android:progressTint="@color/vad_speech"
+            android:progressBackgroundTint="@color/disabled_text" />
+
+        <TextView
+            android:id="@+id/vadMetricsText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="p 0.00 · rms 0.0000 · peak 0.0000 · samples 0"
+            android:textAppearance="@style/TextAppearance.RemoteMedia.Streaming"
+            android:textColor="@color/secondary_text" />
+    </LinearLayout>
+
     <!-- Mic Button (Large) -->
     <com.google.android.material.button.MaterialButton
         android:id="@+id/micButton"
@@ -66,7 +123,7 @@
         android:textSize="14sp"
         app:cornerRadius="60dp"
         app:backgroundTint="@color/mic_active"
-        app:layout_constraintTop_toBottomOf="@id/statusText"
+        app:layout_constraintTop_toBottomOf="@id/vadDebugPanel"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 

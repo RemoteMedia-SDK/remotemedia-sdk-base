@@ -179,6 +179,10 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
 fn load_android_loadable_plugins() -> Vec<LoadableNodeBundle> {
     let plugin_paths = [
         (
+            "Silero VAD",
+            "/data/data/com.remotemedia.inprocess/files/libsilero_vad_loadable_plugin.so",
+        ),
+        (
             "Whisper LiteRT",
             "/data/data/com.remotemedia.inprocess/files/libwhisper_loadable_plugin.so",
         ),
@@ -381,7 +385,7 @@ fn spawn_android_node_tap_drainers(
     node_ids: &[String],
     output_tx: mpsc::Sender<AndroidOutput>,
 ) {
-    for node_id in ["stt", "llm"] {
+    for node_id in ["vad", "stt", "llm"] {
         if !node_ids.iter().any(|id| id == node_id) {
             continue;
         }
@@ -402,6 +406,9 @@ fn spawn_android_node_tap_drainers(
             loop {
                 match rx.recv().await {
                     Ok(output) => {
+                        if source == "vad" && !matches!(output, RuntimeData::Json(_)) {
+                            continue;
+                        }
                         info!(
                             "Android Conversation tap received {} output for {}: {}",
                             source,
@@ -822,12 +829,16 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetA
             "parameters": {"voice": "af_bella", "speed": 1.0}
         }),
         serde_json::json!({
-            "name": "VADNode",
-            "description": "Voice Activity Detection with optional Rust acceleration",
+            "name": "SileroVADNode",
+            "description": "Voice Activity Detection using Silero ONNX",
             "category": "VAD",
             "input_types": ["audio"],
             "output_types": ["vad"],
-            "parameters": {"frame_duration_ms": 30, "energy_threshold": 0.02}
+            "parameters": {
+                "model_path": "models/silero-vad/silero_vad.onnx",
+                "threshold": 0.5,
+                "sampling_rate": 16000
+            }
         }),
         serde_json::json!({
             "name": "LiteRtLmGenerationNode",

@@ -87,6 +87,7 @@ class PipelineManager(private val context: Context) {
      * Load native plugins from assets to private files directory
      */
     private fun loadNativePlugins() {
+        loadNativePlugin("plugins/libsilero_vad_loadable_plugin.so", "libsilero_vad_loadable_plugin.so")
         loadNativePlugin("plugins/libwhisper_loadable_plugin.so", "libwhisper_loadable_plugin.so")
         loadNativePlugin("plugins/liblitert_lm_loadable_plugin.so", "liblitert_lm_loadable_plugin.so")
         loadNativePlugin("plugins/libmisaki_g2p_plugin.so", "libmisaki_g2p_plugin.so")

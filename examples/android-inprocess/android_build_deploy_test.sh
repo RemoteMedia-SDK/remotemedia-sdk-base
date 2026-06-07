@@ -43,6 +43,8 @@ WHISPER_BASE_MODEL_SRC="${WHISPER_BASE_MODEL_SRC:-${WORKSPACE_ROOT}/models/whisp
 WHISPER_TOKENIZER_SRC="${WHISPER_TOKENIZER_SRC:-${WORKSPACE_ROOT}/models/whisper/tokenizer.json}"
 WHISPER_CONFIG_SRC="${WHISPER_CONFIG_SRC:-${WORKSPACE_ROOT}/models/whisper/config.json}"
 WHISPER_STAGING_DIR="${WHISPER_STAGING_DIR:-/data/local/tmp/remotemedia-whisper}"
+SILERO_VAD_MODEL_SRC="${SILERO_VAD_MODEL_SRC:-${WORKSPACE_ROOT}/silero-vad/silero_vad.onnx}"
+SILERO_VAD_STAGING_DIR="${SILERO_VAD_STAGING_DIR:-/data/local/tmp/remotemedia-silero-vad}"
 KOKORO_MODEL_SRC="${KOKORO_MODEL_SRC:-${WORKSPACE_ROOT}/models/kokoro/onnx/model_fp16.onnx}"
 KOKORO_MODEL_NAME="${KOKORO_MODEL_NAME:-$(basename "$KOKORO_MODEL_SRC")}"
 KOKORO_TOKENIZER_SRC="${KOKORO_TOKENIZER_SRC:-${WORKSPACE_ROOT}/models/kokoro/tokenizer.json}"
@@ -200,6 +202,25 @@ build_rust() {
     install -m 0644 "$WHISPER_PLUGIN" app/src/main/assets/plugins/
     success "Copied Whisper loadable plugin to assets/plugins/"
 
+    log "Building Silero VAD loadable plugin for arm64-v8a..."
+    cd "${WORKSPACE_ROOT}/silero-vad"
+    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
+    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
+    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
+    cargo build --target aarch64-linux-android 2>&1 | tail -40
+    cd "$ANDROID_PROJECT"
+
+    SILERO_VAD_PLUGIN="${WORKSPACE_ROOT}/silero-vad/target/aarch64-linux-android/debug/libsilero_vad_loadable_plugin.so"
+    if [[ ! -f "$SILERO_VAD_PLUGIN" ]]; then
+        error "Silero VAD loadable plugin not found: $SILERO_VAD_PLUGIN"
+        exit 1
+    fi
+    mkdir -p app/src/main/assets/plugins
+    install -m 0644 "$SILERO_VAD_PLUGIN" app/src/main/assets/plugins/
+    success "Copied Silero VAD loadable plugin to assets/plugins/"
+
     log "Building Kokoro ONNX loadable plugin for arm64-v8a..."
     cd "${WORKSPACE_ROOT}/kokoro-onnx"
     CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
@@ -321,6 +342,7 @@ verify_apk_contents() {
     log "Verifying APK embeds required manifests and native libraries..."
 
     local required_entries=(
+        "assets/plugins/libsilero_vad_loadable_plugin.so"
         "assets/plugins/libwhisper_loadable_plugin.so"
         "assets/plugins/liblitert_lm_loadable_plugin.so"
         "assets/plugins/libkokoro_onnx_plugin.so"
@@ -378,10 +400,24 @@ deploy_to_device() {
     
     success "Plugin is embedded in APK assets; PipelineManager will extract it to app files dir"
     copy_model_to_device
+    copy_silero_vad_assets_to_device
     copy_whisper_assets_to_device
     copy_kokoro_assets_to_device
     copy_misaki_g2p_assets_to_device
     copy_python_to_device
+}
+
+copy_silero_vad_assets_to_device() {
+    log "Ensuring Silero VAD assets are present in app-private files"
+    if ! adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess id >/dev/null 2>&1; then
+        error "run-as failed. Release build must be debuggable to copy Silero VAD assets into app-private files."
+        exit 1
+    fi
+
+    copy_one_model_asset "$SILERO_VAD_MODEL_SRC" "$SILERO_VAD_STAGING_DIR" "files/models/silero-vad" "silero_vad.onnx" "Silero VAD" "true"
+
+    log "Silero VAD asset diagnostics:"
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/silero-vad || true
 }
 
 copy_model_to_device() {
@@ -739,6 +775,16 @@ class VADNode:
                 f"frame={self.frames_seen} samples={sample_count} energy={energy:.5f}",
                 flush=True,
             )
+
+        if energy < self.energy_threshold:
+            if self.frames_seen <= 3 or self.frames_seen % 10 == 0:
+                print(
+                    "AndroidInProcess VADNode suppressing silence "
+                    f"frame={self.frames_seen} energy={energy:.5f}",
+                    flush=True,
+                )
+            return ""
+
         metadata = {}
         if isinstance(data, dict) and isinstance(data.get("metadata"), dict):
             metadata.update(data["metadata"])

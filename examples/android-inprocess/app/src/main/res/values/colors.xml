@@ -28,6 +28,10 @@
     <color name="warning">#FF9800</color>
     <color name="error">#F44336</color>
     <color name="info">#2196F3</color>
+    <color name="vad_idle">#607D8B</color>
+    <color name="vad_speech">#2E7D32</color>
+    <color name="vad_barge_in">#C62828</color>
+    <color name="debug_panel">#F5F7FA</color>
     
     <!-- White/Black -->
     <color name="white">#FFFFFF</color>
