@@ -17,7 +17,6 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // External native build with CMake
         externalNativeBuild {
             cmake {
                 arguments("-DANDROID_STL=c++_shared")
@@ -25,7 +24,6 @@ android {
             }
         }
 
-        // NDK configuration
         ndk {
             abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
         }
@@ -60,12 +58,12 @@ android {
         buildConfig = true
     }
 
-    // Packaging options - using modern API
     packagingOptions {
-        // Don't strip debug symbols from native libraries
         jniLibs {
             useLegacyPackaging = true
         }
+        doNotStrip.add("**/libremotemedia_android_inprocess.so")
+        doNotStrip.add("**/libpython3.11.so")
     }
 
     externalNativeBuild {
@@ -76,6 +74,7 @@ android {
 }
 
 dependencies {
+    // AndroidX
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")

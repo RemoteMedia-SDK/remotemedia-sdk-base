@@ -14,3 +14,23 @@ examples/android-inprocess/*.apk
 examples/android-inprocess/*-logcat.txt
 examples/android-inprocess/app/src/main/assets/plugins/
 examples/android-inprocess/app/src/main/jniLibs/
+
+# Kotlin Android library module
+kotlin-android/gradle
+kotlin-android/.gradle/
+kotlin-android/build/
+kotlin-android/local.properties
+kotlin-android/gradlew
+kotlin-android/gradlew.bat
+kotlin-android/*.apk
+kotlin-android/*.aar
+kotlin-android/*.jar
+kotlin-android/.cxx/
+kotlin-android/app/
+# Generated files
+kotlin-android/*.log
+kotlin-android/*.tmp
+gradle/
+.gradle/
+gradlew
+gradlew.bat
