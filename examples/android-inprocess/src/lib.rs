@@ -15,7 +15,7 @@ use remotemedia_core::{
 };
 use remotemedia_python_nodes::{
     register_default_python_nodes, register_python_node, NodeProvider, PythonNodeConfig,
-    PythonNodesProvider,
+    PythonNodesProvider, PythonExecutionMode,
 };
 use serde::Serialize;
 use std::path::Path;
@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 const ANDROID_APP_FILES_DIR: &str = "/data/data/com.remotemedia.inprocess/files";
 const ANDROID_PYTHON_HOME: &str = "/data/data/com.remotemedia.inprocess/files/python/bundle";
 const ANDROID_PYTHON_SRC: &str = "/data/data/com.remotemedia.inprocess/files/python/src";
+const ANDROID_HERMES_AGENT_SRC: &str = "/data/data/com.remotemedia.inprocess/files/python/src/hermes_agent";
 static AUDIO_SEND_COUNT: AtomicU64 = AtomicU64::new(0);
 
 type AndroidExecutor = (SelectedRuntime, PipelineExecutor, Vec<LoadableNodeBundle>);
@@ -93,8 +94,8 @@ fn register_android_inprocess_python_nodes() {
     // Hermes Agent test plugin for verifying in-process imports
     register_python_node(
         PythonNodeConfig::new("HermesAgentTestPlugin")
-            .with_python_class("remotemedia.nodes.android_inprocess.HermesAgentTestPlugin")
-            .with_description("Test plugin to verify Hermes Agent imports in-process on Android")
+            .with_python_class("remotemedia.nodes.hermes_agent_plugin.HermesAgentTestPlugin")
+            .with_inprocess(true)
             .with_category("test")
             .accepts(["text", "json"])
             .produces(["text", "json"])
@@ -758,7 +759,8 @@ fn log_manifest_diagnostics(manifest: &Manifest) {
 
 fn configure_android_python_environment() {
     let python_path = format!(
-        "{home}/stdlib.zip:{home}/modules:{home}/site-packages:{src}",
+        "{hermes}:{home}/stdlib.zip:{home}/modules:{home}/site-packages:{src}",
+        hermes = ANDROID_HERMES_AGENT_SRC,
         home = ANDROID_PYTHON_HOME,
         src = ANDROID_PYTHON_SRC
     );

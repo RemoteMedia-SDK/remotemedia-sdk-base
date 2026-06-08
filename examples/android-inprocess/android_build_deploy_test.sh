@@ -54,11 +54,12 @@ MISAKI_G2P_RESOURCE_SRC="${MISAKI_G2P_RESOURCE_SRC:-${WORKSPACE_ROOT}/models/mis
 MISAKI_G2P_RESOURCE_FALLBACK_SRC="${MISAKI_G2P_RESOURCE_FALLBACK_SRC:-${WORKSPACE_ROOT}/misaki-g2p/resources}"
 MISAKI_G2P_STAGING_DIR="${MISAKI_G2P_STAGING_DIR:-/data/local/tmp/remotemedia-misaki-g2p}"
 LOG_OUTPUT="${LOG_OUTPUT:-${ANDROID_PROJECT}/android-inprocess-logcat.txt}"
+# Python-for-Android distro with Hermes Agent (built with build_p4a_hermes_simple.sh)
 PYTHON_FOR_ANDROID_ROOT="${PYTHON_FOR_ANDROID_ROOT:-${HOME}/.local/share/python-for-android/dists}"
-PYTHON_BUNDLE_SRC="${PYTHON_BUNDLE_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_numpy/_python_bundle__arm64-v8a/_python_bundle}"
-PYTHON_BUNDLE_FALLBACK_SRC="${PYTHON_BUNDLE_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/unnamed_dist_1/_python_bundle__arm64-v8a/_python_bundle}"
-PYTHON_NATIVE_LIBS_SRC="${PYTHON_NATIVE_LIBS_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_numpy/libs/arm64-v8a}"
-PYTHON_NATIVE_LIBS_FALLBACK_SRC="${PYTHON_NATIVE_LIBS_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/unnamed_dist_1/libs/arm64-v8a}"
+PYTHON_BUNDLE_SRC="${PYTHON_BUNDLE_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_hermes/_python_bundle__arm64-v8a/_python_bundle}"
+PYTHON_BUNDLE_FALLBACK_SRC="${PYTHON_BUNDLE_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_numpy/_python_bundle__arm64-v8a/_python_bundle}"
+PYTHON_NATIVE_LIBS_SRC="${PYTHON_NATIVE_LIBS_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_hermes/_python_bundle__arm64-v8a/libs/arm64-v8a}"
+PYTHON_NATIVE_LIBS_FALLBACK_SRC="${PYTHON_NATIVE_LIBS_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_numpy/libs/arm64-v8a}"
 PYTHON_SRC="${PYTHON_SRC:-${WORKSPACE_ROOT}/remotemedia-sdk/clients/python}"
 PYTHON_SRC_STAGING_LOCAL="${PYTHON_SRC_STAGING_LOCAL:-/tmp/remotemedia-inprocess-python-src}"
 PYTHON_STAGING_PATH="${PYTHON_STAGING_PATH:-/data/local/tmp/remotemedia-inprocess-python}"
@@ -638,6 +639,22 @@ copy_python_to_device() {
     rm -rf "$PYTHON_SRC_STAGING_LOCAL"
     mkdir -p "$PYTHON_SRC_STAGING_LOCAL"
     cp -aL "$PYTHON_SRC"/. "$PYTHON_SRC_STAGING_LOCAL"/
+    
+    # Also stage Hermes Agent source for in-process imports
+    log "Staging Hermes Agent source for in-process imports..."
+    HERMES_SRC="${WORKSPACE_ROOT}/hermes-agent"
+    if [[ -d "$HERMES_SRC" ]]; then
+        # Copy the hermes_agent package directory
+        cp -aL "$HERMES_SRC" "$PYTHON_SRC_STAGING_LOCAL/hermes_agent"
+        # Copy all root-level Python files so absolute imports work
+        cp "$HERMES_SRC"/*.py "$PYTHON_SRC_STAGING_LOCAL/" 2>/dev/null || true
+        # Copy entire agent directory (already in hermes_agent/agent but ensure root-level agent imports work)
+        cp -aL "$HERMES_SRC/agent" "$PYTHON_SRC_STAGING_LOCAL/" 2>/dev/null || true
+        cp -aL "$HERMES_SRC/tools" "$PYTHON_SRC_STAGING_LOCAL/" 2>/dev/null || true
+        success "Hermes Agent source staged at $PYTHON_SRC_STAGING_LOCAL/"
+    else
+        warn "Hermes Agent source not found at $HERMES_SRC - imports will fail"
+    fi
     cat > "$PYTHON_SRC_STAGING_LOCAL/remotemedia/__init__.py" <<'PY'
 """
 Android in-process staging initializer.
@@ -885,6 +902,58 @@ class DataSinkNode:
 
     def process_streaming(self, data):
         yield self.process(data)
+
+
+class HermesAgentTestPlugin:
+    """Test plugin to verify Hermes Agent imports work in-process on Android."""
+    
+    def initialize(self, config):
+        self.config = dict(config or {})
+        self.imports_ok = False
+        self.import_error = ""
+        self.imported_modules = []
+        try:
+            # Test core Hermes Agent imports (with hermes_agent prefix since source is in hermes_agent/ dir)
+            from hermes_agent.run_agent import AIAgent
+            self.imported_modules.append("hermes_agent.run_agent.AIAgent")
+            
+            from hermes_agent.agent.conversation_loop import run_conversation_loop
+            self.imported_modules.append("hermes_agent.agent.conversation_loop.run_conversation_loop")
+            
+            from hermes_agent.model_tools import get_tool_definitions, handle_function_call
+            self.imported_modules.append("hermes_agent.model_tools.get_tool_definitions")
+            self.imported_modules.append("hermes_agent.model_tools.handle_function_call")
+            
+            from hermes_agent.tools.registry import get_tool_definitions as get_registry_tools
+            self.imported_modules.append("hermes_agent.tools.registry.get_tool_definitions")
+            
+            self.imports_ok = True
+            print(f"HermesAgentTestPlugin imports OK: {self.imported_modules}", flush=True)
+        except ImportError as e:
+            self.imports_ok = False
+            self.import_error = str(e)
+            print(f"HermesAgentTestPlugin import failed: {e}", flush=True)
+    
+    def process(self, data):
+        if self.imports_ok:
+            return {
+                "data_type": "text",
+                "text": "Hermes Agent imports: OK",
+                "modules": self.imported_modules,
+            }
+        else:
+            return {
+                "data_type": "text",
+                "text": f"Hermes Agent imports: FAILED - {self.import_error}",
+                "error": self.import_error,
+            }
+    
+    def process_streaming(self, data):
+        yield self.process(data)
+    
+    def finalize(self):
+        return True
+
 PY
 
     adb -s "$DEVICE_ADDRESS" shell "rm -rf '$PYTHON_STAGING_PATH' && mkdir -p '$PYTHON_STAGING_PATH'"
@@ -896,14 +965,170 @@ PY
     adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp -R "$PYTHON_STAGING_PATH/bundle" files/python/bundle
     adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp -R "$PYTHON_STAGING_PATH/src" files/python/src
 
-    adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'ls -lh files/python/bundle/stdlib.zip && ls -ld files/python/bundle/modules files/python/bundle/site-packages files/python/src/remotemedia/nodes && test -d files/python/bundle/site-packages/numpy && test -f files/python/src/remotemedia/nodes/ml/whisper_stt.py && test -f files/python/src/remotemedia/nodes/tts.py'" || {
+    # Copy libpythonbin.so and all required .so libraries to the bundle directory so python3 wrapper can find them
+    # The libraries are in the p4a distro's libs/arm64-v8a/ directory (at distro root, not inside _python_bundle__arm64-v8a)
+    local DISTRO_ROOT="${python_bundle_src%%/_python_bundle__arm64-v8a*}"
+    local PYTHON_LIBS_SRC="${DISTRO_ROOT}/libs/arm64-v8a"
+    if [[ -f "$PYTHON_LIBS_SRC/libpythonbin.so" ]]; then
+        log "Copying Python libraries to bundle directory..."
+        # Copy all .so files from the libs directory
+        for lib_file in "$PYTHON_LIBS_SRC"/*.so; do
+            if [[ -f "$lib_file" ]]; then
+                lib_name=$(basename "$lib_file")
+                adb -s "$DEVICE_ADDRESS" push "$lib_file" "/data/local/tmp/$lib_name"
+                adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp "/data/local/tmp/$lib_name" "files/python/bundle/$lib_name"
+                adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess chmod +x "files/python/bundle/$lib_name"
+            fi
+        done
+    fi
+
+    # Verify Python runtime (Hermes Agent source is included in staging)
+    adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'ls -lh files/python/bundle/stdlib.zip && ls -ld files/python/bundle/modules files/python/bundle/site-packages files/python/src/remotemedia/nodes files/python/src/hermes_agent && test -d files/python/bundle/site-packages/numpy && test -f files/python/src/remotemedia/nodes/ml/whisper_stt.py && test -f files/python/src/remotemedia/nodes/tts.py'" || {
         error "Python runtime staging verification failed"
         exit 1
     }
 
-    success "Python runtime staged in app-private files"
+    # Install missing PyPI dependencies on device (PyYAML, etc.)
+    log "Installing missing PyPI dependencies on device (PyYAML, etc.)..."
+    
+    cat > /tmp/python3_wrapper << 'PYEOF'
+#!/system/bin/sh
+# Set LD_LIBRARY_PATH so libpythonbin.so can find libpython3.14.so and other deps
+export LD_LIBRARY_PATH="/data/data/com.remotemedia.inprocess/files/python/bundle:${LD_LIBRARY_PATH}"
+# Set PYTHONHOME so Python can find stdlib.zip (encodings module, etc.)
+export PYTHONHOME="/data/data/com.remotemedia.inprocess/files/python/bundle"
+# Also set PYTHONPATH explicitly
+export PYTHONPATH="/data/data/com.remotemedia.inprocess/files/python/bundle/stdlib.zip:/data/data/com.remotemedia.inprocess/files/python/bundle/modules:/data/data/com.remotemedia.inprocess/files/python/bundle/site-packages"
+# Debug output
+echo "DEBUG: PYTHONHOME=$PYTHONHOME" >&2
+echo "DEBUG: PYTHONPATH=$PYTHONPATH" >&2
+echo "DEBUG: LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >&2
+ls -la "$PYTHONHOME/" >&2
+# Try multiple possible locations for libpythonbin.so
+for libpath in \
+    "/data/data/com.remotemedia.inprocess/lib/libpythonbin.so" \
+    "/data/data/com.remotemedia.inprocess/lib/arm64/libpythonbin.so" \
+    "/data/app/com.remotemedia.inprocess-*/lib/arm64/libpythonbin.so" \
+    "/data/data/com.remotemedia.inprocess/lib/libpython3.14.so" \
+    "/data/app/com.remotemedia.inprocess-*/lib/arm64/libpythonbin.so" \
+    "/data/app/com.remotemedia.inprocess-*/lib/libpythonbin.so" \
+    "/data/app/com.remotemedia.inprocess*/lib/arm64/libpythonbin.so" \
+    "/data/data/com.remotemedia.inprocess/lib/main-*/libpythonbin.so" \
+    "/data/app/~~*/com.remotemedia.inprocess*/lib/arm64/libpythonbin.so" \
+    "/data/app/~~*/com.remotemedia.inprocess*/lib/libpythonbin.so" \
+    "/data/app/~~*/com.remotemedia.inprocess*/lib/pythonbin.so" \
+    "/data/user/0/com.remotemedia.inprocess/lib/arm64/libpythonbin.so" \
+    "/data/data/com.remotemedia.inprocess/lib/libpython3.14.so" \
+    "/data/data/com.remotemedia.inprocess/files/python/bundle/libpythonbin.so" \
+    "/data/data/com.remotemedia.inprocess/files/python/bundle/libpython3.14.so"; do
+    if [ -x "$libpath" ]; then
+        exec "$libpath" "$@"
+    fi
+done
+# Fallback: try to find it using find with wider search
+for libpath in $(find /data/data/com.remotemedia.inprocess -name "libpythonbin.so" -type f 2>/dev/null; find /data/app/com.remotemedia.inprocess* -name "libpythonbin.so" -type f 2>/dev/null; find /data/app/~~* -name "libpythonbin.so" -type f 2>/dev/null; find /data/data/com.remotemedia.inprocess/files -name "libpythonbin.so" -type f 2>/dev/null); do
+    if [ -x "$libpath" ]; then
+        exec "$libpath" "$@"
+    fi
+done
+echo "ERROR: libpythonbin.so not found in any location" >&2
+exit 1
+PYEOF
+    adb -s "$DEVICE_ADDRESS" push /tmp/python3_wrapper /data/local/tmp/python3_wrapper 2>&1
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp /data/local/tmp/python3_wrapper /data/data/com.remotemedia.inprocess/files/python3 2>&1
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess chmod +x /data/data/com.remotemedia.inprocess/files/python3 2>&1
+    # Also copy to bundle directory as python3 for direct invocation
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp /data/local/tmp/python3_wrapper /data/data/com.remotemedia.inprocess/files/python/bundle/python3 2>&1
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess chmod +x /data/data/com.remotemedia.inprocess/files/python/bundle/python3 2>&1
+    rm -f /tmp/python3_wrapper
+    
+
+
+    # Write install script to device using Python to avoid shell escaping issues
+    cat > /tmp/deps_install.py << 'PYEOF'
+import subprocess
+import sys
+import os
+
+env = {
+    **os.environ,
+    "PYTHONPATH": "/data/data/com.remotemedia.inprocess/files/python/bundle/site-packages:/data/data/com.remotemedia.inprocess/files/python/bundle/modules:/data/data/com.remotemedia.inprocess/files/python/src",
+    "PYTHONHOME": "/data/data/com.remotemedia.inprocess/files/python/bundle",
+    "PATH": "/data/data/com.remotemedia.inprocess/files/python/bundle:/system/bin:/vendor/bin",
+    "TMPDIR": "/data/data/com.remotemedia.inprocess/files/tmp",
+    "TMP": "/data/data/com.remotemedia.inprocess/files/tmp",
+    "TEMP": "/data/data/com.remotemedia.inprocess/files/tmp",
+    "PIP_CACHE_DIR": "/data/data/com.remotemedia.inprocess/files/tmp/pip-cache",
+    "PIP_NO_CACHE_DIR": "1",
+    "HOME": "/data/data/com.remotemedia.inprocess/files",
+    "XDG_CACHE_HOME": "/data/data/com.remotemedia.inprocess/files/tmp",
 }
 
+# First, bootstrap pip using get-pip.py (p4a doesn't include ensurepip)
+print("Bootstrapping pip with get-pip.py...", flush=True)
+get_pip_path = "/data/local/tmp/get-pip.py"
+
+# Run get-pip.py
+result = subprocess.run([
+    "/data/data/com.remotemedia.inprocess/files/python/bundle/python3",
+    get_pip_path
+], env=env, capture_output=True, text=True, timeout=120)
+print(f"get-pip.py stdout: {result.stdout}", flush=True)
+print(f"get-pip.py stderr: {result.stderr}", flush=True)
+print(f"get-pip.py returncode: {result.returncode}", flush=True)
+
+if result.returncode != 0:
+    print("Failed to bootstrap pip", flush=True)
+    sys.exit(result.returncode)
+
+# Then install pip packages
+packages = [
+    "PyYAML==6.0.3",
+    "requests==2.33.0",
+    "urllib3==2.2.0",
+    "charset-normalizer==3.3.0",
+    "idna==3.6",
+    "certifi==2024.2.2",
+    "pydantic==2.13.4",
+    "pydantic-core==2.18.4",
+    "typing-extensions==4.11.0",
+    "annotated-types==0.7.0",
+    "python-dotenv==1.2.2",
+]
+
+print("Installing pip packages...", flush=True)
+result = subprocess.run([
+    "/data/data/com.remotemedia.inprocess/files/python/bundle/python3",
+    "-m", "pip", "install", "--timeout", "300"
+] + packages, env=env, capture_output=True, text=True, timeout=300)
+print(f"pip install stdout: {result.stdout}", flush=True)
+print(f"pip install stderr: {result.stderr}", flush=True)
+print(f"pip install returncode: {result.returncode}", flush=True)
+
+sys.exit(result.returncode)
+PYEOF
+    adb -s "$DEVICE_ADDRESS" push /tmp/deps_install.py /data/local/tmp/deps_install.py 2>&1
+    rm -f /tmp/deps_install.py
+    
+    # Execute the Python install script via run-as - run from /data/local/tmp 
+    log "Installing PyPI dependencies on device (with ensurepip bootstrap)..."
+    adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'cd /data/local/tmp && PYTHONHOME=/data/data/com.remotemedia.inprocess/files/python/bundle PYTHONPATH=/data/data/com.remotemedia.inprocess/files/python/bundle/stdlib.zip:/data/data/com.remotemedia.inprocess/files/python/bundle/modules:/data/data/com.remotemedia.inprocess/files/python/bundle/site-packages /data/data/com.remotemedia.inprocess/files/python/bundle/python3 /data/local/tmp/deps_install.py 2>&1'" | tail -50
+    
+    # Verify PyYAML is importable
+    log "Verifying PyYAML installation..."
+    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess sh -c '
+        export PYTHONPATH="/data/data/com.remotemedia.inprocess/files/python/bundle/site-packages:/data/data/com.remotemedia.inprocess/files/python/bundle/modules:/data/data/com.remotemedia.inprocess/files/python/src"
+        export PYTHONHOME="/data/data/com.remotemedia.inprocess/files/python/bundle"
+        export PATH="/data/data/com.remotemedia.inprocess/files/python/bundle:$PATH"
+        cd /data/data/com.remotemedia.inprocess/files/python/bundle
+        /data/data/com.remotemedia.inprocess/files/python/bundle/python3 -c "import yaml; print(\"PyYAML OK\")" 2>&1
+    ' 2>&1
+    
+    # Clean up
+    adb -s "$DEVICE_ADDRESS" shell rm /data/local/tmp/deps_install.py
+    
+    success "Python runtime staged in app-private files"
+}
 # =============================================================================
 # STEP 7: Run App & Test
 # =============================================================================
