@@ -89,6 +89,17 @@ fn register_android_inprocess_python_nodes() {
             .produces(Vec::<String>::new())
             .with_inprocess(true),
     );
+
+    // Hermes Agent test plugin for verifying in-process imports
+    register_python_node(
+        PythonNodeConfig::new("HermesAgentTestPlugin")
+            .with_python_class("remotemedia.nodes.android_inprocess.HermesAgentTestPlugin")
+            .with_description("Test plugin to verify Hermes Agent imports in-process on Android")
+            .with_category("test")
+            .accepts(["text", "json"])
+            .produces(["text", "json"])
+            .with_inprocess(true),
+    );
 }
 
 /// Initialize the Android logger
@@ -118,7 +129,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
     register_default_python_nodes();
     info!("Registered default Python nodes");
     register_android_inprocess_python_nodes();
-    info!("Registered Android in-process Python nodes: WhisperSTTNode alias, DebugKokoroTTSNode, VADNode, DataSinkNode");
+    info!("Registered Android in-process Python nodes: WhisperSTTNode alias, DebugKokoroTTSNode, VADNode, DataSinkNode, HermesAgentTestPlugin");
 
     let loadable_bundles = load_android_loadable_plugins();
 
@@ -854,6 +865,14 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetA
             "category": "IO",
             "input_types": ["audio"],
             "output_types": [],
+            "parameters": {}
+        }),
+        serde_json::json!({
+            "name": "HermesAgentTestPlugin",
+            "description": "Test plugin to verify Hermes Agent imports in-process on Android",
+            "category": "TEST",
+            "input_types": ["text", "json"],
+            "output_types": ["text", "json"],
             "parameters": {}
         }),
     ];
