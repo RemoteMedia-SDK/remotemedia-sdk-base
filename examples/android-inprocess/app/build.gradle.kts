@@ -1,7 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.serialization") version "1.9.24"
+    id("org.jetbrains.kotlin.plugin.serialization")
 }
 
 android {
@@ -63,8 +63,9 @@ android {
         jniLibs {
             useLegacyPackaging = true
         }
-        doNotStrip.add("**/libremotemedia_android_inprocess.so")
-        doNotStrip.add("**/libpython3.11.so")
+        // Native libs are now provided by kotlin-android library
+        // doNotStrip.add("**/libremotemedia_android_inprocess.so")
+        // doNotStrip.add("**/libpython3.11.so")
     }
 
     externalNativeBuild {
@@ -96,6 +97,9 @@ dependencies {
 
     // Logging
     implementation("com.jakewharton.timber:timber:5.0.1")
+
+    // RemoteMedia Kotlin Android library (local dependency)
+    implementation(project(":kotlin-android"))
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

@@ -2,6 +2,7 @@ package com.remotemedia.inprocess
 
 import android.app.Application
 import android.content.Context
+import com.remotemedia.android.NativeInterface
 import com.remotemedia.inprocess.BuildConfig
 import timber.log.Timber
 

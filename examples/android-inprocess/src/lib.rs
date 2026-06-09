@@ -106,7 +106,7 @@ fn register_android_inprocess_python_nodes() {
 
 /// Initialize the Android logger
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_initLogger(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_initLogger(
     _env: JNIEnv,
     _class: JClass,
 ) {
@@ -120,7 +120,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_initLogger
 
 /// Initialize the Python runtime and create a pipeline executor
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCreateExecutor(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeCreateExecutor(
     mut _env: JNIEnv,
     _class: JClass,
 ) -> jlong {
@@ -234,7 +234,7 @@ fn load_android_loadable_plugins() -> Vec<LoadableNodeBundle> {
 
 /// Clean up the executor
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeDestroyExecutor(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeDestroyExecutor(
     _env: JNIEnv,
     _class: JClass,
     executor_ptr: jlong,
@@ -250,7 +250,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeDest
 
 /// Create a streaming session from a manifest
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCreateSession(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeCreateSession(
     mut env: JNIEnv,
     _class: JClass,
     executor_ptr: jlong,
@@ -506,7 +506,7 @@ fn describe_android_runtime_data(data: &RuntimeData) -> String {
 
 /// Test Python initialization and import visibility for Android debugging.
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeTestPythonNode(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeTestPythonNode(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -543,7 +543,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeTest
 
 /// Send text input to the session
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeSendInputText(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeSendInputText(
     mut env: JNIEnv,
     _class: JClass,
     session_ptr: jlong,
@@ -581,7 +581,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeSend
 
 /// Send audio samples (PCM 16-bit) to the session
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeSendInputAudio(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeSendInputAudio(
     env: JNIEnv,
     _class: JClass,
     session_ptr: jlong,
@@ -647,7 +647,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeSend
 
 /// Receive output from the session (blocks until output is available or channel is closed)
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeRecvOutput(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeRecvOutput(
     env: JNIEnv,
     _class: JClass,
     session_ptr: jlong,
@@ -685,7 +685,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeRecv
 
 /// Close and destroy a session
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCloseSession(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeCloseSession(
     _env: JNIEnv,
     _class: JClass,
     session_ptr: jlong,
@@ -806,7 +806,7 @@ fn log_path_metadata(label: &str, path: &str) {
 
 /// Get available nodes for UI
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetAvailableNodes(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeGetAvailableNodes(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -892,7 +892,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetA
 
 /// Get full node schema including model sources for a specific node type
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetNodeSchema(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeGetNodeSchema(
     mut env: JNIEnv,
     _class: JClass,
     node_type: JString,
@@ -913,7 +913,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetN
 
 /// Start streaming mode
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeStartStreaming(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeStartStreaming(
     _env: JNIEnv,
     _class: JClass,
     executor_ptr: jlong,
@@ -931,7 +931,7 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeStar
 
 /// Stop streaming
 #[no_mangle]
-pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeStopStreaming(
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeStopStreaming(
     _env: JNIEnv,
     _class: JClass,
     _executor_ptr: jlong,

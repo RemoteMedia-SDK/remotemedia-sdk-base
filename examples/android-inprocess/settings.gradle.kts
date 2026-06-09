@@ -14,3 +14,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = "RemoteMediaAndroidInProcess"
 include(":app")
+include(":kotlin-android")
+project(":kotlin-android").projectDir = file("../../kotlin-android")

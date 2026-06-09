@@ -15,6 +15,11 @@ import androidx.appcompat.widget.AppCompatSpinner
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.remotemedia.android.AudioPlayer
+import com.remotemedia.android.AudioRecorder
+import com.remotemedia.android.ModelDownloader
+import com.remotemedia.android.NativeInterface
+import com.remotemedia.android.PipelineManager
 import com.remotemedia.inprocess.databinding.ActivityMainBinding
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
@@ -201,7 +206,8 @@ class MainActivity : AppCompatActivity() {
             if (audioFramesSeen % 50 == 0) {
                 Log.i(TAG, "Forwarding audio frame $audioFramesSeen (${pcmData.size} bytes)")
             }
-            pipelineManager.sendAudio(pcmData)
+            // Use blocking version since we're in a callback (non-suspend context)
+            pipelineManager.sendAudioBlocking(pcmData)
         }
 
         audioRecorder.onError = { error ->
@@ -867,7 +873,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        pipelineManager.destroy()
+        pipelineManager.destroyBlocking()
         audioRecorder.destroy()
         audioPlayer.destroy()
         binding = null
