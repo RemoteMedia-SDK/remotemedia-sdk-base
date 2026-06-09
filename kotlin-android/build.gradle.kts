@@ -58,6 +58,10 @@ dependencies {
     api("androidx.core:core-ktx:1.12.0")
     api("androidx.annotation:annotation:1.7.0")
 
+    // LiteRT-LM (optional - for LiteRtLmNodeBridge)
+    // Requires Google LiteRT-LM library from maven.google.com or local AAR
+    // api("com.google.ai.edge.litert:litert-lm:0.0.1-nightly")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

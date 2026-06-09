@@ -4,6 +4,7 @@ import android.app.Service
 import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
@@ -11,8 +12,8 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
 
 /**
  * Foreground service for continuous audio processing.
@@ -41,6 +42,10 @@ class AudioProcessingService : Service() {
     private lateinit var player: AudioPlayer
     private lateinit var pipelineManager: PipelineManager
 
+    // Audio focus
+    private var audioManager: AudioManager? = null
+    private var focusListener: AudioManager.OnAudioFocusChangeListener? = null
+
     // Configuration
     private var sampleRate = 16000
     private var outputSampleRate = 24000
@@ -50,9 +55,6 @@ class AudioProcessingService : Service() {
     private var isProcessing = false
     private val processingScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // Audio queue for sending to pipeline
-    private val audioSendQueue = Channel<ByteArray>(10)
-
     inner class LocalBinder : Binder() {
         fun getService(): AudioProcessingService = this@AudioProcessingService
     }
@@ -60,6 +62,9 @@ class AudioProcessingService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+
+        // Request audio focus
+        requestAudioFocus()
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -104,12 +109,16 @@ class AudioProcessingService : Service() {
                     throw IllegalStateException("Failed to load manifest: $manifest")
                 }
 
+                // Ensure models are ready (download if needed)
+                val modelsReady = pipelineManager.ensureModelsReady()
+                if (!modelsReady) {
+                    throw IllegalStateException("Model preparation failed")
+                }
+
                 // Configure audio
                 recorder = AudioRecorder(this@AudioProcessingService)
-                recorder.setFormat(sampleRate, 1, 20)
 
                 player = AudioPlayer(this@AudioProcessingService)
-                player.setInputSampleRate(outputSampleRate)
 
                 // Set up pipeline callbacks
                 pipelineManager.onOutput = { outputJson ->
@@ -128,15 +137,19 @@ class AudioProcessingService : Service() {
                     Log.i(TAG, "Pipeline state: $state")
                 }
 
+                pipelineManager.onModelDownloadProgress = { modelName, downloadedBytes, totalBytes, percent ->
+                    Log.i(TAG, "Model download: $modelName ${percent.toInt()}%")
+                }
+
                 // Start streaming
                 val streamingStarted = pipelineManager.startStreamingBlocking()
                 if (!streamingStarted) {
                     throw IllegalStateException("Failed to start streaming")
                 }
 
-                // Start audio I/O
+                // Set up audio I/O callbacks
                 recorder.onAudioData = { pcmData ->
-                    // Send to pipeline
+                    // Send to pipeline (already resampled to 16kHz by AudioRecorder)
                     pipelineManager.sendAudioBlocking(pcmData, sampleRate, 1)
                 }
 
@@ -160,6 +173,7 @@ class AudioProcessingService : Service() {
                     Log.w(TAG, "Audio underrun")
                 }
 
+                // Start audio I/O (AudioRecorder resamples 48kHz->16kHz, AudioPlayer resamples 24kHz->48kHz)
                 recorder.start()
                 player.start(outputSampleRate)
 
@@ -196,6 +210,7 @@ class AudioProcessingService : Service() {
             player.destroy()
 
             stopForeground(true)
+            abandonAudioFocus()
             stopSelf()
 
             Log.i(TAG, "Audio processing stopped")
@@ -234,6 +249,46 @@ class AudioProcessingService : Service() {
             .setOngoing(true)
             .setShowWhen(false)
             .build()
+    }
+
+    private fun requestAudioFocus() {
+        audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+
+        focusListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+            when (focusChange) {
+                AudioManager.AUDIOFOCUS_LOSS -> {
+                    Log.i(TAG, "Audio focus lost - pausing")
+                    // Could pause pipeline here
+                }
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                    Log.i(TAG, "Audio focus lost transient - pausing")
+                    // Could pause pipeline here
+                }
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                    Log.i(TAG, "Audio focus duck - lowering volume")
+                    // Could lower volume here
+                }
+                AudioManager.AUDIOFOCUS_GAIN -> {
+                    Log.i(TAG, "Audio focus gained - resuming")
+                    // Could resume pipeline here
+                }
+            }
+        }
+
+        val result = audioManager?.requestAudioFocus(
+            focusListener!!,
+            AudioManager.STREAM_VOICE_CALL,
+            AudioManager.AUDIOFOCUS_GAIN
+        )
+
+        if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            Log.w(TAG, "Audio focus not granted")
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        audioManager?.abandonAudioFocus(focusListener!!)
+        focusListener = null
     }
 
     override fun onDestroy() {

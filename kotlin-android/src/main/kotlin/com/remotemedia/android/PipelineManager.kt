@@ -4,6 +4,10 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
@@ -32,10 +36,17 @@ class PipelineManager(private val context: Context) {
     private val sampleRate = 16000
     private val channels = 1
 
+    // Model downloader for fetching models not in APK
+    private val modelDownloader = ModelDownloader(context)
+
+    // Cache of node type to schema for this manifest resolution
+    private val nodeSchemaCache = mutableMapOf<String, ModelDownloader.NodeSchema>()
+
     // Callbacks (for backward compatibility and simple UI integration)
     var onOutput: ((String) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
     var onStateChange: ((PipelineState) -> Unit)? = null
+    var onModelDownloadProgress: ((String, Long, Long, Double) -> Unit)? = null
 
     // Pipeline configuration
     private var currentManifest: String? = null
@@ -62,9 +73,7 @@ class PipelineManager(private val context: Context) {
             updateState(PipelineState.INITIALIZING)
 
             // Ensure native loadable plugins are extracted to files directory
-            if (!pluginLoaded) {
-                loadNativePlugins()
-            }
+            extractRuntimeAssets()
 
             executorHandle = NativeInterface.nativeCreateExecutor()
             if (executorHandle == 0L) {
@@ -90,27 +99,389 @@ class PipelineManager(private val context: Context) {
     /**
      * Load native plugins from assets to private files directory
      */
-    private fun loadNativePlugins() {
-        loadNativePlugin("plugins/libsilero_vad_loadable_plugin.so", "libsilero_vad_loadable_plugin.so")
-        loadNativePlugin("plugins/libwhisper_loadable_plugin.so", "libwhisper_loadable_plugin.so")
-        loadNativePlugin("plugins/liblitert_lm_loadable_plugin.so", "liblitert_lm_loadable_plugin.so")
-        loadNativePlugin("plugins/libmisaki_g2p_plugin.so", "libmisaki_g2p_plugin.so")
-        loadNativePlugin("plugins/libkokoro_onnx_plugin.so", "libkokoro_onnx_plugin.so")
+    private fun extractRuntimeAssets() {
+        if (pluginLoaded) {
+            Log.i(TAG, "Runtime assets already extracted")
+            return
+        }
+
+        // Native loadable plugins: assets/plugins/*.so -> files/*.so
+        extractAssetFile(
+            assetPath = "plugins/libsilero_vad_loadable_plugin.so",
+            destFile = File(context.filesDir, "libsilero_vad_loadable_plugin.so")
+        )
+        extractAssetFile(
+            assetPath = "plugins/libwhisper_loadable_plugin.so",
+            destFile = File(context.filesDir, "libwhisper_loadable_plugin.so")
+        )
+        extractAssetFile(
+            assetPath = "plugins/liblitert_lm_loadable_plugin.so",
+            destFile = File(context.filesDir, "liblitert_lm_loadable_plugin.so")
+        )
+        extractAssetFile(
+            assetPath = "plugins/libmisaki_g2p_plugin.so",
+            destFile = File(context.filesDir, "libmisaki_g2p_plugin.so")
+        )
+        extractAssetFile(
+            assetPath = "plugins/libkokoro_onnx_plugin.so",
+            destFile = File(context.filesDir, "libkokoro_onnx_plugin.so")
+        )
+
+        // Python runtime: assets/python-runtimes/hermes/... -> files/python/...
+        extractAssetTree(
+            assetPath = "python-runtimes/hermes/bundle",
+            destDir = File(context.filesDir, "python/bundle")
+        )
+        extractAssetTree(
+            assetPath = "python-runtimes/hermes/src",
+            destDir = File(context.filesDir, "python/src")
+        )
+
+        // Small/model support assets: assets/models/... -> files/models/...
+        extractAssetTree(
+            assetPath = "models/silero-vad",
+            destDir = File(context.filesDir, "models/silero-vad")
+        )
+        extractAssetTree(
+            assetPath = "models/whisper",
+            destDir = File(context.filesDir, "models/whisper")
+        )
+        extractAssetTree(
+            assetPath = "models/kokoro",
+            destDir = File(context.filesDir, "models/kokoro")
+        )
+        extractAssetTree(
+            assetPath = "models/misaki-g2p",
+            destDir = File(context.filesDir, "models/misaki-g2p")
+        )
+
+        File(context.filesDir, "cache/litert-lm").mkdirs()
+
         pluginLoaded = true
+        Log.i(TAG, "Runtime assets extracted")
     }
 
-    private fun loadNativePlugin(assetPath: String, fileName: String) {
+    private fun extractAssetFile(assetPath: String, destFile: File) {
         try {
-            val pluginFile = File(context.filesDir, fileName)
-            Log.i(TAG, "Extracting native plugin from assets: $assetPath")
+            destFile.parentFile?.mkdirs()
+
+            Log.i(TAG, "Extracting asset file: $assetPath -> ${destFile.absolutePath}")
             context.assets.open(assetPath).use { inputStream ->
-                FileOutputStream(pluginFile).use { outputStream ->
+                FileOutputStream(destFile).use { outputStream ->
                     inputStream.copyTo(outputStream)
                 }
             }
-            Log.i(TAG, "Plugin extracted to: ${pluginFile.absolutePath}")
+
+            // Plugin .so files loaded via dlopen need executable/readable mode.
+            destFile.setReadable(true, true)
+            destFile.setExecutable(true, true)
+
+            Log.i(TAG, "Extracted asset file: ${destFile.absolutePath}")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to extract native plugin: $assetPath", e)
+            Log.e(TAG, "Failed to extract asset file: $assetPath", e)
+            throw e
+        }
+    }
+
+    private fun extractAssetTree(assetPath: String, destDir: File) {
+        val children = try {
+            context.assets.list(assetPath)?.toList().orEmpty()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to list asset directory: $assetPath", e)
+            throw e
+        }
+
+        if (children.isEmpty()) {
+            // AssetManager returns an empty list for files.
+            extractAssetFile(assetPath, destDir)
+            return
+        }
+
+        destDir.mkdirs()
+
+        for (child in children) {
+            val childAssetPath = "$assetPath/$child"
+            val childDest = File(destDir, child)
+
+            val grandChildren = try {
+                context.assets.list(childAssetPath)?.toList().orEmpty()
+            } catch (_: Exception) {
+                emptyList()
+            }
+
+            if (grandChildren.isEmpty()) {
+                extractAssetFile(childAssetPath, childDest)
+            } else {
+                extractAssetTree(childAssetPath, childDest)
+            }
+        }
+    }
+
+    /** Legacy alias for backwards compatibility */
+    @Deprecated("Use extractRuntimeAssets() instead", ReplaceWith("extractRuntimeAssets()"))
+    private fun loadNativePlugins() {
+        extractRuntimeAssets()
+    }
+
+    /**
+     * Resolve model paths in the manifest, downloading any models that aren't cached locally.
+     * This fetches each node's schema (which declares model_sources) and ensures
+     * all required models are downloaded, rewriting paths in the manifest.
+     */
+    private suspend fun resolveAndDownloadModels(manifestJson: String): String {
+        return try {
+            val json = Json { ignoreUnknownKeys = true }
+                .decodeFromString(JsonElement.serializer(), manifestJson)
+
+            val jsonObject = json as? JsonObject ?: return manifestJson
+
+            val nodesElement = jsonObject["nodes"]
+            if (nodesElement !is JsonArray) return manifestJson
+
+            val updatedNodes = mutableListOf<JsonElement>()
+            nodeSchemaCache.clear()
+
+            for (nodeElement in nodesElement) {
+                val nodeObj = nodeElement as? JsonObject
+                if (nodeObj == null) {
+                    updatedNodes.add(nodeElement)
+                    continue
+                }
+
+                val nodeType = nodeObj["node_type"]?.let { (it as JsonPrimitive).content }
+                val nodeId = nodeObj["id"]?.let { (it as JsonPrimitive).content } ?: "unknown"
+
+                val paramsElement = nodeObj["params"]
+                if (paramsElement !is JsonObject) {
+                    updatedNodes.add(nodeElement)
+                    continue
+                }
+
+                val paramsObj = paramsElement
+                val updatedParams = paramsObj.toMutableMap()
+
+                // Fetch node schema if we have a node_type
+                nodeType?.let { type ->
+                    if (!nodeSchemaCache.containsKey(type)) {
+                        val schema = runBlocking {
+                            modelDownloader.getNodeSchema(type)
+                        }
+                        schema?.let { nodeSchemaCache[type] = it }
+                    }
+                }
+
+                // Download all models declared in the node's schema
+                nodeType?.let { type ->
+                    nodeSchemaCache[type]?.modelSources?.files?.forEach { source ->
+                        if (!source.required) return@forEach // skip optional for now, they're handled by model_sources in manifest
+
+                        val localPath = File(context.filesDir, "models/${source.path}").absolutePath
+                        val expectedPath = File(context.filesDir, "models/${source.path}")
+
+                        // If model already exists at expected path, use it
+                        if (expectedPath.exists() && expectedPath.length() > 0) {
+                            // Rewrite any param field matching the declared path
+                            updatedParams.forEach { (key, value) ->
+                                val s = (value as? JsonPrimitive)?.content ?: return@forEach
+                                if (s.contains(source.path) || s.contains(source.filename)) {
+                                    updatedParams[key] = JsonPrimitive(localPath)
+                                }
+                            }
+                            return@forEach
+                        }
+
+                        // Download the model
+                        updateState(PipelineState.INITIALIZING)
+                        val listener = object : ModelDownloader.DownloadProgressListener {
+                            override fun onProgress(modelName: String, downloadedBytes: Long, totalBytes: Long, percent: Double) {
+                                scope.launch(Dispatchers.Main) {
+                                    onModelDownloadProgress?.invoke(modelName, downloadedBytes, totalBytes, percent)
+                                }
+                            }
+                            override fun onCompleted(modelName: String, localPath: String) {}
+                            override fun onError(modelName: String, error: String) {}
+                        }
+
+                        val result = runBlocking {
+                            modelDownloader.ensureModelDownloaded(source, listener)
+                        }
+
+                        when (result) {
+                            is Result.Success -> {
+                                val downloadedPath = result.getOrNull()!!
+                                Log.i(TAG, "Model resolved to local path: $downloadedPath")
+                                // Rewrite any param field matching the declared path
+                                updatedParams.forEach { (key, value) ->
+                                    val s = (value as? JsonPrimitive)?.content ?: return@forEach
+                                    if (s.contains(source.path) || s.contains(source.filename)) {
+                                        updatedParams[key] = JsonPrimitive(downloadedPath)
+                                    }
+                                }
+                            }
+                            is Result.Failure -> {
+                                val error = result.getExceptionOrNull()?.message ?: "Unknown download error"
+                                Log.e(TAG, "Failed to download model: ${source.filename} - $error")
+                                if (source.required) {
+                                    throw IllegalStateException("Required model download failed: ${source.filename} - $error")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Also check for model_path parameter (legacy support)
+                paramsObj["model_path"]?.let { modelPathElement ->
+                    val modelPath = (modelPathElement as? JsonPrimitive)?.content
+                    if (modelPath != null && modelPath.isNotEmpty()) {
+                        val fileName = File(modelPath).name
+                        // Check if we already downloaded it via schema
+                        val alreadyHandled = nodeType?.let { type ->
+                            nodeSchemaCache[type]?.modelSources?.files?.any { it.filename == fileName } ?: false
+                        } ?: false
+
+                        if (!alreadyHandled) {
+                            // Try legacy lookup by filename
+                            val listener = object : ModelDownloader.DownloadProgressListener {
+                                override fun onProgress(modelName: String, downloadedBytes: Long, totalBytes: Long, percent: Double) {
+                                    scope.launch(Dispatchers.Main) {
+                                        onModelDownloadProgress?.invoke(modelName, downloadedBytes, totalBytes, percent)
+                                    }
+                                }
+                                override fun onCompleted(modelName: String, localPath: String) {}
+                                override fun onError(modelName: String, error: String) {}
+                            }
+
+                            val result = runBlocking {
+                                modelDownloader.ensureModelDownloaded(fileName, listener)
+                            }
+
+                            when (result) {
+                                is Result.Success -> {
+                                    val localPath = result.getOrNull()!!
+                                    Log.i(TAG, "Model resolved to local path: $localPath")
+                                    updatedParams["model_path"] = JsonPrimitive(localPath)
+                                }
+                                is Result.Failure -> {
+                                    val error = result.getExceptionOrNull()?.message ?: "Unknown download error"
+                                    Log.e(TAG, "Failed to download model: $fileName - $error")
+                                    throw IllegalStateException("Model download failed: $fileName - $error")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Also check for cache_dir that might need updating
+                paramsObj["cache_dir"]?.let { cacheDirElement ->
+                    val cacheDir = (cacheDirElement as? JsonPrimitive)?.content
+                    if (cacheDir != null && cacheDir.contains("cache/litert-lm")) {
+                        // Ensure cache directory exists
+                        File(cacheDir).mkdirs()
+                    }
+                }
+
+                // Metadata-driven resolution: inspect params["model_sources"] and
+                // download/rewrite declared files when they are missing locally.
+                paramsObj["model_sources"]?.let { modelSourcesElement ->
+                    val filesElement = (modelSourcesElement as? JsonObject)?.get("files")
+                    if (filesElement is JsonArray) {
+                        for (fileElement in filesElement) {
+                            val fileObj = fileElement as? JsonObject ?: continue
+                            val pathStr = (fileObj.get("path") as? JsonPrimitive)?.content ?: continue
+                            if (pathStr.isEmpty()) continue
+
+                            val filename = (fileObj.get("filename") as? JsonPrimitive)?.content ?: File(pathStr).name
+                            val required = (fileObj.get("required") as? JsonPrimitive)?.content?.toBooleanStrictOrNull() ?: true
+
+                            // Already present: nothing to do.
+                            if (File(pathStr).exists()) continue
+
+                            // Try to find in schema
+                            val schemaSource = nodeType?.let { type ->
+                                nodeSchemaCache[type]?.modelSources?.files?.find { it.filename == filename }
+                            } ?: null
+
+                            if (schemaSource != null) {
+                                val listener = object : ModelDownloader.DownloadProgressListener {
+                                    override fun onProgress(modelName: String, downloadedBytes: Long, totalBytes: Long, percent: Double) {
+                                        scope.launch(Dispatchers.Main) {
+                                            onModelDownloadProgress?.invoke(modelName, downloadedBytes, totalBytes, percent)
+                                        }
+                                    }
+                                    override fun onCompleted(modelName: String, localPath: String) {}
+                                    override fun onError(modelName: String, error: String) {}
+                                }
+
+                                val result = runBlocking {
+                                    modelDownloader.ensureModelDownloaded(schemaSource, listener)
+                                }
+
+                                when (result) {
+                                    is Result.Success -> {
+                                        val localPath = result.getOrNull()!!
+                                        Log.i(TAG, "Resolved model_sources file '$filename' to local path: $localPath")
+
+                                        // Rewrite any param field whose string value matches the declared path.
+                                        for ((key, value) in updatedParams) {
+                                            val s = (value as? JsonPrimitive)?.content ?: continue
+                                            if (s == pathStr) {
+                                                updatedParams[key] = JsonPrimitive(localPath)
+                                            }
+                                        }
+                                    }
+                                    is Result.Failure -> {
+                                        val error = result.getExceptionOrNull()?.message ?: "Unknown download error"
+                                        if (required) {
+                                            Log.e(TAG, "Failed to download required model: $filename - $error")
+                                            throw IllegalStateException("Model download failed: $filename - $error")
+                                        } else {
+                                            Log.w(TAG, "Optional model missing, skipping: $filename - $error")
+                                        }
+                                    }
+                                }
+                            } else if (required) {
+                                Log.w(TAG, "Required model has no registered downloader: $filename at $pathStr")
+                            }
+                        }
+                    }
+                }
+
+                // Rebuild node with updated params using JsonObject builder
+                val updatedNode = nodeObj.toMutableMap().apply {
+                    put("params", JsonObject(updatedParams))
+                }
+                updatedNodes.add(JsonObject(updatedNode))
+            }
+
+            // Rebuild manifest with updated nodes
+            val updatedManifest = (jsonObject as JsonObject).toMutableMap().apply {
+                put("nodes", JsonArray(updatedNodes))
+            }
+
+            return Json { prettyPrint = true }.encodeToString(JsonElement.serializer(), JsonObject(updatedManifest))
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to resolve model paths", e)
+            throw e
+        }
+    }
+
+    /**
+     * Ensure all models in the current manifest are downloaded and paths resolved.
+     * Call this after loading a manifest and before executing.
+     */
+    suspend fun ensureModelsReady(): Boolean {
+        if (currentManifest == null) {
+            onError?.invoke("No manifest loaded")
+            return false
+        }
+
+        try {
+            currentManifest = resolveAndDownloadModels(currentManifest!!)
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to ensure models ready", e)
+            onError?.invoke("Model preparation failed: ${e.message}")
+            return false
         }
     }
 
@@ -153,6 +524,11 @@ class PipelineManager(private val context: Context) {
             return@withContext null
         }
 
+        // Ensure models are ready before execution
+        if (!ensureModelsReady()) {
+            return@withContext null
+        }
+
         updateState(PipelineState.RUNNING)
 
         try {
@@ -189,6 +565,11 @@ class PipelineManager(private val context: Context) {
         if (isStreaming.get()) {
             Log.w(TAG, "Already streaming")
             return@withContext true
+        }
+
+        // Ensure models are ready before starting streaming
+        if (!ensureModelsReady()) {
+            return@withContext false
         }
 
         try {

@@ -65,6 +65,10 @@ object NativeInterface {
     @JvmStatic
     external fun nativeGetAvailableNodes(): String
 
+    // Get full node schema (including model sources) for a specific node type
+    @JvmStatic
+    external fun nativeGetNodeSchema(nodeType: String): String
+
     // Start streaming mode
     @JvmStatic
     external fun nativeStartStreaming(handle: Long): Boolean
@@ -73,7 +77,7 @@ object NativeInterface {
     @JvmStatic
     external fun nativeStopStreaming(handle: Long): Boolean
 
-        // LiteRT-LM Kotlin node bridge
+    // LiteRT-LM Kotlin node bridge
     @JvmStatic
     external fun nativeCreateLiteRtNode(
         executorHandle: Long,
@@ -119,3 +123,16 @@ fun parseAvailableNodes(json: String): List<NodeInfo> {
         emptyList()
     }
 }
+
+/** Exception thrown by native operations */
+class NativeException(message: String) : RuntimeException(message)
+
+/** Pipeline node information for UI */
+data class NodeInfo(
+    val name: String,
+    val description: String,
+    val category: String, // "STT", "LLM", "TTS", "VAD", "UTILITY"
+    val inputTypes: List<String>,
+    val outputTypes: List<String>,
+    val parameters: Map<String, Any>
+)

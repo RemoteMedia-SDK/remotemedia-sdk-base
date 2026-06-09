@@ -7,221 +7,272 @@ import android.media.AudioTrack
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.SendChannel
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
-/**
- * Low-latency audio player using AudioTrack.
- * Plays PCM16 audio with configurable sample rate, handles resampling from pipeline output rates.
+/** Low-latency audio player using AudioTrack.
+ * Plays 48kHz mono PCM16, handles resampling from 24kHz (Kokoro) or 16kHz.
  */
 class AudioPlayer(private val context: Context) {
 
     companion object {
         private const val TAG = "AudioPlayer"
-        private const val DEFAULT_BUFFER_FRAMES = 5
-        private const val DEFAULT_OUTPUT_SAMPLE_RATE = 48000
     }
 
-    enum class State {
-        IDLE,
-        PLAYING,
-        ERROR
-    }
+    // Audio configuration
+    private val outputSampleRate = 48000  // Device playback rate
+    private val channelConfig = AudioFormat.CHANNEL_OUT_MONO
+    private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+    private val frameSizeMs = 20  // 20ms frames
+    private val outputFrameSize = outputSampleRate * frameSizeMs / 1000  // 960 samples
 
-    // Configuration
-    private var inputSampleRate = 24000 // Default for Kokoro TTS
-    private var outputSampleRate = DEFAULT_OUTPUT_SAMPLE_RATE
-    private var channels = 1
-
-    // AudioTrack
+    // State
     private var audioTrack: AudioTrack? = null
+    private var isPlaying = false
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var playJob: Job? = null
 
-    // Audio queue
-    private val audioQueue = Channel<ByteArray>(DEFAULT_BUFFER_FRAMES * 2)
+    // Input channel for audio data to play
+    private var audioChannel = Channel<ByteArray>(capacity = 100)
+
+    // Resample ratios
+    private var inputSampleRate = 24000  // Default Kokoro sample rate
 
     // Callbacks
     var onError: ((String) -> Unit)? = null
-    var onStateChange: ((State) -> Unit)? = null
+    var onStateChange: ((PlaybackState) -> Unit)? = null
     var onUnderrun: (() -> Unit)? = null
 
-    // Internal state
-    private var currentState = State.IDLE
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var isPlaying = false
-
-    /**
-     * Configure audio format (call before start)
-     * @param inputSampleRate Sample rate of incoming audio (e.g., 16000 for Whisper, 24000 for Kokoro)
-     */
-    fun setInputSampleRate(inputSampleRate: Int) {
-        require(inputSampleRate in 8000..48000) { "Input sample rate must be 8000-48000 Hz" }
-        this.inputSampleRate = inputSampleRate
+    enum class PlaybackState {
+        IDLE,
+        STARTING,
+        PLAYING,
+        STOPPING,
+        STOPPED,
+        ERROR
     }
 
     /**
-     * Start playback
-     * @param inputSampleRate Sample rate of audio that will be enqueued
+     * Initialize and start playback
      */
-    fun start(inputSampleRate: Int = this.inputSampleRate) {
-        if (currentState == State.PLAYING) {
+    fun start(inputSampleRate: Int = 24000): Boolean {
+        if (isPlaying) {
             Log.w(TAG, "Already playing")
-            return
+            return true
         }
 
+        audioChannel = Channel(capacity = 100)
         this.inputSampleRate = inputSampleRate
+        updateState(PlaybackState.STARTING)
 
-        scope.launch {
-            try {
-                updateState(State.PLAYING)
+        return try {
+            // Calculate buffer size
+            val minBufferSize = AudioTrack.getMinBufferSize(
+                outputSampleRate,
+                channelConfig,
+                audioFormat
+            )
 
-                val bufferSize = AudioTrack.getMinBufferSize(outputSampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT)
-                if (bufferSize == AudioTrack.ERROR || bufferSize == AudioTrack.ERROR_BAD_VALUE) {
-                    throw IllegalStateException("Invalid audio parameters")
-                }
-
-                val audioAttributes = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-
-                val audioFormat = AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(outputSampleRate)
-                    .setChannelMask(channelConfig)
-                    .build()
-
-                audioTrack = AudioTrack.Builder()
-                    .setAudioAttributes(audioAttributes)
-                    .setAudioFormat(audioFormat)
-                    .setBufferSizeInBytes(bufferSize)
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build()
-
-                if (audioTrack!!.state != AudioTrack.STATE_INITIALIZED) {
-                    throw IllegalStateException("AudioTrack initialization failed")
-                }
-
-                audioTrack!!.play()
-                isPlaying = true
-
-                // Use buffer size divided by frame size for frames per callback
-                val framesPerCallback = bufferSize / (channels * 2)
-                val bufferSizeBytes = framesPerCallback * channels * 2
-                val buffer = ByteArray(bufferSizeBytes)
-                val silenceBuffer = ByteArray(bufferSizeBytes)
-
-                while (isPlaying) {
-                    var filled = 0
-
-                    // Try to fill buffer from queue
-                    while (filled < bufferSizeBytes) {
-                        val remaining = bufferSizeBytes - filled
-                        val chunk = audioQueue.tryReceive()
-
-                        when {
-                            chunk.isSuccess -> {
-                                val audioData = chunk.getOrNull()
-                                if (audioData != null) {
-                                    val copySize = minOf(audioData.size, remaining)
-                                    audioData.copyInto(buffer, filled, 0, copySize)
-                                    filled += copySize
-
-                                    // If chunk was larger than remaining, put remainder back
-                                    if (audioData.size > copySize) {
-                                        val remainder = audioData.copyOfRange(copySize, audioData.size)
-                                        scope.launch { audioQueue.send(remainder) }
-                                    }
-                                }
-                            }
-                            chunk.isClosed -> {
-                                // Channel closed
-                                break
-                            }
-                            else -> {
-                                // Queue empty - fill with silence (underrun)
-                                if (filled == 0) {
-                                    withContext(Dispatchers.Main) {
-                                        onUnderrun?.invoke()
-                                    }
-                                }
-                                silenceBuffer.copyInto(buffer, filled, 0, remaining)
-                                filled = bufferSizeBytes
-                            }
-                        }
-                    }
-
-                    // Write to AudioTrack
-                    val result = audioTrack!!.write(buffer, 0, bufferSizeBytes, AudioTrack.WRITE_BLOCKING)
-                    if (result < 0) {
-                        Log.e(TAG, "AudioTrack write error: $result")
-                        break
-                    }
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Playback error", e)
-                withContext(Dispatchers.Main) {
-                    onError?.invoke(e.message ?: "Playback failed")
-                    updateState(State.ERROR)
-                }
+            if (minBufferSize == AudioTrack.ERROR || minBufferSize == AudioTrack.ERROR_BAD_VALUE) {
+                throw IllegalStateException("Invalid audio parameters")
             }
+
+            // Use larger buffer for stability (3-5 frames ahead)
+            val bufferSize = maxOf(minBufferSize, outputFrameSize * 5 * 2)
+
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .setFlags(AudioAttributes.FLAG_LOW_LATENCY)
+                .build()
+
+            val audioFormat = android.media.AudioFormat.Builder()
+                .setEncoding(this.audioFormat)
+                .setSampleRate(outputSampleRate)
+                .setChannelMask(channelConfig)
+                .build()
+
+            audioTrack = AudioTrack.Builder()
+                .setAudioAttributes(audioAttributes)
+                .setAudioFormat(audioFormat)
+                .setBufferSizeInBytes(bufferSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+
+            if (audioTrack?.state != AudioTrack.STATE_INITIALIZED) {
+                throw IllegalStateException("AudioTrack initialization failed")
+            }
+
+            audioTrack?.play()
+
+            isPlaying = true
+            updateState(PlaybackState.PLAYING)
+
+            // Start playback loop
+            playJob = scope.launch {
+                playbackLoop()
+            }
+
+            Log.i(TAG, "Playback started at ${outputSampleRate}Hz (input: ${inputSampleRate}Hz)")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start playback", e)
+            updateState(PlaybackState.ERROR)
+            onError?.invoke("Failed to start playback: ${e.message}")
+            cleanup()
+            false
         }
     }
 
     /**
-     * Enqueue PCM16 audio data for playback
-     */
-    fun enqueue(pcmData: ByteArray) {
-        scope.launch {
-            audioQueue.send(pcmData)
-        }
-    }
-
-    /**
-     * Stop playback and clear queue
+     * Stop playback
      */
     fun stop() {
+        if (!isPlaying) return
+
+        updateState(PlaybackState.STOPPING)
         isPlaying = false
+
+        playJob?.cancel()
+        playJob = null
+
+        // Wait a bit for buffer to drain
         scope.launch {
-            try {
-                audioTrack?.stop()
-                audioTrack?.release()
-                audioTrack = null
-            } catch (e: Exception) {
-                Log.e(TAG, "Error stopping player", e)
-            }
-            // Clear queue
-            while (true) {
-                val result = audioQueue.tryReceive()
-                if (result.isClosed || !result.isSuccess) {
-                    break
-                }
-            }
-            updateState(State.IDLE)
+            delay(100)
+            cleanup()
+            updateState(PlaybackState.STOPPED)
+            Log.i(TAG, "Playback stopped")
         }
     }
 
     /**
-     * Release all resources
+     * Queue audio data for playback (resamples from inputSampleRate to outputSampleRate)
+     * @param pcmData PCM16 audio data at inputSampleRate
+     * @return true if queued successfully
      */
+    fun queueAudio(pcmData: ByteArray): Boolean {
+        if (!isPlaying) return false
+
+        try {
+            // Resample if needed
+            val outputData = if (inputSampleRate != outputSampleRate) {
+                resample(pcmData, inputSampleRate, outputSampleRate)
+            } else {
+                pcmData
+            }
+
+            // Non-blocking offer
+            val result = audioChannel.trySend(outputData)
+            if (!result.isSuccess) {
+                Log.w(TAG, "Audio queue rejected ${outputData.size} bytes: ${result.exceptionOrNull()?.message}")
+            }
+            return result.isSuccess
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to queue audio", e)
+            onError?.invoke("Queue audio error: ${e.message}")
+            return false
+        }
+    }
+
+    /**
+     * Send channel for external producers
+     */
+    fun getAudioChannel(): SendChannel<ByteArray> = audioChannel
+
+    /**
+     * Playback loop - reads from channel and writes to AudioTrack
+     */
+    private suspend fun playbackLoop() {
+        val writeBuffer = ByteArray(outputFrameSize * 2)
+
+        while (isPlaying && scope.coroutineContext.isActive) {
+            try {
+                // Try to get data from channel with timeout
+                val data = withTimeoutOrNull(50) {
+                    audioChannel.receive()
+                }
+
+                if (data != null) {
+                    val bytesWritten = audioTrack?.write(data, 0, data.size, AudioTrack.WRITE_BLOCKING)
+
+                    if (bytesWritten != null && bytesWritten < 0) {
+                        Log.e(TAG, "AudioTrack write error: $bytesWritten")
+                        if (bytesWritten == AudioTrack.ERROR_INVALID_OPERATION) {
+                            onUnderrun?.invoke()
+                        }
+                    }
+                } else {
+                    // No data available - write silence to prevent underrun
+                    audioTrack?.write(writeBuffer, 0, writeBuffer.size, AudioTrack.WRITE_NON_BLOCKING)
+                }
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                // Channel receive timeout - write silence
+                audioTrack?.write(writeBuffer, 0, writeBuffer.size, AudioTrack.WRITE_NON_BLOCKING)
+            } catch (e: Exception) {
+                if (isPlaying) {
+                    Log.e(TAG, "Playback loop error", e)
+                    onError?.invoke("Playback error: ${e.message}")
+                }
+                break
+            }
+        }
+    }
+
+    /**
+     * Simple linear interpolation resampler
+     * For production, use rubato or similar high-quality resampler
+     */
+    private fun resample(input: ByteArray, inRate: Int, outRate: Int): ByteArray {
+        val inBuffer = ByteBuffer.wrap(input).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        val inSamples = ShortArray(inBuffer.remaining())
+        inBuffer.get(inSamples)
+        val inLen = input.size / 2
+
+        val ratio = outRate.toDouble() / inRate
+        val outLen = (inLen * ratio).toInt()
+        val outSamples = ShortArray(outLen)
+
+        // Linear interpolation
+        for (i in 0 until outLen) {
+            val srcPos = i / ratio
+            val srcIndex = srcPos.toInt()
+            val frac = srcPos - srcIndex
+
+            if (srcIndex + 1 < inLen) {
+                val s0 = inSamples[srcIndex].toDouble()
+                val s1 = inSamples[srcIndex + 1].toDouble()
+                outSamples[i] = (s0 + (s1 - s0) * frac).toInt().toShort()
+            } else if (srcIndex < inLen) {
+                outSamples[i] = inSamples[srcIndex]
+            }
+        }
+
+        // Convert to bytes
+        val output = ByteArray(outLen * 2)
+        val outBuffer = ByteBuffer.wrap(output).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        outBuffer.put(outSamples)
+
+        return output
+    }
+
+    private fun cleanup() {
+        audioTrack?.stop()
+        audioTrack?.release()
+        audioTrack = null
+        audioChannel.close()
+    }
+
+    private fun updateState(state: PlaybackState) {
+        scope.launch(Dispatchers.Main) {
+            onStateChange?.invoke(state)
+        }
+    }
+
+    fun isPlaying(): Boolean = isPlaying
+
     fun destroy() {
         stop()
         scope.coroutineContext.cancelChildren()
-        onError = null
-        onStateChange = null
-        onUnderrun = null
     }
-
-    private val channelConfig: Int
-        get() = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
-
-    private fun updateState(newState: State) {
-        if (currentState != newState) {
-            currentState = newState
-            scope.launch(Dispatchers.Main) {
-                onStateChange?.invoke(newState)
-            }
-        }
-    }
-
-    fun getCurrentState(): State = currentState
-    fun isActive(): Boolean = currentState == State.PLAYING
 }
