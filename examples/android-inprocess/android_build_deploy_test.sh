@@ -259,9 +259,19 @@ bundle_has_httpx() {
     [[ -f "$bundle/site-packages/httpx/_transports/__init__.py" || -f "$bundle/site-packages/httpx/_transports/__init__.pyc" ]]
 }
 
-find_python_bundle_with_httpx() {
+bundle_has_websockets() {
+    local bundle="$1"
+    [[ -f "$bundle/site-packages/websockets/__init__.py" || -f "$bundle/site-packages/websockets/__init__.pyc" ]]
+}
+
+bundle_has_required_python_modules() {
+    local bundle="$1"
+    bundle_has_httpx "$bundle" && bundle_has_websockets "$bundle"
+}
+
+find_python_bundle_with_required_modules() {
     find_all_python_bundles | while IFS= read -r bundle; do
-        if bundle_has_httpx "$bundle"; then
+        if bundle_has_required_python_modules "$bundle"; then
             echo "$bundle"
             return 0
         fi
@@ -282,12 +292,22 @@ resolve_python_bundle_src() {
         fi
     fi
 
-    if [[ -d "$python_bundle_src" ]] && ! bundle_has_httpx "$python_bundle_src"; then
-        warn "Selected bundle does not contain httpx transport support: $python_bundle_src" >&2
-        if httpx_bundle=$(find_python_bundle_with_httpx); then
-            warn "Switching to bundle with httpx: $httpx_bundle" >&2
-            python_bundle_src="$httpx_bundle"
+    if [[ -d "$python_bundle_src" ]] && ! bundle_has_required_python_modules "$python_bundle_src"; then
+        warn "Selected bundle does not contain required Hermes Python modules (httpx._transports and websockets): $python_bundle_src" >&2
+        if modules_bundle=$(find_python_bundle_with_required_modules); then
+            warn "Switching to bundle with required Hermes Python modules: $modules_bundle" >&2
+            python_bundle_src="$modules_bundle"
+        else
+            error "No available python-for-android bundle contains required Hermes Python modules (httpx._transports and websockets)." >&2
+            warn "Rebuild with build_p4a_hermes_simple.sh after updating requirements-hermes.txt." >&2
+            exit 1
         fi
+    fi
+
+    if [[ -d "$python_bundle_src" ]] && ! bundle_has_required_python_modules "$python_bundle_src"; then
+        error "Resolved bundle still missing required Hermes Python modules: $python_bundle_src" >&2
+        warn "Rebuild with build_p4a_hermes_simple.sh and verify site-packages contains httpx/_transports and websockets." >&2
+        exit 1
     fi
 
     if [[ ! -d "$python_bundle_src" ]]; then

@@ -23,6 +23,7 @@ psutil==7.2.2
 pathspec==1.1.1
 fastapi==0.133.1
 uvicorn[standard]==0.41.0
+websockets
 Pillow==12.2.0
 
 # CLI and cron extras

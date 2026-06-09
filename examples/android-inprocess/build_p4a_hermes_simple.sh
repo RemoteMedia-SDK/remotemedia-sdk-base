@@ -72,6 +72,15 @@ REQUIRED_DISTROS=(
     "urllib3"
     "certifi"
     "pyyaml"
+    "httpx"
+    "httpcore"
+    "websockets"
+)
+
+# Critical module paths that must exist to avoid runtime import failures.
+REQUIRED_MODULE_PATHS=(
+    "httpx/_transports/__init__.py"
+    "websockets/__init__.py"
 )
 
 log "Building python-for-android distro: ${DIST_NAME}"
@@ -159,6 +168,15 @@ verify_required_python_dists() {
             success "Found ${dist}"
         else
             error "Missing required distribution: ${dist}"
+            missing=1
+        fi
+    done
+
+    for rel_path in "${REQUIRED_MODULE_PATHS[@]}"; do
+        if [[ -f "${site_packages}/${rel_path}" || -f "${site_packages}/${rel_path}c" ]]; then
+            success "Found module path ${rel_path}"
+        else
+            error "Missing required module path: ${rel_path}"
             missing=1
         fi
     done
