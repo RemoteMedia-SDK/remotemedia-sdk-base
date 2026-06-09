@@ -172,15 +172,6 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeCrea
             bundle.register_into(&mut registry);
         }
     }
-    {
-        let registry = executor.registry();
-        let mut registry = registry.blocking_write();
-        registry.register(wrap_ffi_factory(
-            litert_lm_loadable_plugin::LiteRtLmGenerationNodeFactory,
-        ));
-    }
-    info!("Registered linked LiteRT-LM factory into executor registry");
-
     info!("Registered Android loadable plugin factories");
 
     // Box and leak the executor to get a raw pointer we can pass to Java
@@ -206,6 +197,10 @@ fn load_android_loadable_plugins() -> Vec<LoadableNodeBundle> {
         (
             "Kokoro ONNX",
             "/data/data/com.remotemedia.inprocess/files/libkokoro_onnx_plugin.so",
+        ),
+        (
+            "LiteRT-LM",
+            "/data/data/com.remotemedia.inprocess/files/liblitert_lm_loadable_plugin.so",
         ),
     ];
     let mut bundles = Vec::new();
@@ -463,10 +458,6 @@ fn spawn_android_runtime_heartbeat(rt: &tokio::runtime::Runtime, session_id: Str
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             ticks += 1;
-            info!(
-                "Android session runtime heartbeat {} for {}",
-                ticks, session_id
-            );
         }
     });
 }

@@ -72,26 +72,29 @@ object NativeInterface {
     // Stop streaming
     @JvmStatic
     external fun nativeStopStreaming(handle: Long): Boolean
+
+        // LiteRT-LM Kotlin node bridge
+    @JvmStatic
+    external fun nativeCreateLiteRtNode(
+        executorHandle: Long,
+        nodeId: String,
+        modelPath: String,
+        backend: String,
+        maxNumTokens: Int,
+        systemPrompt: String?,
+    ): Long
+
+    @JvmStatic
+    external fun nativeDestroyLiteRtNode(executorHandle: Long, nodeHandle: Long)
+
+    @JvmStatic
+    external fun nativeGenerateLiteRtNode(
+        executorHandle: Long,
+        nodeHandle: Long,
+        sessionId: String,
+        text: String,
+    ): Boolean
 }
-
-/** Exception thrown by native operations */
-class NativeException(message: String) : RuntimeException(message)
-
-/** Pipeline execution modes */
-enum class PipelineMode {
-    UNARY,
-    STREAMING
-}
-
-/** Pipeline node information for UI */
-data class NodeInfo(
-    val name: String,
-    val description: String,
-    val category: String, // "STT", "LLM", "TTS", "VAD", "UTILITY"
-    val inputTypes: List<String>,
-    val outputTypes: List<String>,
-    val parameters: Map<String, Any>
-)
 
 /** Parses node list from native JSON */
 fun parseAvailableNodes(json: String): List<NodeInfo> {
