@@ -29,11 +29,50 @@ error() { echo -e "${RED}[ERR]${NC} $*"; }
 DIST_NAME="remotemedia_hermes"
 ARCH="arm64-v8a"
 PYTHON_VERSION="3.11"
-P4A_ROOT="${HOME}/.local/share/python-for-android"
+find_python_for_android_root() {
+    if [[ -n "${P4A_ROOT:-}" && -d "$P4A_ROOT" ]]; then
+        echo "$P4A_ROOT"
+        return 0
+    fi
+
+    if [[ -d "${HOME}/.local/share/python-for-android" ]]; then
+        echo "${HOME}/.local/share/python-for-android"
+        return 0
+    fi
+
+    if [[ -d "${HOME}/snap/code/current/.local/share/python-for-android" ]]; then
+        echo "${HOME}/snap/code/current/.local/share/python-for-android"
+        return 0
+    fi
+
+    local candidate
+    candidate=$(find "${HOME}/snap/code" -maxdepth 6 -type d -path '*/.local/share/python-for-android' 2>/dev/null | head -n1)
+    if [[ -n "$candidate" ]]; then
+        echo "$candidate"
+        return 0
+    fi
+
+    echo "${HOME}/.local/share/python-for-android"
+}
+P4A_ROOT="$(find_python_for_android_root)"
 DIST_DIR="${P4A_ROOT}/dists/${DIST_NAME}"
+ACTUAL_DIST_DIR=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="/tmp/p4a_build_${DIST_NAME}"
 REQUIREMENTS_FILE="${SCRIPT_DIR}/requirements-hermes.txt"
+
+# Critical packages that must be present in the produced Python bundle.
+# These map to distribution names in site-packages (dist-info directories).
+REQUIRED_DISTROS=(
+    "requests"
+    "charset_normalizer"
+    "idna"
+    "pydantic"
+    "python_dotenv"
+    "urllib3"
+    "certifi"
+    "pyyaml"
+)
 
 log "Building python-for-android distro: ${DIST_NAME}"
 log "Architecture: ${ARCH}"
@@ -55,7 +94,8 @@ fi
 success "Requirements file found: ${REQUIREMENTS_FILE}"
 
 # Read requirements and join with commas
-REQUIREMENTS=$(grep -v '^#' "${REQUIREMENTS_FILE}" | grep -v '^$' | tr '\n' ',' | sed 's/,$//')
+mapfile -t REQUIREMENTS_ARRAY < <(grep -v '^#' "${REQUIREMENTS_FILE}" | sed 's/#.*$//' | awk 'NF > 0 { print $0 }')
+REQUIREMENTS=$(IFS=, ; echo "${REQUIREMENTS_ARRAY[*]}")
 log "Requirements: ${REQUIREMENTS}"
 
 # Clean previous build
@@ -69,7 +109,7 @@ log "This may take 10-30 minutes depending on network and CPU..."
 
 # Set Android SDK/NDK paths for p4a
 export ANDROID_SDK_ROOT="/home/acidhax/Android/Sdk"
-export ANDROID_NDK_ROOT="/home/acidhax/Android/Sdk/ndk/25.2.9519653"
+export ANDROID_NDK_ROOT="/home/acidhax/Android/Sdk/ndk/27.0.11718014"
 export ANDROID_HOME="/home/acidhax/Android/Sdk"
 export JAVA_HOME="/usr/lib/jvm/java-21-openjdk-amd64"
 export PATH="/home/acidhax/Android/Sdk/platform-tools:${PATH}"
@@ -77,7 +117,7 @@ export PATH="/home/acidhax/Android/Sdk/platform-tools:${PATH}"
 # Use p4a create with requirements
 cd "${BUILD_DIR}"
 p4a create \
-    --name "${DIST_NAME}" \
+    --dist-name "${DIST_NAME}" \
     --package "com.remotemedia.inprocess" \
     --version "0.1.0" \
     --bootstrap sdl2 \
@@ -86,7 +126,8 @@ p4a create \
     --python-version "${PYTHON_VERSION}" \
     --ndk-api 24 \
     --android-api 34 \
-    --ndk-dir "/home/acidhax/Android/Sdk/ndk/25.2.9519653" \
+    --ndk-dir "/home/acidhax/Android/Sdk/ndk/27.0.11718014" \
+    --blacklist-requirements ruamel.yaml \
     --permission INTERNET \
     --permission ACCESS_NETWORK_STATE \
     --permission RECORD_AUDIO \
@@ -94,23 +135,97 @@ p4a create \
     --dist-dir "${P4A_ROOT}/dists" \
     2>&1 | tee "${SCRIPT_DIR}/p4a_build_hermes.log"
 
+verify_required_python_dists() {
+    local bundle_root="${ACTUAL_DIST_DIR}/_python_bundle__${ARCH}/_python_bundle"
+    local site_packages=""
+
+    if [[ -d "${bundle_root}/site-packages" ]]; then
+        site_packages="${bundle_root}/site-packages"
+    else
+        # Fallback for alternate p4a layouts
+        site_packages=$(find "${bundle_root}" -type d -name site-packages 2>/dev/null | head -1 || true)
+    fi
+
+    if [[ -z "${site_packages}" || ! -d "${site_packages}" ]]; then
+        error "Could not locate site-packages in built distro under ${bundle_root}"
+        return 1
+    fi
+
+    log "Verifying required Python distributions in: ${site_packages}"
+    local missing=0
+
+    for dist in "${REQUIRED_DISTROS[@]}"; do
+        if compgen -G "${site_packages}/${dist}-*.dist-info" > /dev/null; then
+            success "Found ${dist}"
+        else
+            error "Missing required distribution: ${dist}"
+            missing=1
+        fi
+    done
+
+    if [[ "${missing}" -ne 0 ]]; then
+        error "Required Python distributions are missing from the built p4a bundle"
+        return 1
+    fi
+
+    success "All required Python distributions are present in the p4a bundle"
+    return 0
+}
+
+resolve_actual_dist_dir() {
+    # Prefer configured dist dir when present
+    if [[ -d "${DIST_DIR}" ]]; then
+        ACTUAL_DIST_DIR="${DIST_DIR}"
+        return 0
+    fi
+
+    # Fallback: parse p4a output log
+    local from_log
+    from_log=$(sed -n 's/^\[INFO\]:    Dist can be found at (for now) //p' "${SCRIPT_DIR}/p4a_build_hermes.log" | tail -1)
+    if [[ -n "${from_log}" && -d "${from_log}" ]]; then
+        ACTUAL_DIST_DIR="${from_log}"
+        return 0
+    fi
+
+    # Last resort: newest distro directory
+    local newest
+    newest=$(find "${P4A_ROOT}/dists" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
+    if [[ -n "${newest}" && -d "${newest}" ]]; then
+        ACTUAL_DIST_DIR="${newest}"
+        return 0
+    fi
+
+    return 1
+}
+
 # Check if build succeeded
 if [[ ${PIPESTATUS[0]} -eq 0 ]]; then
     success "python-for-android build completed successfully!"
-    log "Distribution created at: ${DIST_DIR}"
+
+    if ! resolve_actual_dist_dir; then
+        error "Unable to resolve built distro directory"
+        exit 1
+    fi
+
+    log "Distribution created at: ${ACTUAL_DIST_DIR}"
+
+    if ! verify_required_python_dists; then
+        error "Built distro failed dependency verification"
+        exit 1
+    fi
     
     # Show what was built
     log "Built architectures:"
-    find "${DIST_DIR}" -name "_python_bundle__${ARCH}" -type d 2>/dev/null | head -5
+    find "${ACTUAL_DIST_DIR}" -name "_python_bundle__${ARCH}" -type d 2>/dev/null | head -5
     
     log "Python libraries:"
-    find "${DIST_DIR}" -name "libpython*.so" 2>/dev/null | head -5
+    find "${ACTUAL_DIST_DIR}" -name "libpython*.so" 2>/dev/null | head -5
     
     log ""
     log "To use this in the Android build, set these environment variables:"
     log "  export PYTHON_FOR_ANDROID_ROOT=${P4A_ROOT}"
-    log "  export PYTHON_BUNDLE_SRC=${DIST_DIR}/_python_bundle__${ARCH}/_python_bundle"
-    log "  export PYTHON_NATIVE_LIBS_SRC=${DIST_DIR}/_python_bundle__${ARCH}/libs/${ARCH}"
+    log "  export PYTHON_BUNDLE_SRC=${ACTUAL_DIST_DIR}/_python_bundle__${ARCH}/_python_bundle"
+    log "  export PYTHON_NATIVE_LIBS_SRC=${ACTUAL_DIST_DIR}/_python_bundle__${ARCH}/libs/${ARCH}"
     log ""
     log "Then run the main build script:"
     log "  ./android_build_deploy_test.sh --device <IP:PORT>"

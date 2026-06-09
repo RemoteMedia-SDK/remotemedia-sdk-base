@@ -1,0 +1,16 @@
+{
+  "version": "1",
+  "metadata": {
+    "name": "hermes-profile-import-test",
+    "description": "Test manifest for Hermes profile import on Android"
+  },
+  "nodes": [
+    {
+      "id": "hermes_profile_import",
+      "node_type": "HermesProfileImportPlugin",
+      "params": {},
+      "is_streaming": false
+    }
+  ],
+  "connections": []
+}

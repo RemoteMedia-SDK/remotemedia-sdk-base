@@ -1,0 +1,170 @@
+{
+  "version": "1",
+  "metadata": {
+    "name": "voice-assistant-hermes",
+    "description": "Offline voice assistant with VAD, STT, Hermes Agent LLM, and TTS",
+    "auto_negotiate": true,
+    "strict_capabilities": false
+  },
+  "plugins": [
+    {
+      "path": "/data/data/com.remotemedia.inprocess/files/libsilero_vad_loadable_plugin.so"
+    },
+    {
+      "path": "/data/data/com.remotemedia.inprocess/files/libwhisper_loadable_plugin.so"
+    },
+    {
+      "path": "/data/data/com.remotemedia.inprocess/files/libmisaki_g2p_plugin.so"
+    },
+    {
+      "path": "/data/data/com.remotemedia.inprocess/files/libkokoro_onnx_plugin.so"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "vad_chunker",
+      "node_type": "AudioChunkerNode",
+      "params": {
+        "chunk_size": 512
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "vad",
+      "node_type": "SileroVADNode",
+      "params": {
+        "model_path": "/data/data/com.remotemedia.inprocess/files/models/silero-vad/silero_vad.onnx",
+        "threshold": 0.5,
+        "neg_threshold": 0.35,
+        "sampling_rate": 16000,
+        "min_speech_duration_ms": 250,
+        "min_silence_duration_ms": 500,
+        "speech_pad_ms": 150,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "accumulator",
+      "node_type": "AudioBufferAccumulatorNode",
+      "params": {
+        "min_utterance_duration_ms": 300,
+        "max_utterance_duration_ms": 30000,
+        "emit_cancel_on_speech_start": false
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "stt",
+      "node_type": "WhisperNode",
+      "params": {
+        "model": "tiny",
+        "backend": "litert",
+        "model_path": "/data/data/com.remotemedia.inprocess/files/models/whisper/whisper_tiny_30s_f32.tflite",
+        "tokenizer_path": "/data/data/com.remotemedia.inprocess/files/models/whisper/tokenizer.json",
+        "config_path": "/data/data/com.remotemedia.inprocess/files/models/whisper/config.json",
+        "language": "en",
+        "task": "transcribe",
+        "max_tokens": 224,
+        "max_window_ms": 2000,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "llm",
+      "node_type": "HermesAgentPlugin",
+      "params": {
+        "base_url": "http://localhost:30000/v1",
+        "model": "hermes-3-llama-3.1-8b",
+        "api_key": "",
+        "system_prompt": "You are a helpful voice assistant. Keep responses concise and natural for speech.",
+        "temperature": 0.7,
+        "max_tokens": 2048
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "text_collector",
+      "node_type": "TextCollectorNode",
+      "params": {
+        "split_pattern": "[.!?;\\n]+",
+        "min_sentence_length": 8,
+        "yield_partial_on_end": true,
+        "partial_flush_chars": 0
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "g2p",
+      "node_type": "MisakiG2PNode",
+      "params": {
+        "resource_dir": "/data/data/com.remotemedia.inprocess/files/models/misaki-g2p",
+        "dialect": "en-US",
+        "unknown_policy": "grapheme",
+        "emit_token_metadata": false,
+        "execution_mode": "InProcess"
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "tts",
+      "node_type": "KokoroTTSNode",
+      "params": {
+        "backend": "onnx",
+        "model_dir": "/data/data/com.remotemedia.inprocess/files/models/kokoro",
+        "model": "model_fp16.onnx",
+        "tokenizer_path": "/data/data/com.remotemedia.inprocess/files/models/kokoro/tokenizer.json",
+        "voice": "af_bella",
+        "speed": 1.0,
+        "input_mode": "phonemes",
+        "execution_provider": "cpu",
+        "nnapi_use_fp16": false,
+        "nnapi_disable_cpu": false,
+        "intra_threads": 4,
+        "inter_threads": 1
+      },
+      "is_streaming": true
+    },
+    {
+      "id": "audio_output",
+      "node_type": "DataSinkNode",
+      "params": {},
+      "is_streaming": true
+    }
+  ],
+  "connections": [
+    {
+      "from": "vad_chunker",
+      "to": "vad"
+    },
+    {
+      "from": "vad",
+      "to": "accumulator"
+    },
+    {
+      "from": "accumulator",
+      "to": "stt"
+    },
+    {
+      "from": "stt",
+      "to": "llm"
+    },
+    {
+      "from": "llm",
+      "to": "text_collector"
+    },
+    {
+      "from": "text_collector",
+      "to": "g2p"
+    },
+    {
+      "from": "g2p",
+      "to": "tts"
+    },
+    {
+      "from": "tts",
+      "to": "audio_output"
+    }
+  ]
+}

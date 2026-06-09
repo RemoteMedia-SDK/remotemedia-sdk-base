@@ -102,6 +102,28 @@ fn register_android_inprocess_python_nodes() {
             .produces(["text", "json"])
             .with_inprocess(true),
     );
+
+    // Hermes Agent profile import test plugin
+    register_python_node(
+        PythonNodeConfig::new("HermesProfileImportPlugin")
+            .with_python_class("remotemedia.nodes.hermes_agent_plugin.HermesProfileImportPlugin")
+            .with_inprocess(true)
+            .with_category("test")
+            .accepts(["text", "json"])
+            .produces(["text", "json"])
+            .with_inprocess(true),
+    );
+
+    // Hermes Agent LLM plugin for in-process conversation with tool calling
+    register_python_node(
+        PythonNodeConfig::new("HermesAgentPlugin")
+            .with_python_class("remotemedia.nodes.hermes_agent_plugin.HermesAgentPlugin")
+            .with_inprocess(true)
+            .with_category("llm")
+            .accepts(["text", "json"])
+            .produces(["text", "json"])
+            .with_inprocess(true),
+    );
 }
 
 /// Initialize the Android logger
@@ -131,7 +153,7 @@ pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeCreate
     register_default_python_nodes();
     info!("Registered default Python nodes");
     register_android_inprocess_python_nodes();
-    info!("Registered Android in-process Python nodes: WhisperSTTNode alias, DebugKokoroTTSNode, VADNode, DataSinkNode, HermesAgentTestPlugin");
+    info!("Registered Android in-process Python nodes: WhisperSTTNode alias, DebugKokoroTTSNode, VADNode, DataSinkNode, HermesAgentTestPlugin, HermesProfileImportPlugin, HermesAgentPlugin");
 
     let loadable_bundles = load_android_loadable_plugins();
 
@@ -883,6 +905,21 @@ pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeGetAva
             "input_types": ["text", "json"],
             "output_types": ["text", "json"],
             "parameters": {}
+        }),
+        serde_json::json!({
+            "name": "HermesAgentPlugin",
+            "description": "Hermes Agent LLM with tool calling for in-process conversation",
+            "category": "LLM",
+            "input_types": ["text", "json"],
+            "output_types": ["text", "json"],
+            "parameters": {
+                "base_url": "http://localhost:30000/v1",
+                "model": "hermes-3-llama-3.1-8b",
+                "api_key": "",
+                "system_prompt": "You are a helpful assistant.",
+                "temperature": 0.7,
+                "max_tokens": 2048
+            }
         }),
     ];
 

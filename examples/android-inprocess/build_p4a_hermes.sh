@@ -63,7 +63,32 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Paths
-P4A_ROOT="${HOME}/.local/share/python-for-android"
+find_python_for_android_root() {
+    if [[ -n "${P4A_ROOT:-}" && -d "$P4A_ROOT" ]]; then
+        echo "$P4A_ROOT"
+        return 0
+    fi
+
+    if [[ -d "${HOME}/.local/share/python-for-android" ]]; then
+        echo "${HOME}/.local/share/python-for-android"
+        return 0
+    fi
+
+    if [[ -d "${HOME}/snap/code/current/.local/share/python-for-android" ]]; then
+        echo "${HOME}/snap/code/current/.local/share/python-for-android"
+        return 0
+    fi
+
+    local candidate
+    candidate=$(find "${HOME}/snap/code" -maxdepth 6 -type d -path '*/.local/share/python-for-android' 2>/dev/null | head -n1)
+    if [[ -n "$candidate" ]]; then
+        echo "$candidate"
+        return 0
+    fi
+
+    echo "${HOME}/.local/share/python-for-android"
+}
+P4A_ROOT="$(find_python_for_android_root)"
 DIST_DIR="${P4A_ROOT}/dists/${DIST_NAME}"
 BUILD_DIR="/tmp/p4a_build_${DIST_NAME}"
 REQUIREMENTS_FILE="${BUILD_DIR}/requirements.txt"
@@ -158,7 +183,7 @@ cd "${BUILD_DIR}"
 
 # Use p4a to create a distribution
 p4a create \
-    --name "${DIST_NAME}" \
+    --dist-name "${DIST_NAME}" \
     --package "com.remotemedia.inprocess" \
     --version "0.1.0" \
     --bootstrap sdl2 \

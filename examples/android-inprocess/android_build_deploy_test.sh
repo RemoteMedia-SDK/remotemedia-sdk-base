@@ -14,7 +14,7 @@
 # - Python 3.10+ with python-for-android (for PyO3 linkage)
 # - Physical arm64 Android device with USB/WiFi debugging
 #
-# Usage: ./android_build_deploy_test.sh [--device IP:PORT] [--skip-build] [--skip-deploy]
+# Usage: ./android_build_deploy_test.sh [--device IP:PORT] [--pipeline NAME] [--skip-build] [--skip-deploy]
 # =============================================================================
 
 set -euo pipefail
@@ -34,7 +34,7 @@ ANDROID_PROJECT="${ANDROID_PROJECT:-${SCRIPT_DIR}}"
 DEVICE_ADDRESS="${DEVICE_ADDRESS:-192.168.18.60:35713}"
 SKIP_BUILD=false
 SKIP_DEPLOY=false
-TEST_PIPELINE="${TEST_PIPELINE:-voice-assistant-mobile.json}"
+TEST_PIPELINE="${TEST_PIPELINE:-hermes-agent-test.json}"
 MODEL_SRC="${MODEL_SRC:-${WORKSPACE_ROOT}/litert-lm-loadable-plugin/gemma-4-E2B-it.litertlm}"
 MODEL_STAGING_PATH="${MODEL_STAGING_PATH:-/data/local/tmp/gemma-4-E2B-it.litertlm}"
 MODEL_DEVICE_PATH="${MODEL_DEVICE_PATH:-/data/data/com.remotemedia.inprocess/files/models/gemma-4-E2B-it.litertlm}"
@@ -55,11 +55,49 @@ MISAKI_G2P_RESOURCE_FALLBACK_SRC="${MISAKI_G2P_RESOURCE_FALLBACK_SRC:-${WORKSPAC
 MISAKI_G2P_STAGING_DIR="${MISAKI_G2P_STAGING_DIR:-/data/local/tmp/remotemedia-misaki-g2p}"
 LOG_OUTPUT="${LOG_OUTPUT:-${ANDROID_PROJECT}/android-inprocess-logcat.txt}"
 # Python-for-Android distro with Hermes Agent (built with build_p4a_hermes_simple.sh)
-PYTHON_FOR_ANDROID_ROOT="${PYTHON_FOR_ANDROID_ROOT:-${HOME}/.local/share/python-for-android/dists}"
-PYTHON_BUNDLE_SRC="${PYTHON_BUNDLE_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_hermes/_python_bundle__arm64-v8a/_python_bundle}"
-PYTHON_BUNDLE_FALLBACK_SRC="${PYTHON_BUNDLE_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_numpy/_python_bundle__arm64-v8a/_python_bundle}"
-PYTHON_NATIVE_LIBS_SRC="${PYTHON_NATIVE_LIBS_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_hermes/_python_bundle__arm64-v8a/libs/arm64-v8a}"
-PYTHON_NATIVE_LIBS_FALLBACK_SRC="${PYTHON_NATIVE_LIBS_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_numpy/libs/arm64-v8a}"
+find_python_for_android_root() {
+    if [[ -n "${PYTHON_FOR_ANDROID_ROOT:-}" && -d "$PYTHON_FOR_ANDROID_ROOT" ]]; then
+        echo "$PYTHON_FOR_ANDROID_ROOT"
+        return 0
+    fi
+
+    local roots=()
+    if [[ -d "${HOME}/snap/code/current/.local/share/python-for-android/dists" ]]; then
+        roots+=("${HOME}/snap/code/current/.local/share/python-for-android/dists")
+    fi
+    while IFS= read -r candidate; do
+        roots+=("$candidate")
+    done < <(find "${HOME}/snap/code" -maxdepth 6 -type d -path '*/.local/share/python-for-android/dists' 2>/dev/null)
+    if [[ -d "${HOME}/.local/share/python-for-android/dists" ]]; then
+        roots+=("${HOME}/.local/share/python-for-android/dists")
+    fi
+
+    for root in "${roots[@]}"; do
+        if [[ -d "$root/remotemedia_hermes" ]]; then
+            echo "$root"
+            return 0
+        fi
+    done
+
+    for root in "${roots[@]}"; do
+        if [[ -d "$root/remotemedia_numpy" ]]; then
+            echo "$root"
+            return 0
+        fi
+    done
+
+    if [[ ${#roots[@]} -gt 0 ]]; then
+        echo "${roots[0]}"
+        return 0
+    fi
+
+    echo "${HOME}/.local/share/python-for-android/dists"
+}
+export PYTHON_FOR_ANDROID_ROOT="$(find_python_for_android_root)"
+export PYTHON_BUNDLE_SRC="${PYTHON_BUNDLE_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_hermes/_python_bundle__arm64-v8a/_python_bundle}"
+export PYTHON_BUNDLE_FALLBACK_SRC="${PYTHON_BUNDLE_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_numpy/_python_bundle__arm64-v8a/_python_bundle}"
+export PYTHON_NATIVE_LIBS_SRC="${PYTHON_NATIVE_LIBS_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_hermes/libs/arm64-v8a}"
+export PYTHON_NATIVE_LIBS_FALLBACK_SRC="${PYTHON_NATIVE_LIBS_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_hermes/_python_bundle__arm64-v8a/libs/arm64-v8a}"
 PYTHON_SRC="${PYTHON_SRC:-${WORKSPACE_ROOT}/remotemedia-sdk/clients/python}"
 PYTHON_SRC_STAGING_LOCAL="${PYTHON_SRC_STAGING_LOCAL:-/tmp/remotemedia-inprocess-python-src}"
 PYTHON_STAGING_PATH="${PYTHON_STAGING_PATH:-/data/local/tmp/remotemedia-inprocess-python}"
@@ -82,6 +120,13 @@ export ANDROID_HOME="$SDK_PATH"
 export ANDROID_SDK_ROOT="$SDK_PATH"
 export ANDROID_NDK_ROOT="$NDK_PATH"
 export PATH="${SDK_PATH}/platform-tools:${PATH}"
+
+NDK_TOOLCHAIN_BIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_TOOLCHAIN_BIN}/aarch64-linux-android24-clang"
+export CC_aarch64_linux_android="${NDK_TOOLCHAIN_BIN}/aarch64-linux-android24-clang"
+export CXX_aarch64_linux_android="${NDK_TOOLCHAIN_BIN}/aarch64-linux-android24-clang++"
+export AR_aarch64_linux_android="${NDK_TOOLCHAIN_BIN}/llvm-ar"
+export RANLIB_aarch64_linux_android="${NDK_TOOLCHAIN_BIN}/llvm-ranlib"
 
 log() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
 success() { echo -e "${GREEN}[OK]${NC} $*"; }
@@ -156,12 +201,20 @@ EOF
 # =============================================================================
 setup_python_symlink() {
     log "Setting up Python library symlink for PyO3..."
-    PYTHON_DIST="$PYTHON_NATIVE_LIBS_FALLBACK_SRC"
-    if [[ -f "$PYTHON_DIST/libpython3.14.so" && ! -f "$PYTHON_DIST/libpython3.10.so" ]]; then
-        ln -sf libpython3.14.so "$PYTHON_DIST/libpython3.10.so"
-        success "Symlink created: libpython3.10.so -> libpython3.14.so"
+    local python_native_libs_src
+    python_native_libs_src="$(resolve_python_native_libs_src)"
+
+    if [[ -f "$python_native_libs_src/libpython3.14.so" ]]; then
+        if [[ ! -f "$python_native_libs_src/libpython3.10.so" ]]; then
+            ln -sf libpython3.14.so "$python_native_libs_src/libpython3.10.so"
+            success "Created symlink: libpython3.10.so -> libpython3.14.so"
+        fi
+        if [[ ! -f "$python_native_libs_src/libpython3.11.so" ]]; then
+            ln -sf libpython3.14.so "$python_native_libs_src/libpython3.11.so"
+            success "Created symlink: libpython3.11.so -> libpython3.14.so"
+        fi
     else
-        warn "Python symlink already exists or libpython3.14.so not found"
+        warn "Python symlink not configured because libpython3.14.so was not found in $python_native_libs_src"
     fi
 }
 
@@ -169,11 +222,72 @@ setup_python_symlink() {
 # =============================================================================
 # STEP 3b: Package runtime assets into APK
 # =============================================================================
+find_all_python_bundles() {
+    local root="$PYTHON_FOR_ANDROID_ROOT"
+    local arch="arm64-v8a"
+    if [[ ! -d "$root" ]]; then
+        return 1
+    fi
+
+    find "$root" -type d -path "*/_python_bundle__${arch}/_python_bundle" 2>/dev/null
+}
+
+find_latest_python_bundle() {
+    find_all_python_bundles | while IFS= read -r bundle; do
+        if [[ -d "$bundle" ]]; then
+            printf '%s %s\n' "$(stat -c '%Y' "$bundle")" "$bundle"
+        fi
+    done | sort -n | tail -1 | cut -d' ' -f2- || true
+}
+
+find_latest_python_native_libs() {
+    local root="$PYTHON_FOR_ANDROID_ROOT"
+    local arch="arm64-v8a"
+    if [[ ! -d "$root" ]]; then
+        return 1
+    fi
+
+    find "$root" -type d -path "*/libs/${arch}" 2>/dev/null | while IFS= read -r libs; do
+        if [[ -d "$libs" ]]; then
+            printf '%s %s\n' "$(stat -c '%Y' "$libs")" "$libs"
+        fi
+    done | sort -n | tail -1 | cut -d' ' -f2- || true
+}
+
+bundle_has_httpx() {
+    local bundle="$1"
+    [[ -f "$bundle/site-packages/httpx/_transports/__init__.py" || -f "$bundle/site-packages/httpx/_transports/__init__.pyc" ]]
+}
+
+find_python_bundle_with_httpx() {
+    find_all_python_bundles | while IFS= read -r bundle; do
+        if bundle_has_httpx "$bundle"; then
+            echo "$bundle"
+            return 0
+        fi
+    done
+    return 1
+}
+
 resolve_python_bundle_src() {
     local python_bundle_src="$PYTHON_BUNDLE_SRC"
     if [[ ! -d "$python_bundle_src" ]]; then
         warn "Preferred Python-for-Android bundle not found: $python_bundle_src" >&2
-        python_bundle_src="$PYTHON_BUNDLE_FALLBACK_SRC"
+        if latest_bundle=$(find_latest_python_bundle); then
+            warn "Using newest available Python-for-Android bundle: $latest_bundle" >&2
+            python_bundle_src="$latest_bundle"
+        else
+            warn "Attempting fallback bundle: $PYTHON_BUNDLE_FALLBACK_SRC" >&2
+            python_bundle_src="$PYTHON_BUNDLE_FALLBACK_SRC"
+        fi
+    fi
+
+    if [[ -d "$python_bundle_src" ]] && ! bundle_has_httpx "$python_bundle_src"; then
+        warn "Selected bundle does not contain httpx transport support: $python_bundle_src" >&2
+        if httpx_bundle=$(find_python_bundle_with_httpx); then
+            warn "Switching to bundle with httpx: $httpx_bundle" >&2
+            python_bundle_src="$httpx_bundle"
+        fi
     fi
 
     if [[ ! -d "$python_bundle_src" ]]; then
@@ -189,7 +303,13 @@ resolve_python_native_libs_src() {
     local python_native_libs_src="$PYTHON_NATIVE_LIBS_SRC"
     if [[ ! -d "$python_native_libs_src" ]]; then
         warn "Preferred Python native libs not found: $python_native_libs_src" >&2
-        python_native_libs_src="$PYTHON_NATIVE_LIBS_FALLBACK_SRC"
+        if latest_libs=$(find_latest_python_native_libs); then
+            warn "Using newest available Python native libs: $latest_libs" >&2
+            python_native_libs_src="$latest_libs"
+        else
+            warn "Attempting fallback native libs: $PYTHON_NATIVE_LIBS_FALLBACK_SRC" >&2
+            python_native_libs_src="$PYTHON_NATIVE_LIBS_FALLBACK_SRC"
+        fi
     fi
 
     if [[ ! -d "$python_native_libs_src" ]]; then
@@ -199,6 +319,22 @@ resolve_python_native_libs_src() {
     fi
 
     echo "$python_native_libs_src"
+}
+
+ensure_python_shared_lib_symlinks() {
+    local python_native_libs_src
+    python_native_libs_src="$(resolve_python_native_libs_src)"
+
+    if [[ -f "$python_native_libs_src/libpython3.14.so" ]]; then
+        if [[ ! -f "$python_native_libs_src/libpython3.10.so" ]]; then
+            ln -sf libpython3.14.so "$python_native_libs_src/libpython3.10.so"
+            success "Created symlink: libpython3.10.so -> libpython3.14.so"
+        fi
+        if [[ ! -f "$python_native_libs_src/libpython3.11.so" ]]; then
+            ln -sf libpython3.14.so "$python_native_libs_src/libpython3.11.so"
+            success "Created symlink: libpython3.11.so -> libpython3.14.so"
+        fi
+    fi
 }
 
 copy_required_asset_file() {
@@ -628,12 +764,12 @@ build_rust() {
     log "Building Rust cdylib for arm64-v8a..."
     cd "$ANDROID_PROJECT"
 
-    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
-    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
-    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
-    LITERT_LM_LIB_DIR="${WORKSPACE_ROOT}/litert-lm-loadable-plugin/lib/aarch64-linux-android" \
+    ensure_python_shared_lib_symlinks
+
+    local python_native_libs_src
+    python_native_libs_src="$(resolve_python_native_libs_src)"
+    export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-L${python_native_libs_src} -C link-arg=-lpython3.14"
+
     cargo build --release --target aarch64-linux-android 2>&1 | tail -20
 
     SO_FILE="target/aarch64-linux-android/release/libremotemedia_android_inprocess.so"
@@ -650,12 +786,6 @@ build_rust() {
 
     log "Building Whisper loadable plugin for arm64-v8a (LiteRT backend)..."
     cd "${WORKSPACE_ROOT}/whisper"
-    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
-    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
-    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
-    LITERT_LM_LIB_DIR="${WORKSPACE_ROOT}/litert-lm-loadable-plugin/lib/aarch64-linux-android" \
     cargo build --target aarch64-linux-android 2>&1 | tail -40
     cd "$ANDROID_PROJECT"
 
@@ -670,11 +800,6 @@ build_rust() {
 
     log "Building Silero VAD loadable plugin for arm64-v8a..."
     cd "${WORKSPACE_ROOT}/silero-vad"
-    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
-    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
-    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
     cargo build --target aarch64-linux-android 2>&1 | tail -40
     cd "$ANDROID_PROJECT"
 
@@ -689,11 +814,6 @@ build_rust() {
 
     log "Building Kokoro ONNX loadable plugin for arm64-v8a..."
     cd "${WORKSPACE_ROOT}/kokoro-onnx"
-    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
-    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
-    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
     cargo build --target aarch64-linux-android 2>&1 | tail -40
     cd "$ANDROID_PROJECT"
 
@@ -708,11 +828,6 @@ build_rust() {
 
     log "Building Misaki G2P loadable plugin for arm64-v8a..."
     cd "${WORKSPACE_ROOT}/misaki-g2p"
-    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
-    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
-    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
     cargo build --target aarch64-linux-android 2>&1 | tail -40
     cd "$ANDROID_PROJECT"
 
@@ -727,24 +842,11 @@ build_rust() {
 
     log "Building LiteRT-LM loadable plugin for arm64-v8a..."
     cd "${WORKSPACE_ROOT}/litert-lm-loadable-plugin"
-    CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CC_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
-    CXX_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
-    AR_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" \
-    RANLIB_aarch64_linux_android="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" \
-    LITERT_LM_LIB_DIR="${WORKSPACE_ROOT}/litert-lm-loadable-plugin/lib/aarch64-linux-android" \
     cargo build --target aarch64-linux-android 2>&1 | tail -40
     cd "$ANDROID_PROJECT"
 
-    local python_native_libs_src="$PYTHON_NATIVE_LIBS_SRC"
-    if [[ ! -d "$python_native_libs_src" ]]; then
-        warn "Preferred Python native libs not found: $python_native_libs_src" >&2
-        python_native_libs_src="$PYTHON_NATIVE_LIBS_FALLBACK_SRC"
-    fi
-    if [[ ! -d "$python_native_libs_src" ]]; then
-        error "Python native libs not found: $python_native_libs_src" >&2
-        exit 1
-    fi
+    local python_native_libs_src
+    python_native_libs_src="$(resolve_python_native_libs_src)"
     install -m 0644 "$python_native_libs_src"/*.so app/src/main/jniLibs/arm64-v8a/
     success "Copied Python native libraries from $python_native_libs_src"
 
@@ -920,6 +1022,24 @@ run_and_test() {
 
     log "Runtime assets are expected to be extracted from APK assets by the app on first launch."
     log "No Python/model/resource files are adb-pushed by this script."
+
+    # For the profile import test: push a minimal test archive to the app's
+    # internal app files dir (accessible to the app without external storage issues)
+    if [[ "$TEST_PIPELINE" == "hermes-profile-import-test.json" ]]; then
+        local test_archive="${HERMES_TEST_PROFILE_ARCHIVE:-${SCRIPT_DIR}/../../../default.tar.gz}"
+        local device_tmp="/data/local/tmp/hermes_test_profile.tar.gz"
+        local device_internal="/data/data/com.remotemedia.inprocess/files/hermes_test_profile.tar.gz"
+        if [[ -f "$test_archive" ]]; then
+            log "Pushing hermes test profile archive to device internal files dir ($device_internal)..."
+            adb -s "$DEVICE_ADDRESS" push "$test_archive" "$device_tmp"
+            adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'cat /data/local/tmp/hermes_test_profile.tar.gz > files/hermes_test_profile.tar.gz && chmod 600 files/hermes_test_profile.tar.gz'"
+            adb -s "$DEVICE_ADDRESS" shell rm -f "$device_tmp" 2>/dev/null || true
+            success "Archive pushed ($(du -sh "$test_archive" | cut -f1))"
+        else
+            warn "HERMES_TEST_PROFILE_ARCHIVE not set or file not found: $test_archive"
+            warn "Archive must already be present at $device_internal on device"
+        fi
+    fi
     
     # Start MainActivity and ask it to start streaming as soon as the manifest is ready.
     adb -s "$DEVICE_ADDRESS" shell am start -n com.remotemedia.inprocess/.MainActivity --ez auto_start true --ez simulate_speech true --es pipeline "$TEST_PIPELINE"
@@ -928,15 +1048,26 @@ run_and_test() {
     if [[ -z "${TEST_WAIT_SECONDS:-}" && "$TEST_PIPELINE" == "tts-mobile.json" ]]; then
         wait_seconds=130
     fi
+    
+    # Start streaming logcat in background so logs appear in real-time
+    log "Streaming logcat to console (also saving to $LOG_OUTPUT)..."
+    adb -s "$DEVICE_ADDRESS" logcat -v threadtime 2>&1 | tee "$LOG_OUTPUT" &
+    LOGCAT_PID=$!
+    
+    # Ensure logcat process is killed on exit
+    trap 'kill $LOGCAT_PID 2>/dev/null; wait $LOGCAT_PID 2>/dev/null' EXIT
+    
     log "Waiting for auto-started pipeline execution (${wait_seconds}s)..."
     sleep "$wait_seconds"
     
-    # Capture logs
+    # Stop streaming logcat
+    kill $LOGCAT_PID 2>/dev/null
+    wait $LOGCAT_PID 2>/dev/null
+    trap - EXIT
+    
+    # Check extracted runtime assets after launch
     log "Checking extracted runtime assets after launch, if the app exposes them via run-as..."
     adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'ls -lh files/remotemedia/python-runtimes/${PYTHON_RUNTIME_ID}/runtime.json files/remotemedia/python-runtimes/${PYTHON_RUNTIME_ID}/bundle/stdlib.zip 2>/dev/null || true; ls -lh files/models/whisper files/models/kokoro files/models/misaki-g2p 2>/dev/null || true'" || true
-
-    log "Capturing full logcat to $LOG_OUTPUT"
-    adb -s "$DEVICE_ADDRESS" logcat -d > "$LOG_OUTPUT" 2>&1
 
     log "Current activity state:"
     adb -s "$DEVICE_ADDRESS" shell dumpsys activity activities 2>/dev/null \
@@ -951,6 +1082,38 @@ run_and_test() {
         success "Session manifest diagnostics were captured"
     else
         warn "Session manifest diagnostics were not captured; nativeCreateSession was not reached"
+    fi
+
+    if grep -Fq "Loaded manifest: $TEST_PIPELINE" "$LOG_OUTPUT"; then
+        success "PipelineManager loaded requested manifest: $TEST_PIPELINE"
+    else
+        error "PipelineManager did not load requested manifest: $TEST_PIPELINE"
+        exit 1
+    fi
+
+    if [[ "$TEST_PIPELINE" == "hermes-agent-test.json" ]]; then
+        if grep -Fq "Hermes Agent imports: OK" "$LOG_OUTPUT"; then
+            success "HermesAgentTestPlugin validation passed (imports OK)"
+        elif grep -Fq "Hermes Agent imports: FAILED" "$LOG_OUTPUT"; then
+            error "HermesAgentTestPlugin validation failed"
+            exit 1
+        else
+            error "HermesAgentTestPlugin output marker not found in logs"
+            exit 1
+        fi
+    fi
+
+    if [[ "$TEST_PIPELINE" == "hermes-profile-import-test.json" ]]; then
+        if grep -Fq "Hermes profile import: OK" "$LOG_OUTPUT"; then
+            success "HermesProfileImportPlugin validation passed (profile import OK)"
+        elif grep -Fq "Hermes profile import: FAILED" "$LOG_OUTPUT"; then
+            error "HermesProfileImportPlugin validation failed - check logs for error details"
+            grep -F "Hermes profile import: FAILED" "$LOG_OUTPUT" | tail -3 || true
+            exit 1
+        else
+            error "HermesProfileImportPlugin output marker not found in logs"
+            exit 1
+        fi
     fi
 
     if grep -Eq "FATAL EXCEPTION|FORTIFY|crash_dump|AndroidRuntime" "$LOG_OUTPUT"; then

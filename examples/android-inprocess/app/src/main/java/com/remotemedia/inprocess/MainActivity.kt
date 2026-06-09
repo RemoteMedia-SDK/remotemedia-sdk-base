@@ -36,13 +36,14 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "MainActivity"
         private const val REQUEST_AUDIO_PERMISSION = 1001
+        private const val DEFAULT_PIPELINE = "hermes-agent-test.json"
     }
 
     private var binding: ActivityMainBinding? = null
     private val pipelineManager by lazy { PipelineManager(this) }
     private val audioRecorder by lazy { AudioRecorder(this) }
     private val audioPlayer by lazy { AudioPlayer(this) }
-    private var currentPipeline = "voice-assistant-mobile.json"
+    private var currentPipeline = DEFAULT_PIPELINE
     private var pipelineInitialized = false
     private var autoStartRequested = false
     private var autoStartConsumed = false
@@ -126,11 +127,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupPipelineSpinner() {
         val pipelines = listOf(
-            "voice-assistant-mobile.json" to "Voice Assistant (VAD→STT→LLM→TTS)",
+            DEFAULT_PIPELINE to "Hermes Agent Test (In-Process Plugin)",
+            "hermes-profile-import-test.json" to "Hermes Profile Import Test",
+            "voice-assistant-hermes.json" to "Voice Assistant (Hermes Agent LLM)",
+            "voice-assistant-mobile.json" to "Voice Assistant (VAD→STT→LiteRT LLM→TTS)",
             "llm-mobile.json" to "LiteRT LLM (debug)",
             "transcribe-mobile.json" to "Transcribe Only (STT)",
             "tts-mobile.json" to "Text-to-Speech (LLM→TTS)"
         )
+
+        if (pipelines.none { it.first == currentPipeline }) {
+            Log.w(TAG, "Unknown pipeline requested '$currentPipeline'; falling back to $DEFAULT_PIPELINE")
+            currentPipeline = DEFAULT_PIPELINE
+        }
 
         binding?.pipelineSpinner?.adapter = ArrayAdapter(
             this,
@@ -438,6 +447,36 @@ class MainActivity : AppCompatActivity() {
                         return@launch
                     }
                     Toast.makeText(this@MainActivity, "TTS simulation submitted!", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+
+                if (currentPipeline == DEFAULT_PIPELINE) {
+                    val text = "Verify Hermes Agent test plugin imports."
+                    Log.i(TAG, "Sending Hermes test text input: $text")
+                    runOnUiThread {
+                        binding?.progressBar?.visibility = View.GONE
+                        appendUserTranscript(text)
+                    }
+                    if (!pipelineManager.sendText(text)) {
+                        showError("Failed to send Hermes test text")
+                        return@launch
+                    }
+                    Toast.makeText(this@MainActivity, "Hermes test input submitted!", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+
+                if (currentPipeline == "hermes-profile-import-test.json") {
+                    val archivePath = "${filesDir.absolutePath}/hermes_test_profile.tar.gz"
+                    Log.i(TAG, "Sending profile import test archive path: $archivePath")
+                    runOnUiThread {
+                        binding?.progressBar?.visibility = View.GONE
+                        appendUserTranscript(archivePath)
+                    }
+                    if (!pipelineManager.sendText(archivePath)) {
+                        showError("Failed to send profile import path")
+                        return@launch
+                    }
+                    Toast.makeText(this@MainActivity, "Profile import test submitted!", Toast.LENGTH_SHORT).show()
                     return@launch
                 }
 

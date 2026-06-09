@@ -72,15 +72,21 @@ class ModelDownloader(private val context: Context) {
 
     /** Fetch node schema from native registry (cached). */
     suspend fun getNodeSchema(nodeType: String): NodeSchema? = withContext(Dispatchers.IO) {
-        schemaCache.getOrPut(nodeType) {
-            try {
-                val json = NativeInterface.nativeGetNodeSchema(nodeType)
-                val nodeSchema = snakeCaseJson.decodeFromString(NodeSchema.serializer(), json)
-                if (nodeSchema.nodeType.isEmpty()) null else nodeSchema
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to fetch schema for $nodeType: ${e.message}")
-                null
+        schemaCache[nodeType]?.let { return@withContext it }
+
+        try {
+            val json = NativeInterface.nativeGetNodeSchema(nodeType)
+            val nodeSchema = snakeCaseJson.decodeFromString(NodeSchema.serializer(), json)
+            if (nodeSchema.nodeType.isEmpty()) {
+                Log.w(TAG, "Schema for $nodeType is missing node_type; skipping model resolution")
+                return@withContext null
             }
+
+            schemaCache.putIfAbsent(nodeType, nodeSchema)
+            return@withContext nodeSchema
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to fetch schema for $nodeType: ${e.message}")
+            return@withContext null
         }
     }
 
