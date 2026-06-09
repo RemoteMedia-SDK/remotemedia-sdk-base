@@ -8,6 +8,7 @@
 use crate::capabilities::MediaCapabilities;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Pipeline manifest structure (v1)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +414,209 @@ fn default_required() -> bool {
     true
 }
 
+/// Source kind for a downloadable model asset.
+///
+/// Serialized forms are stable for interchange:
+/// - `huggingface`
+/// - `http`
+/// - `local`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceKind {
+    #[serde(rename = "huggingface")]
+    HuggingFace,
+    #[serde(rename = "http")]
+    Http,
+    #[serde(rename = "local")]
+    Local,
+}
+
+impl Default for SourceKind {
+    fn default() -> Self {
+        Self::HuggingFace
+    }
+}
+
+impl From<SourceKind> for &'static str {
+    fn from(value: SourceKind) -> Self {
+        match value {
+            SourceKind::HuggingFace => "huggingface",
+            SourceKind::Http => "http",
+            SourceKind::Local => "local",
+        }
+    }
+}
+
+/// One downloadable model asset declared in a node's `params["model_sources"]`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelSourceFile {
+    /// Filesystem path expected at runtime.
+    pub path: String,
+    /// Retrieval source kind.
+    #[serde(default)]
+    pub source: SourceKind,
+    /// File name used when fetching/caching.
+    pub filename: String,
+    /// Whether the file is required. Defaults to true.
+    #[serde(default = "default_required")]
+    pub required: bool,
+    /// Optional SHA256 (hex, lowercase) for cache verification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Optional direct download URL. When set, platforms should fetch from
+    /// this location instead of deriving a URL from `source`/`filename`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Per-node model sources declaration in `params["model_sources"]`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NodeModelSources {
+    pub files: Vec<ModelSourceFile>,
+}
+
+/// Resolution outcome for one referenced model asset.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResolvedModelAsset {
+    /// Node ID that referenced this file.
+    pub node_id: String,
+    /// Runtime path declared by the node metadata.
+    pub path: String,
+    /// File name used when fetching/caching.
+    pub filename: String,
+    /// Declared source kind.
+    pub source: SourceKind,
+    /// Whether node declared this file required.
+    pub required: bool,
+    /// Optional expected SHA256 (hex, lowercase).
+    pub sha256: Option<String>,
+    /// Absolute resolved path checked on disk, if provided by base_dir.
+    pub resolved_path: Option<PathBuf>,
+    /// Whether the resolved path currently exists on disk.
+    pub exists: bool,
+}
+
+/// Aggregated analysis output for a manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResolvedModelAssets {
+    /// All referenced assets, in declaration order.
+    pub assets: Vec<ResolvedModelAsset>,
+    /// Subset of assets that are absent and required.
+    pub missing_required: Vec<ResolvedModelAsset>,
+}
+
+/// Per-node diagnostics suitable for logging/UI.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NodeModelDiagnostics {
+    /// Node under inspection.
+    pub node_id: String,
+    /// Declared source files.
+    pub files: Vec<ModelSourceFile>,
+    /// How many of those files currently exist under the base dir.
+    pub present: usize,
+    /// How many required files are missing.
+    pub missing_required: usize,
+}
+
+impl NodeModelSources {
+    /// Convenience constructor for tests/builders.
+    pub fn new(files: Vec<ModelSourceFile>) -> Self {
+        Self { files }
+    }
+}
+
+impl Manifest {
+    /// Analyze downloadable model assets referenced by this manifest.
+
+    /// Returns `ResolvedModelAssets` describing every file declared in
+    /// `nodes[].params["model_sources"]` and whether it exists under `base_dir`.
+    ///
+    /// This helper never performs network I/O or downloads. Platform layers
+    /// remain responsible for fetching/caching and for any auth or pin checks.
+    pub fn analyze_model_assets(&self, base_dir: impl AsRef<Path>) -> Result<ResolvedModelAssets> {
+        let base = base_dir.as_ref();
+        let mut out = ResolvedModelAssets::default();
+        for node in &self.nodes {
+            let Some(node_sources) = node
+                .params
+                .get("model_sources")
+                .and_then(|v| serde_json::from_value::<NodeModelSources>(v.clone()).ok())
+            else {
+                continue;
+            };
+
+            for file in &node_sources.files {
+                let resolved = if file.path.is_empty() {
+                    None
+                } else {
+                    let p = base.join(&file.path);
+                    let exists = p.exists();
+                    Some(p)
+                };
+                let exists = resolved.as_ref().map(|p| p.exists()).unwrap_or(false);
+
+                let asset = ResolvedModelAsset {
+                    node_id: node.id.clone(),
+                    path: file.path.clone(),
+                    filename: file.filename.clone(),
+                    source: file.source,
+                    required: file.required,
+                    sha256: file.sha256.clone(),
+                    resolved_path: resolved,
+                    exists,
+                };
+                out.assets.push(asset);
+            }
+        }
+
+        out.missing_required = out
+            .assets
+            .iter()
+            .filter(|a| a.required && !a.exists)
+            .cloned()
+            .collect();
+
+        Ok(out)
+    }
+
+    /// Per-node diagnostics for logging/UI around model availability.
+    pub fn node_model_diagnostics(&self, base_dir: impl AsRef<Path>) -> Result<Vec<NodeModelDiagnostics>> {
+        let mut diags = Vec::new();
+        for node in &self.nodes {
+            let Some(node_sources) = node
+                .params
+                .get("model_sources")
+                .and_then(|v| serde_json::from_value::<NodeModelSources>(v.clone()).ok())
+            else {
+                continue;
+            };
+
+            let base = base_dir.as_ref();
+            let mut present = 0usize;
+            let mut missing_required = 0usize;
+            for file in &node_sources.files {
+                let exists = if file.path.is_empty() {
+                    false
+                } else {
+                    base.join(&file.path).exists()
+                };
+                if exists {
+                    present += 1;
+                } else if file.required {
+                    missing_required += 1;
+                }
+            }
+
+            diags.push(NodeModelDiagnostics {
+                node_id: node.id.clone(),
+                files: node_sources.files.clone(),
+                present,
+                missing_required,
+            });
+        }
+        Ok(diags)
+    }
+}
+
 /// Parse a JSON manifest string into a Manifest struct
 pub fn parse(json: &str) -> Result<Manifest> {
     serde_json::from_str(json)
@@ -657,5 +861,165 @@ mod tests {
 
         let manifest = parse(json).unwrap();
         assert!(!manifest.nodes[0].is_output_node); // Defaults to false
+    }
+
+    #[test]
+    fn test_model_sources_ignored_when_absent() {
+        let json = r#"{
+            "version": "v1",
+            "metadata": { "name": "test-pipeline" },
+            "nodes": [
+                {
+                    "id": "node1",
+                    "node_type": "WhisperNode",
+                    "params": {"language": "en"}
+                }
+            ],
+            "connections": []
+        }"#;
+
+        let manifest = parse(json).expect("parse");
+        let dir = std::env::temp_dir();
+        let assets = manifest.analyze_model_assets(&dir).expect("analyze");
+        assert!(assets.assets.is_empty());
+        assert!(assets.missing_required.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_model_assets_with_present_file() {
+        let dir = std::env::temp_dir().join("remotemedia-model-assets-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("whisper-tiny.tflite");
+        let _ = std::fs::write(&target, b"x");
+
+        let manifest = Manifest {
+            version: "v1".to_string(),
+            metadata: ManifestMetadata { name: "test".to_string(), ..Default::default() },
+            nodes: vec![NodeManifest {
+                id: "asr".to_string(),
+                node_type: "WhisperNode".to_string(),
+                params: serde_json::json!({
+                    "model_path": target.to_string_lossy().to_string(),
+                    "model_sources": {
+                        "files": [{
+                            "path": target.to_string_lossy().to_string(),
+                            "source": "huggingface",
+                            "filename": "whisper-tiny.tflite",
+                            "required": true,
+                            "sha256": "ffff"
+                        }]
+                    }
+                }),
+                ..Default::default()
+            }],
+            connections: vec![],
+            python_env: None,
+            plugins: Vec::new(),
+        };
+
+        let assets = manifest.analyze_model_assets(&dir).expect("analyze");
+        assert_eq!(assets.assets.len(), 1);
+        assert!(assets.assets[0].exists);
+        assert!(assets.missing_required.is_empty());
+
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn test_analyze_model_assets_with_missing_required_file() {
+        let dir = std::env::temp_dir().join("remotemedia-model-assets-test-missing");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("tok.json");
+
+        let manifest = Manifest {
+            version: "v1".to_string(),
+            metadata: ManifestMetadata { name: "test".to_string(), ..Default::default() },
+            nodes: vec![NodeManifest {
+                id: "asr".to_string(),
+                node_type: "WhisperNode".to_string(),
+                params: serde_json::json!({
+                    "tokenizer_path": path.to_string_lossy().to_string(),
+                    "model_sources": {
+                        "files": [{
+                            "path": path.to_string_lossy().to_string(),
+                            "source": "huggingface",
+                            "filename": "tok.json",
+                            "required": true
+                        }]
+                    }
+                }),
+                ..Default::default()
+            }],
+            connections: vec![],
+            python_env: None,
+            plugins: Vec::new(),
+        };
+
+        let assets = manifest.analyze_model_assets(&dir).expect("analyze");
+        assert_eq!(assets.assets.len(), 1);
+        assert!(!assets.assets[0].exists);
+        assert_eq!(assets.missing_required.len(), 1);
+
+        let diags = manifest.node_model_diagnostics(&dir).expect("diag");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].present, 0);
+        assert_eq!(diags[0].missing_required, 1);
+    }
+
+    #[test]
+    fn test_analyze_model_assets_with_optional_missing_file() {
+        let dir = std::env::temp_dir().join("remotemedia-model-assets-test-opt");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+
+        let manifest = Manifest {
+            version: "v1".to_string(),
+            metadata: ManifestMetadata { name: "test".to_string(), ..Default::default() },
+            nodes: vec![NodeManifest {
+                id: "asr".to_string(),
+                node_type: "WhisperNode".to_string(),
+                params: serde_json::json!({
+                    "config_path": path.to_string_lossy().to_string(),
+                    "model_sources": {
+                        "files": [{
+                            "path": path.to_string_lossy().to_string(),
+                            "source": "huggingface",
+                            "filename": "config.json",
+                            "required": false
+                        }]
+                    }
+                }),
+                ..Default::default()
+            }],
+            connections: vec![],
+            python_env: None,
+            plugins: Vec::new(),
+        };
+
+        let assets = manifest.analyze_model_assets(&dir).expect("analyze");
+        assert_eq!(assets.assets.len(), 1);
+        assert!(!assets.assets[0].exists);
+        assert!(assets.missing_required.is_empty());
+    }
+
+    #[test]
+    fn test_model_sources_malformed_ignored() {
+        let json = r#"{
+            "version": "v1",
+            "metadata": { "name": "test" },
+            "nodes": [
+                {
+                    "id": "bad",
+                    "node_type": "X",
+                    "params": { "model_sources": "not-an-object" }
+                }
+            ],
+            "connections": []
+        }"#;
+
+        let manifest = parse(json).expect("parse");
+        let dir = std::env::temp_dir();
+        let assets = manifest.analyze_model_assets(&dir).expect("analyze");
+        assert!(assets.assets.is_empty());
     }
 }

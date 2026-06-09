@@ -126,6 +126,11 @@ pub mod data {
     };
 }
 
+#[cfg(feature = "hf-download")]
+pub mod model_downloader;
+#[cfg(feature = "hf-download")]
+pub use model_downloader::HfModelDownloader;
+
 /// Manifest parsing module
 pub mod manifest;
 

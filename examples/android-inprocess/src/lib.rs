@@ -8,6 +8,7 @@ use remotemedia_core::{
     executor::SelectedRuntime,
     loadable::factory::{wrap_ffi_factory, LoadableNodeBundle},
     manifest::Manifest,
+    nodes::schema::create_builtin_schema_registry,
     transport::{
         session_control::ControlAddress, ClientOutputReceivers, PipelineExecutor, SessionHandle,
         SessionInputSender, TransportData,
@@ -744,6 +745,8 @@ fn log_manifest_diagnostics(manifest: &Manifest) {
         if let Some(params) = node.params.as_object() {
             for key in [
                 "model_path",
+                "model_dir",
+                "resource_dir",
                 "tokenizer_path",
                 "config_path",
                 "cache_dir",
@@ -859,7 +862,20 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetA
             "category": "LLM",
             "input_types": ["text"],
             "output_types": ["text"],
-            "parameters": {"model_path": "gemma-4-E2B-it.litertlm", "backend": "cpu"}
+            "parameters": {
+                "model_path": "gemma-4-E2B-it.litertlm",
+                "backend": "cpu",
+                "model_sources": {
+                    "files": [
+                        {
+                            "path": "gemma-4-E2B-it.litertlm",
+                            "source": "huggingface",
+                            "filename": "gemma-4-E2B-it.litertlm",
+                            "required": true
+                        }
+                    ]
+                }
+            }
         }),
         serde_json::json!({
             "name": "DataSinkNode",
@@ -881,6 +897,27 @@ pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetA
 
     let json_str = serde_json::to_string(&nodes).unwrap_or_default();
     env.new_string(json_str).unwrap().into_raw()
+}
+
+/// Get full node schema including model sources for a specific node type
+#[no_mangle]
+pub extern "system" fn Java_com_remotemedia_inprocess_NativeInterface_nativeGetNodeSchema(
+    mut env: JNIEnv,
+    _class: JClass,
+    node_type: JString,
+) -> jstring {
+    let node_type: String = env.get_string(&node_type).unwrap().into();
+    
+    // Use the built-in schema registry
+    let registry = create_builtin_schema_registry();
+    
+    if let Some(schema) = registry.get(&node_type) {
+        let json_str = serde_json::to_string(&schema).unwrap_or_default();
+        env.new_string(json_str).unwrap().into_raw()
+    } else {
+        // Return empty JSON object if not found
+        env.new_string("{}").unwrap().into_raw()
+    }
 }
 
 /// Start streaming mode

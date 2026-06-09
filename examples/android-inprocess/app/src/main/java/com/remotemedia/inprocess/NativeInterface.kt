@@ -65,6 +65,10 @@ object NativeInterface {
     @JvmStatic
     external fun nativeGetAvailableNodes(): String
 
+    // Get full node schema (including model sources) for a specific node type
+    @JvmStatic
+    external fun nativeGetNodeSchema(nodeType: String): String
+
     // Start streaming mode
     @JvmStatic
     external fun nativeStartStreaming(handle: Long): Boolean

@@ -1,0 +1,41 @@
+{
+  "version": "v1",
+  "metadata": {
+    "name": "whisper-liteert-asr",
+    "description": "Sample manifest using model_sources metadata for metadata-driven model downloads."
+  },
+  "nodes": [
+    {
+      "id": "asr",
+      "node_type": "WhisperNode",
+      "params": {
+        "model_path": "$BASE/models/whisper/whisper-tiny.tflite",
+        "tokenizer_path": "$BASE/models/whisper/tokenizer.json",
+        "model_sources": {
+          "files": [
+            {
+              "path": "$BASE/models/whisper/whisper-tiny.tflite",
+              "source": "huggingface",
+              "filename": "whisper-tiny.tflite",
+              "required": true,
+              "sha256": "ffff"
+            },
+            {
+              "path": "$BASE/models/whisper/tokenizer.json",
+              "source": "huggingface",
+              "filename": "tokenizer.json",
+              "required": true
+            },
+            {
+              "path": "$BASE/models/whisper/config.json",
+              "source": "huggingface",
+              "filename": "config.json",
+              "required": false
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": []
+}

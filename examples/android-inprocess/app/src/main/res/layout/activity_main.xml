@@ -49,6 +49,48 @@
         app:layout_constraintStart_toEndOf="@id/statusText"
         app:layout_constraintBottom_toBottomOf="@id/statusText" />
 
+    <!-- Model Download Progress -->
+    <LinearLayout
+        android:id="@+id/modelDownloadProgress"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:layout_marginBottom="8dp"
+        android:orientation="vertical"
+        android:visibility="gone"
+        app:layout_constraintTop_toBottomOf="@id/statusText"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <TextView
+            android:id="@+id/modelDownloadTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Downloading Models..."
+            android:textAppearance="@style/TextAppearance.RemoteMedia.Label"
+            android:textColor="@color/primary_text" />
+
+        <ProgressBar
+            android:id="@+id/modelDownloadProgressBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="8dp"
+            android:layout_marginTop="8dp"
+            android:max="100"
+            android:progress="0"
+            android:progressTint="@color/accent"
+            android:progressBackgroundTint="@color/disabled_text" />
+
+        <TextView
+            android:id="@+id/modelDownloadStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="Preparing..."
+            android:textAppearance="@style/TextAppearance.RemoteMedia.Streaming"
+            android:textColor="@color/secondary_text" />
+    </LinearLayout>
+
     <LinearLayout
         android:id="@+id/vadDebugPanel"
         android:layout_width="0dp"

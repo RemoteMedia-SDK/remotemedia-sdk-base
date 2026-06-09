@@ -64,6 +64,15 @@ PYTHON_SRC="${PYTHON_SRC:-${WORKSPACE_ROOT}/remotemedia-sdk/clients/python}"
 PYTHON_SRC_STAGING_LOCAL="${PYTHON_SRC_STAGING_LOCAL:-/tmp/remotemedia-inprocess-python-src}"
 PYTHON_STAGING_PATH="${PYTHON_STAGING_PATH:-/data/local/tmp/remotemedia-inprocess-python}"
 
+# APK/AAR asset packaging configuration. The deploy phase must not push these
+# resources over adb; it should install the APK and let the app extract assets
+# into app-private storage on first launch.
+APP_ASSETS_DIR="${APP_ASSETS_DIR:-${ANDROID_PROJECT}/app/src/main/assets}"
+PYTHON_RUNTIME_ID="${PYTHON_RUNTIME_ID:-hermes}"
+PYTHON_RUNTIME_ASSETS_DIR="${PYTHON_RUNTIME_ASSETS_DIR:-${APP_ASSETS_DIR}/python-runtimes/${PYTHON_RUNTIME_ID}}"
+BUNDLE_SMALL_MODELS_IN_APK="${BUNDLE_SMALL_MODELS_IN_APK:-true}"
+BUNDLE_LARGE_LLM_IN_APK="${BUNDLE_LARGE_LLM_IN_APK:-false}"
+
 NDK_VERSION="${NDK_VERSION:-25.2.9519653}"
 SDK_PATH="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-${HOME}/Android/Sdk}}"
 NDK_PATH="${ANDROID_NDK_ROOT:-${SDK_PATH}/ndk/${NDK_VERSION}}"
@@ -154,6 +163,462 @@ setup_python_symlink() {
     else
         warn "Python symlink already exists or libpython3.14.so not found"
     fi
+}
+
+
+# =============================================================================
+# STEP 3b: Package runtime assets into APK
+# =============================================================================
+resolve_python_bundle_src() {
+    local python_bundle_src="$PYTHON_BUNDLE_SRC"
+    if [[ ! -d "$python_bundle_src" ]]; then
+        warn "Preferred Python-for-Android bundle not found: $python_bundle_src" >&2
+        python_bundle_src="$PYTHON_BUNDLE_FALLBACK_SRC"
+    fi
+
+    if [[ ! -d "$python_bundle_src" ]]; then
+        error "Python-for-Android bundle not found: $python_bundle_src" >&2
+        warn "Build it first with build_p4a_hermes_simple.sh or override PYTHON_BUNDLE_SRC." >&2
+        exit 1
+    fi
+
+    echo "$python_bundle_src"
+}
+
+resolve_python_native_libs_src() {
+    local python_native_libs_src="$PYTHON_NATIVE_LIBS_SRC"
+    if [[ ! -d "$python_native_libs_src" ]]; then
+        warn "Preferred Python native libs not found: $python_native_libs_src" >&2
+        python_native_libs_src="$PYTHON_NATIVE_LIBS_FALLBACK_SRC"
+    fi
+
+    if [[ ! -d "$python_native_libs_src" ]]; then
+        error "Python native libs not found: $python_native_libs_src" >&2
+        warn "Build the p4a distro first or override PYTHON_NATIVE_LIBS_SRC." >&2
+        exit 1
+    fi
+
+    echo "$python_native_libs_src"
+}
+
+copy_required_asset_file() {
+    local src="$1"
+    local dst="$2"
+    local label="$3"
+
+    if [[ ! -f "$src" ]]; then
+        error "$label not found: $src"
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "$dst")"
+    install -m 0644 "$src" "$dst"
+    success "Packaged $label: ${dst#${ANDROID_PROJECT}/}"
+}
+
+copy_optional_asset_file() {
+    local src="$1"
+    local dst="$2"
+    local label="$3"
+
+    if [[ ! -f "$src" ]]; then
+        warn "Optional $label not found: $src"
+        return
+    fi
+
+    mkdir -p "$(dirname "$dst")"
+    install -m 0644 "$src" "$dst"
+    success "Packaged optional $label: ${dst#${ANDROID_PROJECT}/}"
+}
+
+copy_required_asset_dir() {
+    local src="$1"
+    local dst="$2"
+    local label="$3"
+
+    if [[ ! -d "$src" ]]; then
+        error "$label directory not found: $src"
+        exit 1
+    fi
+
+    rm -rf "$dst"
+    mkdir -p "$(dirname "$dst")"
+    cp -aL "$src" "$dst"
+    success "Packaged $label: ${dst#${ANDROID_PROJECT}/}"
+}
+
+resolve_misaki_resource_src() {
+    if [[ -d "$MISAKI_G2P_RESOURCE_SRC" ]]; then
+        echo "$MISAKI_G2P_RESOURCE_SRC"
+    elif [[ -d "$MISAKI_G2P_RESOURCE_FALLBACK_SRC" ]]; then
+        warn "Using bundled Misaki G2P fixture resources: $MISAKI_G2P_RESOURCE_FALLBACK_SRC" >&2
+        echo "$MISAKI_G2P_RESOURCE_FALLBACK_SRC"
+    else
+        error "Misaki G2P resources not found: $MISAKI_G2P_RESOURCE_SRC"
+        warn "Provide production resources there or set MISAKI_G2P_RESOURCE_SRC."
+        exit 1
+    fi
+}
+
+stage_python_sources_for_apk() {
+    local dst="$1"
+
+    if [[ ! -d "$PYTHON_SRC" ]]; then
+        error "RemoteMedia Python sources not found: $PYTHON_SRC"
+        exit 1
+    fi
+
+    rm -rf "$PYTHON_SRC_STAGING_LOCAL"
+    mkdir -p "$PYTHON_SRC_STAGING_LOCAL"
+    cp -aL "$PYTHON_SRC"/. "$PYTHON_SRC_STAGING_LOCAL"/
+
+    local hermes_src="${WORKSPACE_ROOT}/hermes-agent"
+    if [[ -d "$hermes_src" ]]; then
+        cp -aL "$hermes_src" "$PYTHON_SRC_STAGING_LOCAL/hermes_agent"
+        cp "$hermes_src"/*.py "$PYTHON_SRC_STAGING_LOCAL/" 2>/dev/null || true
+        cp -aL "$hermes_src/agent" "$PYTHON_SRC_STAGING_LOCAL/" 2>/dev/null || true
+        cp -aL "$hermes_src/tools" "$PYTHON_SRC_STAGING_LOCAL/" 2>/dev/null || true
+        success "Staged Hermes Agent source for APK packaging"
+    else
+        warn "Hermes Agent source not found at $hermes_src - Hermes imports may fail"
+    fi
+
+    mkdir -p "$PYTHON_SRC_STAGING_LOCAL/remotemedia/nodes"
+    cat > "$PYTHON_SRC_STAGING_LOCAL/remotemedia/__init__.py" <<'PY'
+"""
+Android in-process staging initializer.
+
+Keep package import side effects minimal so explicit node imports do not pull
+desktop-only optional dependencies such as aiortc, av, torch, or kokoro.
+"""
+
+__path__ = __import__("pkgutil").extend_path(__path__, __name__)
+__version__ = "0.1.0"
+PY
+
+    cat > "$PYTHON_SRC_STAGING_LOCAL/remotemedia/nodes/__init__.py" <<'PY'
+"""
+Android in-process staging initializer for node packages.
+
+Explicit imports like `remotemedia.nodes.ml.whisper_stt.WhisperSTTNode` should
+not import every desktop node module as a side effect.
+"""
+
+from .registration import (
+    NodeRegistration,
+    discover_and_register,
+    export_to_json,
+    export_to_rust,
+    get_node_registration,
+    get_registered_nodes,
+    streaming_node,
+)
+from .loader import (
+    get_loaded_nodes,
+    get_node_class,
+    register_node_class,
+    register_python_node,
+    register_python_nodes_from_config,
+)
+
+__all__ = [
+    "NodeRegistration",
+    "discover_and_register",
+    "export_to_json",
+    "export_to_rust",
+    "get_node_registration",
+    "get_registered_nodes",
+    "streaming_node",
+    "get_loaded_nodes",
+    "get_node_class",
+    "register_node_class",
+    "register_python_node",
+    "register_python_nodes_from_config",
+]
+PY
+
+    cat > "$PYTHON_SRC_STAGING_LOCAL/remotemedia/nodes/android_inprocess.py" <<'PY'
+"""
+Android in-process adapters for the PyO3 bridge.
+
+These adapters intentionally avoid desktop-only node imports. Native Android
+loadable plugins should be preferred for Whisper, VAD, Kokoro, Misaki G2P, and
+LiteRT-LM when available.
+"""
+
+import math
+from types import SimpleNamespace
+
+
+def _audio_object(data, samples=None, sample_rate=None, channels=None, metadata=None):
+    if isinstance(data, dict):
+        samples = data.get("samples", samples)
+        sample_rate = data.get("sample_rate", sample_rate)
+        channels = data.get("channels", channels)
+        metadata = data.get("metadata", metadata)
+        stream_id = data.get("stream_id")
+        timestamp_us = data.get("timestamp_us")
+        arrival_ts_us = data.get("arrival_ts_us")
+    else:
+        stream_id = getattr(data, "stream_id", None)
+        timestamp_us = getattr(data, "timestamp_us", None)
+        arrival_ts_us = getattr(data, "arrival_ts_us", None)
+
+    out = SimpleNamespace(
+        data_type="audio",
+        samples=list(samples or []),
+        sample_rate=int(sample_rate or 16000),
+        channels=int(channels or 1),
+    )
+    if stream_id is not None:
+        out.stream_id = stream_id
+    if timestamp_us is not None:
+        out.timestamp_us = int(timestamp_us)
+    if arrival_ts_us is not None:
+        out.arrival_ts_us = int(arrival_ts_us)
+    if metadata is not None:
+        out.metadata = metadata
+    return out
+
+
+def _audio_stats(data):
+    if isinstance(data, dict):
+        samples = data.get("samples") or []
+        sample_rate = int(data.get("sample_rate") or 16000)
+        channels = int(data.get("channels") or 1)
+    else:
+        samples = getattr(data, "samples", []) or []
+        sample_rate = int(getattr(data, "sample_rate", 16000) or 16000)
+        channels = int(getattr(data, "channels", 1) or 1)
+
+    if not samples:
+        return 0, sample_rate, channels, 0.0
+    total = 0.0
+    peak = 0.0
+    limit = min(len(samples), 48000)
+    for sample in samples[:limit]:
+        value = float(sample)
+        total += value * value
+        peak = max(peak, abs(value))
+    rms = math.sqrt(total / limit)
+    return len(samples), sample_rate, channels, max(rms, peak)
+
+
+class VADNode:
+    def initialize(self, config):
+        self.config = dict(config or {})
+        self.energy_threshold = float(self.config.get("energy_threshold", 0.02))
+        self.frames_seen = 0
+        print(f"AndroidInProcess VADNode initialized threshold={self.energy_threshold}", flush=True)
+
+    def process(self, data):
+        self.frames_seen += 1
+        sample_count, sample_rate, channels, energy = _audio_stats(data)
+        if energy < self.energy_threshold:
+            return ""
+        metadata = {}
+        if isinstance(data, dict) and isinstance(data.get("metadata"), dict):
+            metadata.update(data["metadata"])
+        metadata["android_inprocess_vad"] = {
+            "is_speech": bool(energy >= self.energy_threshold),
+            "energy": energy,
+            "sample_count": sample_count,
+        }
+        return _audio_object(data, sample_rate=sample_rate, channels=channels, metadata=metadata)
+
+    def process_streaming(self, data):
+        yield self.process(data)
+
+
+class WhisperSTTNode:
+    def initialize(self, config):
+        self.config = dict(config or {})
+        print("AndroidInProcess WhisperSTTNode compatibility adapter initialized", flush=True)
+
+    def process(self, data):
+        return ""
+
+    def process_streaming(self, data):
+        output = self.process(data)
+        if output:
+            yield output
+
+
+class DebugKokoroTTSNode:
+    def initialize(self, config):
+        self.config = dict(config or {})
+        self.sample_rate = int(self.config.get("sample_rate", 24000))
+        print("AndroidInProcess DebugKokoroTTSNode initialized", flush=True)
+
+    def process(self, data):
+        text = data if isinstance(data, str) else str(data)
+        duration_s = 0.25
+        count = int(self.sample_rate * duration_s)
+        frequency = 660.0 if text.strip() else 330.0
+        amplitude = 0.08
+        samples = [
+            amplitude * math.sin(2.0 * math.pi * frequency * (i / self.sample_rate))
+            for i in range(count)
+        ]
+        return _audio_object(
+            {},
+            samples=samples,
+            sample_rate=self.sample_rate,
+            channels=1,
+            metadata={"android_inprocess_tts": {"debug": True, "input_preview": text[:160]}},
+        )
+
+    def process_streaming(self, data):
+        yield self.process(data)
+
+
+class DataSinkNode:
+    def initialize(self, config):
+        self.config = dict(config or {})
+        self.total_processed = 0
+        print("AndroidInProcess DataSinkNode initialized", flush=True)
+
+    def process(self, data):
+        self.total_processed += 1
+        return data
+
+    def process_streaming(self, data):
+        yield self.process(data)
+
+
+class HermesAgentTestPlugin:
+    """Test plugin to verify Hermes Agent imports work in-process on Android."""
+
+    def initialize(self, config):
+        self.config = dict(config or {})
+        self.imports_ok = False
+        self.import_error = ""
+        self.imported_modules = []
+        try:
+            from hermes_agent.run_agent import AIAgent
+            self.imported_modules.append("hermes_agent.run_agent.AIAgent")
+            from hermes_agent.agent.conversation_loop import run_conversation_loop
+            self.imported_modules.append("hermes_agent.agent.conversation_loop.run_conversation_loop")
+            from hermes_agent.model_tools import get_tool_definitions, handle_function_call
+            self.imported_modules.append("hermes_agent.model_tools.get_tool_definitions")
+            self.imported_modules.append("hermes_agent.model_tools.handle_function_call")
+            from hermes_agent.tools.registry import get_tool_definitions as get_registry_tools
+            self.imported_modules.append("hermes_agent.tools.registry.get_tool_definitions")
+            self.imports_ok = True
+        except ImportError as e:
+            self.import_error = str(e)
+
+    def process(self, data):
+        if self.imports_ok:
+            return {"data_type": "text", "text": "Hermes Agent imports: OK", "modules": self.imported_modules}
+        return {"data_type": "text", "text": f"Hermes Agent imports: FAILED - {self.import_error}", "error": self.import_error}
+
+    def process_streaming(self, data):
+        yield self.process(data)
+
+    def finalize(self):
+        return True
+PY
+
+    rm -rf "$dst"
+    mkdir -p "$(dirname "$dst")"
+    cp -aL "$PYTHON_SRC_STAGING_LOCAL" "$dst"
+    success "Packaged Python sources: ${dst#${ANDROID_PROJECT}/}"
+}
+
+package_python_runtime_assets() {
+    log "Packaging Python runtime into APK assets..."
+
+    local python_bundle_src
+    python_bundle_src="$(resolve_python_bundle_src)"
+    local python_native_libs_src
+    python_native_libs_src="$(resolve_python_native_libs_src)"
+
+    rm -rf "$PYTHON_RUNTIME_ASSETS_DIR"
+    mkdir -p "$PYTHON_RUNTIME_ASSETS_DIR"
+
+    copy_required_asset_dir "$python_bundle_src" "$PYTHON_RUNTIME_ASSETS_DIR/bundle" "Python-for-Android bundle"
+
+    # p4a native libraries are needed both as Android native libs and inside the
+    # extracted runtime bundle for direct libpythonbin.so execution/wrappers.
+    mkdir -p "$PYTHON_RUNTIME_ASSETS_DIR/bundle"
+    install -m 0644 "$python_native_libs_src"/*.so "$PYTHON_RUNTIME_ASSETS_DIR/bundle/"
+    success "Packaged Python native libraries into runtime bundle assets"
+
+    stage_python_sources_for_apk "$PYTHON_RUNTIME_ASSETS_DIR/src"
+
+    cat > "$PYTHON_RUNTIME_ASSETS_DIR/runtime.json" <<JSON
+{
+  "id": "${PYTHON_RUNTIME_ID}",
+  "python": "3.11",
+  "provider": "python-for-android",
+  "abi": "arm64-v8a",
+  "entrypoint": "bundle/python3",
+  "python_home": "bundle",
+  "python_path": [
+    "bundle/stdlib.zip",
+    "bundle/modules",
+    "bundle/site-packages",
+    "src"
+  ],
+  "native_library_dirs": [
+    "bundle"
+  ],
+  "packages": {
+    "remotemedia": "local",
+    "hermes-agent": "local"
+  }
+}
+JSON
+
+    success "Packaged Python runtime manifest: ${PYTHON_RUNTIME_ASSETS_DIR#${ANDROID_PROJECT}/}/runtime.json"
+}
+
+package_small_model_assets() {
+    if [[ "$BUNDLE_SMALL_MODELS_IN_APK" != "true" ]]; then
+        warn "Skipping small model/resource APK packaging because BUNDLE_SMALL_MODELS_IN_APK=$BUNDLE_SMALL_MODELS_IN_APK"
+        return
+    fi
+
+    log "Packaging small model/resource assets into APK..."
+
+    copy_required_asset_file "$SILERO_VAD_MODEL_SRC" "$APP_ASSETS_DIR/models/silero-vad/silero_vad.onnx" "Silero VAD model"
+
+    copy_required_asset_file "$WHISPER_MODEL_SRC" "$APP_ASSETS_DIR/models/whisper/whisper_tiny_30s_f32.tflite" "Whisper tiny model"
+    copy_optional_asset_file "$WHISPER_BASE_MODEL_SRC" "$APP_ASSETS_DIR/models/whisper/whisper_base_30s_f32.tflite" "Whisper base model"
+    copy_required_asset_file "$WHISPER_TOKENIZER_SRC" "$APP_ASSETS_DIR/models/whisper/tokenizer.json" "Whisper tokenizer"
+    copy_optional_asset_file "$WHISPER_CONFIG_SRC" "$APP_ASSETS_DIR/models/whisper/config.json" "Whisper config"
+
+    copy_required_asset_file "$KOKORO_MODEL_SRC" "$APP_ASSETS_DIR/models/kokoro/onnx/$KOKORO_MODEL_NAME" "Kokoro ONNX model"
+    copy_required_asset_file "$KOKORO_TOKENIZER_SRC" "$APP_ASSETS_DIR/models/kokoro/tokenizer.json" "Kokoro tokenizer"
+    copy_required_asset_file "$KOKORO_VOICE_SRC" "$APP_ASSETS_DIR/models/kokoro/voices/af_bella.bin" "Kokoro voice"
+
+    local misaki_src
+    misaki_src="$(resolve_misaki_resource_src)"
+    copy_required_asset_file "$misaki_src/en-US/gold.json" "$APP_ASSETS_DIR/models/misaki-g2p/en-US/gold.json" "Misaki G2P en-US gold"
+    copy_required_asset_file "$misaki_src/en-US/silver.json" "$APP_ASSETS_DIR/models/misaki-g2p/en-US/silver.json" "Misaki G2P en-US silver"
+    copy_optional_asset_file "$misaki_src/en-GB/gold.json" "$APP_ASSETS_DIR/models/misaki-g2p/en-GB/gold.json" "Misaki G2P en-GB gold"
+    copy_optional_asset_file "$misaki_src/en-GB/silver.json" "$APP_ASSETS_DIR/models/misaki-g2p/en-GB/silver.json" "Misaki G2P en-GB silver"
+}
+
+package_large_model_assets_if_requested() {
+    if [[ "$BUNDLE_LARGE_LLM_IN_APK" != "true" ]]; then
+        warn "Not packaging large LLM model in APK. The app/runtime manager should download it separately."
+        return
+    fi
+
+    copy_required_asset_file "$MODEL_SRC" "$APP_ASSETS_DIR/models/gemma-4-E2B-it.litertlm" "LiteRT-LM model"
+}
+
+package_apk_runtime_assets() {
+    log "Packaging runtime assets into APK assets directory..."
+    mkdir -p "$APP_ASSETS_DIR"
+
+    package_python_runtime_assets
+    package_small_model_assets
+    package_large_model_assets_if_requested
+
+    success "APK runtime asset packaging complete"
 }
 
 # =============================================================================
@@ -273,11 +738,11 @@ build_rust() {
 
     local python_native_libs_src="$PYTHON_NATIVE_LIBS_SRC"
     if [[ ! -d "$python_native_libs_src" ]]; then
-        warn "Preferred Python native libs not found: $python_native_libs_src"
+        warn "Preferred Python native libs not found: $python_native_libs_src" >&2
         python_native_libs_src="$PYTHON_NATIVE_LIBS_FALLBACK_SRC"
     fi
     if [[ ! -d "$python_native_libs_src" ]]; then
-        error "Python native libs not found: $python_native_libs_src"
+        error "Python native libs not found: $python_native_libs_src" >&2
         exit 1
     fi
     install -m 0644 "$python_native_libs_src"/*.so app/src/main/jniLibs/arm64-v8a/
@@ -315,6 +780,8 @@ build_rust() {
     mkdir -p app/src/main/assets/plugins
     install -m 0644 "$LOADABLE_PLUGIN" app/src/main/assets/plugins/
     success "Copied RemoteMedia loadable plugin to assets/plugins/"
+
+    package_apk_runtime_assets
 }
 
 # =============================================================================
@@ -353,6 +820,18 @@ verify_apk_contents() {
         "assets/manifests/tts-mobile.json"
         "assets/manifests/transcribe-mobile.json"
         "assets/have_a_wonderful_day.wav"
+        "assets/python-runtimes/${PYTHON_RUNTIME_ID}/runtime.json"
+        "assets/python-runtimes/${PYTHON_RUNTIME_ID}/bundle/stdlib.zip"
+        "assets/python-runtimes/${PYTHON_RUNTIME_ID}/src/remotemedia/__init__.py"
+        "assets/python-runtimes/${PYTHON_RUNTIME_ID}/src/remotemedia/nodes/android_inprocess.py"
+        "assets/models/silero-vad/silero_vad.onnx"
+        "assets/models/whisper/whisper_tiny_30s_f32.tflite"
+        "assets/models/whisper/tokenizer.json"
+        "assets/models/kokoro/onnx/${KOKORO_MODEL_NAME}"
+        "assets/models/kokoro/tokenizer.json"
+        "assets/models/kokoro/voices/af_bella.bin"
+        "assets/models/misaki-g2p/en-US/gold.json"
+        "assets/models/misaki-g2p/en-US/silver.json"
         "lib/arm64-v8a/libremotemedia_android_inprocess.so"
         "lib/arm64-v8a/libc++_shared.so"
         "lib/arm64-v8a/libGemmaModelConstraintProvider.so"
@@ -369,6 +848,25 @@ verify_apk_contents() {
         else
             error "APK missing $entry"
             missing=1
+        fi
+    done
+
+    local optional_entries=(
+        "assets/models/whisper/whisper_base_30s_f32.tflite"
+        "assets/models/whisper/config.json"
+        "assets/models/misaki-g2p/en-GB/gold.json"
+        "assets/models/misaki-g2p/en-GB/silver.json"
+    )
+
+    if [[ "$BUNDLE_LARGE_LLM_IN_APK" == "true" ]]; then
+        optional_entries+=("assets/models/gemma-4-E2B-it.litertlm")
+    fi
+
+    for entry in "${optional_entries[@]}"; do
+        if grep -Fxq "$entry" <<< "$apk_entries"; then
+            success "APK contains optional $entry"
+        else
+            warn "APK does not contain optional $entry"
         fi
     done
 
@@ -395,740 +893,19 @@ deploy_to_device() {
         exit 1
     fi
     
-    # Install APK
+    # Install APK. Do not adb-push runtime assets, Python, small models, or
+    # plugins here: they must already be embedded in the APK and extracted by
+    # the app/runtime manager.
     adb -s "$DEVICE_ADDRESS" install -r "$ANDROID_PROJECT/app/build/outputs/apk/release/app-release.apk"
     success "APK installed"
-    
-    success "Plugin is embedded in APK assets; PipelineManager will extract it to app files dir"
-    copy_model_to_device
-    copy_silero_vad_assets_to_device
-    copy_whisper_assets_to_device
-    copy_kokoro_assets_to_device
-    copy_misaki_g2p_assets_to_device
-    copy_python_to_device
+    success "Runtime assets are embedded in the APK; the app is responsible for first-run extraction."
 }
 
-copy_silero_vad_assets_to_device() {
-    log "Ensuring Silero VAD assets are present in app-private files"
-    if ! adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess id >/dev/null 2>&1; then
-        error "run-as failed. Release build must be debuggable to copy Silero VAD assets into app-private files."
-        exit 1
-    fi
+# Legacy adb-push staging functions were removed intentionally. Runtime assets,
+# Python distributions, plugins, and small models are now packaged into the APK.
+# Large LLM/model artifacts should be downloaded by the app/runtime manager, not
+# pushed by the deploy script.
 
-    copy_one_model_asset "$SILERO_VAD_MODEL_SRC" "$SILERO_VAD_STAGING_DIR" "files/models/silero-vad" "silero_vad.onnx" "Silero VAD" "true"
-
-    log "Silero VAD asset diagnostics:"
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/silero-vad || true
-}
-
-copy_model_to_device() {
-    if [[ ! -f "$MODEL_SRC" ]]; then
-        error "LiteRT-LM model not found: $MODEL_SRC"
-        exit 1
-    fi
-
-    local model_size
-    model_size="$(stat -c%s "$MODEL_SRC")"
-
-    log "Ensuring model is present in app-private files: $MODEL_DEVICE_PATH (${model_size} bytes)"
-    if ! adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess id >/dev/null 2>&1; then
-        error "run-as failed. Release build must be debuggable to copy the model into app-private files."
-        exit 1
-    fi
-
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess mkdir -p files/models
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess mkdir -p files/cache/litert-lm
-
-    local device_size
-    device_size="$(adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess stat -c%s files/models/gemma-4-E2B-it.litertlm 2>/dev/null | tr -d '\r' || true)"
-    device_size="${device_size:-0}"
-
-    if [[ "$device_size" == "$model_size" ]]; then
-        success "Model already present on device with matching size"
-        return
-    fi
-
-    warn "App-private model size is ${device_size}; staging model for run-as copy"
-    local staging_size
-    staging_size="$(adb -s "$DEVICE_ADDRESS" shell "stat -c%s '$MODEL_STAGING_PATH' 2>/dev/null || echo 0" | tr -d '\r')"
-    if [[ "$staging_size" != "$model_size" ]]; then
-        adb -s "$DEVICE_ADDRESS" push "$MODEL_SRC" "$MODEL_STAGING_PATH"
-    else
-        success "Staged model already present with matching size"
-    fi
-
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp "$MODEL_STAGING_PATH" files/models/gemma-4-E2B-it.litertlm
-
-    device_size="$(adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess stat -c%s files/models/gemma-4-E2B-it.litertlm 2>/dev/null | tr -d '\r' || true)"
-    device_size="${device_size:-0}"
-    if [[ "$device_size" != "$model_size" ]]; then
-        error "Model push failed or size mismatch: local=${model_size}, device=${device_size}"
-        exit 1
-    fi
-
-    success "Model copied to device"
-}
-
-copy_one_whisper_asset() {
-    local src="$1"
-    local dst_name="$2"
-    local required="$3"
-
-    if [[ ! -f "$src" ]]; then
-        if [[ "$required" == "true" ]]; then
-            error "Whisper asset not found: $src"
-            exit 1
-        fi
-        warn "Optional Whisper asset not found: $src"
-        return
-    fi
-
-    local src_size
-    src_size="$(stat -c%s "$src")"
-    local staged_path="${WHISPER_STAGING_DIR}/${dst_name}"
-
-    log "Staging Whisper asset $dst_name (${src_size} bytes)"
-    adb -s "$DEVICE_ADDRESS" shell "mkdir -p '$WHISPER_STAGING_DIR'"
-    local staging_size
-    staging_size="$(adb -s "$DEVICE_ADDRESS" shell "stat -c%s '$staged_path' 2>/dev/null || echo 0" | tr -d '\r')"
-    if [[ "$staging_size" != "$src_size" ]]; then
-        adb -s "$DEVICE_ADDRESS" push "$src" "$staged_path"
-    else
-        success "Staged Whisper asset already present: $dst_name"
-    fi
-
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp "$staged_path" "files/models/whisper/$dst_name"
-
-    local device_size
-    device_size="$(adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess stat -c%s "files/models/whisper/$dst_name" 2>/dev/null | tr -d '\r' || true)"
-    device_size="${device_size:-0}"
-    if [[ "$device_size" != "$src_size" ]]; then
-        error "Whisper asset copy failed or size mismatch for $dst_name: local=${src_size}, device=${device_size}"
-        exit 1
-    fi
-    success "Whisper asset copied: $dst_name"
-}
-
-copy_whisper_assets_to_device() {
-    log "Ensuring LiteRT Whisper assets are present in app-private files"
-    if ! adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess id >/dev/null 2>&1; then
-        error "run-as failed. Release build must be debuggable to copy Whisper assets into app-private files."
-        exit 1
-    fi
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess mkdir -p files/models/whisper
-
-    copy_one_whisper_asset "$WHISPER_MODEL_SRC" "whisper_tiny_30s_f32.tflite" "true"
-    copy_one_whisper_asset "$WHISPER_BASE_MODEL_SRC" "whisper_base_30s_f32.tflite" "false"
-    copy_one_whisper_asset "$WHISPER_TOKENIZER_SRC" "tokenizer.json" "true"
-    copy_one_whisper_asset "$WHISPER_CONFIG_SRC" "config.json" "false"
-
-    log "Whisper asset diagnostics:"
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/whisper || true
-}
-
-copy_one_model_asset() {
-    local src="$1"
-    local staged_dir="$2"
-    local device_dir="$3"
-    local dst_name="$4"
-    local label="$5"
-    local required="$6"
-
-    if [[ ! -f "$src" ]]; then
-        if [[ "$required" == "true" ]]; then
-            error "$label asset not found: $src"
-            warn "Provide it at the path above or override the corresponding *_SRC environment variable."
-            exit 1
-        fi
-        warn "Optional $label asset not found: $src"
-        return
-    fi
-
-    local src_size
-    src_size="$(stat -c%s "$src")"
-    local staged_path="${staged_dir}/${dst_name}"
-
-    log "Staging $label asset $dst_name (${src_size} bytes)"
-    adb -s "$DEVICE_ADDRESS" shell "mkdir -p '$staged_dir'"
-    local staging_size
-    staging_size="$(adb -s "$DEVICE_ADDRESS" shell "stat -c%s '$staged_path' 2>/dev/null || echo 0" | tr -d '\r')"
-    if [[ "$staging_size" != "$src_size" ]]; then
-        adb -s "$DEVICE_ADDRESS" push "$src" "$staged_path"
-    else
-        success "Staged $label asset already present: $dst_name"
-    fi
-
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess mkdir -p "$device_dir"
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp "$staged_path" "${device_dir}/${dst_name}"
-
-    local device_size
-    device_size="$(adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess stat -c%s "${device_dir}/${dst_name}" 2>/dev/null | tr -d '\r' || true)"
-    device_size="${device_size:-0}"
-    if [[ "$device_size" != "$src_size" ]]; then
-        error "$label asset copy failed or size mismatch for $dst_name: local=${src_size}, device=${device_size}"
-        exit 1
-    fi
-    success "$label asset copied: $dst_name"
-}
-
-copy_kokoro_assets_to_device() {
-    log "Ensuring Kokoro ONNX assets are present in app-private files"
-    if ! adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess id >/dev/null 2>&1; then
-        error "run-as failed. Release build must be debuggable to copy Kokoro assets into app-private files."
-        exit 1
-    fi
-
-    copy_one_model_asset "$KOKORO_MODEL_SRC" "$KOKORO_STAGING_DIR/onnx" "files/models/kokoro/onnx" "$KOKORO_MODEL_NAME" "Kokoro" "true"
-    copy_one_model_asset "$KOKORO_TOKENIZER_SRC" "$KOKORO_STAGING_DIR" "files/models/kokoro" "tokenizer.json" "Kokoro" "true"
-    copy_one_model_asset "$KOKORO_VOICE_SRC" "$KOKORO_STAGING_DIR/voices" "files/models/kokoro/voices" "af_bella.bin" "Kokoro" "true"
-
-    log "Kokoro asset diagnostics:"
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/kokoro files/models/kokoro/onnx files/models/kokoro/voices || true
-}
-
-resolve_misaki_resource_src() {
-    if [[ -d "$MISAKI_G2P_RESOURCE_SRC" ]]; then
-        echo "$MISAKI_G2P_RESOURCE_SRC"
-    elif [[ -d "$MISAKI_G2P_RESOURCE_FALLBACK_SRC" ]]; then
-        warn "Using bundled Misaki G2P fixture resources: $MISAKI_G2P_RESOURCE_FALLBACK_SRC" >&2
-        echo "$MISAKI_G2P_RESOURCE_FALLBACK_SRC"
-    else
-        error "Misaki G2P resources not found: $MISAKI_G2P_RESOURCE_SRC"
-        warn "Provide production resources there or set MISAKI_G2P_RESOURCE_SRC."
-        exit 1
-    fi
-}
-
-copy_misaki_g2p_assets_to_device() {
-    log "Ensuring Misaki G2P resources are present in app-private files"
-    if ! adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess id >/dev/null 2>&1; then
-        error "run-as failed. Release build must be debuggable to copy Misaki G2P assets into app-private files."
-        exit 1
-    fi
-
-    local src_root
-    src_root="$(resolve_misaki_resource_src)"
-    copy_one_model_asset "${src_root}/en-US/gold.json" "$MISAKI_G2P_STAGING_DIR/en-US" "files/models/misaki-g2p/en-US" "gold.json" "Misaki G2P" "true"
-    copy_one_model_asset "${src_root}/en-US/silver.json" "$MISAKI_G2P_STAGING_DIR/en-US" "files/models/misaki-g2p/en-US" "silver.json" "Misaki G2P" "true"
-    copy_one_model_asset "${src_root}/en-GB/gold.json" "$MISAKI_G2P_STAGING_DIR/en-GB" "files/models/misaki-g2p/en-GB" "gold.json" "Misaki G2P" "false"
-    copy_one_model_asset "${src_root}/en-GB/silver.json" "$MISAKI_G2P_STAGING_DIR/en-GB" "files/models/misaki-g2p/en-GB" "silver.json" "Misaki G2P" "false"
-
-    log "Misaki G2P asset diagnostics:"
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/misaki-g2p files/models/misaki-g2p/en-US || true
-}
-
-copy_python_to_device() {
-    local python_bundle_src="$PYTHON_BUNDLE_SRC"
-    if [[ ! -d "$python_bundle_src" ]]; then
-        warn "Preferred Python-for-Android bundle not found: $python_bundle_src"
-        python_bundle_src="$PYTHON_BUNDLE_FALLBACK_SRC"
-    fi
-
-    if [[ ! -d "$python_bundle_src" ]]; then
-        error "Python-for-Android bundle not found: $python_bundle_src"
-        exit 1
-    fi
-
-    if [[ ! -d "$PYTHON_SRC" ]]; then
-        error "RemoteMedia Python sources not found: $PYTHON_SRC"
-        exit 1
-    fi
-
-    log "Staging Python runtime and RemoteMedia Python sources for app-private execution..."
-    log "Using Python bundle: $python_bundle_src"
-    rm -rf "$PYTHON_SRC_STAGING_LOCAL"
-    mkdir -p "$PYTHON_SRC_STAGING_LOCAL"
-    cp -aL "$PYTHON_SRC"/. "$PYTHON_SRC_STAGING_LOCAL"/
-    
-    # Also stage Hermes Agent source for in-process imports
-    log "Staging Hermes Agent source for in-process imports..."
-    HERMES_SRC="${WORKSPACE_ROOT}/hermes-agent"
-    if [[ -d "$HERMES_SRC" ]]; then
-        # Copy the hermes_agent package directory
-        cp -aL "$HERMES_SRC" "$PYTHON_SRC_STAGING_LOCAL/hermes_agent"
-        # Copy all root-level Python files so absolute imports work
-        cp "$HERMES_SRC"/*.py "$PYTHON_SRC_STAGING_LOCAL/" 2>/dev/null || true
-        # Copy entire agent directory (already in hermes_agent/agent but ensure root-level agent imports work)
-        cp -aL "$HERMES_SRC/agent" "$PYTHON_SRC_STAGING_LOCAL/" 2>/dev/null || true
-        cp -aL "$HERMES_SRC/tools" "$PYTHON_SRC_STAGING_LOCAL/" 2>/dev/null || true
-        success "Hermes Agent source staged at $PYTHON_SRC_STAGING_LOCAL/"
-    else
-        warn "Hermes Agent source not found at $HERMES_SRC - imports will fail"
-    fi
-    cat > "$PYTHON_SRC_STAGING_LOCAL/remotemedia/__init__.py" <<'PY'
-"""
-Android in-process staging initializer.
-
-Keep package import side effects minimal so explicit node imports do not pull
-desktop-only optional dependencies such as aiortc, av, torch, or kokoro.
-"""
-
-__path__ = __import__("pkgutil").extend_path(__path__, __name__)
-__version__ = "0.1.0"
-PY
-    cat > "$PYTHON_SRC_STAGING_LOCAL/remotemedia/nodes/__init__.py" <<'PY'
-"""
-Android in-process staging initializer for node packages.
-
-Explicit imports like `remotemedia.nodes.ml.whisper_stt.WhisperSTTNode` should
-not import every desktop node module as a side effect.
-"""
-
-from .registration import (
-    NodeRegistration,
-    discover_and_register,
-    export_to_json,
-    export_to_rust,
-    get_node_registration,
-    get_registered_nodes,
-    streaming_node,
-)
-from .loader import (
-    get_loaded_nodes,
-    get_node_class,
-    register_node_class,
-    register_python_node,
-    register_python_nodes_from_config,
-)
-
-__all__ = [
-    "NodeRegistration",
-    "discover_and_register",
-    "export_to_json",
-    "export_to_rust",
-    "get_node_registration",
-    "get_registered_nodes",
-    "streaming_node",
-    "get_loaded_nodes",
-    "get_node_class",
-    "register_node_class",
-    "register_python_node",
-    "register_python_nodes_from_config",
-]
-PY
-    cat > "$PYTHON_SRC_STAGING_LOCAL/remotemedia/nodes/android_inprocess.py" <<'PY'
-"""
-Android in-process adapters for the PyO3 bridge.
-
-The bridge instantiates classes without constructor args, calls
-initialize(config) synchronously, and passes plain Python values converted from
-RuntimeData. These adapters intentionally avoid desktop-only node imports.
-"""
-
-import math
-from types import SimpleNamespace
-
-
-def _audio_object(data, samples=None, sample_rate=None, channels=None, metadata=None):
-    if isinstance(data, dict):
-        samples = data.get("samples", samples)
-        sample_rate = data.get("sample_rate", sample_rate)
-        channels = data.get("channels", channels)
-        metadata = data.get("metadata", metadata)
-        stream_id = data.get("stream_id")
-        timestamp_us = data.get("timestamp_us")
-        arrival_ts_us = data.get("arrival_ts_us")
-    else:
-        stream_id = getattr(data, "stream_id", None)
-        timestamp_us = getattr(data, "timestamp_us", None)
-        arrival_ts_us = getattr(data, "arrival_ts_us", None)
-
-    out = SimpleNamespace(
-        data_type="audio",
-        samples=list(samples or []),
-        sample_rate=int(sample_rate or 16000),
-        channels=int(channels or 1),
-    )
-    if stream_id is not None:
-        out.stream_id = stream_id
-    if timestamp_us is not None:
-        out.timestamp_us = int(timestamp_us)
-    if arrival_ts_us is not None:
-        out.arrival_ts_us = int(arrival_ts_us)
-    if metadata is not None:
-        out.metadata = metadata
-    return out
-
-
-def _audio_stats(data):
-    if isinstance(data, dict):
-        samples = data.get("samples") or []
-        sample_rate = int(data.get("sample_rate") or 16000)
-        channels = int(data.get("channels") or 1)
-    else:
-        samples = getattr(data, "samples", []) or []
-        sample_rate = int(getattr(data, "sample_rate", 16000) or 16000)
-        channels = int(getattr(data, "channels", 1) or 1)
-
-    if not samples:
-        return 0, sample_rate, channels, 0.0
-    total = 0.0
-    peak = 0.0
-    for sample in samples[: min(len(samples), 48000)]:
-        value = float(sample)
-        total += value * value
-        peak = max(peak, abs(value))
-    rms = math.sqrt(total / min(len(samples), 48000))
-    return len(samples), sample_rate, channels, max(rms, peak)
-
-
-class VADNode:
-    def initialize(self, config):
-        self.config = dict(config or {})
-        self.energy_threshold = float(self.config.get("energy_threshold", 0.02))
-        self.frames_seen = 0
-        print(
-            "AndroidInProcess VADNode initialized "
-            f"threshold={self.energy_threshold} config={self.config}",
-            flush=True,
-        )
-
-    def process(self, data):
-        self.frames_seen += 1
-        sample_count, sample_rate, channels, energy = _audio_stats(data)
-        if self.frames_seen <= 3 or self.frames_seen % 10 == 0:
-            print(
-                "AndroidInProcess VADNode process "
-                f"frame={self.frames_seen} samples={sample_count} energy={energy:.5f}",
-                flush=True,
-            )
-
-        if energy < self.energy_threshold:
-            if self.frames_seen <= 3 or self.frames_seen % 10 == 0:
-                print(
-                    "AndroidInProcess VADNode suppressing silence "
-                    f"frame={self.frames_seen} energy={energy:.5f}",
-                    flush=True,
-                )
-            return ""
-
-        metadata = {}
-        if isinstance(data, dict) and isinstance(data.get("metadata"), dict):
-            metadata.update(data["metadata"])
-        metadata["android_inprocess_vad"] = {
-            "is_speech": bool(energy >= self.energy_threshold),
-            "energy": energy,
-            "sample_count": sample_count,
-        }
-        return _audio_object(data, sample_rate=sample_rate, channels=channels, metadata=metadata)
-
-    def process_streaming(self, data):
-        yield self.process(data)
-
-
-class WhisperSTTNode:
-    def initialize(self, config):
-        self.config = dict(config or {})
-        self.frames_seen = 0
-        print(
-            "AndroidInProcess WhisperSTTNode compatibility adapter initialized. "
-            "Use native WhisperNode from libwhisper_loadable_plugin.so for LiteRT ASR.",
-            flush=True,
-        )
-
-    def process(self, data):
-        self.frames_seen += 1
-        sample_count, sample_rate, channels, energy = _audio_stats(data)
-        print(
-            "AndroidInProcess WhisperSTTNode compatibility adapter suppressed "
-            f"frame={self.frames_seen} samples={sample_count} energy={energy:.5f}",
-            flush=True,
-        )
-        return ""
-
-    def process_streaming(self, data):
-        output = self.process(data)
-        if output:
-            yield output
-
-
-class DebugKokoroTTSNode:
-    def initialize(self, config):
-        self.config = dict(config or {})
-        self.sample_rate = int(self.config.get("sample_rate", 24000))
-        print(
-            "AndroidInProcess DebugKokoroTTSNode debug adapter initialized. "
-            "Desktop KokoroTTSNode requires async execution plus kokoro/soundfile "
-            "and is not directly runnable by the current PyO3 bridge.",
-            flush=True,
-        )
-
-    def process(self, data):
-        text = data if isinstance(data, str) else str(data)
-        print(
-            "AndroidInProcess DebugKokoroTTSNode process "
-            f"text_preview={text[:80]!r}",
-            flush=True,
-        )
-        duration_s = 0.25
-        count = int(self.sample_rate * duration_s)
-        frequency = 660.0 if text.strip() else 330.0
-        amplitude = 0.08
-        samples = [
-            amplitude * math.sin(2.0 * math.pi * frequency * (i / self.sample_rate))
-            for i in range(count)
-        ]
-        return _audio_object(
-            {},
-            samples=samples,
-            sample_rate=self.sample_rate,
-            channels=1,
-            metadata={
-                "android_inprocess_tts": {
-                    "debug": True,
-                    "input_preview": text[:160],
-                }
-            },
-        )
-
-    def process_streaming(self, data):
-        yield self.process(data)
-
-
-class DataSinkNode:
-    def initialize(self, config):
-        self.config = dict(config or {})
-        self.total_processed = 0
-        print("AndroidInProcess DataSinkNode initialized", flush=True)
-
-    def process(self, data):
-        self.total_processed += 1
-        print(
-            "AndroidInProcess DataSinkNode processed "
-            f"count={self.total_processed} type={type(data).__name__}",
-            flush=True,
-        )
-        return data
-
-    def process_streaming(self, data):
-        yield self.process(data)
-
-
-class HermesAgentTestPlugin:
-    """Test plugin to verify Hermes Agent imports work in-process on Android."""
-    
-    def initialize(self, config):
-        self.config = dict(config or {})
-        self.imports_ok = False
-        self.import_error = ""
-        self.imported_modules = []
-        try:
-            # Test core Hermes Agent imports (with hermes_agent prefix since source is in hermes_agent/ dir)
-            from hermes_agent.run_agent import AIAgent
-            self.imported_modules.append("hermes_agent.run_agent.AIAgent")
-            
-            from hermes_agent.agent.conversation_loop import run_conversation_loop
-            self.imported_modules.append("hermes_agent.agent.conversation_loop.run_conversation_loop")
-            
-            from hermes_agent.model_tools import get_tool_definitions, handle_function_call
-            self.imported_modules.append("hermes_agent.model_tools.get_tool_definitions")
-            self.imported_modules.append("hermes_agent.model_tools.handle_function_call")
-            
-            from hermes_agent.tools.registry import get_tool_definitions as get_registry_tools
-            self.imported_modules.append("hermes_agent.tools.registry.get_tool_definitions")
-            
-            self.imports_ok = True
-            print(f"HermesAgentTestPlugin imports OK: {self.imported_modules}", flush=True)
-        except ImportError as e:
-            self.imports_ok = False
-            self.import_error = str(e)
-            print(f"HermesAgentTestPlugin import failed: {e}", flush=True)
-    
-    def process(self, data):
-        if self.imports_ok:
-            return {
-                "data_type": "text",
-                "text": "Hermes Agent imports: OK",
-                "modules": self.imported_modules,
-            }
-        else:
-            return {
-                "data_type": "text",
-                "text": f"Hermes Agent imports: FAILED - {self.import_error}",
-                "error": self.import_error,
-            }
-    
-    def process_streaming(self, data):
-        yield self.process(data)
-    
-    def finalize(self):
-        return True
-
-PY
-
-    adb -s "$DEVICE_ADDRESS" shell "rm -rf '$PYTHON_STAGING_PATH' && mkdir -p '$PYTHON_STAGING_PATH'"
-    adb -s "$DEVICE_ADDRESS" push "$python_bundle_src" "$PYTHON_STAGING_PATH/bundle"
-    adb -s "$DEVICE_ADDRESS" push "$PYTHON_SRC_STAGING_LOCAL" "$PYTHON_STAGING_PATH/src"
-
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess rm -rf files/python
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess mkdir -p files/python
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp -R "$PYTHON_STAGING_PATH/bundle" files/python/bundle
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp -R "$PYTHON_STAGING_PATH/src" files/python/src
-
-    # Copy libpythonbin.so and all required .so libraries to the bundle directory so python3 wrapper can find them
-    # The libraries are in the p4a distro's libs/arm64-v8a/ directory (at distro root, not inside _python_bundle__arm64-v8a)
-    local DISTRO_ROOT="${python_bundle_src%%/_python_bundle__arm64-v8a*}"
-    local PYTHON_LIBS_SRC="${DISTRO_ROOT}/libs/arm64-v8a"
-    if [[ -f "$PYTHON_LIBS_SRC/libpythonbin.so" ]]; then
-        log "Copying Python libraries to bundle directory..."
-        # Copy all .so files from the libs directory
-        for lib_file in "$PYTHON_LIBS_SRC"/*.so; do
-            if [[ -f "$lib_file" ]]; then
-                lib_name=$(basename "$lib_file")
-                adb -s "$DEVICE_ADDRESS" push "$lib_file" "/data/local/tmp/$lib_name"
-                adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp "/data/local/tmp/$lib_name" "files/python/bundle/$lib_name"
-                adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess chmod +x "files/python/bundle/$lib_name"
-            fi
-        done
-    fi
-
-    # Verify Python runtime (Hermes Agent source is included in staging)
-    adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'ls -lh files/python/bundle/stdlib.zip && ls -ld files/python/bundle/modules files/python/bundle/site-packages files/python/src/remotemedia/nodes files/python/src/hermes_agent && test -d files/python/bundle/site-packages/numpy && test -f files/python/src/remotemedia/nodes/ml/whisper_stt.py && test -f files/python/src/remotemedia/nodes/tts.py'" || {
-        error "Python runtime staging verification failed"
-        exit 1
-    }
-
-    # Install missing PyPI dependencies on device (PyYAML, etc.)
-    log "Installing missing PyPI dependencies on device (PyYAML, etc.)..."
-    
-    cat > /tmp/python3_wrapper << 'PYEOF'
-#!/system/bin/sh
-# Set LD_LIBRARY_PATH so libpythonbin.so can find libpython3.14.so and other deps
-export LD_LIBRARY_PATH="/data/data/com.remotemedia.inprocess/files/python/bundle:${LD_LIBRARY_PATH}"
-# Set PYTHONHOME so Python can find stdlib.zip (encodings module, etc.)
-export PYTHONHOME="/data/data/com.remotemedia.inprocess/files/python/bundle"
-# Also set PYTHONPATH explicitly
-export PYTHONPATH="/data/data/com.remotemedia.inprocess/files/python/bundle/stdlib.zip:/data/data/com.remotemedia.inprocess/files/python/bundle/modules:/data/data/com.remotemedia.inprocess/files/python/bundle/site-packages"
-# Debug output
-echo "DEBUG: PYTHONHOME=$PYTHONHOME" >&2
-echo "DEBUG: PYTHONPATH=$PYTHONPATH" >&2
-echo "DEBUG: LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >&2
-ls -la "$PYTHONHOME/" >&2
-# Try multiple possible locations for libpythonbin.so
-for libpath in \
-    "/data/data/com.remotemedia.inprocess/lib/libpythonbin.so" \
-    "/data/data/com.remotemedia.inprocess/lib/arm64/libpythonbin.so" \
-    "/data/app/com.remotemedia.inprocess-*/lib/arm64/libpythonbin.so" \
-    "/data/data/com.remotemedia.inprocess/lib/libpython3.14.so" \
-    "/data/app/com.remotemedia.inprocess-*/lib/arm64/libpythonbin.so" \
-    "/data/app/com.remotemedia.inprocess-*/lib/libpythonbin.so" \
-    "/data/app/com.remotemedia.inprocess*/lib/arm64/libpythonbin.so" \
-    "/data/data/com.remotemedia.inprocess/lib/main-*/libpythonbin.so" \
-    "/data/app/~~*/com.remotemedia.inprocess*/lib/arm64/libpythonbin.so" \
-    "/data/app/~~*/com.remotemedia.inprocess*/lib/libpythonbin.so" \
-    "/data/app/~~*/com.remotemedia.inprocess*/lib/pythonbin.so" \
-    "/data/user/0/com.remotemedia.inprocess/lib/arm64/libpythonbin.so" \
-    "/data/data/com.remotemedia.inprocess/lib/libpython3.14.so" \
-    "/data/data/com.remotemedia.inprocess/files/python/bundle/libpythonbin.so" \
-    "/data/data/com.remotemedia.inprocess/files/python/bundle/libpython3.14.so"; do
-    if [ -x "$libpath" ]; then
-        exec "$libpath" "$@"
-    fi
-done
-# Fallback: try to find it using find with wider search
-for libpath in $(find /data/data/com.remotemedia.inprocess -name "libpythonbin.so" -type f 2>/dev/null; find /data/app/com.remotemedia.inprocess* -name "libpythonbin.so" -type f 2>/dev/null; find /data/app/~~* -name "libpythonbin.so" -type f 2>/dev/null; find /data/data/com.remotemedia.inprocess/files -name "libpythonbin.so" -type f 2>/dev/null); do
-    if [ -x "$libpath" ]; then
-        exec "$libpath" "$@"
-    fi
-done
-echo "ERROR: libpythonbin.so not found in any location" >&2
-exit 1
-PYEOF
-    adb -s "$DEVICE_ADDRESS" push /tmp/python3_wrapper /data/local/tmp/python3_wrapper 2>&1
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp /data/local/tmp/python3_wrapper /data/data/com.remotemedia.inprocess/files/python3 2>&1
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess chmod +x /data/data/com.remotemedia.inprocess/files/python3 2>&1
-    # Also copy to bundle directory as python3 for direct invocation
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess cp /data/local/tmp/python3_wrapper /data/data/com.remotemedia.inprocess/files/python/bundle/python3 2>&1
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess chmod +x /data/data/com.remotemedia.inprocess/files/python/bundle/python3 2>&1
-    rm -f /tmp/python3_wrapper
-    
-
-
-    # Write install script to device using Python to avoid shell escaping issues
-    cat > /tmp/deps_install.py << 'PYEOF'
-import subprocess
-import sys
-import os
-
-env = {
-    **os.environ,
-    "PYTHONPATH": "/data/data/com.remotemedia.inprocess/files/python/bundle/site-packages:/data/data/com.remotemedia.inprocess/files/python/bundle/modules:/data/data/com.remotemedia.inprocess/files/python/src",
-    "PYTHONHOME": "/data/data/com.remotemedia.inprocess/files/python/bundle",
-    "PATH": "/data/data/com.remotemedia.inprocess/files/python/bundle:/system/bin:/vendor/bin",
-    "TMPDIR": "/data/data/com.remotemedia.inprocess/files/tmp",
-    "TMP": "/data/data/com.remotemedia.inprocess/files/tmp",
-    "TEMP": "/data/data/com.remotemedia.inprocess/files/tmp",
-    "PIP_CACHE_DIR": "/data/data/com.remotemedia.inprocess/files/tmp/pip-cache",
-    "PIP_NO_CACHE_DIR": "1",
-    "HOME": "/data/data/com.remotemedia.inprocess/files",
-    "XDG_CACHE_HOME": "/data/data/com.remotemedia.inprocess/files/tmp",
-}
-
-# First, bootstrap pip using get-pip.py (p4a doesn't include ensurepip)
-print("Bootstrapping pip with get-pip.py...", flush=True)
-get_pip_path = "/data/local/tmp/get-pip.py"
-
-# Run get-pip.py
-result = subprocess.run([
-    "/data/data/com.remotemedia.inprocess/files/python/bundle/python3",
-    get_pip_path
-], env=env, capture_output=True, text=True, timeout=120)
-print(f"get-pip.py stdout: {result.stdout}", flush=True)
-print(f"get-pip.py stderr: {result.stderr}", flush=True)
-print(f"get-pip.py returncode: {result.returncode}", flush=True)
-
-if result.returncode != 0:
-    print("Failed to bootstrap pip", flush=True)
-    sys.exit(result.returncode)
-
-# Then install pip packages
-packages = [
-    "PyYAML==6.0.3",
-    "requests==2.33.0",
-    "urllib3==2.2.0",
-    "charset-normalizer==3.3.0",
-    "idna==3.6",
-    "certifi==2024.2.2",
-    "pydantic==2.13.4",
-    "pydantic-core==2.18.4",
-    "typing-extensions==4.11.0",
-    "annotated-types==0.7.0",
-    "python-dotenv==1.2.2",
-]
-
-print("Installing pip packages...", flush=True)
-result = subprocess.run([
-    "/data/data/com.remotemedia.inprocess/files/python/bundle/python3",
-    "-m", "pip", "install", "--timeout", "300"
-] + packages, env=env, capture_output=True, text=True, timeout=300)
-print(f"pip install stdout: {result.stdout}", flush=True)
-print(f"pip install stderr: {result.stderr}", flush=True)
-print(f"pip install returncode: {result.returncode}", flush=True)
-
-sys.exit(result.returncode)
-PYEOF
-    adb -s "$DEVICE_ADDRESS" push /tmp/deps_install.py /data/local/tmp/deps_install.py 2>&1
-    rm -f /tmp/deps_install.py
-    
-    # Execute the Python install script via run-as - run from /data/local/tmp 
-    log "Installing PyPI dependencies on device (with ensurepip bootstrap)..."
-    adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'cd /data/local/tmp && PYTHONHOME=/data/data/com.remotemedia.inprocess/files/python/bundle PYTHONPATH=/data/data/com.remotemedia.inprocess/files/python/bundle/stdlib.zip:/data/data/com.remotemedia.inprocess/files/python/bundle/modules:/data/data/com.remotemedia.inprocess/files/python/bundle/site-packages /data/data/com.remotemedia.inprocess/files/python/bundle/python3 /data/local/tmp/deps_install.py 2>&1'" | tail -50
-    
-    # Verify PyYAML is importable
-    log "Verifying PyYAML installation..."
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess sh -c '
-        export PYTHONPATH="/data/data/com.remotemedia.inprocess/files/python/bundle/site-packages:/data/data/com.remotemedia.inprocess/files/python/bundle/modules:/data/data/com.remotemedia.inprocess/files/python/src"
-        export PYTHONHOME="/data/data/com.remotemedia.inprocess/files/python/bundle"
-        export PATH="/data/data/com.remotemedia.inprocess/files/python/bundle:$PATH"
-        cd /data/data/com.remotemedia.inprocess/files/python/bundle
-        /data/data/com.remotemedia.inprocess/files/python/bundle/python3 -c "import yaml; print(\"PyYAML OK\")" 2>&1
-    ' 2>&1
-    
-    # Clean up
-    adb -s "$DEVICE_ADDRESS" shell rm /data/local/tmp/deps_install.py
-    
-    success "Python runtime staged in app-private files"
-}
 # =============================================================================
 # STEP 7: Run App & Test
 # =============================================================================
@@ -1141,14 +918,8 @@ run_and_test() {
     adb -s "$DEVICE_ADDRESS" logcat -c
     adb -s "$DEVICE_ADDRESS" shell pm grant com.remotemedia.inprocess android.permission.RECORD_AUDIO 2>/dev/null || true
 
-    log "Verifying app-private model before launch..."
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/gemma-4-E2B-it.litertlm files/cache/litert-lm || true
-    log "Verifying app-private Whisper assets before launch..."
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/whisper || true
-    log "Verifying app-private Kokoro and Misaki G2P assets before launch..."
-    adb -s "$DEVICE_ADDRESS" shell run-as com.remotemedia.inprocess ls -lh files/models/kokoro files/models/kokoro/onnx files/models/kokoro/voices files/models/misaki-g2p files/models/misaki-g2p/en-US || true
-    log "Verifying app-private Python runtime before launch..."
-    adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'ls -lh files/python/bundle/stdlib.zip && ls -ld files/python/bundle/modules files/python/bundle/site-packages files/python/bundle/site-packages/numpy files/python/src/remotemedia/nodes'" || true
+    log "Runtime assets are expected to be extracted from APK assets by the app on first launch."
+    log "No Python/model/resource files are adb-pushed by this script."
     
     # Start MainActivity and ask it to start streaming as soon as the manifest is ready.
     adb -s "$DEVICE_ADDRESS" shell am start -n com.remotemedia.inprocess/.MainActivity --ez auto_start true --ez simulate_speech true --es pipeline "$TEST_PIPELINE"
@@ -1161,6 +932,9 @@ run_and_test() {
     sleep "$wait_seconds"
     
     # Capture logs
+    log "Checking extracted runtime assets after launch, if the app exposes them via run-as..."
+    adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'ls -lh files/remotemedia/python-runtimes/${PYTHON_RUNTIME_ID}/runtime.json files/remotemedia/python-runtimes/${PYTHON_RUNTIME_ID}/bundle/stdlib.zip 2>/dev/null || true; ls -lh files/models/whisper files/models/kokoro files/models/misaki-g2p 2>/dev/null || true'" || true
+
     log "Capturing full logcat to $LOG_OUTPUT"
     adb -s "$DEVICE_ADDRESS" logcat -d > "$LOG_OUTPUT" 2>&1
 

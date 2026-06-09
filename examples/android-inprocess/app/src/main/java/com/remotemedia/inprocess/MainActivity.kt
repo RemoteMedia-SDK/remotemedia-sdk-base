@@ -188,6 +188,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Model download progress
+        pipelineManager.onModelDownloadProgress = { modelName, downloadedBytes, totalBytes, percent ->
+            runOnUiThread {
+                updateModelDownloadProgress(modelName, downloadedBytes, totalBytes, percent)
+            }
+        }
+
         // Audio recorder callbacks
         audioRecorder.onAudioData = { pcmData ->
             audioFramesSeen += 1
@@ -244,6 +251,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Model download progress UI helpers
+    private fun showModelDownloadProgress(show: Boolean) {
+        binding?.modelDownloadProgress?.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show) {
+            binding?.modelDownloadProgressBar?.progress = 0
+            binding?.modelDownloadStatus?.text = "Preparing..."
+        }
+    }
+
+    private fun updateModelDownloadProgress(modelName: String, downloadedBytes: Long, totalBytes: Long, percent: Double) {
+        binding?.modelDownloadProgress?.visibility = View.VISIBLE
+        binding?.modelDownloadProgressBar?.progress = percent.toInt()
+        val downloadedMB = downloadedBytes / (1024 * 1024)
+        val totalMB = totalBytes / (1024 * 1024)
+        if (totalBytes > 0) {
+            binding?.modelDownloadStatus?.text = "$modelName: ${percent.toInt()}% ($downloadedMB MB / $totalMB MB)"
+        } else {
+            binding?.modelDownloadTitle?.text = "Downloading Models..."
+            binding?.modelDownloadStatus?.text = "$modelName: ${downloadedMB} MB downloaded"
+        }
+    }
+
     private fun toggleListening() {
         if (!pipelineManager.isStreamingActive()) {
             startListening()
@@ -263,12 +292,15 @@ class MainActivity : AppCompatActivity() {
         binding?.micButton?.text = "Starting..."
         binding?.statusText?.text = "Starting..."
         binding?.progressBar?.visibility = View.VISIBLE
+        showModelDownloadProgress(true)
 
         lifecycleScope.launch {
             try {
                 val started = pipelineManager.startStreaming()
                 if (started) {
                     Log.i(TAG, "Pipeline streaming started; starting recorder/player")
+                    showModelDownloadProgress(false)
+                    binding?.progressBar?.visibility = View.GONE
                     val recording = audioRecorder.start()
                     if (recording) {
                         val playing = audioPlayer.start(24000) // Kokoro default sample rate
@@ -367,6 +399,7 @@ class MainActivity : AppCompatActivity() {
         lastSpeaker = null
         lifecycleScope.launch {
             binding?.progressBar?.visibility = View.VISIBLE
+            showModelDownloadProgress(true)
             binding?.statusText?.text = "Simulating speech..."
 
             try {
@@ -378,6 +411,8 @@ class MainActivity : AppCompatActivity() {
                         showError("Failed to start pipeline for simulation")
                         return@launch
                     }
+                    showModelDownloadProgress(false)
+                    binding?.progressBar?.visibility = View.GONE
                     audioPlayer.start(24000)
                     updateUIForState(PipelineManager.PipelineState.STREAMING)
                 } else {
