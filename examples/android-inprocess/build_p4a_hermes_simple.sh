@@ -75,12 +75,15 @@ REQUIRED_DISTROS=(
     "httpx"
     "httpcore"
     "websockets"
+    "typing_extensions"
 )
 
 # Critical module paths that must exist to avoid runtime import failures.
 REQUIRED_MODULE_PATHS=(
     "httpx/_transports/__init__.py"
     "websockets/__init__.py"
+    "charset_normalizer/__init__.py"
+    "typing_extensions.py"
 )
 
 log "Building python-for-android distro: ${DIST_NAME}"

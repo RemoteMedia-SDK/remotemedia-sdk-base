@@ -264,9 +264,19 @@ bundle_has_websockets() {
     [[ -f "$bundle/site-packages/websockets/__init__.py" || -f "$bundle/site-packages/websockets/__init__.pyc" ]]
 }
 
+bundle_has_typing_extensions() {
+    local bundle="$1"
+    [[ -f "$bundle/site-packages/typing_extensions.py" || -f "$bundle/site-packages/typing_extensions.pyc" ]]
+}
+
+bundle_has_charset_normalizer() {
+    local bundle="$1"
+    [[ -f "$bundle/site-packages/charset_normalizer/__init__.py" || -f "$bundle/site-packages/charset_normalizer/__init__.pyc" ]]
+}
+
 bundle_has_required_python_modules() {
     local bundle="$1"
-    bundle_has_httpx "$bundle" && bundle_has_websockets "$bundle"
+    bundle_has_httpx "$bundle" && bundle_has_websockets "$bundle" && bundle_has_typing_extensions "$bundle" && bundle_has_charset_normalizer "$bundle"
 }
 
 find_python_bundle_with_required_modules() {
@@ -293,12 +303,12 @@ resolve_python_bundle_src() {
     fi
 
     if [[ -d "$python_bundle_src" ]] && ! bundle_has_required_python_modules "$python_bundle_src"; then
-        warn "Selected bundle does not contain required Hermes Python modules (httpx._transports and websockets): $python_bundle_src" >&2
+        warn "Selected bundle does not contain required Hermes Python modules (httpx._transports, websockets, typing_extensions, charset_normalizer): $python_bundle_src" >&2
         if modules_bundle=$(find_python_bundle_with_required_modules); then
             warn "Switching to bundle with required Hermes Python modules: $modules_bundle" >&2
             python_bundle_src="$modules_bundle"
         else
-            error "No available python-for-android bundle contains required Hermes Python modules (httpx._transports and websockets)." >&2
+            error "No available python-for-android bundle contains required Hermes Python modules (httpx._transports, websockets, typing_extensions, charset_normalizer)." >&2
             warn "Rebuild with build_p4a_hermes_simple.sh after updating requirements-hermes.txt." >&2
             exit 1
         fi
@@ -306,7 +316,7 @@ resolve_python_bundle_src() {
 
     if [[ -d "$python_bundle_src" ]] && ! bundle_has_required_python_modules "$python_bundle_src"; then
         error "Resolved bundle still missing required Hermes Python modules: $python_bundle_src" >&2
-        warn "Rebuild with build_p4a_hermes_simple.sh and verify site-packages contains httpx/_transports and websockets." >&2
+        warn "Rebuild with build_p4a_hermes_simple.sh and verify site-packages contains httpx/_transports, websockets, typing_extensions.py, and charset_normalizer/." >&2
         exit 1
     fi
 
@@ -1045,18 +1055,32 @@ run_and_test() {
 
     # For Hermes profile-aware pipelines: push a test profile archive to the app's
     # internal files dir so HermesAgentPlugin can import/select it before AIAgent init.
-    if [[ "$TEST_PIPELINE" == "hermes-profile-import-test.json" || "$TEST_PIPELINE" == "voice-assistant-hermes.json" ]]; then
-        local test_archive="${HERMES_TEST_PROFILE_ARCHIVE:-${SCRIPT_DIR}/../../../default.tar.gz}"
+    if [[ "$TEST_PIPELINE" == *"hermes-profile-import-test.json" || "$TEST_PIPELINE" == *"voice-assistant-hermes.json" ]]; then
+        local test_archive="${HERMES_TEST_PROFILE_ARCHIVE:-}"
+        if [[ -z "$test_archive" ]]; then
+            local archive_candidates=(
+                "${WORKSPACE_ROOT}/default.tar.gz"
+                "${SDK_BASE_ROOT}/default.tar.gz"
+                "${SCRIPT_DIR}/default.tar.gz"
+                "${SCRIPT_DIR}/../../../default.tar.gz"
+            )
+            for candidate in "${archive_candidates[@]}"; do
+                if [[ -f "$candidate" ]]; then
+                    test_archive="$candidate"
+                    break
+                fi
+            done
+        fi
         local device_tmp="/data/local/tmp/hermes_test_profile.tar.gz"
         local device_internal="/data/data/com.remotemedia.inprocess/files/hermes_test_profile.tar.gz"
-        if [[ -f "$test_archive" ]]; then
+        if [[ -n "$test_archive" && -f "$test_archive" ]]; then
             log "Pushing hermes test profile archive to device internal files dir ($device_internal)..."
             adb -s "$DEVICE_ADDRESS" push "$test_archive" "$device_tmp"
             adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess sh -c 'cat /data/local/tmp/hermes_test_profile.tar.gz > files/hermes_test_profile.tar.gz && chmod 600 files/hermes_test_profile.tar.gz'"
             adb -s "$DEVICE_ADDRESS" shell rm -f "$device_tmp" 2>/dev/null || true
             success "Archive pushed ($(du -sh "$test_archive" | cut -f1))"
         else
-            warn "HERMES_TEST_PROFILE_ARCHIVE not set or file not found: $test_archive"
+            warn "Hermes test profile archive not found. Checked HERMES_TEST_PROFILE_ARCHIVE and default locations under workspace/sdk/script dirs."
             warn "Archive must already be present at $device_internal on device"
         fi
     fi
