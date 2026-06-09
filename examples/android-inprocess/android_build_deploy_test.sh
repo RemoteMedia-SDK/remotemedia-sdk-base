@@ -1043,9 +1043,9 @@ run_and_test() {
     log "Runtime assets are expected to be extracted from APK assets by the app on first launch."
     log "No Python/model/resource files are adb-pushed by this script."
 
-    # For the profile import test: push a minimal test archive to the app's
-    # internal app files dir (accessible to the app without external storage issues)
-    if [[ "$TEST_PIPELINE" == "hermes-profile-import-test.json" ]]; then
+    # For Hermes profile-aware pipelines: push a test profile archive to the app's
+    # internal files dir so HermesAgentPlugin can import/select it before AIAgent init.
+    if [[ "$TEST_PIPELINE" == "hermes-profile-import-test.json" || "$TEST_PIPELINE" == "voice-assistant-hermes.json" ]]; then
         local test_archive="${HERMES_TEST_PROFILE_ARCHIVE:-${SCRIPT_DIR}/../../../default.tar.gz}"
         local device_tmp="/data/local/tmp/hermes_test_profile.tar.gz"
         local device_internal="/data/data/com.remotemedia.inprocess/files/hermes_test_profile.tar.gz"
