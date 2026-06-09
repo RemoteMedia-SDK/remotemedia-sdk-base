@@ -68,6 +68,12 @@ android {
         // doNotStrip.add("**/libpython3.11.so")
     }
 
+    // Keep underscore-prefixed Python package paths (for example `httpx/_transports`)
+    // in APK assets. The default ignore pattern can strip them.
+    aaptOptions {
+        ignoreAssetsPattern = "!.svn:!.git:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~"
+    }
+
     externalNativeBuild {
         cmake {
             path("../CMakeLists.txt")
