@@ -12,6 +12,8 @@
 # - Maturity: requires pydantic_core 2.46.4, jiter 0.15.0
 #
 # Output: Wheels placed in app/src/main/assets/python-wheels/
+#
+# Usage: ./cross_compile_android_python_native.sh
 # =============================================================================
 
 set -euo pipefail
@@ -29,16 +31,17 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[ERR]${NC} $*"; }
 
 # =============================================================================
-# Configuration
+# Configuration - set via environment or auto-detect
 # =============================================================================
-ANDROID_PROJECT="/home/acidhax/dev/personal/remotemedia/remotemedia-sdk-base/examples/android-inprocess"
-WHEELS_DIR="${ANDROID_PROJECT}/app/src/main/assets/python-wheels"
+ANDROID_PROJECT="${ANDROID_PROJECT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+WHEELS_DIR="${WHEELS_DIR:-${ANDROID_PROJECT}/app/src/main/assets/python-wheels}"
 
-# Python-for-Android paths (adjusts based on your p4a build)
-P4A_ROOT="/home/acidhax/.local/share/python-for-android"
-P4A_DIST="remotemedia_hermes"
-P4A_ARCH="arm64-v8a"
-P4A_NDK_API="24"
+# Python-for-Android paths
+P4A_ROOT="${P4A_ROOT:-~/.local/share/python-for-android}"
+P4A_ROOT="${P4A_ROOT/#\~/$HOME}"  # expand tilde
+P4A_DIST="${P4A_DIST:-remotemedia_hermes}"
+P4A_ARCH="${P4A_ARCH:-arm64-v8a}"
+P4A_NDK_API="${P4A_NDK_API:-24}"
 
 # p4a build directories use arm64-v8a (with hyphens) converted to arm64_v8a (underscores) in lib.android paths
 P4A_ARCH_UNDERSCORE="arm64_v8a"
@@ -50,7 +53,8 @@ PYTHON_SYSCONFIGDATA="${PYTHON_ANDROID_BUILD}/build/lib.android-${P4A_NDK_API}-$
 PYTHON_SYSCONFIGDATA_DEST="${PYTHON_ANDROID_BUILD}/_sysconfigdata__android_aarch64-linux-android.py"
 
 # NDK paths
-NDK_PATH="/home/acidhax/Android/Sdk/ndk/27.0.11718014"
+NDK_PATH="${NDK_PATH:-~/Android/Sdk/ndk/27.0.11718014}"
+NDK_PATH="${NDK_PATH/#\~/$HOME}"  # expand tilde
 TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64"
 TARGET=aarch64-linux-android24
 
@@ -76,12 +80,21 @@ export _PYTHON_SYSCONFIGDATA_NAME="_sysconfigdata__android_aarch64-linux-android
 # Cargo config for Android
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-L${PYTHON_LIB_DIR} -C link-arg=-lpython3.14"
 
-# Create wheels directory
+# Build cache directory (within project)
+BUILD_CACHE_DIR="${ANDROID_PROJECT}/.build_cache"
+
+# Create directories
 mkdir -p "${WHEELS_DIR}"
+mkdir -p "${BUILD_CACHE_DIR}"
 
 # =============================================================================
 # Helper functions
 # =============================================================================
+log() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
+success() { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+error() { echo -e "${RED}[ERR]${NC} $*"; }
+
 verify_env() {
     log "Verifying build environment..."
     
@@ -159,7 +172,6 @@ build_pydantic_core() {
     unzip -q "${TEMPLATE_WHEEL}"
     cp "${LIB}" pydantic_core/_pydantic_core.so
     
-    # Update METADATA version if needed (optional)
     zip -r "${WHEEL}" . -x "*.git*"
     
     success "Created pydantic_core wheel: ${WHEEL}"
@@ -172,6 +184,7 @@ build_jiter() {
     local VERSION="0.15.0"
     local OUT_DIR="/tmp/jiter-${VERSION}"
     local WHEEL="${WHEELS_DIR}/jiter-${VERSION}-android_cp314.whl"
+    local CACHE_LIB="${BUILD_CACHE_DIR}/jiter_python.so"
     
     log "Building jiter ${VERSION} for Android..."
     
@@ -183,15 +196,14 @@ build_jiter() {
     cd /tmp
     
     # Use cached library if available (avoids rebuild)
-    if [[ -f "/home/acidhax/jiter_python.so" ]]; then
-        log "Using cached jiter library from /home/acidhax/jiter_python.so"
-        LIB="/home/acidhax/jiter_python.so"
+    if [[ -f "${CACHE_LIB}" ]]; then
+        log "Using cached jiter library from ${CACHE_LIB}"
+        LIB="${CACHE_LIB}"
     else
         rm -rf "jiter-${VERSION}"
         
         # Download source from PyPI
         log "Downloading jiter ${VERSION} from PyPI..."
-        # URL from PyPI JSON API
         curl -L "https://files.pythonhosted.org/packages/66/b5/55f06bb281d92fb3cc86d14e1def2bd908bb77693183e7cb1f5a3c388b0c/jiter-${VERSION}.tar.gz" \
             -o "jiter-${VERSION}.tar.gz"
         
@@ -205,17 +217,17 @@ build_jiter() {
         cd "${OUT_DIR}"
         
         log "Cross-compiling jiter with cargo..."
-        # Set PYTHONPATH so host python can find the android sysconfigdata
         PYTHONPATH="${PYTHON_ANDROID_BUILD}" cargo build --target aarch64-linux-android --release 2>&1 | tail -20
         
         local LIB="${OUT_DIR}/target/aarch64-linux-android/release/libjiter_python.so"
         [[ -f "${LIB}" ]] || error "jiter build failed: ${LIB} not found"
         
-        cp "${LIB}" /home/acidhax/jiter_python.so
-        LIB="/home/acidhax/jiter_python.so"
+        # Cache for future runs
+        cp "${LIB}" "${CACHE_LIB}"
+        LIB="${CACHE_LIB}"
     fi
     
-    LIB="/home/acidhax/jiter_python.so"
+    LIB="${CACHE_LIB}"
     [[ -f "${LIB}" ]] || error "jiter library not found at ${LIB}"
     
     log "Creating wheel..."
@@ -230,12 +242,6 @@ build_jiter() {
     # Replace pydantic_core with jiter
     rm -rf pydantic_core pydantic_core-2.46.4.dist-info
     
-    # Debug: check if LIB exists
-    log "DEBUG: LIB = ${LIB}"
-    log "DEBUG: ls -la ${LIB}:"
-    ls -la "${LIB}" 2>&1 || log "DEBUG: ls failed"
-    
-    # Use cp instead of mv to avoid losing the cached file
     cp "${LIB}" jiter/jiter.cpython-314-aarch64-linux-android.so
     
     # Create minimal __init__.py
@@ -290,7 +296,6 @@ Root-Is-Purelib: false
 Tag: cp314-cp314-android_aarch64
 EOF
     
-    # Create RECORD (minimal)
     cat > jiter-0.15.0.dist-info/RECORD << 'EOF'
 jiter/__init__.py,,
 jiter/jiter.cpython-314-aarch64-linux-android.so,,
@@ -317,6 +322,7 @@ main() {
     log "NDK: ${NDK_PATH}"
     log "Python: ${PYTHON_ANDROID_BUILD}"
     log "Wheels output: ${WHEELS_DIR}"
+    log "Build cache: ${BUILD_CACHE_DIR}"
     
     verify_env
     
