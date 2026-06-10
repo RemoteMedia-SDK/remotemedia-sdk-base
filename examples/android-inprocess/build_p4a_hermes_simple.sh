@@ -126,7 +126,7 @@ export ANDROID_HOME="/home/acidhax/Android/Sdk"
 export JAVA_HOME="/usr/lib/jvm/java-21-openjdk-amd64"
 export PATH="/home/acidhax/Android/Sdk/platform-tools:${PATH}"
 
-# Use p4a create with requirements
+# Use p4a create with requirements. Recipes are hardcoded to 3.11.9 (hermes-agent requires <3.14)
 cd "${BUILD_DIR}"
 p4a create \
     --dist-name "${DIST_NAME}" \
@@ -135,11 +135,11 @@ p4a create \
     --bootstrap sdl2 \
     --requirements "${REQUIREMENTS}" \
     --arch "${ARCH}" \
-    --python-version "${PYTHON_VERSION}" \
+    --python-version "3.11" \
     --ndk-api 24 \
     --android-api 34 \
     --ndk-dir "/home/acidhax/Android/Sdk/ndk/27.0.11718014" \
-    --blacklist-requirements ruamel.yaml \
+    --blacklist-requirements ruamel.yaml,pydantic_core \
     --permission INTERNET \
     --permission ACCESS_NETWORK_STATE \
     --permission RECORD_AUDIO \

@@ -28,6 +28,10 @@ android {
         ndk {
             abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
         }
+
+        // Default pipeline manifest, overridable via -PdefaultPipeline=...
+        val defaultPipeline = project.findProperty("defaultPipeline")?.toString() ?: "hermes-agent-test.json"
+        buildConfigField("String", "DEFAULT_PIPELINE", "\"$defaultPipeline\"")
     }
 
     buildTypes {

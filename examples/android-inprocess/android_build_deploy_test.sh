@@ -34,7 +34,8 @@ ANDROID_PROJECT="${ANDROID_PROJECT:-${SCRIPT_DIR}}"
 DEVICE_ADDRESS="${DEVICE_ADDRESS:-192.168.18.60:35713}"
 SKIP_BUILD=false
 SKIP_DEPLOY=false
-TEST_PIPELINE="${TEST_PIPELINE:-hermes-agent-test.json}"
+DEFAULT_PIPELINE="${DEFAULT_PIPELINE:-hermes-agent-test.json}"
+TEST_PIPELINE="${TEST_PIPELINE:-$DEFAULT_PIPELINE}"
 MODEL_SRC="${MODEL_SRC:-${WORKSPACE_ROOT}/litert-lm-loadable-plugin/gemma-4-E2B-it.litertlm}"
 MODEL_STAGING_PATH="${MODEL_STAGING_PATH:-/data/local/tmp/gemma-4-E2B-it.litertlm}"
 MODEL_DEVICE_PATH="${MODEL_DEVICE_PATH:-/data/data/com.remotemedia.inprocess/files/models/gemma-4-E2B-it.litertlm}"
@@ -111,8 +112,32 @@ PYTHON_RUNTIME_ASSETS_DIR="${PYTHON_RUNTIME_ASSETS_DIR:-${APP_ASSETS_DIR}/python
 BUNDLE_SMALL_MODELS_IN_APK="${BUNDLE_SMALL_MODELS_IN_APK:-true}"
 BUNDLE_LARGE_LLM_IN_APK="${BUNDLE_LARGE_LLM_IN_APK:-false}"
 
-NDK_VERSION="${NDK_VERSION:-25.2.9519653}"
 SDK_PATH="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-${HOME}/Android/Sdk}}"
+resolve_ndk_version() {
+    if [[ -n "${NDK_VERSION:-}" ]]; then
+        echo "$NDK_VERSION"
+        return
+    fi
+    local ndk_dir="${SDK_PATH}/ndk"
+    if [[ ! -d "$ndk_dir" ]]; then
+        echo ""
+        return
+    fi
+    local candidate
+    candidate="$(find "$ndk_dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -n 1 || true)"
+    if [[ -n "$candidate" ]]; then
+        echo "$candidate"
+        return
+    fi
+    echo ""
+}
+NDK_VERSION_DEFAULT="$(resolve_ndk_version)"
+NDK_VERSION="${NDK_VERSION:-${NDK_VERSION_DEFAULT:-}}"
+if [[ -z "${NDK_VERSION}" ]]; then
+    echo -e "\033[0;31m[ERR]\033[0m No NDK found in ${SDK_PATH}/ndk; set NDK_VERSION or install an NDK." >&2
+    exit 1
+fi
+echo -e "\033[1;33m[!]\033[0m Resolved NDK_VERSION=${NDK_VERSION}"
 NDK_PATH="${ANDROID_NDK_ROOT:-${SDK_PATH}/ndk/${NDK_VERSION}}"
 CARGO_CONFIG="${ANDROID_PROJECT}/.cargo/config.toml"
 
@@ -158,7 +183,15 @@ verify_environment() {
         exit 1
     fi
     success "Cargo config found"
-    
+
+    # Ensure rustup/bin is available even in non-login shells
+    export PATH="$HOME/.cargo/bin:$PATH"
+    if ! command -v rustup &> /dev/null; then
+        error "rustup not found; installed Android Rust targets cannot be managed"
+        exit 1
+    fi
+    success "rustup available"
+
     # Check Rust targets
     rustup target list --installed | grep -q "aarch64-linux-android" || {
         error "aarch64-linux-android target not installed"
@@ -713,6 +746,28 @@ package_python_runtime_assets() {
 
     stage_python_sources_for_apk "$PYTHON_RUNTIME_ASSETS_DIR/src"
 
+    unzip_python_wheel_to_bundle() {
+        local wheel_path="$1"
+        if [[ ! -f "$wheel_path" ]]; then
+            warn "Wheel not found, skipping: $wheel_path"
+            return 0
+        fi
+        unzip -q -o "$wheel_path" -d "$PYTHON_RUNTIME_ASSETS_DIR/bundle/site-packages"
+        success "Packaged wheel: ${wheel_path#${ANDROID_PROJECT}/}"
+    }
+
+    # Install ALL prepared wheels into the runtime bundle, not just pydantic.
+    # p4a may miss or downgrade packages; these wheels ensure the exact versions
+    # from requirements-hermes.txt are present, including native modules like
+    # pydantic_core.
+    if [[ -d "$ANDROID_PROJECT/app/src/main/assets/python-wheels" ]]; then
+        local wheel
+        for wheel in "$ANDROID_PROJECT/app/src/main/assets/python-wheels"/*.whl; do
+            [[ -f "$wheel" ]] || continue
+            unzip_python_wheel_to_bundle "$wheel"
+        done
+    fi
+
     cat > "$PYTHON_RUNTIME_ASSETS_DIR/runtime.json" <<JSON
 {
   "id": "${PYTHON_RUNTIME_ID}",
@@ -922,8 +977,18 @@ build_rust() {
 build_apk() {
     log "Building Gradle APK (Release)..."
     cd "$ANDROID_PROJECT"
-    
-    ./gradlew assembleRelease --no-daemon 2>&1 | tail -40
+
+    # Ensure JAVA_HOME points to a valid JDK; fall back to OpenJDK 21
+    if [[ -z "${JAVA_HOME:-}" || ! -d "${JAVA_HOME}" ]]; then
+        export JAVA_HOME="/usr/lib/jvm/java-21-openjdk-amd64"
+    fi
+
+    local gradle_args=("assembleRelease" "--no-daemon")
+    if [[ -n "${DEFAULT_PIPELINE:-}" ]]; then
+        gradle_args+=("-PdefaultPipeline=$DEFAULT_PIPELINE")
+    fi
+
+    ./gradlew "${gradle_args[@]}" 2>&1 | tail -40
     
     APK_FILE="app/build/outputs/apk/release/app-release.apk"
     if [[ ! -f "$APK_FILE" ]]; then
@@ -1093,21 +1158,14 @@ run_and_test() {
         wait_seconds=130
     fi
     
-    # Start streaming logcat in background so logs appear in real-time
-    log "Streaming logcat to console (also saving to $LOG_OUTPUT)..."
-    adb -s "$DEVICE_ADDRESS" logcat -v threadtime 2>&1 | tee "$LOG_OUTPUT" &
-    LOGCAT_PID=$!
-    
-    # Ensure logcat process is killed on exit
-    trap 'kill $LOGCAT_PID 2>/dev/null; wait $LOGCAT_PID 2>/dev/null' EXIT
-    
     log "Waiting for auto-started pipeline execution (${wait_seconds}s)..."
     sleep "$wait_seconds"
     
-    # Stop streaming logcat
-    kill $LOGCAT_PID 2>/dev/null
-    wait $LOGCAT_PID 2>/dev/null
-    trap - EXIT
+    # Dump logcat buffer after test instead of streaming live
+    log "Dumping logcat to $LOG_OUTPUT..."
+    adb -s "$DEVICE_ADDRESS" logcat -d > "$LOG_OUTPUT"
+    
+    log "For live/filtered logs: adb -s $DEVICE_ADDRESS logcat -v threadtime | grep -E 'RemoteMedia|PipelineManager|MainActivity|NativeInterface|AudioRecorder|AudioPlayer|AndroidRuntime|DEBUG|LiteRT|Whisper|Kokoro|Misaki|G2P|Python|InProcess|Manifest|model|tokenizer'"
     
     # Check extracted runtime assets after launch
     log "Checking extracted runtime assets after launch, if the app exposes them via run-as..."
