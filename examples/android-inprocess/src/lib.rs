@@ -21,13 +21,10 @@ use remotemedia_python_nodes::{
 use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
-const ANDROID_APP_FILES_DIR: &str = "/data/data/com.remotemedia.inprocess/files";
-const ANDROID_PYTHON_HOME: &str = "/data/data/com.remotemedia.inprocess/files/python/bundle";
-const ANDROID_PYTHON_SRC: &str = "/data/data/com.remotemedia.inprocess/files/python/src";
-const ANDROID_HERMES_AGENT_SRC: &str = "/data/data/com.remotemedia.inprocess/files/python/src/hermes_agent";
+static APP_FILES_DIR: OnceLock<String> = OnceLock::new();
 static AUDIO_SEND_COUNT: AtomicU64 = AtomicU64::new(0);
 
 type AndroidExecutor = (SelectedRuntime, PipelineExecutor, Vec<LoadableNodeBundle>);
@@ -138,6 +135,26 @@ pub extern "system" fn Java_com_remotemedia_android_NativeInterface_initLogger(
             .with_tag("RemoteMedia"),
     );
     info!("RemoteMedia Android logger initialized");
+}
+
+/// Set the app's files directory from Kotlin (must be called before nativeCreateExecutor)
+#[no_mangle]
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeSetAppFilesDir(
+    mut env: JNIEnv,
+    _class: JClass,
+    files_dir: JString,
+) {
+    let dir: String = match env.get_string(&files_dir) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("Failed to get files_dir string: {}", e);
+            return;
+        }
+    };
+    match APP_FILES_DIR.set(dir.clone()) {
+        Ok(_) => info!("App files directory set to: {}", dir),
+        Err(_) => error!("App files directory already set, ignoring new value: {}", dir),
+    }
 }
 
 /// Initialize the Python runtime and create a pipeline executor
@@ -774,14 +791,19 @@ fn log_manifest_diagnostics(manifest: &Manifest) {
 }
 
 fn configure_android_python_environment() {
+    let app_files_dir = get_app_files_dir();
+    let python_home = format!("{}/python/bundle", app_files_dir);
+    let python_src = format!("{}/python/src", app_files_dir);
+    let hermes_agent_src = format!("{}/python/src/hermes_agent", app_files_dir);
+
     let python_path = format!(
         "{hermes}:{home}/stdlib.zip:{home}/modules:{home}/site-packages:{src}",
-        hermes = ANDROID_HERMES_AGENT_SRC,
-        home = ANDROID_PYTHON_HOME,
-        src = ANDROID_PYTHON_SRC
+        hermes = hermes_agent_src,
+        home = python_home,
+        src = python_src
     );
 
-    std::env::set_var("PYTHONHOME", ANDROID_PYTHON_HOME);
+    std::env::set_var("PYTHONHOME", &python_home);
     std::env::set_var("PYTHONPATH", &python_path);
     std::env::set_var("PYTHONNOUSERSITE", "1");
     std::env::set_var("PYTHONDONTWRITEBYTECODE", "1");
@@ -790,22 +812,33 @@ fn configure_android_python_environment() {
         std::env::set_var("REMOTEMEDIA_NODE_TIMEOUT_MS", "120000");
     }
 
+    // Set HOME for Python (used by Hermes and other libraries)
+    std::env::set_var("HOME", &app_files_dir);
+
     info!("Configured Android Python environment");
-    log_path_metadata("app files dir", ANDROID_APP_FILES_DIR);
-    log_path_metadata("PYTHONHOME", ANDROID_PYTHON_HOME);
+    log_path_metadata("app files dir", &app_files_dir);
+    log_path_metadata("PYTHONHOME", &python_home);
     log_path_metadata(
         "PYTHONPATH stdlib.zip",
-        &format!("{ANDROID_PYTHON_HOME}/stdlib.zip"),
+        &format!("{}/stdlib.zip", python_home),
     );
     log_path_metadata(
         "PYTHONPATH modules",
-        &format!("{ANDROID_PYTHON_HOME}/modules"),
+        &format!("{}/modules", python_home),
     );
     log_path_metadata(
         "PYTHONPATH site-packages",
-        &format!("{ANDROID_PYTHON_HOME}/site-packages"),
+        &format!("{}/site-packages", python_home),
     );
-    log_path_metadata("PYTHONPATH remotemedia src", ANDROID_PYTHON_SRC);
+    log_path_metadata("PYTHONPATH remotemedia src", &python_src);
+}
+
+/// Get the app files directory, with fallback to the old hardcoded path
+fn get_app_files_dir() -> String {
+    APP_FILES_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "/data/data/com.remotemedia.inprocess/files".to_string())
 }
 
 fn log_path_metadata(label: &str, path: &str) {
@@ -954,163 +987,137 @@ pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeGetHer
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
+    let app_files_dir = get_app_files_dir();
+    let hermes_src = format!("{}/python/src/hermes_agent", app_files_dir);
+    let hermes_home = format!("{}/hermes_home", app_files_dir);
     // Initialize Python and run the hermes_cli.profiles module to get profile data
-    match Python::try_attach(|py| -> PyResult<String> {
-        // Run the Python code to get Hermes Agent profile data
-        let code = r#"
-import sys
-import os
-import json
+        let result = Python::try_attach(|py| -> PyResult<String> {
+            // Run the Python code to get Hermes Agent profile data
+            let code = format!(
+                r#"
+    import sys
+    import os
+    import json
 
-# Add hermes_agent source to path
-hermes_src = "/data/data/com.remotemedia.inprocess/files/python/src/hermes_agent"
-if hermes_src not in sys.path:
-    sys.path.insert(0, hermes_src)
+    # Add hermes_agent source to path
+    hermes_src = "{hermes_src}"
+    if hermes_src not in sys.path:
+        sys.path.insert(0, hermes_src)
 
-# Set up environment for Hermes
-home = "/data/data/com.remotemedia.inprocess/files"
-os.environ["HOME"] = home
-hermes_home = "/data/data/com.remotemedia.inprocess/files/hermes_home"
-os.environ["HERMES_HOME"] = hermes_home
-os.makedirs(hermes_home, exist_ok=True)
-os.makedirs(os.path.join(hermes_home, "profiles"), exist_ok=True)
-os.makedirs(os.path.join(hermes_home, "logs"), exist_ok=True)
+    # Set up environment for Hermes
+    home = "{app_files_dir}"
+    os.environ["HOME"] = home
+    hermes_home = "{hermes_home}"
+    os.environ["HERMES_HOME"] = hermes_home
+    os.makedirs(hermes_home, exist_ok=True)
+    os.makedirs(os.path.join(hermes_home, "profiles"), exist_ok=True)
+    os.makedirs(os.path.join(hermes_home, "logs"), exist_ok=True)
 
-try:
-    from hermes_cli.profiles import (
-        list_profiles,
-        get_active_profile_name,
-        get_profile_dir,
-    )
-    from hermes_constants import get_hermes_home
-    
-    # Get all profiles
-    profiles = {}
-    profile_names = list_profiles()
-    
-    for name in profile_names:
+    try:
+        from hermes_cli.profiles import (
+            list_profiles,
+            get_active_profile_name,
+            get_profile_dir,
+        )
+        from hermes_constants import get_hermes_home
+
+        # Get all profiles
+        profiles = {{}}
+        profile_names = list_profiles()
+
+        for name in profile_names:
+            try:
+                profile_path = get_hermes_home(name)
+                profiles[name] = {{
+                    "name": name,
+                    "path": str(profile_path),
+                    "active": false
+                }}
+            except Exception as e:
+                profiles[name] = {{"name": name, "error": str(e)}}
+
+        # Get active profile
         try:
-            profile_path = get_hermes_home(name)
-            profiles[name] = {
-                "name": name,
-                "path": str(profile_path),
-                "active": False  # Will update below
-            }
-        except Exception as e:
-            profiles[name] = {"name": name, "error": str(e)}
-    
-    # Get active profile
-    try:
-        active_name = get_active_profile_name()
-    except Exception:
-        active_name = "default"
-    
-    if active_name in profiles:
-        profiles[active_name]["active"] = True
-    
-    # Get models and tools from active profile if available
-    models = []
-    tools = []
-    
-    try:
-        active_profile = active_name
-        if active_name not in profiles:
+            active_name = get_active_profile_name()
+        except Exception:
             active_name = "default"
-        
-        profile_dir = get_hermes_home(active_name)
-        
-        # Try to load config.yaml from profile
-        config_path = os.path.join(profile_dir, "config.yaml")
-        if os.path.exists(config_path):
-            import yaml
-            with open(config_path, 'r') as f:
-                config = yaml.safe_load(f) or {}
-            
-            # Extract model info
-            model_cfg = config.get("model", {})
-            if isinstance(model_cfg, dict):
-                for key, value in model_cfg.items():
-                    if key != "default" and not key.startswith("_"):
-                        models.append({
-                            "id": key,
-                            "base_url": value.get("base_url", ""),
-                            "model": value.get("model", key),
-                            "temperature": value.get("temperature", 0.7),
-                            "max_tokens": value.get("max_tokens", 2048)
-                        })
-            
-            # Extract tools
-            tools_cfg = config.get("tools", {})
-            if isinstance(tools_cfg, dict):
-                for tool_name, tool_cfg in tools_cfg.items():
-                    tools.append({
-                        "name": tool_name,
-                        "enabled": tool_cfg.get("enabled", True) if isinstance(tool_cfg, dict) else True
-                    })
-    except Exception as e:
-        pass
-    
-    result = {
-        "active_profile": active_name,
-        "profiles": list(profiles.values()),
-        "models": models,
-        "tools": tools,
-        "hermes_home": hermes_home,
-    }
-    
-    print(json.dumps(result))
-except Exception as e:
-    print(json.dumps({"error": str(e), "profiles": [], "models": [], "tools": []}))
-"#;
-        let locals = pyo3::types::PyDict::new(py);
-        locals.set_item("os", py.import("os")?)?;
-        
-        let c_code = std::ffi::CString::new(code).unwrap();
-        let result = py.eval(&c_code, None, Some(&locals));
+
+        if active_name in profiles:
+            profiles[active_name]["active"] = true
+
+        # Get models and tools from active profile if available
+        models = []
+        tools = []
+
+        try:
+            active_profile = active_name
+            if active_name not in profiles:
+                active_name = "default"
+
+            profile_dir = get_hermes_home(active_name)
+
+            # Try to load config.yaml from profile
+            config_path = os.path.join(profile_dir, "config.yaml")
+            if os.path.exists(config_path):
+                import yaml
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f) or {{}}
+
+                # Extract model info
+                model_cfg = config.get("model", {{}})
+                if isinstance(model_cfg, dict):
+                    for key, value in model_cfg.items():
+                        if key != "default" and not key.startswith("_"):
+                            models.append({{
+                                "id": key,
+                                "base_url": value.get("base_url", ""),
+                                "model": value.get("model", key),
+                                "temperature": value.get("temperature", 0.7),
+                                "max_tokens": value.get("max_tokens", 2048)
+                            }})
+
+                # Extract tools
+                tools_cfg = config.get("tools", {{}})
+                if isinstance(tools_cfg, dict):
+                    for tool_name, tool_cfg in tools_cfg.items():
+                        tools.append({{
+                            "name": tool_name,
+                            "enabled": tool_cfg.get("enabled", True) if isinstance(tool_cfg, dict) else True
+                        }})
+        except Exception as e:
+            pass
+
+        result = {{
+            "active_profile": active_name,
+            "profiles": list(profiles.values()),
+            "models": models,
+            "tools": tools,
+            "hermes_home": hermes_home,
+        }}
+        json.dumps(result)
+    </"#,
+                hermes_src = hermes_src,
+                app_files_dir = app_files_dir,
+                hermes_home = hermes_home,
+            );
+            let c_code = std::ffi::CString::new(code).unwrap();
+            let result = py.eval(&c_code, None, None)?;
+            result.extract::<String>()
+        });
+
         match result {
-            Ok(obj) => {
-                let json_str = obj.to_string();
-                Ok(json_str)
+            Some(Ok(json_str)) => env.new_string(json_str).unwrap().into_raw(),
+            Some(Err(e)) => {
+                error!("Failed to get Hermes profile data: {:?}", e);
+                env.new_string("{}").unwrap().into_raw()
             }
-            Err(e) => {
-                let err = format!("{{\"error\": \"{}\", \"profiles\": [], \"models\": [], \"tools\": []}}", e.to_string().replace("\"", "\\\""));
-                Ok(err)
+            None => {
+                env.new_string("{\"error\": \"Python not initialized\"}").unwrap().into_raw()
             }
-        }
-    }) {
-        Some(res) => {
-            match res {
-                Ok(json_str) => return env.new_string(json_str).unwrap().into_raw(),
-                Err(e) => {
-                    let error_json = format!("{{\"error\": \"{}\", \"profiles\": [], \"models\": [], \"tools\": []}}", e.to_string().replace("\"", "\\\""));
-                    return env.new_string(error_json).unwrap().into_raw();
-                }
-            }
-        }
-        None => {
-            let error_json = "{\"error\": \"Python interpreter not available\", \"profiles\": [], \"models\": [], \"tools\": []}";
-            return env.new_string(error_json).unwrap().into_raw();
         }
     }
-}
 
 /// Start streaming mode
-#[no_mangle]
-pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeStartStreaming(
-    _env: JNIEnv,
-    _class: JClass,
-    executor_ptr: jlong,
-) -> jboolean {
-    let executor_ptr = executor_ptr as *mut AndroidExecutor;
-    if executor_ptr.is_null() {
-        error!("Executor pointer is null");
-        return jni::sys::JNI_FALSE;
-    }
-
-    // This function is a placeholder - actual streaming is done via session
-    info!("Start streaming called");
-    jni::sys::JNI_TRUE
-}
 
 /// Stop streaming
 #[no_mangle]

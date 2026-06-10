@@ -20,6 +20,10 @@ object NativeInterface {
     @JvmStatic
     external fun initLogger()
 
+    // Set the app's files directory (must be called before nativeCreateExecutor)
+    @JvmStatic
+    external fun nativeSetAppFilesDir(filesDir: String)
+
     // Create a pipeline executor (unary)
     @JvmStatic
     external fun nativeCreateExecutor(): Long

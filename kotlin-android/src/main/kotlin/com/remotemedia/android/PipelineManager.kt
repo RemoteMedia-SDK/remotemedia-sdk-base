@@ -72,6 +72,9 @@ class PipelineManager(private val context: Context) {
         try {
             updateState(PipelineState.INITIALIZING)
 
+            // Set app files directory for native code (must be before nativeCreateExecutor)
+            NativeInterface.nativeSetAppFilesDir(context.filesDir.absolutePath)
+
             // Ensure native loadable plugins are extracted to files directory
             extractRuntimeAssets()
 
