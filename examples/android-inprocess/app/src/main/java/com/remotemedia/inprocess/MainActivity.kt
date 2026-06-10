@@ -7,11 +7,14 @@ import android.media.AudioManager
 import android.os.Bundle
 import android.util.Log
 import android.view.View
+import android.view.Menu
+import android.view.MenuItem
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.AppCompatSpinner
+import androidx.appcompat.widget.Toolbar
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
@@ -75,6 +78,25 @@ class MainActivity : AppCompatActivity() {
     private fun setupToolbar() {
         supportActionBar?.title = "RemoteMedia Voice Assistant"
         supportActionBar?.subtitle = "Offline • On-Device"
+    }
+
+    override fun onCreateOptionsMenu(menu: Menu?): Boolean {
+        menuInflater.inflate(R.menu.main_menu, menu)
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        return when (item.itemId) {
+            R.id.action_settings -> {
+                Toast.makeText(this, "Settings coming soon", Toast.LENGTH_SHORT).show()
+                true
+            }
+            R.id.action_hermes_profile -> {
+                startActivity(android.content.Intent(this, HermesProfileActivity::class.java))
+                true
+            }
+            else -> super.onOptionsItemSelected(item)
+        }
     }
 
     private fun checkAudioPermission() {

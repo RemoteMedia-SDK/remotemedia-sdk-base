@@ -2,19 +2,16 @@
   "version": "1",
   "metadata": {
     "name": "simulator",
-    "description": "Offline voice assistant simulator: VAD → STT → LiteRT LLM (Gemma) → G2P → TTS (Kokoro). Full end-to-end on-device speech-to-speech pipeline.",
+    "description": "hermes.",
     "auto_negotiate": true,
     "strict_capabilities": false
   },
-  "plugins": [
+    "plugins": [
     {
       "path": "/data/data/com.remotemedia.inprocess/files/libsilero_vad_loadable_plugin.so"
     },
     {
       "path": "/data/data/com.remotemedia.inprocess/files/libwhisper_loadable_plugin.so"
-    },
-    {
-      "path": "/data/data/com.remotemedia.inprocess/files/liblitert_lm_loadable_plugin.so"
     },
     {
       "path": "/data/data/com.remotemedia.inprocess/files/libmisaki_g2p_plugin.so"
@@ -76,14 +73,14 @@
     },
     {
       "id": "llm",
-      "node_type": "LiteRtLmGenerationNode",
+      "node_type": "HermesAgentPlugin",
       "params": {
-        "model_path": "/data/data/com.remotemedia.inprocess/files/models/gemma-4-E2B-it.litertlm",
-        "backend": "cpu",
-        "cache_dir": "/data/data/com.remotemedia.inprocess/files/cache/litert-lm",
-        "max_num_tokens": 2048,
-        "parallel_file_section_loading": true,
-        "execution_mode": "InProcess"
+        "base_url": "http://localhost:30000/v1",
+        "model": "hermes-3-llama-3.1-8b",
+        "api_key": "",
+        "system_prompt": "You are a helpful voice assistant. Keep responses concise and natural for speech.",
+        "temperature": 0.7,
+        "max_tokens": 2048
       },
       "is_streaming": true
     },

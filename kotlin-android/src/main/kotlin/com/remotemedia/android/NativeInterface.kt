@@ -69,6 +69,12 @@ object NativeInterface {
     @JvmStatic
     external fun nativeGetNodeSchema(nodeType: String): String
 
+    /** 
+     * Get Hermes Agent profile data (profiles, active profile, models, tools, etc.)
+     */
+    @JvmStatic
+    external fun nativeGetHermesProfileData(): String
+
     // Start streaming mode
     @JvmStatic
     external fun nativeStartStreaming(handle: Long): Boolean
@@ -85,7 +91,7 @@ object NativeInterface {
         modelPath: String,
         backend: String,
         maxNumTokens: Int,
-        systemPrompt: String?,
+        systemPrompt: String?
     ): Long
 
     @JvmStatic
@@ -96,7 +102,7 @@ object NativeInterface {
         executorHandle: Long,
         nodeHandle: Long,
         sessionId: String,
-        text: String,
+        text: String
     ): Boolean
 }
 

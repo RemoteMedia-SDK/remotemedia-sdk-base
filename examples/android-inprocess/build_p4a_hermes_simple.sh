@@ -9,6 +9,12 @@
 #   ./build_p4a_hermes_simple.sh
 #
 # The output will be at ~/.local/share/python-for-android/dists/remotemedia_hermes/
+#
+# Environment variables (optional):
+#   ANDROID_SDK_ROOT - Android SDK path (default: ~/Android/Sdk)
+#   ANDROID_NDK_ROOT - Android NDK path (default: ~/Android/Sdk/ndk/27.0.11718014)
+#   JAVA_HOME - Java home (default: /usr/lib/jvm/java-21-openjdk-amd64)
+#   P4A_ROOT - python-for-android root (default: ~/.local/share/python-for-android)
 # =============================================================================
 
 set -euo pipefail
@@ -28,10 +34,22 @@ error() { echo -e "${RED}[ERR]${NC} $*"; }
 # Configuration
 DIST_NAME="remotemedia_hermes"
 ARCH="arm64-v8a"
-PYTHON_VERSION="3.11"
+
+# Use environment variables with sensible defaults
+ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${HOME}/Android/Sdk}"
+ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-${ANDROID_SDK_ROOT}/ndk/27.0.11718014}"
+ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
+
+export ANDROID_SDK_ROOT
+export ANDROID_NDK_ROOT
+export ANDROID_HOME
+export JAVA_HOME
+export PATH="${ANDROID_SDK_ROOT}/platform-tools:${PATH}"
+
 find_python_for_android_root() {
-    if [[ -n "${P4A_ROOT:-}" && -d "$P4A_ROOT" ]]; then
-        echo "$P4A_ROOT"
+    if [[ -n "${P4A_ROOT:-}" && -d "${P4A_ROOT}" ]]; then
+        echo "${P4A_ROOT}"
         return 0
     fi
 
@@ -47,13 +65,14 @@ find_python_for_android_root() {
 
     local candidate
     candidate=$(find "${HOME}/snap/code" -maxdepth 6 -type d -path '*/.local/share/python-for-android' 2>/dev/null | head -n1)
-    if [[ -n "$candidate" ]]; then
-        echo "$candidate"
+    if [[ -n "${candidate}" ]]; then
+        echo "${candidate}"
         return 0
     fi
 
     echo "${HOME}/.local/share/python-for-android"
 }
+
 P4A_ROOT="$(find_python_for_android_root)"
 DIST_DIR="${P4A_ROOT}/dists/${DIST_NAME}"
 ACTUAL_DIST_DIR=""
@@ -86,9 +105,21 @@ REQUIRED_MODULE_PATHS=(
     "typing_extensions.py"
 )
 
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
+success() { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+error() { echo -e "${RED}[ERR]${NC} $*"; }
+
 log "Building python-for-android distro: ${DIST_NAME}"
 log "Architecture: ${ARCH}"
-log "Python version: ${PYTHON_VERSION}"
+log "Python version: 3.11 (pinned in p4a recipes)"
 
 # Check python-for-android
 if ! command -v p4a &> /dev/null; then
@@ -119,14 +150,7 @@ mkdir -p "${BUILD_DIR}"
 log "Building python-for-android distribution..."
 log "This may take 10-30 minutes depending on network and CPU..."
 
-# Set Android SDK/NDK paths for p4a
-export ANDROID_SDK_ROOT="/home/acidhax/Android/Sdk"
-export ANDROID_NDK_ROOT="/home/acidhax/Android/Sdk/ndk/27.0.11718014"
-export ANDROID_HOME="/home/acidhax/Android/Sdk"
-export JAVA_HOME="/usr/lib/jvm/java-21-openjdk-amd64"
-export PATH="/home/acidhax/Android/Sdk/platform-tools:${PATH}"
-
-# Use p4a create with requirements. Recipes are hardcoded to 3.11.9 (hermes-agent requires <3.14)
+# Use p4a create with requirements. Recipes pinned to Python 3.11 (hermes-agent requires <3.14)
 cd "${BUILD_DIR}"
 p4a create \
     --dist-name "${DIST_NAME}" \
@@ -138,7 +162,7 @@ p4a create \
     --python-version "3.11" \
     --ndk-api 24 \
     --android-api 34 \
-    --ndk-dir "/home/acidhax/Android/Sdk/ndk/27.0.11718014" \
+    --ndk-dir "${ANDROID_NDK_ROOT}" \
     --blacklist-requirements ruamel.yaml,pydantic_core \
     --permission INTERNET \
     --permission ACCESS_NETWORK_STATE \

@@ -948,6 +948,152 @@ pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeGetNod
     }
 }
 
+/// Get Hermes Agent profile data for UI (profiles, active profile, models, tools, etc.)
+#[no_mangle]
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeGetHermesProfileData(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    // Initialize Python and run the hermes_cli.profiles module to get profile data
+    match Python::try_attach(|py| -> PyResult<String> {
+        // Run the Python code to get Hermes Agent profile data
+        let code = r#"
+import sys
+import os
+import json
+
+# Add hermes_agent source to path
+hermes_src = "/data/data/com.remotemedia.inprocess/files/python/src/hermes_agent"
+if hermes_src not in sys.path:
+    sys.path.insert(0, hermes_src)
+
+# Set up environment for Hermes
+home = "/data/data/com.remotemedia.inprocess/files"
+os.environ["HOME"] = home
+hermes_home = "/data/data/com.remotemedia.inprocess/files/hermes_home"
+os.environ["HERMES_HOME"] = hermes_home
+os.makedirs(hermes_home, exist_ok=True)
+os.makedirs(os.path.join(hermes_home, "profiles"), exist_ok=True)
+os.makedirs(os.path.join(hermes_home, "logs"), exist_ok=True)
+
+try:
+    from hermes_cli.profiles import (
+        list_profiles,
+        get_active_profile_name,
+        get_profile_dir,
+    )
+    from hermes_constants import get_hermes_home
+    
+    # Get all profiles
+    profiles = {}
+    profile_names = list_profiles()
+    
+    for name in profile_names:
+        try:
+            profile_path = get_hermes_home(name)
+            profiles[name] = {
+                "name": name,
+                "path": str(profile_path),
+                "active": False  # Will update below
+            }
+        except Exception as e:
+            profiles[name] = {"name": name, "error": str(e)}
+    
+    # Get active profile
+    try:
+        active_name = get_active_profile_name()
+    except Exception:
+        active_name = "default"
+    
+    if active_name in profiles:
+        profiles[active_name]["active"] = True
+    
+    # Get models and tools from active profile if available
+    models = []
+    tools = []
+    
+    try:
+        active_profile = active_name
+        if active_name not in profiles:
+            active_name = "default"
+        
+        profile_dir = get_hermes_home(active_name)
+        
+        # Try to load config.yaml from profile
+        config_path = os.path.join(profile_dir, "config.yaml")
+        if os.path.exists(config_path):
+            import yaml
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f) or {}
+            
+            # Extract model info
+            model_cfg = config.get("model", {})
+            if isinstance(model_cfg, dict):
+                for key, value in model_cfg.items():
+                    if key != "default" and not key.startswith("_"):
+                        models.append({
+                            "id": key,
+                            "base_url": value.get("base_url", ""),
+                            "model": value.get("model", key),
+                            "temperature": value.get("temperature", 0.7),
+                            "max_tokens": value.get("max_tokens", 2048)
+                        })
+            
+            # Extract tools
+            tools_cfg = config.get("tools", {})
+            if isinstance(tools_cfg, dict):
+                for tool_name, tool_cfg in tools_cfg.items():
+                    tools.append({
+                        "name": tool_name,
+                        "enabled": tool_cfg.get("enabled", True) if isinstance(tool_cfg, dict) else True
+                    })
+    except Exception as e:
+        pass
+    
+    result = {
+        "active_profile": active_name,
+        "profiles": list(profiles.values()),
+        "models": models,
+        "tools": tools,
+        "hermes_home": hermes_home,
+    }
+    
+    print(json.dumps(result))
+except Exception as e:
+    print(json.dumps({"error": str(e), "profiles": [], "models": [], "tools": []}))
+"#;
+        let locals = pyo3::types::PyDict::new(py);
+        locals.set_item("os", py.import("os")?)?;
+        
+        let c_code = std::ffi::CString::new(code).unwrap();
+        let result = py.eval(&c_code, None, Some(&locals));
+        match result {
+            Ok(obj) => {
+                let json_str = obj.to_string();
+                Ok(json_str)
+            }
+            Err(e) => {
+                let err = format!("{{\"error\": \"{}\", \"profiles\": [], \"models\": [], \"tools\": []}}", e.to_string().replace("\"", "\\\""));
+                Ok(err)
+            }
+        }
+    }) {
+        Some(res) => {
+            match res {
+                Ok(json_str) => return env.new_string(json_str).unwrap().into_raw(),
+                Err(e) => {
+                    let error_json = format!("{{\"error\": \"{}\", \"profiles\": [], \"models\": [], \"tools\": []}}", e.to_string().replace("\"", "\\\""));
+                    return env.new_string(error_json).unwrap().into_raw();
+                }
+            }
+        }
+        None => {
+            let error_json = "{\"error\": \"Python interpreter not available\", \"profiles\": [], \"models\": [], \"tools\": []}";
+            return env.new_string(error_json).unwrap().into_raw();
+        }
+    }
+}
+
 /// Start streaming mode
 #[no_mangle]
 pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeStartStreaming(

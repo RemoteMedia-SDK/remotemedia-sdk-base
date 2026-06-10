@@ -8,4 +8,29 @@
     <string name="listening">Listening... Speak now</string>
     <string name="processing">Processing...</string>
     <string name="error_prefix">Error: </string>
+
+    <!-- Settings -->
+    <string name="settings">Settings</string>
+    <string name="hermes_profile">Hermes Profile</string>
+    <string name="hermes_profile_title">Hermes Agent Profile</string>
+    <string name="hermes_home_label">Hermes Home</string>
+    <string name="hermes_profile_name_label">Active Profile</string>
+    <string name="hermes_config_label">Config Path</string>
+    <string name="hermes_soul_label">SOUL.md Path</string>
+    <string name="hermes_config_exists">Config exists</string>
+    <string name="hermes_config_missing">Config missing</string>
+    <string name="hermes_soul_exists">SOUL.md exists</string>
+    <string name="hermes_soul_missing">SOUL.md missing</string>
+    <string name="hermes_profile_status_loaded">Profile loaded</string>
+    <string name="hermes_profile_status_not_loaded">No profile loaded</string>
+    <string name="hermes_profile_status_error">Error: %s</string>
+    <string name="copy_path">Copy Path</string>
+    <string name="copied_to_clipboard">Copied to clipboard</string>
+    <string name="open_file">Open File</string>
+    <string name="refresh">Refresh</string>
+    <string name="hermes_model_config">Model Configuration</string>
+    <string name="hermes_base_url">Base URL</string>
+    <string name="hermes_model">Model</string>
+    <string name="hermes_temperature">Temperature</string>
+    <string name="hermes_max_tokens">Max Tokens</string>
 </resources>
