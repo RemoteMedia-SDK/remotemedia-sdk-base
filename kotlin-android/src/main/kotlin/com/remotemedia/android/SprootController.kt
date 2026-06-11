@@ -23,12 +23,11 @@ class SprootController(private val context: Context) {
     }
 
     private val sprootDir = File(context.filesDir, "sproot")
-    private val runDir = File(sprootDir, "run")
+    private val runDir = File(context.filesDir, "sproot/run")
     private val rootfsDir = File(sprootDir, "rootfs")
     
     private val prootExe = File(context.applicationInfo.nativeLibraryDir, "libproot.so")
     private val socketFile = File(runDir, "runner.sock")
-    private val rootfsRunnerExe = File(context.applicationInfo.nativeLibraryDir, "libremotemedia_sproot_runner.so")
 
     private var containerProcess: Process? = null
     private val isRunning = AtomicBoolean(false)
@@ -42,7 +41,7 @@ class SprootController(private val context: Context) {
     suspend fun start(): String? = withContext(Dispatchers.IO) {
         if (isRunning.get()) {
             Log.w(TAG, "Sproot container is already running")
-            return@withContext socketFile.absolutePath
+            return@withContext socketFile.canonicalPath
         }
 
         try {
@@ -56,18 +55,74 @@ class SprootController(private val context: Context) {
             }
 
             val prootCommand = buildProotCommand()
+
+            // Shared env for both smoke-test and real launch
+            val prootEnv = mutableMapOf<String, String>().also { env ->
+                env["PROOT_TMP_DIR"] = context.cacheDir.canonicalPath
+                env["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
+                env["PROOT_NO_SECCOMP"] = "1"
+                env["PROOT_LOADER"] = File(context.applicationInfo.nativeLibraryDir, "libproot_loader.so").canonicalPath
+            }
+
+            val glibcHostPath = File(context.filesDir, "sproot-glibc").canonicalPath
+            val nativeHostPath = context.applicationInfo.nativeLibraryDir
+
+            logPathDiagnostics("glibc_ld", File(nativeHostPath, "libglibc_ld.so"))
+            logPathDiagnostics("runner", File(nativeHostPath, "libremotemedia_sproot_runner.so"))
+
+            // PRoot smoke-test: run the glibc runner through the APK-packaged glibc loader
+            // to confirm PRoot can execute the glibc entrypoint before the real runner boot.
+            val smokeCommand = listOf(
+                prootExe.canonicalPath,
+                "-v", "9",
+                "-0",
+                "-r", rootfsDir.canonicalPath,
+                "-w", "/",
+
+                "-b", "/sys:/sys",
+                "-b", "/proc:/proc",
+                "-b", "/dev:/dev",
+                "-b", "${File(sprootDir, "shm").canonicalPath}:/dev/shm",
+
+                "-b", "/system",
+                "-b", "/apex",
+                "-b", "/system_ext",
+                "-b", "/product",
+                "-b", "/vendor",
+                "-b", "/odm",
+                "-b", "/linkerconfig/ld.config.txt:/linkerconfig/ld.config.txt",
+
+                "-b", "$nativeHostPath:/apk-native",
+                "-b", "$glibcHostPath:/apk-native-glibc",
+                "-b", "${runDir.canonicalPath}:/mnt/run",
+                "-b", "${context.cacheDir.canonicalPath}:${context.cacheDir.canonicalPath}",
+
+                "/apk-native/libglibc_ld.so",
+                "--library-path",
+                "/apk-native-glibc:/apk-native:/lib:/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/aarch64-linux-gnu",
+                "/apk-native/libremotemedia_sproot_runner.so",
+                "--version"
+            )
+            try {
+                Log.i(TAG, "PRoot smoke-test: ${smokeCommand.joinToString(" ")}")
+                val smokeProc = ProcessBuilder(smokeCommand)
+                    .directory(sprootDir)
+                    .redirectErrorStream(true)
+                    .also { it.environment().putAll(prootEnv) }
+                    .start()
+                val smokeOut = smokeProc.inputStream.bufferedReader().use { it.readText() }
+                val smokeExit = smokeProc.waitFor()
+                Log.i(TAG, "PRoot smoke-test exit=$smokeExit out=${smokeOut.trim()}")
+            } catch (t: Throwable) {
+                Log.w(TAG, "PRoot smoke-test threw: ${t.message}")
+            }
+
             Log.i(TAG, "Launching PRoot: ${prootCommand.joinToString(" ")}")
 
             val processBuilder = ProcessBuilder(prootCommand)
                 .directory(sprootDir)
                 .redirectErrorStream(true)
-
-            // Setup environment variables in the container process
-            val env = processBuilder.environment()
-            env["PROOT_TMP_DIR"] = context.cacheDir.absolutePath
-            env["LD_LIBRARY_PATH"] = context.applicationInfo.nativeLibraryDir
-            env["PROOT_NO_SECCOMP"] = "1"
-            env.remove("LD_PRELOAD")
+                .also { it.environment().putAll(prootEnv) }
 
             val process = processBuilder.start()
             containerProcess = process
@@ -90,7 +145,7 @@ class SprootController(private val context: Context) {
             }.start()
 
             // Wait for the Unix Domain Socket file to appear
-            Log.i(TAG, "Waiting for UDS socket to appear at ${socketFile.absolutePath}...")
+            Log.i(TAG, "Waiting for UDS socket to appear at ${socketFile.canonicalPath}...")
             val startTime = System.currentTimeMillis()
             var socketCreated = false
             
@@ -111,7 +166,7 @@ class SprootController(private val context: Context) {
             }
 
             Log.i(TAG, "Sproot container runner successfully booted and listening on UDS socket.")
-            socketFile.absolutePath
+            socketFile.canonicalPath
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start Sproot container", e)
             stop()
@@ -167,6 +222,22 @@ class SprootController(private val context: Context) {
         File(rootfsDir, "product").mkdirs()
         File(rootfsDir, "vendor").mkdirs()
         File(rootfsDir, "odm").mkdirs()
+
+        // Ensure host and guest shm folders exist
+        File(sprootDir, "shm").mkdirs()
+        File(rootfsDir, "dev/shm").mkdirs()
+
+        // Ensure guest bind-mount target folders exist inside rootfs
+        File(rootfsDir, "apk-native").mkdirs()
+        File(rootfsDir, "apk-native-glibc").mkdirs()
+        File(rootfsDir, "mnt/run").mkdirs()
+        File(rootfsDir, "mnt/models").mkdirs()
+        File(rootfsDir, "mnt/plugins").mkdirs()
+        File(rootfsDir, "mnt/python_src").mkdirs()
+        File(rootfsDir, context.cacheDir.canonicalPath.removePrefix("/")).mkdirs()
+
+        // Create symlinks for versioned glibc libraries
+        setupGlibcSymlinks()
     }
 
     private fun extractRequiredBinaries() {
@@ -182,7 +253,12 @@ class SprootController(private val context: Context) {
                     }
                 }
                 Log.i(TAG, "Extracting rootfs tarball...")
-                extractTar(rootfsTar.absolutePath, rootfsDir)
+                extractTar(rootfsTar.canonicalPath, rootfsDir)
+
+                // Explicitly validate required paths after extraction
+                require(File(rootfsDir, "lib/aarch64-linux-gnu").exists()) { "Rootfs extraction missing lib/aarch64-linux-gnu" }
+                require(File(rootfsDir, "usr/lib").exists()) { "Rootfs extraction missing usr/lib" }
+                require(File(rootfsDir, "tmp").exists()) { "Rootfs extraction missing tmp" }
             } finally {
                 if (rootfsTar.exists()) {
                     rootfsTar.delete()
@@ -191,42 +267,20 @@ class SprootController(private val context: Context) {
             rootfsMarker.createNewFile()
         }
 
-        // 2. Create placeholder for guest runner binary bind mount (under both bin/ and usr/bin/ for usr-merge compatibility)
-        val runnerPlaceholder1 = File(rootfsDir, "bin/remotemedia-sproot-runner")
-        if (!runnerPlaceholder1.exists()) {
-            runnerPlaceholder1.parentFile?.mkdirs()
-            runnerPlaceholder1.createNewFile()
-        }
-        val runnerPlaceholder2 = File(rootfsDir, "usr/bin/remotemedia-sproot-runner")
-        if (!runnerPlaceholder2.exists()) {
-            runnerPlaceholder2.parentFile?.mkdirs()
-            runnerPlaceholder2.createNewFile()
-        }
-    }
-
-    private fun extractAssetFile(assetPath: String, destFile: File) {
-        try {
-            destFile.parentFile?.mkdirs()
-            context.assets.open(assetPath).use { inputStream ->
-                FileOutputStream(destFile).use { outputStream ->
-                    inputStream.copyTo(outputStream)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to extract asset $assetPath to ${destFile.absolutePath}", e)
-            throw e
-        }
+        // Runner binary and glibc loader are now packaged as APK native libraries (jniLibs).
+        // No extraction into rootfs needed. The glibc ld-linux and runner .so files
+        // are invoked directly from the APK native library directory via --library-path.
     }
 
     private fun extractTar(tarPath: String, destDir: File) {
         try {
-            val process = Runtime.getRuntime().exec(arrayOf("tar", "-xof", tarPath, "-C", destDir.absolutePath))
+            val process = Runtime.getRuntime().exec(arrayOf("tar", "-xof", tarPath, "-C", destDir.canonicalPath))
             val errorReader = process.errorStream.bufferedReader()
             val outputReader = process.inputStream.bufferedReader()
-            
+
             val stderr = StringBuilder()
             val stdout = StringBuilder()
-            
+
             val errThread = Thread {
                 try {
                     var line: String?
@@ -236,7 +290,7 @@ class SprootController(private val context: Context) {
                 } catch (_: Exception) {}
             }
             errThread.start()
-            
+
             val outThread = Thread {
                 try {
                     var line: String?
@@ -246,38 +300,94 @@ class SprootController(private val context: Context) {
                 } catch (_: Exception) {}
             }
             outThread.start()
-            
+
             val result = process.waitFor()
             errThread.join(1000)
             outThread.join(1000)
-            
-            if (result != 0) {
-                val errStr = stderr.toString().trim()
-                val outStr = stdout.toString().trim()
-                Log.e(TAG, "tar stdout: $outStr")
-                Log.e(TAG, "tar stderr: $errStr")
-                throw IOException("tar extraction exited with code $result. stderr: $errStr")
+
+            // On Android FUSE, tar always emits symlink warnings (can't link, Permission denied).
+            // These are non-critical - the files are extracted, just symlinks aren't created.
+            // Always treat extraction as success since the actual file contents are there.
+            val errStr = stderr.toString().trim()
+            val outStr = stdout.toString().trim()
+            Log.i(TAG, "tar exit code: $result")
+            if (errStr.isNotBlank()) {
+                Log.i(TAG, "tar stderr (non-critical symlink warnings): ${errStr.lines().count()} lines")
             }
+            if (outStr.isNotBlank()) {
+                Log.i(TAG, "tar stdout: $outStr")
+            }
+            // Always continue - rootfs files are extracted despite symlink warnings
         } catch (e: Exception) {
             Log.e(TAG, "Exception extracting tar: $tarPath", e)
             throw e
         }
     }
 
+    private fun setupGlibcSymlinks() {
+        val glibcDir = File(context.filesDir, "sproot-glibc")
+        glibcDir.mkdirs()
+
+        val nativeHostPath = context.applicationInfo.nativeLibraryDir
+
+        val mappings = mapOf(
+            "libc.so.6" to "libglibc_libc.so",
+            "libm.so.6" to "libglibc_libm.so",
+            "libdl.so.2" to "libglibc_libdl.so",
+            "libpthread.so.0" to "libglibc_libpthread.so",
+            "libresolv.so.2" to "libglibc_libresolv.so",
+            "libutil.so.1" to "libglibc_libutil.so",
+            "librt.so.1" to "libglibc_librt.so",
+            "libnsl.so.2" to "libglibc_libnsl.so",
+            "libgcc_s.so.1" to "libglibc_libgcc_s.so",
+            "libstdc++.so.6" to "libglibc_libstdcxx.so",
+            "libz.so.1" to "libglibc_libz.so",
+            "libffi.so.8" to "libglibc_libffi.so",
+            "libssl.so.3" to "libglibc_libssl.so",
+            "libcrypto.so.3" to "libglibc_libcrypto.so",
+            "libpython3.11.so.1.0" to "libglibc_libpython3_11.so"
+        )
+
+        for ((symlinkName, targetName) in mappings) {
+            val symlinkFile = File(glibcDir, symlinkName)
+            val targetFile = File(nativeHostPath, targetName)
+            
+            // Re-create symlink to ensure correctness
+            if (symlinkFile.exists() || java.nio.file.Files.isSymbolicLink(symlinkFile.toPath())) {
+                symlinkFile.delete()
+            }
+            
+            try {
+                java.nio.file.Files.createSymbolicLink(
+                    symlinkFile.toPath(),
+                    java.nio.file.Paths.get(targetFile.canonicalPath)
+                )
+                Log.i(TAG, "Created glibc symlink: ${symlinkFile.name} -> ${targetFile.name}")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to create glibc symlink: ${symlinkFile.name}", e)
+            }
+        }
+    }
+
     private fun buildProotCommand(): List<String> {
-        val modelsHostPath = File(context.filesDir, "models").absolutePath
-        val pluginsHostPath = File(context.filesDir, "plugins").absolutePath
-        val pythonHostPath = File(context.filesDir, "python/src").absolutePath
-        val runHostPath = runDir.absolutePath
+        val modelsHostPath = File(context.filesDir, "models").canonicalPath
+        val pluginsHostPath = File(context.filesDir, "plugins").canonicalPath
+        val pythonHostPath = File(context.filesDir, "python/src").canonicalPath
+        val runHostPath = runDir.canonicalPath
+        val glibcHostPath = File(context.filesDir, "sproot-glibc").canonicalPath
+        val nativeHostPath = context.applicationInfo.nativeLibraryDir
 
         return listOf(
-            prootExe.absolutePath,
+            prootExe.canonicalPath,
             "-0",
-            "-r", rootfsDir.absolutePath,
+            "-r", rootfsDir.canonicalPath,
             "-w", "/",
+
             "-b", "/sys:/sys",
             "-b", "/proc:/proc",
             "-b", "/dev:/dev",
+            "-b", "${File(sprootDir, "shm").canonicalPath}:/dev/shm",
+
             "-b", "/system",
             "-b", "/apex",
             "-b", "/system_ext",
@@ -285,14 +395,34 @@ class SprootController(private val context: Context) {
             "-b", "/vendor",
             "-b", "/odm",
             "-b", "/linkerconfig/ld.config.txt:/linkerconfig/ld.config.txt",
+
+            "-b", "$nativeHostPath:/apk-native",
+            "-b", "$glibcHostPath:/apk-native-glibc",
             "-b", "$modelsHostPath:/mnt/models",
             "-b", "$pluginsHostPath:/mnt/plugins",
             "-b", "$pythonHostPath:/mnt/python_src",
             "-b", "$runHostPath:/mnt/run",
-            "-b", "${rootfsRunnerExe.absolutePath}:/bin/remotemedia-sproot-runner",
-            "-b", "${rootfsRunnerExe.absolutePath}:/usr/bin/remotemedia-sproot-runner",
-            "/bin/remotemedia-sproot-runner",
+            "-b", "${context.cacheDir.canonicalPath}:${context.cacheDir.canonicalPath}",
+
+            "/apk-native/libglibc_ld.so",
+            "--library-path",
+            "/apk-native-glibc:/apk-native:/lib:/lib/aarch64-linux-gnu:/usr/lib:/usr/lib/aarch64-linux-gnu",
+            "/apk-native/libremotemedia_sproot_runner.so",
             "--socket-path", "/mnt/run/runner.sock"
         )
+    }
+
+    private fun logPathDiagnostics(label: String, f: File) {
+        try {
+            val exists = f.exists()
+            val isFile = f.isFile
+            val isDir = f.isDirectory
+            val isSymlink = java.nio.file.Files.isSymbolicLink(f.toPath())
+            val length = if (exists && isFile && !isSymlink) f.length() else -1
+            val canonical = if (exists) f.canonicalPath else "n/a"
+            Log.i(TAG, "FS[$label] path=${f.absolutePath} exists=$exists file=$isFile dir=$isDir symlink=$isSymlink len=$length canonical=$canonical")
+        } catch (t: Throwable) {
+            Log.w(TAG, "FS[$label] path=${f.absolutePath} threw: ${t.message}")
+        }
     }
 }

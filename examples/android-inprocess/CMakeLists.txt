@@ -68,3 +68,78 @@ add_python_library("x86_64-linux-android")
 
 # Main target that Gradle will build
 add_custom_target(remotemedia_android DEPENDS copy_rust_libs)
+
+# Copy SPROOT glibc libraries from prebuilt location
+# These are glibc (aarch64-unknown-linux-gnu) libraries, not Android-targeted
+function(add_glibc_libraries arch)
+    set(jni_libs_dir "${CMAKE_SOURCE_DIR}/src/main/jniLibs/${arch}")
+    set(glibc_built_dir "${CMAKE_SOURCE_DIR}/../../../../remotemedia-scaling/target/aarch64-unknown-linux-gnu/release")
+
+    # Copy runner binary
+    set(runner_src "${glibc_built_dir}/remotemedia-sproot-runner")
+    set(runner_dst "${jni_libs_dir}/libremotemedia_sproot_runner.so")
+    if(EXISTS ${runner_src})
+        add_custom_command(
+            OUTPUT ${runner_dst}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${jni_libs_dir}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${runner_src} ${runner_dst}
+            DEPENDS ${runner_src}
+            COMMENT "Copying SPROOT runner for ${arch}"
+        )
+        add_custom_target(copy_runner_${arch} DEPENDS ${runner_dst})
+        add_dependencies(copy_rust_libs copy_runner_${arch})
+    else()
+        message(WARNING "SPROOT runner not found: ${runner_src}")
+    endif()
+
+    # Source is always arm64-v8a for arm64, x86_64 for x86_64
+    if(arch STREQUAL "aarch64-v8a")
+        set(glibc_src_arch "arm64-v8a")
+    elseif(arch STREQUAL "x86_64")
+        set(glibc_src_arch "x86_64")
+    else()
+        set(glibc_src_arch ${arch})
+    endif()
+    set(glibc_libs_dir "${CMAKE_SOURCE_DIR}/../../../remotemedia-sdk-base/kotlin-android/app/src/main/jniLibs/${glibc_src_arch}")
+
+    # List of glibc libraries to copy
+    set(GLIBC_LIBS
+        libglibc_ld.so
+        libglibc_libc.so
+        libglibc_libm.so
+        libglibc_libdl.so
+        libglibc_libpthread.so
+        libglibc_libresolv.so
+        libglibc_libutil.so
+        libglibc_librt.so
+        libglibc_libnsl.so
+        libglibc_libgcc_s.so
+        libglibc_libstdcxx.so
+        libglibc_libz.so
+        libglibc_libffi.so
+        libglibc_libssl.so
+        libglibc_libcrypto.so
+        libglibc_libpython3_11.so
+    )
+
+    foreach(lib ${GLIBC_LIBS})
+        set(src "${glibc_libs_dir}/${lib}")
+        set(dst "${jni_libs_dir}/${lib}")
+        if(EXISTS ${src})
+            add_custom_command(
+                OUTPUT ${dst}
+                COMMAND ${CMAKE_COMMAND} -E make_directory ${jni_libs_dir}
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different ${src} ${dst}
+                DEPENDS ${src}
+                COMMENT "Copying glibc ${lib} for ${arch}"
+            )
+            add_custom_target(copy_glibc_${lib}_${arch} DEPENDS ${dst})
+            add_dependencies(copy_rust_libs copy_glibc_${lib}_${arch})
+        else()
+            message(WARNING "glibc library not found: ${src}")
+        endif()
+    endforeach()
+endfunction()
+
+add_glibc_libraries("aarch64-v8a")
+add_glibc_libraries("x86_64")

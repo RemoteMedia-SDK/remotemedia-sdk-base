@@ -1023,24 +1023,9 @@ build_rust() {
     install -m 0644 "$LOADABLE_PLUGIN" app/src/main/assets/plugins/
     success "Copied RemoteMedia loadable plugin to assets/plugins/"
 
-    # Compile and package guest sproot runner
-    log "Building guest sproot runner binary..."
-    cd "${WORKSPACE_ROOT}/remotemedia-scaling"
-    cargo build --package remotemedia-scaling-runner-bin --bin remotemedia-sproot-runner --target aarch64-unknown-linux-gnu --release 2>&1 | tail -20
-    cd "$ANDROID_PROJECT"
-
-    RUNNER_BIN="${WORKSPACE_ROOT}/remotemedia-scaling/target/aarch64-unknown-linux-gnu/release/remotemedia-sproot-runner"
-    if [[ ! -f "$RUNNER_BIN" ]]; then
-        error "Sproot runner binary build failed: $RUNNER_BIN not found"
-        exit 1
-    fi
-    mkdir -p "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/assets/sproot"
-    install -m 0755 "$RUNNER_BIN" "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/assets/sproot/"
-    success "Copied guest sproot runner binary to kotlin-android assets/sproot/"
-
     # Also package proot and guest sproot runner as native libraries (.so) in jniLibs to allow execution under Android 10+ W^X policy
     mkdir -p "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a"
-    
+        
     # 1. Download and package libtalloc dependency if not present
     local talloc_target="${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a/libtalloc.so"
     if [[ ! -f "$talloc_target" ]]; then
@@ -1085,9 +1070,60 @@ build_rust() {
         warn "proot not found in assets/sproot/proot; make sure it is built/downloaded"
     fi
 
-    # 4. Package guest sproot runner
-    install -m 0755 "$RUNNER_BIN" "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a/libremotemedia_sproot_runner.so"
-    success "Copied guest sproot runner to kotlin-android jniLibs/arm64-v8a/libremotemedia_sproot_runner.so"
+    # 3b. Download and package proot loader dependency if not present
+    local loader_target="${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a/libproot_loader.so"
+    if [[ ! -f "$loader_target" ]]; then
+        log "Downloading and preparing libproot_loader.so dependency..."
+        local temp_loader_dir
+        temp_loader_dir=$(mktemp -d)
+        curl -L -o "${temp_loader_dir}/proot.deb" "https://packages.termux.org/apt/termux-main/pool/main/p/proot/proot_5.1.107.78-1_aarch64.deb"
+        (
+            cd "$temp_loader_dir"
+            ar x proot.deb
+            if [ -f data.tar.xz ]; then
+                tar -xf data.tar.xz
+            elif [ -f data.tar.zst ]; then
+                tar --use-compress-program=unzstd -xf data.tar.zst
+            elif [ -f data.tar.gz ]; then
+                tar -xf data.tar.gz
+            fi
+        )
+        install -m 0755 "${temp_loader_dir}/data/data/com.termux/files/usr/libexec/proot/loader" "$loader_target"
+        rm -rf "$temp_loader_dir"
+        success "Prepared libproot_loader.so"
+    fi
+
+    # 4. Build sproot runner (glibc) → libremotemedia_sproot_runner.so
+    log "Building guest sproot runner for proot (glibc)..."
+    cd "${WORKSPACE_ROOT}/remotemedia-scaling"
+    (
+        unset RUSTFLAGS
+        cargo build --package remotemedia-scaling-runner-bin \
+            --bin remotemedia-sproot-runner \
+            --target aarch64-unknown-linux-gnu --release 2>&1 | tail -20
+    )
+    cd "$ANDROID_PROJECT"
+
+    PROOT_RUNNER_BIN="${WORKSPACE_ROOT}/remotemedia-scaling/target/aarch64-unknown-linux-gnu/release/remotemedia-sproot-runner"
+    if [[ ! -f "$PROOT_RUNNER_BIN" ]]; then
+        error "Sproot runner (glibc) build failed: $PROOT_RUNNER_BIN not found"
+        exit 1
+    fi
+    mkdir -p "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a"
+    install -m 0755 "$PROOT_RUNNER_BIN" "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a/libremotemedia_sproot_runner.so"
+    success "Copied sproot runner (glibc) to jniLibs/arm64-v8a/libremotemedia_sproot_runner.so"
+
+    # 4c. Copy all renamed glibc libraries to kotlin-android/src/main/jniLibs/arm64-v8a/
+    local glibc_libs_src="${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/app/src/main/jniLibs/arm64-v8a"
+    local glibc_libs_dst="${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a"
+    mkdir -p "$glibc_libs_dst"
+    if [[ -d "$glibc_libs_src" ]]; then
+        log "Copying renamed glibc libraries to library jniLibs..."
+        cp "$glibc_libs_src"/libglibc_*.so "$glibc_libs_dst/"
+        success "Copied renamed glibc libraries to jniLibs"
+    else
+        warn "Glibc libs source directory not found: $glibc_libs_src"
+    fi
 
     package_apk_runtime_assets
 }
@@ -1150,11 +1186,13 @@ verify_apk_contents() {
         "assets/models/kokoro/voices/af_bella.bin"
         "assets/models/misaki-g2p/en-US/gold.json"
         "assets/models/misaki-g2p/en-US/silver.json"
-        "assets/sproot/remotemedia-sproot-runner"
         "lib/arm64-v8a/libremotemedia_android.so"
         "lib/arm64-v8a/libc++_shared.so"
         "lib/arm64-v8a/libGemmaModelConstraintProvider.so"
         "lib/arm64-v8a/liblitert_lm.so"
+        "lib/arm64-v8a/libremotemedia_sproot_runner.so"
+        "lib/arm64-v8a/libglibc_ld.so"
+        "lib/arm64-v8a/libglibc_libpython3_11.so"
     )
 
     local missing=0
@@ -1178,9 +1216,9 @@ verify_apk_contents() {
         "assets/sproot/proot"
         "assets/sproot/rootfs.targz"
         "lib/arm64-v8a/libproot.so"
-        "lib/arm64-v8a/libremotemedia_sproot_runner.so"
         "lib/arm64-v8a/libtalloc.so"
         "lib/arm64-v8a/libandroid-shmem.so"
+        "lib/arm64-v8a/libproot_loader.so"
     )
 
     if [[ "$BUNDLE_LARGE_LLM_IN_APK" == "true" ]]; then
@@ -1280,6 +1318,10 @@ run_and_test() {
         fi
     fi
     
+    # Force re-extraction of glibc assets on next launch by deleting the old files
+    log "Clearing old extracted glibc assets on device to force re-extraction..."
+    adb -s "$DEVICE_ADDRESS" shell "run-as com.remotemedia.inprocess rm -rf files/sproot-glibc" || true
+
     # Start MainActivity and ask it to start streaming as soon as the manifest is ready.
     adb -s "$DEVICE_ADDRESS" shell am start -n com.remotemedia.inprocess/.MainActivity --ez auto_start true --ez simulate_speech true --es pipeline "$TEST_PIPELINE"
     
@@ -1295,7 +1337,7 @@ run_and_test() {
     log "Dumping logcat to $LOG_OUTPUT..."
     adb -s "$DEVICE_ADDRESS" logcat -d > "$LOG_OUTPUT"
     
-    log "For live/filtered logs: adb -s $DEVICE_ADDRESS logcat -v threadtime | grep -E 'RemoteMedia|PipelineManager|MainActivity|NativeInterface|AudioRecorder|AudioPlayer|AndroidRuntime|DEBUG|LiteRT|Whisper|Kokoro|Misaki|G2P|Python|InProcess|Manifest|model|tokenizer'"
+    log "For live/filtered logs: adb -s $DEVICE_ADDRESS logcat -v threadtime | grep -E 'RemoteMedia|PipelineManager|MainActivity|NativeInterface|AudioRecorder|AudioPlayer|AndroidRuntime|DEBUG|LiteRT|Whisper|Kokoro|Misaki|G2P|Python|InProcess|Manifest|model|tokenizer|SprootGuest|SprootController'"
     
     # Check extracted runtime assets after launch
     log "Checking extracted runtime assets after launch, if the app exposes them via run-as..."

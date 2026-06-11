@@ -705,6 +705,7 @@ class PipelineManager(private val context: Context) {
                 NativeInterface.nativeSetSprootSocketPath(socketPath)
             } else {
                 // Ensure no lingering socket path is configured in JNI for in-process runs
+                Log.i(TAG, "Manifest doesn't require glibc runtime, unsetting nativeSprocketSocketPath.")
                 NativeInterface.nativeSetSprootSocketPath("")
             }
 
