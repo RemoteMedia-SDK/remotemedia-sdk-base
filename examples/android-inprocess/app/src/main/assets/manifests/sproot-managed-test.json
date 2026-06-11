@@ -1,0 +1,17 @@
+{
+  "version": "1",
+  "metadata": {
+    "name": "sproot-managed-test",
+    "description": "Test manifest for managed venv in Sproot container",
+    "default_python_runtime": "glibc"
+  },
+  "nodes": [
+    {
+      "id": "sproot_test",
+      "node_type": "SprootManagedTestPlugin",
+      "params": {},
+      "is_streaming": false
+    }
+  ],
+  "connections": []
+}

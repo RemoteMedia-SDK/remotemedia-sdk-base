@@ -43,6 +43,11 @@ android {
             path("CMakeLists.txt")
         }
     }
+
+    aaptOptions {
+        noCompress.add("gz")
+        noCompress.add("tar.gz")
+    }
 }
 
 dependencies {

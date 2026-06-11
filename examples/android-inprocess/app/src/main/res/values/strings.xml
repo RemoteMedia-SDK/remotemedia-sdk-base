@@ -44,10 +44,10 @@
     <string name="select_profile_dir">Select Hermes profile directory (containing auth.json)</string>
     <string name="no_profile_selected">No profile selected</string>
 
-    <!-- Microdroid Runner Management -->
-    <string name="microdroid_runners">Microdroid Runners</string>
-    <string name="microdroid_runners_title">Microdroid pVM Runners</string>
-    <string name="avf_support_label">AVF Support</string>
+    <!-- Sproot Runner Management -->
+    <string name="microdroid_runners">Sproot Runners</string>
+    <string name="microdroid_runners_title">Debian Sproot Runners</string>
+    <string name="avf_support_label">Sproot Support</string>
     <string name="avf_supported">Supported</string>
     <string name="avf_not_supported">Not Supported</string>
     <string name="runner_status_label">Runner Status</string>
@@ -59,25 +59,26 @@
     <string name="btn_deploy_runner">Deploy Runner</string>
     <string name="btn_remove_runner">Remove Runner</string>
     <string name="btn_refresh_status">Refresh Status</string>
-    <string name="btn_connect_vsock">Connect vsock</string>
-    <string name="vsock_status_label">vsock Status</string>
+    <string name="btn_connect_vsock">Connect Sproot</string>
+    <string name="vsock_status_label">Sproot Status</string>
     <string name="vsock_status_connected">Connected</string>
     <string name="vsock_status_disconnected">Disconnected</string>
     <string name="vsock_status_connecting">Connecting...</string>
     <string name="log_label">Activity Log</string>
-    <string name="vm_config_label">VM Configuration</string>
-    <string name="vm_memory">Memory: 512 MB</string>
-    <string name="vm_cpu">CPU: 1 Core</string>
-    <string name="vm_payload">Payload: remotemedia-microdroid-runner</string>
-    <string name="vm_network">Network: Enabled</string>
-    <string name="runner_deployed_success">Runner deployed successfully</string>
-    <string name="runner_deploy_failed">Failed to deploy runner: %s</string>
-    <string name="runner_removed_success">Runner removed successfully</string>
-    <string name="runner_remove_failed">Failed to remove runner: %s</string>
-    <string name="vsock_connected_success">vsock connected on port 5555</string>
-    <string name="vsock_connected_failed">Failed to connect vsock: %s</string>
-    <string name="avf_check_failed">AVF not supported on this device</string>
-    <string name="already_running">Runner is already running</string>
+    <string name="vm_config_label">Sproot Configuration</string>
+    <string name="vm_memory">Rootfs: Debian bookworm</string>
+    <string name="vm_cpu">Engine: PRoot</string>
+    <string name="vm_payload">Payload: remotemedia-sproot-runner</string>
+    <string name="vm_network">Network: Loopback UDS</string>
+    <string name="runner_deployed_success">Sproot deployed successfully</string>
+    <string name="runner_deploy_failed">Failed to deploy Sproot: %s</string>
+    <string name="runner_removed_success">Sproot removed successfully</string>
+    <string name="runner_remove_failed">Failed to remove Sproot: %s</string>
+    <string name="vsock_connected_success">Sproot connected on socket</string>
+    <string name="vsock_connected_failed">Failed to connect Sproot: %s</string>
+    <string name="avf_check_failed">Sproot not supported on this device</string>
+    <string name="already_running">Sproot is already running</string>
+
     <string name="not_running">Runner is not running</string>
     <string name="copy_log">Copy Log</string>
 </resources>

@@ -21,11 +21,6 @@ crate-type = ["rlib"]
 # `llama-cpp-cuda` feature removed from core (llama.cpp nodes moved to
 # RemoteMedia-SDK/llama-cpp plugin); load via
 # `"plugins": ["llama-cpp@v0.1.0"]` in pipeline manifests instead.
-[target.'cfg(not(target_os = "android"))'.dependencies]
-remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv", "multiprocess", "video"] }
-
-[target.'cfg(target_os = "android")'.dependencies]
-remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv", "multiprocess"] }
 
 # WebRTC peer connections, ICE, DTLS, SRTP
 webrtc = "0.14.0"
@@ -88,6 +83,12 @@ clap = { version = "4.5", features = ["derive", "env"], optional = true }
 
 # Docker execution
 bollard = { workspace = true }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv", "multiprocess"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv", "multiprocess"] }
 
 [dev-dependencies]
 remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk" }

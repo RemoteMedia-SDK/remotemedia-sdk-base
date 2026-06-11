@@ -110,7 +110,7 @@ object NativeInterface {
     ): Boolean
 
     @JvmStatic
-    external fun nativeSetVsockFd(fd: Int): Boolean
+    external fun nativeSetSprootSocketPath(path: String): Boolean
 
     // Create a new Hermes profile
     @JvmStatic

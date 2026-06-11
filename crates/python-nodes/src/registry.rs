@@ -584,6 +584,15 @@ pub fn register_default_python_nodes() {
             .with_category("test"),
     );
 
+    register_python_node(
+        PythonNodeConfig::new("SprootManagedTestPlugin")
+            .with_python_class("remotemedia.nodes.android_inprocess.SprootManagedTestPlugin")
+            .with_description("Sproot managed venv test node")
+            .with_category("test")
+            .accepts(["text"])
+            .produces(["text"]),
+    );
+
     tracing::info!(
         count = PYTHON_NODE_REGISTRY.len(),
         "Registered default Python nodes"

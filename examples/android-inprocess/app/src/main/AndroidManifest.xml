@@ -51,12 +51,7 @@
             android:theme="@style/Theme.RemoteMediaInProcess"
             android:windowSoftInputMode="adjustResize" />
 
-        <activity
-            android:name=".MicrodroidRunnerManagementActivity"
-            android:exported="false"
-            android:launchMode="singleTop"
-            android:theme="@style/Theme.RemoteMediaInProcess"
-            android:windowSoftInputMode="adjustResize" />
+
 
         <!-- Foreground service for audio processing -->
         <service

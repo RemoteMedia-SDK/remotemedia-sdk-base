@@ -2,6 +2,11 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
 use log::{error, info};
+use remotemedia_scaling_runner_protocol::{
+    ParticipantInputMessage, ParticipantOutputMessage, ParticipantType,
+    RegisterParticipantRequest, RegisterSessionRequest,
+};
+
 use pyo3::prelude::*;
 use remotemedia_core::{
     data::{AudioSamples, RuntimeData},
@@ -26,15 +31,72 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 static APP_FILES_DIR: OnceLock<String> = OnceLock::new();
 static AUDIO_SEND_COUNT: AtomicU64 = AtomicU64::new(0);
+static SPROOT_SOCKET_PATH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 type AndroidExecutor = (SelectedRuntime, PipelineExecutor, Vec<LoadableNodeBundle>);
 
+enum AndroidSessionInput {
+    InProcess(SessionInputSender),
+    Sproot {
+        tx: mpsc::Sender<remotemedia_scaling_runner_protocol::ParticipantInputMessage>,
+        session_id: String,
+        participant_id: String,
+    },
+}
+
+impl AndroidSessionInput {
+    async fn send(&self, transport_data: remotemedia_core::transport::TransportData) -> Result<(), anyhow::Error> {
+        match self {
+            Self::InProcess(sender) => {
+                sender.send(transport_data).await.map_err(|e| anyhow::anyhow!("send error: {}", e))
+            }
+            Self::Sproot { tx, session_id, participant_id } => {
+                let serialized = serde_json::to_vec(&transport_data.data)?;
+                let msg = remotemedia_scaling_runner_protocol::ParticipantInputMessage {
+                    session_id: session_id.clone(),
+                    participant_id: participant_id.clone(),
+                    transport_data: serialized,
+                    metadata_json: None,
+                };
+                tx.send(msg).await.map_err(|e| anyhow::anyhow!("UDS channel send error: {}", e))
+            }
+        }
+    }
+}
+
+enum AndroidSessionHandle {
+    InProcess(SessionHandle),
+    Sproot {
+        socket_path: String,
+        session_id: String,
+    },
+}
+
 struct AndroidSession {
     rt: tokio::runtime::Runtime,
-    input: SessionInputSender,
-    session: Mutex<Option<SessionHandle>>,
+    input: AndroidSessionInput,
+    session: Mutex<Option<AndroidSessionHandle>>,
     output_rx: AsyncMutex<mpsc::Receiver<AndroidOutput>>,
 }
+
+async fn connect_sproot_runner(socket_path: &str) -> Result<remotemedia_scaling_runner_protocol::runner_control_client::RunnerControlClient<tonic::transport::Channel>, anyhow::Error> {
+    use std::convert::TryFrom;
+    use tonic::transport::{Endpoint, Uri};
+    use tower::service_fn;
+
+    let socket_path = socket_path.to_string();
+    let channel = Endpoint::try_from("http://[::]:50051")?
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let path = socket_path.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::tokio::TokioIo::new(stream))
+            }
+        }))
+        .await?;
+    Ok(remotemedia_scaling_runner_protocol::runner_control_client::RunnerControlClient::new(channel))
+}
+
 
 #[derive(Debug, Serialize)]
 struct AndroidOutput {
@@ -331,53 +393,165 @@ pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeCreate
     }
     let node_ids: Vec<String> = manifest.nodes.iter().map(|node| node.id.clone()).collect();
 
+    let sproot_path = {
+        let mut guard = SPROOT_SOCKET_PATH.lock().unwrap();
+        guard.take()
+    };
+
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let result = rt.block_on(async { executor.create_session(Arc::new(manifest)).await });
+    if let Some(socket_path) = sproot_path.filter(|p| !p.is_empty()) {
+        info!("Sproot socket path is set ({}). Creating UDS Sproot session.", socket_path);
+        let result = rt.block_on(async {
+            let mut client = connect_sproot_runner(&socket_path).await?;
+            let session_id = uuid::Uuid::new_v4().to_string();
+            
+            // Register session
+            let sub_manifest_json = serde_json::to_vec(&manifest)?;
+            let reg_sess_req = RegisterSessionRequest {
+                session_id: session_id.clone(),
+                sub_manifest_json,
+                edges: vec![],
+                session_metadata: std::collections::HashMap::new(),
+                sdk_version: remotemedia_scaling_runner_protocol::runner::SDK_VERSION.to_string(),
+            };
+            let reg_sess_res = client.register_session(reg_sess_req).await?.into_inner();
+            if !reg_sess_res.accepted {
+                return Err(anyhow::anyhow!("Sproot runner rejected session: {}", reg_sess_res.message));
+            }
+            
+            // Register participant
+            let participant_id = "android-ffi-participant".to_string();
+            let reg_part_req = RegisterParticipantRequest {
+                session_id: session_id.clone(),
+                participant_id: participant_id.clone(),
+                participant_type: ParticipantType::Ffi as i32,
+            };
+            let reg_part_res = client.register_participant(reg_part_req).await?.into_inner();
+            if !reg_part_res.accepted {
+                return Err(anyhow::anyhow!("Sproot runner rejected participant: {}", reg_part_res.message));
+            }
 
-    match result {
-        Ok(mut session_handle) => {
-            info!(
-                "Session created successfully: {}",
-                session_handle.session_id
-            );
-            let Some(input) = session_handle.input_sender() else {
-                error!("Session did not expose an input sender");
-                return 0;
-            };
-            let Some(output_receivers) = session_handle.take_output_receivers() else {
-                error!("Session did not expose output receivers");
-                return 0;
-            };
-            let (output_tx, output_rx) = mpsc::channel(256);
-            spawn_android_output_drainers(
-                &rt,
-                session_handle.session_id.clone(),
-                output_receivers,
-                output_tx.clone(),
-            );
-            if let Some(control) = executor.control_bus().get(&session_handle.session_id) {
-                spawn_android_node_tap_drainers(
+            // Establish data channel stream
+            let (tx, rx) = mpsc::channel::<ParticipantInputMessage>(256);
+            let _ = tx.send(ParticipantInputMessage {
+                session_id: session_id.clone(),
+                participant_id: participant_id.clone(),
+                transport_data: vec![],
+                metadata_json: None,
+            }).await;
+
+            let response_stream = client
+                .send_participant_data(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .await
+                .map_err(|e| anyhow::anyhow!("gRPC SendParticipantData error: {}", e))?
+                .into_inner();
+
+            Ok::<_, anyhow::Error>((session_id, participant_id, tx, response_stream))
+        });
+
+        match result {
+            Ok((session_id, participant_id, tx, mut response_stream)) => {
+                info!("Sproot session registered and participant connected. Session ID: {}", session_id);
+                let (output_tx, output_rx) = mpsc::channel::<AndroidOutput>(256);
+
+                let session_id_clone = session_id.clone();
+                rt.spawn(async move {
+                    while let Ok(Some(msg)) = response_stream.message().await {
+                        if msg.transport_data.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_slice::<remotemedia_core::data::RuntimeData>(&msg.transport_data) {
+                            Ok(data) => {
+                                let source = match &data {
+                                    remotemedia_core::data::RuntimeData::Audio { .. } => "audio",
+                                    remotemedia_core::data::RuntimeData::Video { .. } => "video",
+                                    _ => "data",
+                                };
+                                let out = AndroidOutput {
+                                    source: source.to_string(),
+                                    data,
+                                };
+                                if output_tx.send(out).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to deserialize Sproot participant output: {}", e);
+                            }
+                        }
+                    }
+                    info!("Sproot participant output receiver closed for {}", session_id_clone);
+                });
+
+                let boxed = Box::new(AndroidSession {
+                    rt,
+                    input: AndroidSessionInput::Sproot {
+                        tx,
+                        session_id: session_id.clone(),
+                        participant_id,
+                    },
+                    session: Mutex::new(Some(AndroidSessionHandle::Sproot {
+                        socket_path,
+                        session_id,
+                    })),
+                    output_rx: AsyncMutex::new(output_rx),
+                });
+                Box::into_raw(boxed) as jlong
+            }
+            Err(e) => {
+                error!("Failed to initialize Sproot session: {}", e);
+                0
+            }
+        }
+    } else {
+        info!("Sproot socket path not set. Defaulting to InProcess executor session.");
+        let result = rt.block_on(async { executor.create_session(Arc::new(manifest)).await });
+
+        match result {
+            Ok(mut session_handle) => {
+                info!(
+                    "Session created successfully: {}",
+                    session_handle.session_id
+                );
+                let Some(input) = session_handle.input_sender() else {
+                    error!("Session did not expose an input sender");
+                    return 0;
+                };
+                let Some(output_receivers) = session_handle.take_output_receivers() else {
+                    error!("Session did not expose output receivers");
+                    return 0;
+                };
+                let (output_tx, output_rx) = mpsc::channel(256);
+                spawn_android_output_drainers(
                     &rt,
                     session_handle.session_id.clone(),
-                    control,
-                    &node_ids,
-                    output_tx,
+                    output_receivers,
+                    output_tx.clone(),
                 );
+                if let Some(control) = executor.control_bus().get(&session_handle.session_id) {
+                    spawn_android_node_tap_drainers(
+                        &rt,
+                        session_handle.session_id.clone(),
+                        control,
+                        &node_ids,
+                        output_tx,
+                    );
+                }
+                spawn_android_runtime_heartbeat(&rt, session_handle.session_id.clone());
+                // Box and leak the session handle
+                let boxed = Box::new(AndroidSession {
+                    rt,
+                    input: AndroidSessionInput::InProcess(input),
+                    session: Mutex::new(Some(AndroidSessionHandle::InProcess(session_handle))),
+                    output_rx: AsyncMutex::new(output_rx),
+                });
+                Box::into_raw(boxed) as jlong
             }
-            spawn_android_runtime_heartbeat(&rt, session_handle.session_id.clone());
-            // Box and leak the session handle
-            let boxed = Box::new(AndroidSession {
-                rt,
-                input,
-                session: Mutex::new(Some(session_handle)),
-                output_rx: AsyncMutex::new(output_rx),
-            });
-            Box::into_raw(boxed) as jlong
-        }
-        Err(e) => {
-            error!("Failed to create session: {}", e);
-            0
+            Err(e) => {
+                error!("Failed to create session: {}", e);
+                0
+            }
         }
     }
 }
@@ -735,8 +909,21 @@ pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeCloseS
             let boxed = Box::from_raw(session_ptr);
             let mut session_handle = boxed.session.lock().unwrap().take();
             boxed.rt.block_on(async {
-                if let Some(ref mut session) = session_handle {
-                    let _ = session.close().await;
+                if let Some(handle) = session_handle {
+                    match handle {
+                        AndroidSessionHandle::InProcess(mut session) => {
+                            let _ = session.close().await;
+                        }
+                        AndroidSessionHandle::Sproot { socket_path, session_id } => {
+                            if let Ok(mut client) = connect_sproot_runner(&socket_path).await {
+                                let req = remotemedia_scaling_runner_protocol::TerminateSessionRequest {
+                                    session_id,
+                                    reason: "Client closed session".to_string(),
+                                };
+                                let _ = client.terminate_session(req).await;
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -1128,4 +1315,30 @@ pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeStopSt
 ) -> jboolean {
     info!("Stop streaming called");
     jni::sys::JNI_TRUE
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeSetSprootSocketPath(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: jni::objects::JString,
+) -> jboolean {
+    let socket_path: String = match env.get_string(&path) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("Failed to get socket path: {}", e);
+            return jni::sys::JNI_FALSE;
+        }
+    };
+    info!("nativeSetSprootSocketPath called with path: {}", socket_path);
+    if let Ok(mut guard) = SPROOT_SOCKET_PATH.lock() {
+        if socket_path.is_empty() {
+            *guard = None;
+        } else {
+            *guard = Some(socket_path);
+        }
+        jni::sys::JNI_TRUE
+    } else {
+        jni::sys::JNI_FALSE
+    }
 }

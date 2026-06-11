@@ -42,6 +42,9 @@ class PipelineManager(private val context: Context) {
     // Model downloader for fetching models not in APK
     private val modelDownloader = ModelDownloader(context)
 
+    // Sproot container lifecycle controller
+    private val sprootController by lazy { SprootController(context) }
+
     // Cache of node type to schema for this manifest resolution
     private val nodeSchemaCache = mutableMapOf<String, ModelDownloader.NodeSchema>()
 
@@ -692,6 +695,19 @@ class PipelineManager(private val context: Context) {
         try {
             updateState(PipelineState.STREAMING)
 
+            // Determine if we need to start the Debian Sproot runner container
+            if (requiresSproot(currentManifest!!)) {
+                Log.i(TAG, "Manifest requires glibc runtime. Starting Sproot container...")
+                val socketPath = sprootController.start()
+                if (socketPath == null) {
+                    throw NativeException("Failed to boot guest Debian Sproot runner container")
+                }
+                NativeInterface.nativeSetSprootSocketPath(socketPath)
+            } else {
+                // Ensure no lingering socket path is configured in JNI for in-process runs
+                NativeInterface.nativeSetSprootSocketPath("")
+            }
+
             sessionHandle = NativeInterface.nativeCreateSession(executorHandle, currentManifest!!)
             if (sessionHandle == 0L) {
                 throw NativeException("Failed to create session")
@@ -813,6 +829,9 @@ class PipelineManager(private val context: Context) {
             sessionHandle = 0
         }
 
+        // Stop Sproot container if running
+        sprootController.stop()
+
         Log.i(TAG, "Streaming stopped")
         updateState(PipelineState.READY)
     }
@@ -875,6 +894,40 @@ class PipelineManager(private val context: Context) {
     private fun updateState(state: PipelineState) {
         scope.launch(Dispatchers.Main) {
             onStateChange?.invoke(state)
+        }
+    }
+
+    /**
+     * Checks if the manifest specifies the glibc Python runtime either globally
+     * or at the node parameter level.
+     */
+    private fun requiresSproot(manifestJson: String): Boolean {
+        return try {
+            val json = Json { ignoreUnknownKeys = true }
+                .decodeFromString(JsonElement.serializer(), manifestJson)
+            val jsonObject = json as? JsonObject ?: return false
+
+            // Check default_python_runtime in metadata
+            val metadata = jsonObject["metadata"] as? JsonObject
+            val defaultRuntime = (metadata?.get("default_python_runtime") as? JsonPrimitive)?.content
+            if (defaultRuntime == "glibc") {
+                return true
+            }
+
+            // Check if any individual node requires glibc
+            val nodes = jsonObject["nodes"] as? JsonArray ?: return false
+            for (nodeElement in nodes) {
+                val nodeObj = nodeElement as? JsonObject ?: continue
+                val params = nodeObj["params"] as? JsonObject ?: continue
+                val pythonRuntime = (params["python_runtime"] as? JsonPrimitive)?.content
+                if (pythonRuntime == "glibc") {
+                    return true
+                }
+            }
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse manifest to check for glibc/sproot requirements", e)
+            false
         }
     }
 }

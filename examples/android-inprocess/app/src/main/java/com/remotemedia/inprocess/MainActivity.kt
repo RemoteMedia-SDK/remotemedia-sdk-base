@@ -95,10 +95,7 @@ class MainActivity : AppCompatActivity() {
                 startActivity(android.content.Intent(this, HermesProfileActivity::class.java))
                 true
             }
-            R.id.action_microdroid_runners -> {
-                startActivity(android.content.Intent(this, MicrodroidRunnerManagementActivity::class.java))
-                true
-            }
+
             else -> super.onOptionsItemSelected(item)
         }
     }
@@ -160,7 +157,8 @@ class MainActivity : AppCompatActivity() {
             "transcribe-mobile.json" to "Transcribe Only (STT)",
             "tts-mobile.json" to "Text-to-Speech (LLM→TTS)",
             "hermes-agent-test.json" to "Hermes Agent Test (In-Process Plugin)",
-            "hermes-profile-import-test.json" to "Hermes Profile Import Test"
+            "hermes-profile-import-test.json" to "Hermes Profile Import Test",
+            "sproot-managed-test.json" to "Sproot Managed Test (Sproot + Managed venv)"
         )
 
         if (pipelines.none { it.first == currentPipeline }) {
@@ -504,6 +502,21 @@ class MainActivity : AppCompatActivity() {
                         return@launch
                     }
                     Toast.makeText(this@MainActivity, "Profile import test submitted!", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+
+                if (currentPipeline == "sproot-managed-test.json") {
+                    val text = "Verify Sproot managed venv."
+                    Log.i(TAG, "Sending Sproot managed test text input: $text")
+                    runOnUiThread {
+                        binding?.progressBar?.visibility = View.GONE
+                        appendUserTranscript(text)
+                    }
+                    if (!pipelineManager.sendText(text)) {
+                        showError("Failed to send Sproot managed test text")
+                        return@launch
+                    }
+                    Toast.makeText(this@MainActivity, "Sproot managed test input submitted!", Toast.LENGTH_SHORT).show()
                     return@launch
                 }
 

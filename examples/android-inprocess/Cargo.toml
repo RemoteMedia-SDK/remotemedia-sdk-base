@@ -21,13 +21,17 @@ litert-lm-loadable-plugin = { path = "../../../litert-lm-loadable-plugin", defau
 remotemedia-scaling-runner-protocol = { path = "../../../remotemedia-scaling/crates/runner_protocol" }
 tonic = { version = "0.14", features = ["transport"] }
 prost = "0.14"
+tower = { version = "0.4", features = ["util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
 
 # JNI support
 jni = { version = "0.21", default-features = false }
 
 android_logger = "0.15"
 log = "0.4"
-pyo3 = { version = "0.28", features = ["auto-initialize", "abi3-py310"] }
+pyo3 = { version = "0.28", features = ["auto-initialize", "abi3-py311"] }
 
 # Async runtime
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros"] }

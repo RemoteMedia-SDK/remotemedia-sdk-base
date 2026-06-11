@@ -269,10 +269,6 @@ setup_python_symlink() {
     python_native_libs_src="$(resolve_python_native_libs_src)"
 
     if [[ -f "$python_native_libs_src/${LIBPYTHON_NAME}" ]]; then
-        if [[ ! -f "$python_native_libs_src/libpython3.10.so" ]]; then
-            ln -sf "${LIBPYTHON_NAME}" "$python_native_libs_src/libpython3.10.so"
-            success "Created symlink: libpython3.10.so -> ${LIBPYTHON_NAME}"
-        fi
         if [[ ! -f "$python_native_libs_src/libpython3.11.so" ]]; then
             ln -sf "${LIBPYTHON_NAME}" "$python_native_libs_src/libpython3.11.so"
             success "Created symlink: libpython3.11.so -> ${LIBPYTHON_NAME}"
@@ -420,10 +416,6 @@ ensure_python_shared_lib_symlinks() {
     python_native_libs_src="$(resolve_python_native_libs_src)"
 
     if [[ -f "$python_native_libs_src/${LIBPYTHON_NAME}" ]]; then
-        if [[ ! -f "$python_native_libs_src/libpython3.10.so" ]]; then
-            ln -sf "${LIBPYTHON_NAME}" "$python_native_libs_src/libpython3.10.so"
-            success "Created symlink: libpython3.10.so -> ${LIBPYTHON_NAME}"
-        fi
         if [[ ! -f "$python_native_libs_src/libpython3.11.so" ]]; then
             ln -sf "${LIBPYTHON_NAME}" "$python_native_libs_src/libpython3.11.so"
             success "Created symlink: libpython3.11.so -> ${LIBPYTHON_NAME}"
@@ -748,6 +740,34 @@ class HermesAgentTestPlugin:
 
     def finalize(self):
         return True
+
+
+from remotemedia.core.multiprocessing import register_node, python_requires
+
+@register_node("SprootManagedTestPlugin")
+@python_requires(["chardet"])
+class SprootManagedTestPlugin:
+    def initialize(self, config):
+        self.config = dict(config or {})
+        self.imports_ok = False
+        self.import_error = ""
+        try:
+            import chardet
+            self.imports_ok = True
+        except ImportError as e:
+            self.import_error = str(e)
+
+    def process(self, data):
+        import sys
+        if self.imports_ok:
+            return {"data_type": "text", "text": "Sproot managed test: OK", "python_executable": sys.executable}
+        return {"data_type": "text", "text": f"Sproot managed test: FAILED - {self.import_error}", "error": self.import_error, "python_executable": sys.executable}
+
+    def process_streaming(self, data):
+        yield self.process(data)
+
+    def finalize(self):
+        return True
 PY
 
     rm -rf "$dst"
@@ -880,6 +900,13 @@ build_rust() {
     log "Building Rust JNI library (remotemedia-android-inprocess) for arm64-v8a..."
     cd "${ANDROID_PROJECT}"
 
+    # Set up PyO3 library path for linking
+    local python_native_libs_src
+    python_native_libs_src="$(resolve_python_native_libs_src)"
+    export PYO3_LIBRARY_PATH="$python_native_libs_src"
+    export RUSTFLAGS="-L native=$python_native_libs_src"
+    log "Set PYO3_LIBRARY_PATH to $PYO3_LIBRARY_PATH and RUSTFLAGS to $RUSTFLAGS"
+
     # Compile the in-process client-side JNI library
     export PROTOC=/home/acidhax/miniconda3/bin/protoc
     cargo build --package remotemedia-android-inprocess --target aarch64-linux-android --release 2>&1 | tail -20
@@ -893,8 +920,9 @@ build_rust() {
     
     # Copy to jniLibs
     mkdir -p "${ANDROID_PROJECT}/app/src/main/jniLibs/arm64-v8a"
-    install -m 0644 "$SO_FILE" "${ANDROID_PROJECT}/app/src/main/jniLibs/arm64-v8a/"
-    success "Copied to jniLibs/arm64-v8a/"
+    install -m 0644 "$SO_FILE" "${ANDROID_PROJECT}/app/src/main/jniLibs/arm64-v8a/libremotemedia_android_inprocess.so"
+    install -m 0644 "$SO_FILE" "${ANDROID_PROJECT}/app/src/main/jniLibs/arm64-v8a/libremotemedia_android.so"
+    success "Copied to jniLibs/arm64-v8a/ as libremotemedia_android_inprocess.so and libremotemedia_android.so"
 
     log "Building Whisper loadable plugin for arm64-v8a (LiteRT backend)..."
     cd "${WORKSPACE_ROOT}/whisper"
@@ -995,20 +1023,71 @@ build_rust() {
     install -m 0644 "$LOADABLE_PLUGIN" app/src/main/assets/plugins/
     success "Copied RemoteMedia loadable plugin to assets/plugins/"
 
-    # Compile and package Microdroid runner
-    log "Building Microdroid VM runner binary..."
+    # Compile and package guest sproot runner
+    log "Building guest sproot runner binary..."
     cd "${WORKSPACE_ROOT}/remotemedia-scaling"
-    cargo build --package remotemedia-scaling-runner-bin --bin remotemedia-microdroid-runner --target aarch64-linux-android --release 2>&1 | tail -20
+    cargo build --package remotemedia-scaling-runner-bin --bin remotemedia-sproot-runner --target aarch64-unknown-linux-gnu --release 2>&1 | tail -20
     cd "$ANDROID_PROJECT"
 
-    RUNNER_BIN="${WORKSPACE_ROOT}/remotemedia-scaling/target/aarch64-linux-android/release/remotemedia-microdroid-runner"
+    RUNNER_BIN="${WORKSPACE_ROOT}/remotemedia-scaling/target/aarch64-unknown-linux-gnu/release/remotemedia-sproot-runner"
     if [[ ! -f "$RUNNER_BIN" ]]; then
-        error "Microdroid runner binary build failed: $RUNNER_BIN not found"
+        error "Sproot runner binary build failed: $RUNNER_BIN not found"
         exit 1
     fi
-    mkdir -p "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/assets/microdroid"
-    install -m 0755 "$RUNNER_BIN" "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/assets/microdroid/"
-    success "Copied Microdroid runner binary to kotlin-android assets/microdroid/"
+    mkdir -p "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/assets/sproot"
+    install -m 0755 "$RUNNER_BIN" "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/assets/sproot/"
+    success "Copied guest sproot runner binary to kotlin-android assets/sproot/"
+
+    # Also package proot and guest sproot runner as native libraries (.so) in jniLibs to allow execution under Android 10+ W^X policy
+    mkdir -p "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a"
+    
+    # 1. Download and package libtalloc dependency if not present
+    local talloc_target="${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a/libtalloc.so"
+    if [[ ! -f "$talloc_target" ]]; then
+        log "Downloading and preparing libtalloc dependency..."
+        local temp_talloc_dir
+        temp_talloc_dir=$(mktemp -d)
+        curl -L -o "${temp_talloc_dir}/talloc.deb" "https://packages.termux.org/apt/termux-main/pool/main/libt/libtalloc/libtalloc_2.4.3_aarch64.deb"
+        (
+            cd "$temp_talloc_dir"
+            ar x talloc.deb
+            tar -xf data.tar.xz
+        )
+        cp "${temp_talloc_dir}/data/data/com.termux/files/usr/lib/libtalloc.so.2.4.3" "$talloc_target"
+        rm -rf "$temp_talloc_dir"
+        success "Prepared libtalloc.so"
+    fi
+
+    # 2. Download and package libandroid-shmem dependency if not present
+    local shmem_target="${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a/libandroid-shmem.so"
+    if [[ ! -f "$shmem_target" ]]; then
+        log "Downloading and preparing libandroid-shmem dependency..."
+        local temp_shmem_dir
+        temp_shmem_dir=$(mktemp -d)
+        curl -L -o "${temp_shmem_dir}/shmem.deb" "https://packages.termux.org/apt/termux-main/pool/main/liba/libandroid-shmem/libandroid-shmem_0.7_aarch64.deb"
+        (
+            cd "$temp_shmem_dir"
+            ar x shmem.deb
+            tar -xf data.tar.xz
+        )
+        cp "${temp_shmem_dir}/data/data/com.termux/files/usr/lib/libandroid-shmem.so" "$shmem_target"
+        rm -rf "$temp_shmem_dir"
+        success "Prepared libandroid-shmem.so"
+    fi
+
+    # 3. Package and patch proot
+    if [[ -f "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/assets/sproot/proot" ]]; then
+        install -m 0755 "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/assets/sproot/proot" "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a/libproot.so"
+        # Patch libproot.so to look for libtalloc.so instead of libtalloc.so.2
+        patchelf --replace-needed libtalloc.so.2 libtalloc.so "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a/libproot.so"
+        success "Copied and patched proot to kotlin-android jniLibs/arm64-v8a/libproot.so"
+    else
+        warn "proot not found in assets/sproot/proot; make sure it is built/downloaded"
+    fi
+
+    # 4. Package guest sproot runner
+    install -m 0755 "$RUNNER_BIN" "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/jniLibs/arm64-v8a/libremotemedia_sproot_runner.so"
+    success "Copied guest sproot runner to kotlin-android jniLibs/arm64-v8a/libremotemedia_sproot_runner.so"
 
     package_apk_runtime_assets
 }
@@ -1025,14 +1104,14 @@ build_apk() {
         export JAVA_HOME="/usr/lib/jvm/java-21-openjdk-amd64"
     fi
 
-    local gradle_args=("assembleRelease" "--no-daemon")
+    local gradle_args=("assembleDebug" "--no-daemon")
     if [[ -n "${DEFAULT_PIPELINE:-}" ]]; then
         gradle_args+=("-PdefaultPipeline=$DEFAULT_PIPELINE")
     fi
 
     ./gradlew "${gradle_args[@]}" 2>&1 | tail -40
     
-    APK_FILE="app/build/outputs/apk/release/app-release.apk"
+    APK_FILE="app/build/outputs/apk/debug/app-debug.apk"
     if [[ ! -f "$APK_FILE" ]]; then
         error "APK not found: $APK_FILE"
         exit 1
@@ -1071,8 +1150,7 @@ verify_apk_contents() {
         "assets/models/kokoro/voices/af_bella.bin"
         "assets/models/misaki-g2p/en-US/gold.json"
         "assets/models/misaki-g2p/en-US/silver.json"
-        "assets/microdroid/remotemedia-microdroid-runner"
-        "assets/microdroid/runner_vm_config.json"
+        "assets/sproot/remotemedia-sproot-runner"
         "lib/arm64-v8a/libremotemedia_android.so"
         "lib/arm64-v8a/libc++_shared.so"
         "lib/arm64-v8a/libGemmaModelConstraintProvider.so"
@@ -1097,6 +1175,12 @@ verify_apk_contents() {
         "assets/models/whisper/config.json"
         "assets/models/misaki-g2p/en-GB/gold.json"
         "assets/models/misaki-g2p/en-GB/silver.json"
+        "assets/sproot/proot"
+        "assets/sproot/rootfs.targz"
+        "lib/arm64-v8a/libproot.so"
+        "lib/arm64-v8a/libremotemedia_sproot_runner.so"
+        "lib/arm64-v8a/libtalloc.so"
+        "lib/arm64-v8a/libandroid-shmem.so"
     )
 
     if [[ "$BUNDLE_LARGE_LLM_IN_APK" == "true" ]]; then
@@ -1137,7 +1221,7 @@ deploy_to_device() {
     # Install APK. Do not adb-push runtime assets, Python, small models, or
     # plugins here: they must already be embedded in the APK and extracted by
     # the app/runtime manager.
-    adb -s "$DEVICE_ADDRESS" install -r "$ANDROID_PROJECT/app/build/outputs/apk/release/app-release.apk"
+    adb -s "$DEVICE_ADDRESS" install -r "$ANDROID_PROJECT/app/build/outputs/apk/debug/app-debug.apk"
     success "APK installed"
     success "Runtime assets are embedded in the APK; the app is responsible for first-run extraction."
 }
@@ -1260,6 +1344,18 @@ run_and_test() {
             exit 1
         else
             error "HermesProfileImportPlugin output marker not found in logs"
+            exit 1
+        fi
+    fi
+
+    if [[ "$TEST_PIPELINE" == "sproot-managed-test.json" ]]; then
+        if grep -Fq "Sproot managed test: OK" "$LOG_OUTPUT"; then
+            success "SprootManagedTestPlugin validation passed (chardet imported in venv OK)"
+        elif grep -Fq "Sproot managed test: FAILED" "$LOG_OUTPUT"; then
+            error "SprootManagedTestPlugin validation failed"
+            exit 1
+        else
+            error "SprootManagedTestPlugin output marker not found in logs"
             exit 1
         fi
     fi

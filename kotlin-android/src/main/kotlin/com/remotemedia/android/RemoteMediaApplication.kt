@@ -29,11 +29,16 @@ open class RemoteMediaApplication : Application() {
     fun initRemoteMedia() {
         // Load native library
         try {
-            System.loadLibrary("remotemedia_android")
-            android.util.Log.i("RemoteMedia", "Loaded libremotemedia_android.so")
+            System.loadLibrary("remotemedia_android_inprocess")
+            android.util.Log.i("RemoteMedia", "Loaded libremotemedia_android_inprocess.so")
         } catch (e: UnsatisfiedLinkError) {
-            android.util.Log.e("RemoteMedia", "Failed to load libremotemedia_android.so", e)
-            throw RuntimeException("RemoteMedia native library not found. Ensure the AAR is included.", e)
+            try {
+                System.loadLibrary("remotemedia_android")
+                android.util.Log.i("RemoteMedia", "Loaded libremotemedia_android.so")
+            } catch (e2: UnsatisfiedLinkError) {
+                android.util.Log.e("RemoteMedia", "Failed to load JNI libraries", e2)
+                throw RuntimeException("RemoteMedia native library not found. Ensure the library is included.", e2)
+            }
         }
 
         // Initialize JNI logger

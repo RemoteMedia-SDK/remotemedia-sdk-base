@@ -202,6 +202,10 @@ pub struct ManifestMetadata {
     /// `auto_negotiate` is also true and successfully bridges every gap.
     #[serde(default)]
     pub strict_capabilities: bool,
+
+    /// Default Python runtime to use if not overridden by node params ("bionic" or "glibc").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_python_runtime: Option<String>,
 }
 
 /// Node manifest entry

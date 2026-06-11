@@ -76,6 +76,8 @@ android {
     // in APK assets. The default ignore pattern can strip them.
     aaptOptions {
         ignoreAssetsPattern = "!.svn:!.git:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~"
+        noCompress.add("gz")
+        noCompress.add("tar.gz")
     }
 
     externalNativeBuild {

@@ -356,6 +356,7 @@ members = [
     "crates/services/http-server",
     "crates/services/telephony-server",
     "crates/python-nodes",
+    "crates/android",
 ]
 
 [workspace.package]
@@ -424,7 +425,7 @@ hyper = "1.1"
 axum = "0.7"
 
 # Python FFI (for FFI transport crate)
-pyo3 = { version = "0.28", features = ["abi3-py310", "auto-initialize"], default-features = false }
+pyo3 = { version = "0.28", features = ["abi3-py311", "auto-initialize"], default-features = false }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 numpy = "0.28"
 
