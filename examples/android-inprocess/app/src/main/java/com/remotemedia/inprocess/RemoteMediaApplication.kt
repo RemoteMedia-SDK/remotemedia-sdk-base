@@ -27,7 +27,10 @@ class RemoteMediaApplication : Application() {
         }.onFailure {
             Timber.w(it, "LiteRT-LM native library not available")
         }
-        System.loadLibrary("remotemedia_android_inprocess")
+        System.loadLibrary("remotemedia_android")
+
+        // Set app files directory for native code (must be after loadLibrary for JNI to be available)
+        NativeInterface.nativeSetAppFilesDir(filesDir.absolutePath)
 
         // Initialize logger from JNI
         NativeInterface.initLogger()

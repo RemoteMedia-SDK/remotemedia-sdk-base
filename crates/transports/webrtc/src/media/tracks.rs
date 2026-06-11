@@ -12,9 +12,56 @@ use crate::{Error, Result};
 use parking_lot::RwLock;
 use remotemedia_core::data::video::{PixelFormat, VideoCodec};
 use remotemedia_core::data::RuntimeData;
+#[cfg(feature = "video")]
 use remotemedia_core::nodes::video::{
     VideoDecoderConfig, VideoDecoderNode, VideoEncoderConfig, VideoEncoderNode,
 };
+
+#[cfg(not(feature = "video"))]
+pub struct VideoEncoderConfig {
+    pub codec: VideoCodec,
+    pub bitrate: u32,
+    pub framerate: u32,
+    pub keyframe_interval: u32,
+    pub quality_preset: String,
+    pub hardware_accel: bool,
+    pub threads: u32,
+}
+
+#[cfg(not(feature = "video"))]
+pub struct VideoEncoderNode;
+
+#[cfg(not(feature = "video"))]
+impl VideoEncoderNode {
+    pub fn new(_config: VideoEncoderConfig) -> Result<Self> {
+        Ok(Self)
+    }
+    pub async fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
+        Err(crate::Error::EncodingError("Video support is disabled".to_string()))
+    }
+}
+
+#[cfg(not(feature = "video"))]
+pub struct VideoDecoderConfig {
+    pub expected_codec: Option<VideoCodec>,
+    pub output_format: PixelFormat,
+    pub hardware_accel: bool,
+    pub threads: u32,
+    pub error_resilience: String,
+}
+
+#[cfg(not(feature = "video"))]
+pub struct VideoDecoderNode;
+
+#[cfg(not(feature = "video"))]
+impl VideoDecoderNode {
+    pub fn new(_config: VideoDecoderConfig) -> Result<Self> {
+        Ok(Self)
+    }
+    pub async fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
+        Err(crate::Error::EncodingError("Video support is disabled".to_string()))
+    }
+}
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock as AsyncRwLock;
@@ -449,7 +496,7 @@ impl VideoTrack {
             RuntimeData::Video {
                 pixel_data,
                 codec: Some(_),
-                timestamp_us,
+                ref timestamp_us,
                 ..
             } => (pixel_data.clone(), *timestamp_us),
             _ => {

@@ -95,6 +95,10 @@ class MainActivity : AppCompatActivity() {
                 startActivity(android.content.Intent(this, HermesProfileActivity::class.java))
                 true
             }
+            R.id.action_microdroid_runners -> {
+                startActivity(android.content.Intent(this, MicrodroidRunnerManagementActivity::class.java))
+                true
+            }
             else -> super.onOptionsItemSelected(item)
         }
     }

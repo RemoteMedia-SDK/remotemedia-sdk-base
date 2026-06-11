@@ -982,19 +982,24 @@ impl PipelineExecutor {
     ///
     /// A SessionHandle for sending inputs and receiving outputs
     pub async fn create_session(&self, manifest: Arc<Manifest>) -> Result<SessionHandle> {
+        tracing::info!("create_session: begin");
         // Try the default pool first when one is attached. The Weak
         // upgrade returns None if the caller has dropped their last
         // Arc<WarmSessionPool> — fall back to cold-build cleanly in
         // that case (D2/D6 in design.md).
+        tracing::info!("create_session: locking default_pool");
         let pool = self
             .default_pool
             .lock()
             .expect("default_pool mutex poisoned")
             .as_ref()
             .and_then(|weak| weak.upgrade());
+        tracing::info!("create_session: default_pool lock ok, pool={}", pool.is_some());
         if let Some(pool) = pool {
+            tracing::info!("create_session: delegating to warm pool");
             return pool.acquire(manifest).await;
         }
+        tracing::info!("create_session: falling back to cold_build_session");
         self.cold_build_session(manifest).await
     }
 
@@ -1095,12 +1100,26 @@ impl PipelineExecutor {
         // BEFORE validation runs — otherwise unknown-node-type errors
         // would fire even though the plugin would have contributed
         // exactly that type. Idempotent: bundles cache by canonical path.
-        self.ensure_plugins_loaded(&manifest).await?;
+        tracing::info!(
+            session_name = %manifest.metadata.name,
+            nodes = %manifest.nodes.len(),
+            "cold_build_session: start"
+        );
+        if let Err(e) = self.ensure_plugins_loaded(&manifest).await {
+            tracing::error!(error = %e, "cold_build_session: ensure_plugins_loaded failed");
+            return Err(e);
+        }
+        tracing::info!("cold_build_session: ensure_plugins_loaded ok");
         // Validate manifest (cycles, unknown node types) then run capability
         // negotiation. The returned manifest may have FastResampleNode entries
         // spliced in by negotiation when `metadata.auto_negotiate` is set.
-        self.validate_manifest(&manifest).await?;
+        if let Err(e) = self.validate_manifest(&manifest).await {
+            tracing::error!(error = %e, "cold_build_session: validate_manifest failed");
+            return Err(e);
+        }
+        tracing::info!("cold_build_session: validate_manifest ok");
         let manifest = self.negotiate_capabilities(manifest).await?;
+        tracing::info!("cold_build_session: negotiate_capabilities ok");
 
         let session_id = self.generate_session_id();
 

@@ -398,6 +398,38 @@ impl InProcessExecutorBridge {
         }
 
         match node_type {
+            "HermesAgentTestPlugin" => (
+                "remotemedia.nodes.hermes_agent_plugin".to_string(),
+                "HermesAgentTestPlugin".to_string(),
+            ),
+            "HermesProfileImportPlugin" => (
+                "remotemedia.nodes.hermes_agent_plugin".to_string(),
+                "HermesProfileImportPlugin".to_string(),
+            ),
+            "HermesAgentPlugin" => (
+                "remotemedia.nodes.hermes_agent_plugin".to_string(),
+                "HermesAgentPlugin".to_string(),
+            ),
+            "WhisperSTTNode" => (
+                "remotemedia.nodes.android_inprocess".to_string(),
+                "WhisperSTTNode".to_string(),
+            ),
+            "DebugKokoroTTSNode" => (
+                "remotemedia.nodes.android_inprocess".to_string(),
+                "DebugKokoroTTSNode".to_string(),
+            ),
+            "VADNode" => (
+                "remotemedia.nodes.android_inprocess".to_string(),
+                "VADNode".to_string(),
+            ),
+            "DataSinkNode" => (
+                "remotemedia.nodes.android_inprocess".to_string(),
+                "DataSinkNode".to_string(),
+            ),
+            "EchoNode" => (
+                "remotemedia.nodes.multiprocess_test_nodes".to_string(),
+                "EchoNode".to_string(),
+            ),
             "python_whisper" => (
                 "remotemedia_nodes.whisper".to_string(),
                 "WhisperSTTNode".to_string(),

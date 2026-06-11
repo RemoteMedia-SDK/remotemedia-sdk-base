@@ -11,6 +11,8 @@ import kotlinx.serialization.json.JsonPrimitive
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.io.path.copyTo
+import kotlin.io.path.deleteRecursively
 
 /**
  * Manages RemoteMedia pipeline lifecycle and execution.
@@ -23,7 +25,8 @@ class PipelineManager(private val context: Context) {
         private var pluginLoaded = false
     }
 
-    // State
+    // Use application context for asset access (merged assets)
+    private val appAssets = context.applicationContext.assets
     private var executorHandle: Long = 0
     private var sessionHandle: Long = 0
     private val isRunning = AtomicBoolean(false)
@@ -108,6 +111,15 @@ class PipelineManager(private val context: Context) {
             return
         }
 
+        val homeDir = File(context.filesDir, ".hermes")
+        val marker = File(homeDir, ".extracted")
+
+        if (marker.exists()) {
+            Log.i(TAG, "Runtime assets already extracted to ${homeDir.absolutePath}")
+            pluginLoaded = true
+            return
+        }
+
         // Native loadable plugins: assets/plugins/*.so -> files/*.so
         extractAssetFile(
             assetPath = "plugins/libsilero_vad_loadable_plugin.so",
@@ -160,6 +172,9 @@ class PipelineManager(private val context: Context) {
 
         File(context.filesDir, "cache/litert-lm").mkdirs()
 
+        // Create ~/.hermes/ directory if it doesn't exist (profile will be loaded/created at runtime)
+        homeDir.mkdirs()
+
         pluginLoaded = true
         Log.i(TAG, "Runtime assets extracted")
     }
@@ -169,7 +184,7 @@ class PipelineManager(private val context: Context) {
             destFile.parentFile?.mkdirs()
 
             Log.i(TAG, "Extracting asset file: $assetPath -> ${destFile.absolutePath}")
-            context.assets.open(assetPath).use { inputStream ->
+            appAssets.open(assetPath).use { inputStream ->
                 FileOutputStream(destFile).use { outputStream ->
                     inputStream.copyTo(outputStream)
                 }
@@ -188,7 +203,7 @@ class PipelineManager(private val context: Context) {
 
     private fun extractAssetTree(assetPath: String, destDir: File) {
         val children = try {
-            context.assets.list(assetPath)?.toList().orEmpty()
+            appAssets.list(assetPath)?.toList().orEmpty()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to list asset directory: $assetPath", e)
             throw e
@@ -207,7 +222,7 @@ class PipelineManager(private val context: Context) {
             val childDest = File(destDir, child)
 
             val grandChildren = try {
-                context.assets.list(childAssetPath)?.toList().orEmpty()
+                appAssets.list(childAssetPath)?.toList().orEmpty()
             } catch (_: Exception) {
                 emptyList()
             }
@@ -224,6 +239,105 @@ class PipelineManager(private val context: Context) {
     @Deprecated("Use extractRuntimeAssets() instead", ReplaceWith("extractRuntimeAssets()"))
     private fun loadNativePlugins() {
         extractRuntimeAssets()
+    }
+
+    private fun assetExists(assetPath: String): Boolean {
+        return try {
+            val entries = appAssets.list(assetPath)
+            entries != null && entries.isNotEmpty()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun extractTar(tarPath: String, destDir: File) {
+        destDir.mkdirs()
+        try {
+            val process = Runtime.getRuntime().exec("tar -xf $tarPath -C ${destDir.absolutePath}")
+            val result = process.waitFor()
+            if (result == 0) {
+                Log.i(TAG, "Extracted tar: $tarPath -> ${destDir.absolutePath}")
+            } else {
+                Log.e(TAG, "Failed to extract tar: $tarPath, exit code: $result")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception extracting tar: $tarPath", e)
+        }
+    }
+
+    /**
+     * Load a Hermes profile from a directory containing auth.json and other profile files.
+     * Copies the profile to ~/.hermes/ for runtime access.
+     */
+    suspend fun loadHermesProfile(profileDir: File): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val homeDir = File(context.filesDir, ".hermes")
+            if (homeDir.exists()) {
+                // Clear existing profile
+                homeDir.listFiles()?.forEach { it.deleteRecursively() }
+            }
+            homeDir.mkdirs()
+
+            val authJson = File(profileDir, "auth.json")
+            if (!authJson.exists()) {
+                Log.e(TAG, "Profile directory missing auth.json: $profileDir")
+                return@withContext false
+            }
+
+            // Copy auth.json
+            val destAuth = File(homeDir, "auth.json")
+            authJson.copyTo(destAuth, overwrite = true)
+
+            // Copy any other profile files
+            profileDir.listFiles()?.forEach { file ->
+                if (file.name != "auth.json" && file.isFile) {
+                    val dest = File(homeDir, file.name)
+                    file.copyTo(dest, overwrite = true)
+                }
+            }
+
+            val marker = File(homeDir, ".extracted")
+            marker.createNewFile()
+
+            Log.i(TAG, "Loaded Hermes profile from: $profileDir")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load Hermes profile", e)
+            false
+        }
+    }
+
+    /**
+     * Create a new Hermes profile using the hermes CLI tools.
+     * This runs the profile creation process and saves it to ~/.hermes/
+     */
+    suspend fun createHermesProfile(profileName: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val homeDir = File(context.filesDir, ".hermes")
+            homeDir.mkdirs()
+
+            // Run Python-based profile creation using the Hermes CLI tools via JNI
+            // This will create auth.json and default config
+            val success = NativeInterface.nativeCreateHermesProfile(profileName, homeDir.absolutePath)
+
+            if (success) {
+                val marker = File(homeDir, ".extracted")
+                marker.createNewFile()
+                Log.i(TAG, "Created Hermes profile: $profileName")
+            }
+            success
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create Hermes profile", e)
+            false
+        }
+    }
+
+    /**
+     * Check if a valid Hermes profile exists in ~/.hermes/
+     */
+    fun hasHermesProfile(): Boolean {
+        val authJson = File(context.filesDir, ".hermes/default/auth.json")
+        return authJson.exists() && authJson.length() > 0
     }
 
     /**
@@ -493,7 +607,7 @@ class PipelineManager(private val context: Context) {
      */
     fun loadManifest(manifestName: String): Boolean {
         return try {
-            val inputStream = context.assets.open("manifests/$manifestName")
+            val inputStream = appAssets.open("manifests/$manifestName")
             val manifestJson = inputStream.readBytes().decodeToString()
             currentManifest = manifestJson
             Log.i(TAG, "Loaded manifest: $manifestName")
@@ -655,7 +769,7 @@ class PipelineManager(private val context: Context) {
     private suspend fun receiveLoop() {
         while (isStreaming.get()) {
             try {
-                val output = NativeInterface.nativeRecvOutput(sessionHandle)
+                val output = NativeInterface.nativeRecvOutput(sessionHandle) ?: break
 
                 if (output.isEmpty()) {
                     // End of stream

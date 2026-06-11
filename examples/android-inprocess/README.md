@@ -65,7 +65,7 @@ A complete Android application that executes RemoteMedia speech-to-speech pipeli
    ```bash
    rustup target add aarch64-linux-android x86_64-linux-android
    ```
-3. **Python 3.11+** for model bundling:
+3. **Python 3.11** for model bundling:
    ```bash
    pip install huggingface_hub requests
    ```

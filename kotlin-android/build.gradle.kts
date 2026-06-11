@@ -35,8 +35,7 @@ android {
         jniLibs {
             useLegacyPackaging = true
         }
-        doNotStrip.add("**/libremotemedia_android_inprocess.so")
-        doNotStrip.add("**/libpython3.11.so")
+        doNotStrip.add("**/libremotemedia_android.so")
     }
 
     externalNativeBuild {

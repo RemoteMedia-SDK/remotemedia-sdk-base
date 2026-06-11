@@ -31,8 +31,12 @@ success() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[ERR]${NC} $*"; }
 
+# Load central Python version configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../scripts/read-python-config.sh"
+
 # Configuration
-DIST_NAME="remotemedia_hermes"
+DIST_NAME="${P4A_DIST_NAME:-remotemedia_hermes}"
 ARCH="arm64-v8a"
 
 # Use environment variables with sensible defaults
@@ -119,7 +123,7 @@ error() { echo -e "${RED}[ERR]${NC} $*"; }
 
 log "Building python-for-android distro: ${DIST_NAME}"
 log "Architecture: ${ARCH}"
-log "Python version: 3.11 (pinned in p4a recipes)"
+log "Python version: ${PYTHON_VERSION} (via central config)"
 
 # Check python-for-android
 if ! command -v p4a &> /dev/null; then
@@ -143,14 +147,12 @@ log "Requirements: ${REQUIREMENTS}"
 
 # Clean previous build
 log "Cleaning previous build..."
-rm -rf "${DIST_DIR}"
-mkdir -p "${BUILD_DIR}"
-
 # Build the distribution
 log "Building python-for-android distribution..."
 log "This may take 10-30 minutes depending on network and CPU..."
+log "Using Python version: ${PYTHON_VERSION} (from central config)"
 
-# Use p4a create with requirements. Recipes pinned to Python 3.11 (hermes-agent requires <3.14)
+# Use p4a create with requirements.
 cd "${BUILD_DIR}"
 p4a create \
     --dist-name "${DIST_NAME}" \
@@ -159,7 +161,7 @@ p4a create \
     --bootstrap sdl2 \
     --requirements "${REQUIREMENTS}" \
     --arch "${ARCH}" \
-    --python-version "3.11" \
+    --python-version "${PYTHON_VERSION}" \
     --ndk-api 24 \
     --android-api 34 \
     --ndk-dir "${ANDROID_NDK_ROOT}" \

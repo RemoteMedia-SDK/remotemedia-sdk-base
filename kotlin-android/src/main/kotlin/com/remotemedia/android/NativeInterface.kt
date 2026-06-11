@@ -108,6 +108,13 @@ object NativeInterface {
         sessionId: String,
         text: String
     ): Boolean
+
+    @JvmStatic
+    external fun nativeSetVsockFd(fd: Int): Boolean
+
+    // Create a new Hermes profile
+    @JvmStatic
+    external fun nativeCreateHermesProfile(profileName: String, profileDir: String): Boolean
 }
 
 /** Parses node list from native JSON */

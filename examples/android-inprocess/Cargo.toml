@@ -18,12 +18,16 @@ remotemedia-python-nodes = { path = "../../crates/python-nodes", features = ["in
 remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk", features = ["inprocess-python"] }
 remotemedia-litert-nodes = { path = "../../../remotemedia-litert-nodes", default-features = false, features = ["whisper"] }
 litert-lm-loadable-plugin = { path = "../../../litert-lm-loadable-plugin", default-features = false }
+remotemedia-scaling-runner-protocol = { path = "../../../remotemedia-scaling/crates/runner_protocol" }
+tonic = { version = "0.14", features = ["transport"] }
+prost = "0.14"
 
 # JNI support
 jni = { version = "0.21", default-features = false }
+
 android_logger = "0.15"
 log = "0.4"
-pyo3 = { version = "0.28", features = ["auto-initialize"] }
+pyo3 = { version = "0.28", features = ["auto-initialize", "abi3-py310"] }
 
 # Async runtime
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros"] }

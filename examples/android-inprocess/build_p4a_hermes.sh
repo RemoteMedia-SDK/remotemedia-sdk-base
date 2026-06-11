@@ -30,11 +30,14 @@ success() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[ERR]${NC} $*"; }
 
+# Load central Python version configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../scripts/read-python-config.sh"
+
 # Default configuration
 CLEAN_BUILD=false
 ARCH="arm64-v8a"
-DIST_NAME="remotemedia_hermes"
-PYTHON_VERSION="3.11"
+DIST_NAME="${P4A_DIST_NAME:-remotemedia_hermes}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -95,7 +98,7 @@ REQUIREMENTS_FILE="${BUILD_DIR}/requirements.txt"
 
 log "Building python-for-android distro: ${DIST_NAME}"
 log "Architecture: ${ARCH}"
-log "Python version: ${PYTHON_VERSION}"
+log "Python version: ${PYTHON_VERSION} (from central config)"
 
 # Check python-for-android
 if ! command -v p4a &> /dev/null; then

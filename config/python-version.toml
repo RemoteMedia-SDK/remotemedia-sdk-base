@@ -1,0 +1,17 @@
+# Central Python version configuration for RemoteMedia SDK
+# Single source of truth for Python version across all build systems
+
+[python]
+version = "3.11.9"
+major_minor = "3.11"
+abi3_feature = "abi3-py310"
+libpython_name = "libpython3.11.so"
+p4a_dist_name = "remotemedia_hermes"
+p4a_python_version = "3.11"
+cross_python_version = "3.11"
+cross_libpython = "libpython3.11.so"
+wheel_tag = "cp311"
+wheel_abi = "cp311"
+wheel_platform = "android_aarch64"
+sysconfigdata_suffix = "3.11"
+p4a_python_version_major_minor = "3.11"

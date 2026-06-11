@@ -14,4 +14,10 @@
         android:title="@string/hermes_profile"
         app:showAsAction="never" />
 
+    <item
+        android:id="@+id/action_microdroid_runners"
+        android:icon="@android:drawable/ic_menu_manage"
+        android:title="@string/microdroid_runners"
+        app:showAsAction="never" />
+
 </menu>

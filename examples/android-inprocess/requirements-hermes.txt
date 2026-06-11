@@ -20,7 +20,6 @@ prompt_toolkit==3.0.52
 croniter==6.0.0
 Markdown==3.10.2
 PyJWT[crypto]==2.12.1
-psutil==7.2.2
 pathspec==1.1.1
 fastapi==0.133.1
 uvicorn[standard]==0.41.0

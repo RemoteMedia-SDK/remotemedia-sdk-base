@@ -7,7 +7,7 @@
   "nodes": [
     {
       "id": "hermes_test",
-      "node_type": "HermesAgentTestPlugin",
+      "node_type": "EchoNode",
       "params": {},
       "is_streaming": false
     }

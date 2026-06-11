@@ -100,7 +100,7 @@ Some packages may not have aarch64-linux-android wheels. p4a will attempt to bui
 3. Exclude the package if not critical
 
 ### Python version
-The script uses Python 3.11 by default. If you need a different version, edit `PYTHON_VERSION` in the build script.
+The script uses Python 3.11 by default (from central config). To change the version, update `config/python-version.toml` and re-run the build scripts.
 
 ## Output Structure
 
@@ -110,10 +110,10 @@ After successful build:
 ├── _python_bundle__arm64-v8a/
 │   ├── _python_bundle/          # Python stdlib + packages
 │   │   ├── lib/
-│   │   ├── lib/python3.11/
+│   │   ├── lib/python${PYTHON_MAJOR_MINOR}/
 │   │   └── runscripts/
 │   └── libs/arm64-v8a/
-│       ├── libpython3.11.so
+│       ├── ${LIBPYTHON_NAME}
 │       └── *.so                 # Native extensions
 └── templates/
 ```

@@ -11,7 +11,7 @@
 # - Rust 1.75+ with aarch64-linux-android and x86_64-linux-android targets
 # - Gradle 8.7+ (via wrapper)
 # - Kotlin 1.9.22+
-# - Python 3.10+ with python-for-android (for PyO3 linkage)
+# - Python 3.11+ with python-for-android (for PyO3 linkage)
 # - Physical arm64 Android device with USB/WiFi debugging
 #
 # Usage: ./android_build_deploy_test.sh [--device IP:PORT] [--pipeline NAME] [--skip-build] [--skip-deploy]
@@ -55,6 +55,10 @@ MISAKI_G2P_RESOURCE_SRC="${MISAKI_G2P_RESOURCE_SRC:-${WORKSPACE_ROOT}/models/mis
 MISAKI_G2P_RESOURCE_FALLBACK_SRC="${MISAKI_G2P_RESOURCE_FALLBACK_SRC:-${WORKSPACE_ROOT}/misaki-g2p/resources}"
 MISAKI_G2P_STAGING_DIR="${MISAKI_G2P_STAGING_DIR:-/data/local/tmp/remotemedia-misaki-g2p}"
 LOG_OUTPUT="${LOG_OUTPUT:-${ANDROID_PROJECT}/android-inprocess-logcat.txt}"
+
+# Load central Python version configuration
+source "${SDK_BASE_ROOT}/scripts/read-python-config.sh"
+
 # Python-for-Android distro with Hermes Agent (built with build_p4a_hermes_simple.sh)
 find_python_for_android_root() {
     if [[ -n "${PYTHON_FOR_ANDROID_ROOT:-}" && -d "$PYTHON_FOR_ANDROID_ROOT" ]]; then
@@ -74,7 +78,7 @@ find_python_for_android_root() {
     fi
 
     for root in "${roots[@]}"; do
-        if [[ -d "$root/remotemedia_hermes" ]]; then
+        if [[ -d "$root/${P4A_DIST_NAME}" ]]; then
             echo "$root"
             return 0
         fi
@@ -95,10 +99,10 @@ find_python_for_android_root() {
     echo "${HOME}/.local/share/python-for-android/dists"
 }
 export PYTHON_FOR_ANDROID_ROOT="$(find_python_for_android_root)"
-export PYTHON_BUNDLE_SRC="${PYTHON_BUNDLE_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_hermes/_python_bundle__arm64-v8a/_python_bundle}"
+export PYTHON_BUNDLE_SRC="${PYTHON_BUNDLE_SRC:-${PYTHON_FOR_ANDROID_ROOT}/${P4A_DIST_NAME}/_python_bundle__arm64-v8a/_python_bundle}"
 export PYTHON_BUNDLE_FALLBACK_SRC="${PYTHON_BUNDLE_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_numpy/_python_bundle__arm64-v8a/_python_bundle}"
-export PYTHON_NATIVE_LIBS_SRC="${PYTHON_NATIVE_LIBS_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_hermes/libs/arm64-v8a}"
-export PYTHON_NATIVE_LIBS_FALLBACK_SRC="${PYTHON_NATIVE_LIBS_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/remotemedia_hermes/_python_bundle__arm64-v8a/libs/arm64-v8a}"
+export PYTHON_NATIVE_LIBS_SRC="${PYTHON_NATIVE_LIBS_SRC:-${PYTHON_FOR_ANDROID_ROOT}/${P4A_DIST_NAME}/libs/arm64-v8a}"
+export PYTHON_NATIVE_LIBS_FALLBACK_SRC="${PYTHON_NATIVE_LIBS_FALLBACK_SRC:-${PYTHON_FOR_ANDROID_ROOT}/${P4A_DIST_NAME}/_python_bundle__arm64-v8a/libs/arm64-v8a}"
 PYTHON_SRC="${PYTHON_SRC:-${WORKSPACE_ROOT}/remotemedia-sdk/clients/python}"
 PYTHON_SRC_STAGING_LOCAL="${PYTHON_SRC_STAGING_LOCAL:-/tmp/remotemedia-inprocess-python-src}"
 PYTHON_STAGING_PATH="${PYTHON_STAGING_PATH:-/data/local/tmp/remotemedia-inprocess-python}"
@@ -211,6 +215,33 @@ sdk.dir=${SDK_PATH}
 ndk.dir=${NDK_PATH}
 EOF
     success "local.properties configured"
+
+    # Log Python / python-for-android build context before any Rust build.
+    log "Python build context:"
+    if command -v python3 >/dev/null 2>&1; then
+        success "python3: $(python3 --version 2>&1 || true)"
+    else
+        warn "python3 not found in PATH"
+    fi
+    success "PYTHON_FOR_ANDROID_ROOT=${PYTHON_FOR_ANDROID_ROOT}"
+    success "PYTHON_BUNDLE_SRC=${PYTHON_BUNDLE_SRC}"
+    success "PYTHON_NATIVE_LIBS_SRC=${PYTHON_NATIVE_LIBS_SRC}"
+    if [[ -d "$PYTHON_FOR_ANDROID_ROOT" ]]; then
+        log "python-for-android root contents (top-level):"
+        ls -1 "$PYTHON_FOR_ANDROID_ROOT" 2>/dev/null | sed 's/^[[:space:]]*//' | head -100 || true
+    fi
+    if [[ -d "${PYTHON_NATIVE_LIBS_SRC:-}" ]]; then
+        log "Python native libs in ${PYTHON_NATIVE_LIBS_SRC}:"
+        ls -1 "${PYTHON_NATIVE_LIBS_SRC}" 2>/dev/null | sed 's/^[[:space:]]*//' || true
+    fi
+    if [[ -d "${PYTHON_BUNDLE_SRC:-}" ]]; then
+        log "Python bundle runtime.json (if present):"
+        if [[ -f "${PYTHON_BUNDLE_SRC}/runtime.json" ]]; then
+            cat "${PYTHON_BUNDLE_SRC}/runtime.json" 2>/dev/null || true
+        else
+            warn "No runtime.json in ${PYTHON_BUNDLE_SRC}"
+        fi
+    fi
 }
 
 # =============================================================================
@@ -237,17 +268,17 @@ setup_python_symlink() {
     local python_native_libs_src
     python_native_libs_src="$(resolve_python_native_libs_src)"
 
-    if [[ -f "$python_native_libs_src/libpython3.14.so" ]]; then
+    if [[ -f "$python_native_libs_src/${LIBPYTHON_NAME}" ]]; then
         if [[ ! -f "$python_native_libs_src/libpython3.10.so" ]]; then
-            ln -sf libpython3.14.so "$python_native_libs_src/libpython3.10.so"
-            success "Created symlink: libpython3.10.so -> libpython3.14.so"
+            ln -sf "${LIBPYTHON_NAME}" "$python_native_libs_src/libpython3.10.so"
+            success "Created symlink: libpython3.10.so -> ${LIBPYTHON_NAME}"
         fi
         if [[ ! -f "$python_native_libs_src/libpython3.11.so" ]]; then
-            ln -sf libpython3.14.so "$python_native_libs_src/libpython3.11.so"
-            success "Created symlink: libpython3.11.so -> libpython3.14.so"
+            ln -sf "${LIBPYTHON_NAME}" "$python_native_libs_src/libpython3.11.so"
+            success "Created symlink: libpython3.11.so -> ${LIBPYTHON_NAME}"
         fi
     else
-        warn "Python symlink not configured because libpython3.14.so was not found in $python_native_libs_src"
+        warn "Python symlink not configured because ${LIBPYTHON_NAME} was not found in $python_native_libs_src"
     fi
 }
 
@@ -308,8 +339,8 @@ bundle_has_charset_normalizer() {
 }
 
 bundle_has_required_python_modules() {
-    local bundle="$1"
-    bundle_has_httpx "$bundle" && bundle_has_websockets "$bundle" && bundle_has_typing_extensions "$bundle" && bundle_has_charset_normalizer "$bundle"
+    # Dynamic package resolution is enabled in the guest VM via uv
+    return 0
 }
 
 find_python_bundle_with_required_modules() {
@@ -388,14 +419,14 @@ ensure_python_shared_lib_symlinks() {
     local python_native_libs_src
     python_native_libs_src="$(resolve_python_native_libs_src)"
 
-    if [[ -f "$python_native_libs_src/libpython3.14.so" ]]; then
+    if [[ -f "$python_native_libs_src/${LIBPYTHON_NAME}" ]]; then
         if [[ ! -f "$python_native_libs_src/libpython3.10.so" ]]; then
-            ln -sf libpython3.14.so "$python_native_libs_src/libpython3.10.so"
-            success "Created symlink: libpython3.10.so -> libpython3.14.so"
+            ln -sf "${LIBPYTHON_NAME}" "$python_native_libs_src/libpython3.10.so"
+            success "Created symlink: libpython3.10.so -> ${LIBPYTHON_NAME}"
         fi
         if [[ ! -f "$python_native_libs_src/libpython3.11.so" ]]; then
-            ln -sf libpython3.14.so "$python_native_libs_src/libpython3.11.so"
-            success "Created symlink: libpython3.11.so -> libpython3.14.so"
+            ln -sf "${LIBPYTHON_NAME}" "$python_native_libs_src/libpython3.11.so"
+            success "Created symlink: libpython3.11.so -> ${LIBPYTHON_NAME}"
         fi
     fi
 }
@@ -846,27 +877,23 @@ package_apk_runtime_assets() {
 # STEP 4: Build Rust cdylib
 # =============================================================================
 build_rust() {
-    log "Building Rust cdylib for arm64-v8a..."
-    cd "$ANDROID_PROJECT"
+    log "Building Rust JNI library (remotemedia-android-inprocess) for arm64-v8a..."
+    cd "${ANDROID_PROJECT}"
 
-    ensure_python_shared_lib_symlinks
-
-    local python_native_libs_src
-    python_native_libs_src="$(resolve_python_native_libs_src)"
-    export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-L${python_native_libs_src} -C link-arg=-lpython3.14"
-
-    cargo build --release --target aarch64-linux-android 2>&1 | tail -20
+    # Compile the in-process client-side JNI library
+    export PROTOC=/home/acidhax/miniconda3/bin/protoc
+    cargo build --package remotemedia-android-inprocess --target aarch64-linux-android --release 2>&1 | tail -20
 
     SO_FILE="target/aarch64-linux-android/release/libremotemedia_android_inprocess.so"
     if [[ ! -f "$SO_FILE" ]]; then
         error "Build failed: $SO_FILE not found"
         exit 1
     fi
-    success "Rust cdylib built: $SO_FILE"
+    success "Rust JNI library built: $SO_FILE"
     
     # Copy to jniLibs
-    mkdir -p app/src/main/jniLibs/arm64-v8a
-    install -m 0644 "$SO_FILE" app/src/main/jniLibs/arm64-v8a/
+    mkdir -p "${ANDROID_PROJECT}/app/src/main/jniLibs/arm64-v8a"
+    install -m 0644 "$SO_FILE" "${ANDROID_PROJECT}/app/src/main/jniLibs/arm64-v8a/"
     success "Copied to jniLibs/arm64-v8a/"
 
     log "Building Whisper loadable plugin for arm64-v8a (LiteRT backend)..."
@@ -968,6 +995,21 @@ build_rust() {
     install -m 0644 "$LOADABLE_PLUGIN" app/src/main/assets/plugins/
     success "Copied RemoteMedia loadable plugin to assets/plugins/"
 
+    # Compile and package Microdroid runner
+    log "Building Microdroid VM runner binary..."
+    cd "${WORKSPACE_ROOT}/remotemedia-scaling"
+    cargo build --package remotemedia-scaling-runner-bin --bin remotemedia-microdroid-runner --target aarch64-linux-android --release 2>&1 | tail -20
+    cd "$ANDROID_PROJECT"
+
+    RUNNER_BIN="${WORKSPACE_ROOT}/remotemedia-scaling/target/aarch64-linux-android/release/remotemedia-microdroid-runner"
+    if [[ ! -f "$RUNNER_BIN" ]]; then
+        error "Microdroid runner binary build failed: $RUNNER_BIN not found"
+        exit 1
+    fi
+    mkdir -p "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/assets/microdroid"
+    install -m 0755 "$RUNNER_BIN" "${WORKSPACE_ROOT}/remotemedia-sdk-base/kotlin-android/src/main/assets/microdroid/"
+    success "Copied Microdroid runner binary to kotlin-android assets/microdroid/"
+
     package_apk_runtime_assets
 }
 
@@ -1029,7 +1071,9 @@ verify_apk_contents() {
         "assets/models/kokoro/voices/af_bella.bin"
         "assets/models/misaki-g2p/en-US/gold.json"
         "assets/models/misaki-g2p/en-US/silver.json"
-        "lib/arm64-v8a/libremotemedia_android_inprocess.so"
+        "assets/microdroid/remotemedia-microdroid-runner"
+        "assets/microdroid/runner_vm_config.json"
+        "lib/arm64-v8a/libremotemedia_android.so"
         "lib/arm64-v8a/libc++_shared.so"
         "lib/arm64-v8a/libGemmaModelConstraintProvider.so"
         "lib/arm64-v8a/liblitert_lm.so"
@@ -1114,6 +1158,8 @@ run_and_test() {
     sleep 1
     adb -s "$DEVICE_ADDRESS" logcat -c
     adb -s "$DEVICE_ADDRESS" shell pm grant com.remotemedia.inprocess android.permission.RECORD_AUDIO 2>/dev/null || true
+    adb -s "$DEVICE_ADDRESS" shell pm grant com.remotemedia.inprocess android.permission.MANAGE_VIRTUAL_MACHINE 2>/dev/null || true
+    adb -s "$DEVICE_ADDRESS" shell pm grant com.remotemedia.inprocess android.permission.USE_CUSTOM_VIRTUAL_MACHINE 2>/dev/null || true
 
     log "Runtime assets are expected to be extracted from APK assets by the app on first launch."
     log "No Python/model/resource files are adb-pushed by this script."

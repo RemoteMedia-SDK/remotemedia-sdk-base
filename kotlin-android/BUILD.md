@@ -97,7 +97,7 @@ kotlin-android/
 │   └── jniLibs/                # Native libraries (copied by CMake)
 │       ├── arm64-v8a/
 │       │   ├── libremotemedia_android_inprocess.so
-│       │   ├── libpython3.11.so
+│       │   ├── ${LIBPYTHON_NAME}
 │       │   ├── liblitert_lm.so
 │       │   └── libGemmaModelConstraintProvider.so
 │       └── x86_64/
@@ -131,7 +131,7 @@ The library expects these native libraries at runtime (included via `jniLibs`):
 | Library | Source | Purpose |
 |---------|--------|---------|
 | `libremotemedia_android_inprocess.so` | Rust cargo build | Pipeline executor |
-| `libpython3.11.so` | python-for-android | In-process Python runtime |
+| `libpython3.11.so` | python-for-android | In-process Python runtime (see config/python-version.toml) |
 | `liblitert_lm.so` | LiteRT-LM Bazel build | LLM engine |
 | `libGemmaModelConstraintProvider.so` | LiteRT-LM prebuilt | Gemma model support |
 

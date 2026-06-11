@@ -3,12 +3,12 @@
 # Cross-compile Android Python native modules (pydantic_core, jiter, etc.)
 # =============================================================================
 # This script cross-compiles Rust-based Python native modules for Android
-# using the python-for-android toolchain's Python 3.14.
+# using the python-for-android toolchain's Python 3.12.
 #
 # Prerequisites:
 # - Android NDK r25c+ (tested with 27.0.11718014)
 # - Rust with aarch64-linux-android target
-# - python-for-android distro with Python 3.14 built
+# - python-for-android distro with Python 3.12 built
 # - Maturity: requires pydantic_core 2.46.4, jiter 0.15.0
 #
 # Output: Wheels placed in app/src/main/assets/python-wheels/
@@ -30,6 +30,10 @@ success() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[ERR]${NC} $*"; }
 
+# Load central Python version configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../scripts/read-python-config.sh"
+
 # =============================================================================
 # Configuration - set via environment or auto-detect
 # =============================================================================
@@ -49,36 +53,8 @@ PYTHON_BUILD_DIR="${P4A_ROOT}/build/other_builds/python3/${P4A_ARCH}__ndk_target
 PYTHON_ANDROID_BUILD="${PYTHON_BUILD_DIR}/android-build"
 PYTHON_INCLUDE="${PYTHON_BUILD_DIR}/Include"
 PYTHON_LIB_DIR="${PYTHON_ANDROID_BUILD}"
-PYTHON_SYSCONFIGDATA="${PYTHON_ANDROID_BUILD}/build/lib.android-${P4A_NDK_API}-${P4A_ARCH_UNDERSCORE}-3.14/_sysconfigdata__android_aarch64-linux-android.py"
+PYTHON_SYSCONFIGDATA="${PYTHON_ANDROID_BUILD}/build/lib.linux-aarch64-${PYTHON_SYSCONFIGDATA_SUFFIX}/_sysconfigdata__linux_aarch64-linux-android.py"
 PYTHON_SYSCONFIGDATA_DEST="${PYTHON_ANDROID_BUILD}/_sysconfigdata__android_aarch64-linux-android.py"
-
-# NDK paths
-NDK_PATH="${NDK_PATH:-~/Android/Sdk/ndk/27.0.11718014}"
-NDK_PATH="${NDK_PATH/#\~/$HOME}"  # expand tilde
-TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64"
-TARGET=aarch64-linux-android24
-
-export CC="${TOOLCHAIN}/bin/${TARGET}-clang"
-export CXX="${TOOLCHAIN}/bin/${TARGET}-clang++"
-export AR="${TOOLCHAIN}/bin/llvm-ar"
-export RANLIB="${TOOLCHAIN}/bin/llvm-ranlib"
-export STRIP="${TOOLCHAIN}/bin/llvm-strip"
-
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${TOOLCHAIN}/bin/aarch64-linux-android24-clang"
-export CC_aarch64_linux_android="${CC}"
-export CXX_aarch64_linux_android="${CXX}"
-export AR_aarch64_linux_android="${AR}"
-export RANLIB_aarch64_linux_android="${RANLIB}"
-
-# PyO3 cross-compilation environment
-export PYO3_CROSS=1
-export PYO3_CROSS_LIB_DIR="${PYTHON_ANDROID_BUILD}"
-export PYO3_CROSS_PYTHON_VERSION="3.14"
-export PYO3_CROSS_PYTHON_IMPLEMENTATION=CPython
-export _PYTHON_SYSCONFIGDATA_NAME="_sysconfigdata__android_aarch64-linux-android"
-
-# Cargo config for Android
-export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-L${PYTHON_LIB_DIR} -C link-arg=-lpython3.14"
 
 # Build cache directory (within project)
 BUILD_CACHE_DIR="${ANDROID_PROJECT}/.build_cache"
@@ -100,7 +76,8 @@ verify_env() {
     
     [[ -d "${PYTHON_ANDROID_BUILD}" ]] || error "Python Android build not found: ${PYTHON_ANDROID_BUILD}"
     [[ -f "${PYTHON_SYSCONFIGDATA}" ]] || error "_sysconfigdata not found: ${PYTHON_SYSCONFIGDATA}"
-    [[ -f "${PYTHON_ANDROID_BUILD}/libpython3.14.so" ]] || error "libpython3.14.so not found"
+    # Verify Python build
+    [[ -f "${PYTHON_ANDROID_BUILD}/${LIBPYTHON_NAME}" ]] || error "${LIBPYTHON_NAME} not found in ${PYTHON_ANDROID_BUILD}"
     
     # Copy sysconfigdata to where PYO3 expects it
     cp "${PYTHON_SYSCONFIGDATA}" "${PYTHON_SYSCONFIGDATA_DEST}"
@@ -124,7 +101,7 @@ verify_env() {
 build_pydantic_core() {
     local VERSION="2.46.4"
     local OUT_DIR="/tmp/pydantic_core-${VERSION}"
-    local WHEEL="${WHEELS_DIR}/pydantic_core-${VERSION}-android_cp314.whl"
+    local WHEEL="${WHEELS_DIR}/pydantic_core-${VERSION}-android_cp312.whl"
     
     log "Building pydantic_core ${VERSION} for Android..."
     
@@ -158,13 +135,13 @@ build_pydantic_core() {
     rm -rf "${WHEEL_DIR}"
     mkdir -p "${WHEEL_DIR}"
     
-    # Use existing wheel as template
-    local TEMPLATE_WHEEL=$(find "${WHEELS_DIR}" -name "pydantic_core-*.whl" | head -1)
-    if [[ -z "${TEMPLATE_WHEEL}" ]]; then
-        error "No template pydantic_core wheel found in ${WHEELS_DIR}"
-    fi
-    
     cd /tmp
+    rm -rf pydantic_core_wheel
+    mkdir -p pydantic_core_wheel
+    cd pydantic_core_wheel
+    
+    unzip -q "${TEMPLATE_WHEEL}"
+    cp "${LIB}" pydantic_core/_pydantic_core.cpython-312-aarch64-linux-android.so
     rm -rf pydantic_core_wheel
     mkdir -p pydantic_core_wheel
     cd pydantic_core_wheel
@@ -183,7 +160,7 @@ build_pydantic_core() {
 build_jiter() {
     local VERSION="0.15.0"
     local OUT_DIR="/tmp/jiter-${VERSION}"
-    local WHEEL="${WHEELS_DIR}/jiter-${VERSION}-android_cp314.whl"
+    local WHEEL="${WHEELS_DIR}/jiter-${VERSION}-android_cp312.whl"
     local CACHE_LIB="${BUILD_CACHE_DIR}/jiter_python.so"
     
     log "Building jiter ${VERSION} for Android..."
@@ -237,12 +214,12 @@ build_jiter() {
     cd jiter_wheel
     
     # Use pydantic_core wheel as template for structure
-    unzip -q "${WHEELS_DIR}/pydantic_core-2.46.4-android_cp314.whl"
+    unzip -q "${WHEELS_DIR}/pydantic_core-2.46.4-android_cp312.whl"
     
     # Replace pydantic_core with jiter
     rm -rf pydantic_core pydantic_core-2.46.4.dist-info
     
-    cp "${LIB}" jiter/jiter.cpython-314-aarch64-linux-android.so
+    cp "${LIB}" jiter/jiter.cpython-312-aarch64-linux-android.so
     
     # Create minimal __init__.py
     cat > jiter/__init__.py << 'EOF'
@@ -265,7 +242,7 @@ EOF
     
     # Create dist-info
     mkdir -p jiter-0.15.0.dist-info
-    cat > jiter-0.15.0.dist-info/METADATA << 'EOF'
+    cat > jiter-0.15.0.dist-info/METADATA << EOF
 Metadata-Version: 2.1
 Name: jiter
 Version: 0.15.0
@@ -276,10 +253,7 @@ Author-email: pyo3@pyo3.rs
 License: MIT OR Apache-2.0
 Platform: any
 Classifier: Programming Language :: Python :: 3
-Classifier: Programming Language :: Python :: 3.11
-Classifier: Programming Language :: Python :: 3.12
-Classifier: Programming Language :: Python :: 3.13
-Classifier: Programming Language :: Python :: 3.14
+Classifier: Programming Language :: Python :: ${PYTHON_MAJOR_MINOR}
 Classifier: Programming Language :: Rust
 Classifier: License :: OSI Approved :: MIT License
 Classifier: License :: OSI Approved :: Apache Software License
@@ -288,12 +262,11 @@ Classifier: Intended Audience :: Developers
 Requires-Python: >=3.9
 Provides-Extra: test
 EOF
-    
-    cat > jiter-0.15.0.dist-info/WHEEL << 'EOF'
+    cat > jiter-0.15.0.dist-info/WHEEL << EOF
 Wheel-Version: 1.0
 Generator: cross_compile_android_python_native.sh
 Root-Is-Purelib: false
-Tag: cp314-cp314-android_aarch64
+Tag: ${WHEEL_TAG}-${WHEEL_ABI}-${WHEEL_PLATFORM}
 EOF
     
     cat > jiter-0.15.0.dist-info/RECORD << 'EOF'
@@ -323,7 +296,7 @@ main() {
     log "Python: ${PYTHON_ANDROID_BUILD}"
     log "Wheels output: ${WHEELS_DIR}"
     log "Build cache: ${BUILD_CACHE_DIR}"
-    
+    log "Target Python: ${PYTHON_VERSION}"
     verify_env
     
     build_pydantic_core
