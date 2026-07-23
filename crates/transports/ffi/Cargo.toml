@@ -85,7 +85,7 @@ napi-build = { version = "2", optional = true }
 [features]
 default = ["python", "native-numpy", "bundled-uv-embedded", "python-telephony"]
 # Python bindings (PyO3)
-python = ["dep:pyo3", "dep:pyo3-async-runtimes", "dep:numpy"]
+python = ["dep:pyo3", "dep:pyo3-async-runtimes", "dep:numpy", "remotemedia-core/loadable"]
 extension-module = ["pyo3/extension-module", "python"]
 native-numpy = ["python"]
 # Embed a `uv` binary into the Python wheel so `PYTHON_ENV_MODE=managed`
@@ -156,6 +156,7 @@ grpc = [
     "dep:tonic-web",
     "dep:tower-http",
     "dep:http",
-    "dep:uuid"
+    "dep:uuid",
+    "remotemedia-core/loadable"
 ]
 
