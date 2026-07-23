@@ -1,3 +1,5 @@
+#![cfg(target_os = "android")]
+
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;

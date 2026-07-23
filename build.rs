@@ -84,12 +84,6 @@ fn setup_ffmpeg() {
         println!("cargo:rustc-link-lib=z");
         println!("cargo:rustc-link-lib=lzma");
         println!("cargo:rustc-link-lib=bz2");
-        // X11/VDPAU for hardware acceleration (Linux only)
-        #[cfg(target_os = "linux")]
-        {
-            println!("cargo:rustc-link-lib=X11");
-            println!("cargo:rustc-link-lib=vdpau");
-        }
         // OpenSSL for RTMPS/HTTPS network protocols.
         // Windows MSVC openssl-src / conda-forge ship `libssl.lib` /
         // `libcrypto.lib`; non-MSVC toolchains use the unprefixed names.
