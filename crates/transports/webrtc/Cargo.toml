@@ -105,6 +105,10 @@ protobuf-src = { workspace = true }
 default = ["grpc-signaling"]
 codecs = ["dep:media-codec-vpx"]
 h264 = ["dep:openh264"]
+# Video codec support (spec 012). Enables `remotemedia_core::nodes::video`
+# (VideoEncoderNode / VideoDecoderNode), which the `video_integration_test`
+# integration test depends on. Off by default because it pulls in ac-ffmpeg.
+video = ["remotemedia-core/video"]
 # Generic signaling feature for event bridge types (WebRtcEventBridge, etc.)
 signaling = ["ws-signaling"]
 # WebSocket signaling requires grpc-signaling because ServerPeer uses generated protobufs
@@ -147,3 +151,7 @@ avatar-cc = ["avatar-core"]
 # cc-render or live2d-render plugin at runtime.
 avatar = ["avatar-core"]
 full = ["codecs", "h264", "grpc-signaling", "ws-signaling"]
+
+[[test]]
+name = "video_integration_test"
+required-features = ["video"]

@@ -87,13 +87,7 @@ impl AsyncStreamingNode for ResampleStreamingNode {
                 arrival_ts_us,
                 metadata,
             ),
-            other => {
-                return Err(Error::InvalidInput {
-                    message: format!("Expected Audio, got {:?}", other.data_type()),
-                    node_id: "FastResampleNode".into(),
-                    context: "process".into(),
-                });
-            }
+            other => return Ok(other),
         };
         let out_stream_id = self.output_stream_id.clone().or(in_stream_id);
 
@@ -413,13 +407,7 @@ impl AsyncStreamingNode for AutoResampleStreamingNode {
                 arrival_ts_us,
                 metadata,
             ),
-            other => {
-                return Err(Error::InvalidInput {
-                    message: format!("Expected Audio, got {:?}", other.data_type()),
-                    node_id: self.node_id.clone(),
-                    context: "process".into(),
-                });
-            }
+            other => return Ok(other),
         };
         let out_stream_id = self.config.output_stream_id.clone().or(in_stream_id);
 

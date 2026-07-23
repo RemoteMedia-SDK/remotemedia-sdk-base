@@ -106,13 +106,7 @@ impl AsyncStreamingNode for AudioFormatConverterStreamingNode {
                 arrival_ts_us,
                 metadata,
             ),
-            other => {
-                return Err(Error::InvalidInput {
-                    message: format!("Expected Audio, got {:?}", other.data_type()),
-                    node_id: NODE_TYPE.into(),
-                    context: "process".into(),
-                });
-            }
+            other => return Ok(other),
         };
 
         // Step 1: pack the f32 samples into an AudioBuffer::F32. We deref via
