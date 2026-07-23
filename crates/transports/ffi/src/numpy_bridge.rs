@@ -416,7 +416,6 @@ mod tests {
 
     #[test]
     fn test_is_numpy_array() {
-        pyo3::prepare_freethreaded_python();
 
         Python::attach(|py| {
             // Try to import numpy (skip test if not available)
@@ -449,7 +448,6 @@ result = np.array([1.0, 2.0, 3.0])
 
     #[test]
     fn test_extract_numpy_metadata() {
-        pyo3::prepare_freethreaded_python();
 
         Python::attach(|py| {
             if py.import("numpy").is_err() {
@@ -480,7 +478,6 @@ result = np.array([[1, 2], [3, 4]], dtype=np.int32)
 
     #[test]
     fn test_numpy_roundtrip() {
-        pyo3::prepare_freethreaded_python();
 
         Python::attach(|py| {
             if py.import("numpy").is_err() {
@@ -525,7 +522,6 @@ result = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
 
     #[test]
     fn test_numpy_to_vec() {
-        pyo3::prepare_freethreaded_python();
 
         Python::attach(|py| {
             if py.import("numpy").is_err() {
@@ -554,7 +550,6 @@ result = np.array([1.0, 2.0, 3.0, 4.0])
 
     #[test]
     fn test_vec_to_numpy() {
-        pyo3::prepare_freethreaded_python();
 
         Python::attach(|py| {
             if py.import("numpy").is_err() {
@@ -578,7 +573,6 @@ result = np.array([1.0, 2.0, 3.0, 4.0])
 
     #[test]
     fn test_numpy_to_audio_buffer() {
-        pyo3::prepare_freethreaded_python();
 
         Python::attach(|py| {
             if py.import("numpy").is_err() {
@@ -617,7 +611,6 @@ result = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.float32)
 
     #[test]
     fn test_audio_buffer_to_numpy_mono() {
-        pyo3::prepare_freethreaded_python();
 
         Python::attach(|py| {
             if py.import("numpy").is_err() {
@@ -641,7 +634,6 @@ result = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.float32)
 
     #[test]
     fn test_audio_buffer_to_numpy_stereo() {
-        pyo3::prepare_freethreaded_python();
 
         Python::attach(|py| {
             if py.import("numpy").is_err() {
@@ -665,7 +657,6 @@ result = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.float32)
 
     #[test]
     fn test_zero_copy_roundtrip() {
-        pyo3::prepare_freethreaded_python();
 
         Python::attach(|py| {
             if py.import("numpy").is_err() {

@@ -759,7 +759,6 @@ mod tests {
 
     #[test]
     fn test_python_to_json_primitives() {
-        pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             // None
             let py_none = py.None().into_bound(py);
@@ -786,7 +785,6 @@ mod tests {
 
     #[test]
     fn test_python_to_json_list() {
-        pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             let py_list = vec![1, 2, 3].into_bound_py_any(py).unwrap();
             let result = python_to_json(py, &py_list).unwrap();
@@ -800,7 +798,6 @@ mod tests {
 
     #[test]
     fn test_python_to_json_dict() {
-        pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             let py_dict = [("name", "Alice"), ("city", "NYC")]
                 .into_iter()
@@ -819,7 +816,6 @@ mod tests {
 
     #[test]
     fn test_json_to_python_primitives() {
-        pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             // Null
             let json_null = Value::Null;
@@ -845,7 +841,6 @@ mod tests {
 
     #[test]
     fn test_json_to_python_collections() {
-        pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             // Array
             let json_array = Value::Array(vec![Value::from(1), Value::from(2), Value::from(3)]);
@@ -870,7 +865,6 @@ mod tests {
 
     #[test]
     fn test_round_trip() {
-        pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             // Create complex Python structure
             let py_list = PyList::empty(py);
@@ -896,7 +890,6 @@ mod tests {
 
     #[test]
     fn test_tuple_conversion() {
-        pyo3::prepare_freethreaded_python();
         Python::attach(|py| {
             use pyo3::types::PyTuple;
 
