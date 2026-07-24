@@ -168,7 +168,7 @@ impl AudioBufferAccumulatorNode {
         >,
         metadata: Option<&serde_json::Value>,
         stream_id: Option<&str>,
-    ) -> Result<Option<RuntimeData>> {
+    ) -> Result<Vec<RuntimeData>> {
         let samples = self.convert_audio_to_f32(audio_buf)?;
 
         // Get or create state for this session
@@ -217,14 +217,14 @@ impl AudioBufferAccumulatorNode {
                 // `is_speaking = true` after the flush so the next
                 // chunk re-opens accumulation immediately and the
                 // user's continuous utterance survives the cap.
-                let out = self.flush_buffer(state, session_id)?;
+                let outs = self.flush_buffer(state, session_id)?;
                 state.is_speaking = true;
                 state.accumulated_samples.clear();
                 state.chunks_accumulated = 0;
-                return Ok(out);
+                return Ok(outs);
             }
 
-            Ok(None)
+            Ok(vec![])
         } else {
             // Not speaking yet, buffer this audio in pending for speech padding
             tracing::trace!(
@@ -255,7 +255,7 @@ impl AudioBufferAccumulatorNode {
                 pending_vec.drain(0..(pending_vec.len() - max_padding_chunks));
             }
 
-            Ok(None)
+            Ok(vec![])
         }
     }
 
@@ -268,7 +268,7 @@ impl AudioBufferAccumulatorNode {
             String,
             Vec<(Vec<f32>, u32, u32, std::time::Instant)>,
         >,
-    ) -> Result<Option<RuntimeData>> {
+    ) -> Result<Vec<RuntimeData>> {
         fn nested_bool(value: &serde_json::Value, key: &str) -> bool {
             value.get(key).and_then(|v| v.as_bool()).unwrap_or_else(|| {
                 ["payload", "data", "event"].iter().any(|nested_key| {
@@ -366,7 +366,7 @@ impl AudioBufferAccumulatorNode {
             }
 
             if self.emit_cancel_on_speech_start {
-                Ok(Some(RuntimeData::ControlMessage {
+                Ok(vec![RuntimeData::ControlMessage {
                     message_type: ControlMessageType::CancelSpeculation {
                         from_timestamp: 0,
                         to_timestamp: 0,
@@ -374,9 +374,9 @@ impl AudioBufferAccumulatorNode {
                     segment_id: None,
                     timestamp_ms: 0,
                     metadata: serde_json::Value::Null,
-                }))
+                }])
             } else {
-                Ok(None)
+                Ok(vec![])
             }
         } else if is_speech_end {
             // Always clear pending on speech_end, whether or not
@@ -406,15 +406,13 @@ impl AudioBufferAccumulatorNode {
                         state.accumulated_samples.len(),
                         state.chunks_accumulated
                     );
-
                     return self.flush_buffer(state, session_id);
                 }
             }
-
-            Ok(None)
+            Ok(vec![])
         } else {
             // No action needed for intermediate VAD frames
-            Ok(None)
+            Ok(vec![])
         }
     }
 
@@ -422,7 +420,7 @@ impl AudioBufferAccumulatorNode {
         &self,
         state: &mut BufferState,
         session_id: &str,
-    ) -> Result<Option<RuntimeData>> {
+    ) -> Result<Vec<RuntimeData>> {
         if state.accumulated_samples.is_empty() {
             // Promoted to INFO: flushing with no samples means VAD
             // emitted speech_end before any audio chunks arrived in
@@ -435,7 +433,7 @@ impl AudioBufferAccumulatorNode {
                 session_id,
             );
             state.is_speaking = false;
-            return Ok(None);
+            return Ok(vec![]);
         }
 
         // Check minimum duration
@@ -454,7 +452,7 @@ impl AudioBufferAccumulatorNode {
             state.accumulated_samples.clear();
             state.is_speaking = false;
             state.chunks_accumulated = 0;
-            return Ok(None);
+            return Ok(vec![]);
         }
 
         // Energy gate — reject silent / near-silent utterances. Silero
@@ -483,7 +481,7 @@ impl AudioBufferAccumulatorNode {
             state.accumulated_samples.clear();
             state.is_speaking = false;
             state.chunks_accumulated = 0;
-            return Ok(None);
+            return Ok(vec![]);
         }
 
         // Get accumulated samples
@@ -511,7 +509,11 @@ impl AudioBufferAccumulatorNode {
         state.is_speaking = false;
         state.chunks_accumulated = 0;
 
-        Ok(Some(RuntimeData::Audio {
+        // Emit the accumulated audio, then a flush signal so any
+        // downstream STT node (e.g. streaming Whisper) finalizes
+        // the utterance. Without the flush, a streaming STT node
+        // buffers the audio forever and never emits text.
+        let audio = RuntimeData::Audio {
             samples: samples.into(),
             sample_rate,
             channels,
@@ -519,7 +521,9 @@ impl AudioBufferAccumulatorNode {
             timestamp_us: None,
             arrival_ts_us: None,
             metadata: state.last_metadata.clone(),
-        }))
+        };
+        let flush = RuntimeData::Json(serde_json::json!({ "type": "flush" }));
+        Ok(vec![audio, flush])
     }
 
     fn handle_control_message(
@@ -595,7 +599,7 @@ impl SyncStreamingNode for AudioBufferAccumulatorNode {
         // Both locks are `parking_lot::Mutex`; uncontended fast path
         // is a single CAS. No `.await` anywhere in this method; the
         // old async annotations were pure overhead.
-        let output: Option<RuntimeData> = {
+        let output: Vec<RuntimeData> = {
             let mut states = self.states.lock();
             let mut pending = self.pending_audio.lock();
 
@@ -637,21 +641,20 @@ impl SyncStreamingNode for AudioBufferAccumulatorNode {
                         &mut states,
                         &mut pending,
                     );
-                    Some(data.clone())
+                    vec![data.clone()]
                 }
                 _ => {
                     tracing::warn!("[AudioBuffer] Received unexpected data type");
-                    None
+                    vec![]
                 }
             }
         };
 
-        if let Some(output_data) = output {
-            callback(output_data)?;
-            Ok(1)
-        } else {
-            Ok(0)
+        let count = output.len();
+        for out in output {
+            callback(out)?;
         }
+        Ok(count)
     }
 }
 
