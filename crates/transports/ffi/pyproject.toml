@@ -53,6 +53,12 @@ Repository = "https://github.com/remotemedia/remotemedia-sdk.git"
 Issues = "https://github.com/remotemedia/remotemedia-sdk/issues"
 Changelog = "https://github.com/remotemedia/remotemedia-sdk/releases"
 
+[project.dependencies]
+# The Python client SDK provides the public API surface (remotemedia.core.*,
+# remotemedia.nodes.*, etc.). The native runtime shipped by this wheel
+# registers itself into the same namespace package.
+remotemedia-client = ">=0.2.0,<0.3"
+
 [project.optional-dependencies]
 webrtc = []
 dev = [
