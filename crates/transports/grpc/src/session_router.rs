@@ -27,6 +27,7 @@ use remotemedia_core::data::RuntimeData;
 use remotemedia_core::executor::PipelineGraph;
 use remotemedia_core::metrics::RtProbeSet;
 use remotemedia_core::nodes::{StreamingNode, StreamingNodeRegistry};
+use remotemedia_core::transport::session_control::SessionControl;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -163,6 +164,10 @@ pub struct SessionRouter {
     /// Whether the router is running
     running: bool,
 
+    /// Per-session control bus used by source-Python progress, node output
+    /// taps, and coordinator/tool relay events.
+    control: Option<Arc<SessionControl>>,
+
     /// Multiprocess executor for IPC communication (optional)
     #[cfg(feature = "multiprocess")]
     multiprocess_executor: Option<Arc<MultiprocessExecutor>>,
@@ -237,6 +242,7 @@ impl SessionRouter {
             node_tasks: HashMap::new(),
             node_inputs: HashMap::new(),
             running: false,
+            control: None,
             #[cfg(feature = "multiprocess")]
             multiprocess_executor: None,
             probes: Arc::new(RtProbeSet::new()),
@@ -251,6 +257,11 @@ impl SessionRouter {
     /// backpressure when the pipeline is behind.
     pub fn get_input_sender(&self) -> mpsc::Sender<DataPacket> {
         self.client_input_tx.clone()
+    }
+
+    /// Attach the control bus before node initialization and router start.
+    pub fn attach_control(&mut self, control: Arc<SessionControl>) {
+        self.control = Some(control);
     }
 
     /// Snapshot every RT latency probe in declaration order:
@@ -384,7 +395,7 @@ impl SessionRouter {
                     let init_ctx = remotemedia_core::nodes::InitializeContext {
                         session_id: self.session_id.clone(),
                         node_id: node_id.clone(),
-                        control: None,
+                        control: self.control.clone(),
                     };
                     match node.initialize(&init_ctx).await {
                         Ok(_) => {
@@ -584,6 +595,37 @@ impl SessionRouter {
 
     /// Route a packet through the pipeline
     async fn route_packet(&mut self, packet: DataPacket) -> Result<(), Status> {
+        // Node outputs pass through SessionControl before normal graph fan-out.
+        // This publishes requested taps (including tool/blip/system events)
+        // and applies any installed intercept without touching client ingress.
+        let packet = if packet.to_node.is_none() {
+            if let Some(control) = &self.control {
+                let DataPacket {
+                    data,
+                    from_node,
+                    to_node,
+                    session_id,
+                    sequence,
+                    sub_sequence,
+                } = packet;
+                let Some(data) = control.on_node_output(&from_node, None, data).await else {
+                    return Ok(());
+                };
+                DataPacket {
+                    data,
+                    from_node,
+                    to_node,
+                    session_id,
+                    sequence,
+                    sub_sequence,
+                }
+            } else {
+                packet
+            }
+        } else {
+            packet
+        };
+
         // If to_node is specified, route directly to that node (for client input)
         let downstream_nodes = if let Some(ref to_node) = packet.to_node {
             vec![to_node.clone()]
@@ -634,7 +676,22 @@ impl SessionRouter {
 
         // Get or create the node
         let node = self.get_or_create_node(&node_id).await?;
-        let is_streaming = self.registry.is_multi_output_streaming(&node.node_type());
+        // Loadable-plugin factories cannot currently advertise the
+        // multi-output capability across the stable FFI factory ABI.  The
+        // manifest is therefore authoritative when it explicitly marks a
+        // node as streaming; built-in factories retain their capability-based
+        // fallback for legacy manifests.
+        let manifest_streaming = {
+            let session = self.session.lock().await;
+            session
+                .manifest
+                .nodes
+                .iter()
+                .find(|spec| spec.id == node_id)
+                .is_some_and(|spec| spec.is_streaming)
+        };
+        let is_streaming =
+            manifest_streaming || self.registry.is_multi_output_streaming(&node.node_type());
 
         // Create bounded input channel for this node. See
         // DEFAULT_GRPC_NODE_INPUT_CAPACITY for deadlock-safety sizing
@@ -647,6 +704,21 @@ impl SessionRouter {
         let session_id = self.session_id.clone();
         let router_tx = self.loopback_tx.clone(); // Bounded loopback: node → router
         let probes = self.probes.clone(); // Phase B0 instrumentation
+        let control = self
+            .control
+            .clone()
+            .unwrap_or_else(|| SessionControl::new(session_id.clone()));
+        let init_ctx = remotemedia_core::nodes::InitializeContext {
+            session_id: session_id.clone(),
+            node_id: node_id_clone.clone(),
+            control: Some(control.clone()),
+        };
+        let runtime_ctx = remotemedia_core::nodes::NodeRuntimeContext::for_session(
+            session_id.clone(),
+            node_id_clone.clone(),
+            control,
+            node.make_session_state(&init_ctx),
+        );
 
         // Check if this is a multiprocess node and set up continuous output draining
         #[cfg(feature = "multiprocess")]
@@ -785,14 +857,10 @@ impl SessionRouter {
                     let mut output_count = 0_u64;
 
                     let node_dispatch_start = std::time::Instant::now();
-                    let ctx = remotemedia_core::nodes::NodeRuntimeContext::for_test(
-                        session_id.clone(),
-                        node_id_clone.clone(),
-                    );
                     let result = node
                         .process_streaming_async(
                             packet_data,
-                            &ctx,
+                            &runtime_ctx,
                             Box::new(move |output| {
                                 output_count += 1;
                                 let output_packet = DataPacket {
@@ -843,11 +911,7 @@ impl SessionRouter {
                     // Non-streaming node - single output.
                     // Phase B0: record total dispatch latency inline (no spawn).
                     let node_dispatch_start = std::time::Instant::now();
-                    let ctx = remotemedia_core::nodes::NodeRuntimeContext::for_test(
-                        session_id.clone(),
-                        node_id_clone.clone(),
-                    );
-                    let process_result = node.process_async(packet.data, &ctx).await;
+                    let process_result = node.process_async(packet.data, &runtime_ctx).await;
                     probes.node_out.record_since(node_dispatch_start);
                     match process_result {
                         Ok(output) => {

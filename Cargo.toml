@@ -418,6 +418,7 @@ webrtc = "0.14.0"
 # gRPC (for transport crates)
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 tonic-web = "0.14.1"
+tonic-health = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"

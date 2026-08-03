@@ -14,7 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 # Transport library
-remotemedia-grpc = { path = "../../transports/grpc", default-features = true }
+remotemedia-grpc = { path = "../../transports/grpc", default-features = true, features = ["loadable", "multiprocess"] }
+# Force-link the inventory registrations for manifest-declared Python nodes
+# such as WhisperSTTNode and LFM2DemoAgentNode. The generic server still only
+# instantiates them when a submitted manifest requests them.
+remotemedia-python-nodes = { path = "../../python-nodes" }
 
 # Async runtime
 tokio = { workspace = true }

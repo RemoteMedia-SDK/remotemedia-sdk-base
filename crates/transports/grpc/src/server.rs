@@ -12,6 +12,7 @@ use crate::{
         pipeline_execution_service_server::PipelineExecutionServiceServer,
         streaming_pipeline_service_server::StreamingPipelineServiceServer,
     },
+    manifest_wire::PluginPolicy,
     metrics::ServiceMetrics,
     streaming::StreamingServiceImpl,
     ServiceConfig,
@@ -32,6 +33,7 @@ pub struct GrpcServer {
     config: ServiceConfig,
     metrics: Arc<ServiceMetrics>,
     executor: Arc<PipelineExecutor>,
+    plugin_policy: PluginPolicy,
 }
 
 impl GrpcServer {
@@ -50,6 +52,7 @@ impl GrpcServer {
             config,
             metrics,
             executor,
+            plugin_policy: PluginPolicy::from_env()?,
         })
     }
 
@@ -75,18 +78,20 @@ impl GrpcServer {
         );
 
         // Create service implementations with PipelineExecutor (spec 026 migration)
-        let execution_service = ExecutionServiceImpl::new(
+        let execution_service = ExecutionServiceImpl::new_with_policy(
             self.config.auth.clone(),
             self.config.limits.clone(),
             Arc::clone(&self.metrics),
             Arc::clone(&self.executor),
+            self.plugin_policy.clone(),
         );
 
-        let streaming_service = StreamingServiceImpl::new(
+        let streaming_service = StreamingServiceImpl::new_with_policy(
             self.config.auth.clone(),
             self.config.limits.clone(),
             Arc::clone(&self.metrics),
             Arc::clone(&self.executor),
+            self.plugin_policy.clone(),
         );
 
         // Session Control Bus — per-session pub/sub/intercept/node-state.
@@ -120,6 +125,14 @@ impl GrpcServer {
             .named_layer(PipelineControlServer::new(control_service));
 
         // T037: Configure connection pooling and HTTP/2 keepalive for concurrent clients
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
+        health_reporter
+            .set_serving::<PipelineExecutionServiceServer<ExecutionServiceImpl>>()
+            .await;
+        health_reporter
+            .set_serving::<StreamingPipelineServiceServer<StreamingServiceImpl>>()
+            .await;
+
         let server = Server::builder()
             // Allow many concurrent requests per connection
             .concurrency_limit_per_connection(256)
@@ -138,6 +151,7 @@ impl GrpcServer {
             .add_service(execution_service)
             .add_service(streaming_service)
             .add_service(control_service);
+        let server = server.add_service(health_service);
 
         // TODO: Add graceful shutdown on Ctrl+C
         // Requires tokio signal feature which may not be available on all platforms
@@ -163,18 +177,20 @@ impl GrpcServer {
         );
 
         // Create service implementations with PipelineExecutor (spec 026 migration)
-        let execution_service = ExecutionServiceImpl::new(
+        let execution_service = ExecutionServiceImpl::new_with_policy(
             self.config.auth.clone(),
             self.config.limits.clone(),
             Arc::clone(&self.metrics),
             Arc::clone(&self.executor),
+            self.plugin_policy.clone(),
         );
 
-        let streaming_service = StreamingServiceImpl::new(
+        let streaming_service = StreamingServiceImpl::new_with_policy(
             self.config.auth.clone(),
             self.config.limits.clone(),
             Arc::clone(&self.metrics),
             Arc::clone(&self.executor),
+            self.plugin_policy.clone(),
         );
 
         // Session Control Bus — per-session pub/sub/intercept/node-state.
@@ -208,6 +224,14 @@ impl GrpcServer {
             .named_layer(PipelineControlServer::new(control_service));
 
         // T037: Configure connection pooling and HTTP/2 keepalive for concurrent clients
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
+        health_reporter
+            .set_serving::<PipelineExecutionServiceServer<ExecutionServiceImpl>>()
+            .await;
+        health_reporter
+            .set_serving::<StreamingPipelineServiceServer<StreamingServiceImpl>>()
+            .await;
+
         let server = Server::builder()
             // Allow many concurrent requests per connection
             .concurrency_limit_per_connection(256)
@@ -226,6 +250,7 @@ impl GrpcServer {
             .add_service(execution_service)
             .add_service(streaming_service)
             .add_service(control_service);
+        let server = server.add_service(health_service);
 
         info!("gRPC server listening on {}", addr);
 

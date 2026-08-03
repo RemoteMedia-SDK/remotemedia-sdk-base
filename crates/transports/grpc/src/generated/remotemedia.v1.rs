@@ -999,6 +999,15 @@ pub struct PipelineManifest {
     /// Forms a directed acyclic graph (DAG)
     #[prost(message, repeated, tag = "4")]
     pub connections: ::prost::alloc::vec::Vec<Connection>,
+    /// Complete RemoteMedia manifest JSON.
+    ///
+    /// When present, this is the authoritative representation and preserves
+    /// runtime fields that the legacy protobuf projection cannot express (for
+    /// example plugins, python_env, is_output_node, and newer node metadata).
+    /// New clients SHOULD populate only this field. Legacy clients may continue
+    /// using fields 1-4.
+    #[prost(bytes = "vec", tag = "5")]
+    pub manifest_json: ::prost::alloc::vec::Vec<u8>,
 }
 /// Pipeline metadata (unchanged from Feature 003)
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1693,6 +1702,12 @@ pub struct StreamInit {
     /// Helps service optimize buffer allocation
     #[prost(uint64, tag = "5")]
     pub expected_chunk_size: u64,
+    /// Optional SessionControl output taps forwarded as ChunkResult entries.
+    /// Each value is a node id (for example "**system**" or "coordinator").
+    /// Forwarded keys use the "**tap**." prefix so they cannot collide with
+    /// manifest sink node ids. Empty preserves the legacy sink-only behavior.
+    #[prost(string, repeated, tag = "6")]
+    pub output_taps: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Generic streaming message that replaces AudioChunk
 ///
