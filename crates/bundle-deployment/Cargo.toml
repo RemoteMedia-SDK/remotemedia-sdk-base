@@ -1,0 +1,19 @@
+[package]
+name = "remotemedia-bundle-deployment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transport-neutral installation and activation for RemoteMedia bundles"
+
+[dependencies]
+remotemedia-bundle = { path = "../bundle" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
