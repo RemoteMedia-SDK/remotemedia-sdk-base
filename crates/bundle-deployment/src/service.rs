@@ -146,6 +146,15 @@ impl DeploymentService {
         F: FnMut(ProvisioningPhase) -> Result<(), String>,
     {
         self.authenticator.authorize(token)?;
+        if let Some(missing) = revision
+            .content_digests
+            .iter()
+            .find(|digest| !self.content.contains(digest))
+        {
+            return Err(DeploymentError::Provisioning(format!(
+                "required verified content is missing: {missing}"
+            )));
+        }
         {
             let mut operations = self.operations.lock().expect("operation lock poisoned");
             if operations.contains_key(operation_id) {
@@ -373,5 +382,21 @@ mod tests {
         let diagnostic = status.diagnostic.unwrap();
         assert!(!diagnostic.contains("abc"));
         assert!(!diagnostic.contains("xyz"));
+    }
+
+    #[test]
+    fn install_rejects_missing_verified_content_before_provisioning() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = service(temp.path());
+        let mut missing = revision("missing");
+        missing
+            .content_digests
+            .insert(format!("sha256:{}", "a".repeat(64)));
+        let result = service.install(b"secret", "missing-install", missing, 1, |_| Ok(()));
+        assert!(matches!(result, Err(DeploymentError::Provisioning(_))));
+        assert!(service
+            .status(b"secret", "missing-install")
+            .unwrap()
+            .is_none());
     }
 }
