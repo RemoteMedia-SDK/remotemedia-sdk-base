@@ -37,7 +37,9 @@ impl VideoEncoderNode {
         Ok(Self)
     }
     pub async fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
-        Err(crate::Error::EncodingError("Video support is disabled".to_string()))
+        Err(crate::Error::EncodingError(
+            "Video support is disabled".to_string(),
+        ))
     }
 }
 
@@ -59,7 +61,9 @@ impl VideoDecoderNode {
         Ok(Self)
     }
     pub async fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
-        Err(crate::Error::EncodingError("Video support is disabled".to_string()))
+        Err(crate::Error::EncodingError(
+            "Video support is disabled".to_string(),
+        ))
     }
 }
 use std::sync::Arc;

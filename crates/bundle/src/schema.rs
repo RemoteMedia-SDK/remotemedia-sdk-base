@@ -33,6 +33,8 @@ pub struct BundleLock {
     pub plugin_abi: CompatibilityRange,
     #[serde(default)]
     pub plugins: Vec<LockedPlugin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_runtime: Option<NativeRuntimeClosure>,
     #[serde(default)]
     pub python: Option<LockedPythonEnvironment>,
     #[serde(default)]
@@ -63,8 +65,45 @@ pub struct LockedPlugin {
     pub artifact_digest: String,
     pub target: String,
     pub plugin_abi: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_abi: Option<String>,
     pub node_types: Vec<String>,
     pub kind: PluginKind,
+}
+
+/// A native file that must be materialized below an activation-scoped release
+/// directory before a native plugin can be loaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeRuntimeFile {
+    pub digest: String,
+    pub size: u64,
+    pub path: String,
+    pub mode: NativeRuntimeFileMode,
+}
+
+/// A release-local symbolic link used to satisfy a native library SONAME.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeRuntimeSymlink {
+    pub path: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeRuntimeClosure {
+    #[serde(default)]
+    pub files: Vec<NativeRuntimeFile>,
+    #[serde(default)]
+    pub symlinks: Vec<NativeRuntimeSymlink>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeRuntimeFileMode {
+    ReadOnly,
+    Executable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -136,7 +175,7 @@ pub enum AcceleratorBackend {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct AssetDescriptor {
     pub name: String,
     pub digest: String,
@@ -217,6 +256,27 @@ pub struct VerificationReport {
     pub bundle_digest: String,
     #[serde(default)]
     pub findings: Vec<VerificationFinding>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_asset_descriptor_round_trips_with_storage_discriminator() {
+        let asset = AssetDescriptor {
+            name: "tiny-model.bin".to_owned(),
+            digest: "sha256:0123".to_owned(),
+            size: 4,
+            cache_key: "tiny-model".to_owned(),
+            license: None,
+            storage: AssetStorage::Embedded,
+        };
+
+        let bytes = serde_json::to_vec(&asset).unwrap();
+        let decoded: AssetDescriptor = serde_json::from_slice(&bytes).unwrap();
+        assert!(matches!(decoded.storage, AssetStorage::Embedded));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

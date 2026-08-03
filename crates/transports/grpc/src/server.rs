@@ -24,7 +24,8 @@ use remotemedia_bundle::{
     AcceleratorBackend, CompatibilityRange, RuntimeCapabilities, BUNDLE_SCHEMA_VERSION,
 };
 use remotemedia_bundle_deployment::{
-    ActivationRegistry, ContentStore, DeploymentService, TokenAuthenticator,
+    ActivationRegistry, ContentStore, DeploymentService, ReqwestExternalAssetTransport,
+    TokenAuthenticator,
 };
 use remotemedia_core::manifest::Manifest;
 use remotemedia_core::transport::{
@@ -55,7 +56,7 @@ impl GrpcServer {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let metrics = Arc::new(ServiceMetrics::with_default_registry()?);
 
-        let deployment = deployment_service_from_env()?;
+        let deployment = deployment_service_from_env(Arc::clone(&executor))?;
         Ok(Self {
             config,
             metrics,
@@ -331,6 +332,7 @@ impl GrpcServer {
 }
 
 fn deployment_service_from_env(
+    executor: Arc<PipelineExecutor>,
 ) -> Result<Option<BundleDeploymentServiceImpl>, Box<dyn std::error::Error>> {
     let Ok(token) = std::env::var("REMOTEMEDIA_DEPLOY_TOKEN") else {
         return Ok(None);
@@ -345,7 +347,7 @@ fn deployment_service_from_env(
     let capabilities = RuntimeCapabilities {
         schema_version: BUNDLE_SCHEMA_VERSION.to_owned(),
         os: std::env::consts::OS.to_owned(),
-        architecture: std::env::consts::ARCH.to_owned(),
+        architecture: runtime_architecture(),
         native_abi: std::env::var("REMOTEMEDIA_NATIVE_ABI").ok(),
         manifest_schemas: vec!["v1".to_owned()],
         plugin_abi: CompatibilityRange {
@@ -361,15 +363,21 @@ fn deployment_service_from_env(
     };
     let content = ContentStore::open(std::path::Path::new(&root).join("cas"))?;
     let registry = ActivationRegistry::open(std::path::Path::new(&root).join("state"))?;
+    let mut external_transport = ReqwestExternalAssetTransport::new()?;
+    if let Ok(token) = std::env::var("REMOTEMEDIA_EXTERNAL_ASSET_BEARER_TOKEN") {
+        external_transport = external_transport.with_bearer_token(token)?;
+    }
     let service = DeploymentService::new(
         TokenAuthenticator::new(token.as_bytes()),
         capabilities,
         content,
         registry,
-    );
+    )
+    .with_external_asset_transport(std::sync::Arc::new(external_transport));
     Ok(Some(BundleDeploymentServiceImpl::new(
         AuthConfig::new(vec![token], true),
         service,
+        executor,
     )))
 }
 
@@ -379,6 +387,14 @@ fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error>> 
             .parse()
             .map_err(|_| format!("{name} must be an unsigned integer"))?),
         Err(_) => Ok(default),
+    }
+}
+
+fn runtime_architecture() -> String {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64".to_owned(),
+        "aarch64" => "arm64".to_owned(),
+        architecture => architecture.to_owned(),
     }
 }
 
@@ -398,6 +414,11 @@ fn env_list(name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_linux_x86_architecture_for_bundle_profiles() {
+        assert_eq!(runtime_architecture(), "amd64");
+    }
 
     #[test]
     fn test_server_creation() {

@@ -12,20 +12,36 @@ use crate::generated::{
     bundle_deployment_service_server::BundleDeploymentService, ActivateBundleRequest, BlobIdentity,
     BundlePreflightRequest, CancelInstallRequest, DeploymentCapabilitiesRequest,
     DeploymentJsonResponse, EmptyDeploymentResponse, InstallBundleRequest, InstallStatusRequest,
-    MissingBlobsRequest, MissingBlobsResponse, RollbackBundleRequest, RollbackBundleResponse,
+    ListDeploymentsRequest, MissingBlobsRequest, MissingBlobsResponse, RollbackBundleRequest,
+    RollbackBundleResponse, SmokeTestDeploymentRequest, SmokeTestDeploymentResponse,
     UploadBlobChunk, UploadBlobResponse,
 };
+use remotemedia_core::{
+    data::RuntimeData,
+    manifest::Manifest,
+    transport::{PipelineExecutor, TransportData},
+};
+use std::sync::Arc;
 
 const PROTOCOL_VERSION: &str = "v1";
 
 pub struct BundleDeploymentServiceImpl {
     auth: AuthConfig,
     service: CoreDeploymentService,
+    executor: Arc<PipelineExecutor>,
 }
 
 impl BundleDeploymentServiceImpl {
-    pub fn new(auth: AuthConfig, service: CoreDeploymentService) -> Self {
-        Self { auth, service }
+    pub fn new(
+        auth: AuthConfig,
+        service: CoreDeploymentService,
+        executor: Arc<PipelineExecutor>,
+    ) -> Self {
+        Self {
+            auth,
+            service,
+            executor,
+        }
     }
 }
 
@@ -42,6 +58,19 @@ impl BundleDeploymentService for BundleDeploymentServiceImpl {
             .capabilities(token.as_bytes())
             .map_err(status)?;
         Ok(Response::new(json_response(&capabilities)?))
+    }
+
+    async fn list_deployments(
+        &self,
+        request: Request<ListDeploymentsRequest>,
+    ) -> Result<Response<DeploymentJsonResponse>, Status> {
+        let token = authorize(&request, &self.auth)?;
+        require_version(&request.get_ref().protocol_version)?;
+        let deployments = self
+            .service
+            .list_deployments(token.as_bytes())
+            .map_err(status)?;
+        Ok(Response::new(json_response(&deployments)?))
     }
 
     async fn preflight_bundle(
@@ -207,6 +236,46 @@ impl BundleDeploymentService for BundleDeploymentServiceImpl {
             active_bundle_digest,
         }))
     }
+
+    async fn smoke_test_deployment(
+        &self,
+        request: Request<SmokeTestDeploymentRequest>,
+    ) -> Result<Response<SmokeTestDeploymentResponse>, Status> {
+        const MAX_SMOKE_TEXT_BYTES: usize = 4096;
+
+        let token = authorize(&request, &self.auth)?;
+        let request = request.into_inner();
+        require_version(&request.protocol_version)?;
+        if request.input_text.len() > MAX_SMOKE_TEXT_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "smoke input exceeds {MAX_SMOKE_TEXT_BYTES} bytes"
+            )));
+        }
+        let (revision, manifest_bytes) = self
+            .service
+            .active_manifest(token.as_bytes(), &request.deployment_name)
+            .map_err(status)?;
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| Status::failed_precondition(format!("invalid deployed manifest: {error}")))?;
+        let output = self
+            .executor
+            .execute_unary(
+                Arc::new(manifest),
+                TransportData::new(RuntimeData::Text(request.input_text)),
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(format!("deployment smoke test failed: {error}")))?;
+        let RuntimeData::Text(output_text) = output.data else {
+            return Err(Status::failed_precondition(
+                "deployment smoke test produced non-text output",
+            ));
+        };
+        Ok(Response::new(SmokeTestDeploymentResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            active_bundle_digest: revision.bundle_digest,
+            output_text,
+        }))
+    }
 }
 
 fn authorize<T>(request: &Request<T>, auth: &AuthConfig) -> Result<String, Status> {
@@ -268,10 +337,14 @@ fn status(error: DeploymentError) -> Status {
         | DeploymentError::SizeMismatch { .. }
         | DeploymentError::OffsetMismatch { .. }
         | DeploymentError::InvalidName(_)
+        | DeploymentError::InvalidAssetSource(_)
         | DeploymentError::State(_) => Status::invalid_argument(error.to_string()),
-        DeploymentError::NotInstalled(_) | DeploymentError::NoPreviousRevision(_) => {
+        DeploymentError::NotInstalled(_)
+        | DeploymentError::NoPreviousRevision(_)
+        | DeploymentError::MissingManifestDigest(_) => {
             Status::failed_precondition(error.to_string())
         }
+        DeploymentError::ExternalAssetFetch(_) => Status::failed_precondition(error.to_string()),
         DeploymentError::OperationExists(_) => Status::already_exists(error.to_string()),
         DeploymentError::Cancelled(_) => Status::cancelled(error.to_string()),
         DeploymentError::DigestMismatch { .. }

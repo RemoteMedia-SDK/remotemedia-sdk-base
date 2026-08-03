@@ -416,7 +416,6 @@ mod tests {
 
     #[test]
     fn test_is_numpy_array() {
-
         Python::attach(|py| {
             // Try to import numpy (skip test if not available)
             if py.import("numpy").is_err() {
@@ -448,7 +447,6 @@ result = np.array([1.0, 2.0, 3.0])
 
     #[test]
     fn test_extract_numpy_metadata() {
-
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -478,7 +476,6 @@ result = np.array([[1, 2], [3, 4]], dtype=np.int32)
 
     #[test]
     fn test_numpy_roundtrip() {
-
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -522,7 +519,6 @@ result = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
 
     #[test]
     fn test_numpy_to_vec() {
-
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -550,7 +546,6 @@ result = np.array([1.0, 2.0, 3.0, 4.0])
 
     #[test]
     fn test_vec_to_numpy() {
-
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -573,7 +568,6 @@ result = np.array([1.0, 2.0, 3.0, 4.0])
 
     #[test]
     fn test_numpy_to_audio_buffer() {
-
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -611,7 +605,6 @@ result = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.float32)
 
     #[test]
     fn test_audio_buffer_to_numpy_mono() {
-
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -634,7 +627,6 @@ result = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.float32)
 
     #[test]
     fn test_audio_buffer_to_numpy_stereo() {
-
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -657,7 +649,6 @@ result = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.float32)
 
     #[test]
     fn test_zero_copy_roundtrip() {
-
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");

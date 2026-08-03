@@ -7,6 +7,7 @@ package remotemedia.v1;
 service BundleDeploymentService {
   rpc GetDeploymentCapabilities(DeploymentCapabilitiesRequest)
       returns (DeploymentJsonResponse);
+  rpc ListDeployments(ListDeploymentsRequest) returns (DeploymentJsonResponse);
   rpc PreflightBundle(BundlePreflightRequest) returns (DeploymentJsonResponse);
   rpc NegotiateMissingBlobs(MissingBlobsRequest) returns (MissingBlobsResponse);
   rpc UploadBlob(stream UploadBlobChunk) returns (UploadBlobResponse);
@@ -15,9 +16,15 @@ service BundleDeploymentService {
   rpc CancelInstall(CancelInstallRequest) returns (EmptyDeploymentResponse);
   rpc ActivateBundle(ActivateBundleRequest) returns (EmptyDeploymentResponse);
   rpc RollbackBundle(RollbackBundleRequest) returns (RollbackBundleResponse);
+  rpc SmokeTestDeployment(SmokeTestDeploymentRequest)
+      returns (SmokeTestDeploymentResponse);
 }
 
 message DeploymentCapabilitiesRequest {
+  string protocol_version = 1;
+}
+
+message ListDeploymentsRequest {
   string protocol_version = 1;
 }
 
@@ -90,6 +97,18 @@ message RollbackBundleRequest {
 message RollbackBundleResponse {
   string protocol_version = 1;
   string active_bundle_digest = 2;
+}
+
+message SmokeTestDeploymentRequest {
+  string protocol_version = 1;
+  string deployment_name = 2;
+  string input_text = 3;
+}
+
+message SmokeTestDeploymentResponse {
+  string protocol_version = 1;
+  string active_bundle_digest = 2;
+  string output_text = 3;
 }
 
 message EmptyDeploymentResponse {

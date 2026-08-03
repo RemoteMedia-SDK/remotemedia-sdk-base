@@ -615,7 +615,10 @@ impl Manifest {
     }
 
     /// Per-node diagnostics for logging/UI around model availability.
-    pub fn node_model_diagnostics(&self, base_dir: impl AsRef<Path>) -> Result<Vec<NodeModelDiagnostics>> {
+    pub fn node_model_diagnostics(
+        &self,
+        base_dir: impl AsRef<Path>,
+    ) -> Result<Vec<NodeModelDiagnostics>> {
         let mut diags = Vec::new();
         for node in &self.nodes {
             let Some(node_sources) = node
@@ -930,7 +933,10 @@ mod tests {
 
         let manifest = Manifest {
             version: "v1".to_string(),
-            metadata: ManifestMetadata { name: "test".to_string(), ..Default::default() },
+            metadata: ManifestMetadata {
+                name: "test".to_string(),
+                ..Default::default()
+            },
             nodes: vec![NodeManifest {
                 id: "asr".to_string(),
                 node_type: "WhisperNode".to_string(),
@@ -969,7 +975,10 @@ mod tests {
 
         let manifest = Manifest {
             version: "v1".to_string(),
-            metadata: ManifestMetadata { name: "test".to_string(), ..Default::default() },
+            metadata: ManifestMetadata {
+                name: "test".to_string(),
+                ..Default::default()
+            },
             nodes: vec![NodeManifest {
                 id: "asr".to_string(),
                 node_type: "WhisperNode".to_string(),
@@ -1010,7 +1019,10 @@ mod tests {
 
         let manifest = Manifest {
             version: "v1".to_string(),
-            metadata: ManifestMetadata { name: "test".to_string(), ..Default::default() },
+            metadata: ManifestMetadata {
+                name: "test".to_string(),
+                ..Default::default()
+            },
             nodes: vec![NodeManifest {
                 id: "asr".to_string(),
                 node_type: "WhisperNode".to_string(),

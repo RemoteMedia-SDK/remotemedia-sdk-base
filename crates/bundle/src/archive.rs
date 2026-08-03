@@ -682,6 +682,7 @@ mod tests {
                     maximum_exclusive: None,
                 },
                 plugins: Vec::new(),
+                native_runtime: None,
                 python: None,
                 assets: Vec::new(),
             };

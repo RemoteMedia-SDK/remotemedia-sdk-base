@@ -416,11 +416,7 @@ impl AudioBufferAccumulatorNode {
         }
     }
 
-    fn flush_buffer(
-        &self,
-        state: &mut BufferState,
-        session_id: &str,
-    ) -> Result<Vec<RuntimeData>> {
+    fn flush_buffer(&self, state: &mut BufferState, session_id: &str) -> Result<Vec<RuntimeData>> {
         if state.accumulated_samples.is_empty() {
             // Promoted to INFO: flushing with no samples means VAD
             // emitted speech_end before any audio chunks arrived in

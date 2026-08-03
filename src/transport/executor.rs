@@ -994,7 +994,10 @@ impl PipelineExecutor {
             .expect("default_pool mutex poisoned")
             .as_ref()
             .and_then(|weak| weak.upgrade());
-        tracing::info!("create_session: default_pool lock ok, pool={}", pool.is_some());
+        tracing::info!(
+            "create_session: default_pool lock ok, pool={}",
+            pool.is_some()
+        );
         if let Some(pool) = pool {
             tracing::info!("create_session: delegating to warm pool");
             return pool.acquire(manifest).await;

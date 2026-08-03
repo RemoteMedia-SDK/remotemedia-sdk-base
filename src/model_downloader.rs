@@ -32,7 +32,12 @@ impl HfModelDownloader {
         let mut resolved = Vec::new();
         for asset in &assets.assets {
             if asset.exists {
-                resolved.push(asset.resolved_path.clone().unwrap_or_else(|| PathBuf::from(&asset.path)));
+                resolved.push(
+                    asset
+                        .resolved_path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(&asset.path)),
+                );
                 continue;
             }
             if !asset.required {
@@ -54,9 +59,15 @@ impl HfModelDownloader {
     }
 }
 
-fn resolve_dest(downloader: &HfModelDownloader, asset: &crate::manifest::ResolvedModelAsset) -> PathBuf {
+fn resolve_dest(
+    downloader: &HfModelDownloader,
+    asset: &crate::manifest::ResolvedModelAsset,
+) -> PathBuf {
     if asset.path.is_empty() {
-        downloader.cache_root.join(&asset.node_id).join(&asset.filename)
+        downloader
+            .cache_root
+            .join(&asset.node_id)
+            .join(&asset.filename)
     } else {
         Path::new(&asset.path)
             .parent()

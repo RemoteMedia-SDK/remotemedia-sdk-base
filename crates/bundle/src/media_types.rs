@@ -10,6 +10,7 @@ pub const LOCKFILE: &str = "application/vnd.remotemedia.pipeline.lock.v1+json";
 pub const TARGET_REQUIREMENTS: &str =
     "application/vnd.remotemedia.pipeline.target-requirements.v1+json";
 pub const NATIVE_PLUGIN: &str = "application/vnd.remotemedia.pipeline.plugin.native.v1";
+pub const NATIVE_RUNTIME_FILE: &str = "application/vnd.remotemedia.pipeline.runtime.native.v1";
 pub const PYTHON_WHEEL: &str = "application/vnd.remotemedia.pipeline.python.wheel.v1";
 pub const EMBEDDED_ASSET: &str = "application/vnd.remotemedia.pipeline.asset.v1";
 pub const EXTERNAL_ASSETS: &str = "application/vnd.remotemedia.pipeline.assets.v1+json";
