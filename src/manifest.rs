@@ -470,6 +470,24 @@ pub struct ModelSourceFile {
     /// this location instead of deriving a URL from `source`/`filename`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Immutable upstream revision for externally cached deployment assets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// Exact byte size for an external asset. Embedded assets derive this on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Stable content-cache identity. Defaults to the SHA-256 digest when embedded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+    /// Force embedding (`true`) or external caching (`false`) during bundle packing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed: Option<bool>,
+    /// Optional SPDX license identifier for SBOM generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// Whether the deployment target may supply credentials for an external source.
+    #[serde(default)]
+    pub target_may_supply_credentials: bool,
 }
 
 /// Per-node model sources declaration in `params["model_sources"]`.
@@ -493,6 +511,13 @@ pub struct ResolvedModelAsset {
     pub required: bool,
     /// Optional expected SHA256 (hex, lowercase).
     pub sha256: Option<String>,
+    pub url: Option<String>,
+    pub revision: Option<String>,
+    pub size: Option<u64>,
+    pub cache_key: Option<String>,
+    pub embed: Option<bool>,
+    pub license: Option<String>,
+    pub target_may_supply_credentials: bool,
     /// Absolute resolved path checked on disk, if provided by base_dir.
     pub resolved_path: Option<PathBuf>,
     /// Whether the resolved path currently exists on disk.
@@ -565,6 +590,13 @@ impl Manifest {
                     source: file.source,
                     required: file.required,
                     sha256: file.sha256.clone(),
+                    url: file.url.clone(),
+                    revision: file.revision.clone(),
+                    size: file.size,
+                    cache_key: file.cache_key.clone(),
+                    embed: file.embed,
+                    license: file.license.clone(),
+                    target_may_supply_credentials: file.target_may_supply_credentials,
                     resolved_path: resolved,
                     exists,
                 };
@@ -583,7 +615,10 @@ impl Manifest {
     }
 
     /// Per-node diagnostics for logging/UI around model availability.
-    pub fn node_model_diagnostics(&self, base_dir: impl AsRef<Path>) -> Result<Vec<NodeModelDiagnostics>> {
+    pub fn node_model_diagnostics(
+        &self,
+        base_dir: impl AsRef<Path>,
+    ) -> Result<Vec<NodeModelDiagnostics>> {
         let mut diags = Vec::new();
         for node in &self.nodes {
             let Some(node_sources) = node
@@ -898,7 +933,10 @@ mod tests {
 
         let manifest = Manifest {
             version: "v1".to_string(),
-            metadata: ManifestMetadata { name: "test".to_string(), ..Default::default() },
+            metadata: ManifestMetadata {
+                name: "test".to_string(),
+                ..Default::default()
+            },
             nodes: vec![NodeManifest {
                 id: "asr".to_string(),
                 node_type: "WhisperNode".to_string(),
@@ -937,7 +975,10 @@ mod tests {
 
         let manifest = Manifest {
             version: "v1".to_string(),
-            metadata: ManifestMetadata { name: "test".to_string(), ..Default::default() },
+            metadata: ManifestMetadata {
+                name: "test".to_string(),
+                ..Default::default()
+            },
             nodes: vec![NodeManifest {
                 id: "asr".to_string(),
                 node_type: "WhisperNode".to_string(),
@@ -978,7 +1019,10 @@ mod tests {
 
         let manifest = Manifest {
             version: "v1".to_string(),
-            metadata: ManifestMetadata { name: "test".to_string(), ..Default::default() },
+            metadata: ManifestMetadata {
+                name: "test".to_string(),
+                ..Default::default()
+            },
             nodes: vec![NodeManifest {
                 id: "asr".to_string(),
                 node_type: "WhisperNode".to_string(),

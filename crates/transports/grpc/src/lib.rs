@@ -29,6 +29,7 @@ pub mod auth;
 pub mod builder;
 pub mod client;
 pub mod control;
+pub mod deployment;
 pub mod execution;
 pub mod limits;
 pub mod metrics;

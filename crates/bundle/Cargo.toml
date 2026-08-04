@@ -1,0 +1,23 @@
+[package]
+name = "remotemedia-bundle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable RemoteMedia pipeline bundle contracts and OCI archive support"
+
+[dependencies]
+hex.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

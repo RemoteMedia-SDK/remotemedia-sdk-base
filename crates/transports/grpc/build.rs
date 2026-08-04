@@ -25,6 +25,7 @@ fn compile_protos() {
                 "../../../proto/streaming.proto",
                 "../../../proto/webrtc_signaling.proto",
                 "../../../proto/control.proto",
+                "../../../proto/deployment.proto",
             ],
             &["../../../proto/"],
         )

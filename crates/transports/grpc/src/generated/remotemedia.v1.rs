@@ -3038,3 +3038,1309 @@ pub mod pipeline_control_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeploymentCapabilitiesRequest {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListDeploymentsRequest {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeploymentJsonResponse {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub canonical_json: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BundlePreflightRequest {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub candidates_json: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BlobIdentity {
+    #[prost(string, tag = "1")]
+    pub digest: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub size: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MissingBlobsRequest {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub blobs: ::prost::alloc::vec::Vec<BlobIdentity>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MissingBlobsResponse {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub missing: ::prost::alloc::vec::Vec<BlobIdentity>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UploadBlobChunk {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub blob: ::core::option::Option<BlobIdentity>,
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UploadBlobResponse {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub digest: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub committed_size: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InstallBundleRequest {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub operation_id: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "3")]
+    pub revision_json: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    pub total_bytes: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InstallStatusRequest {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub operation_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CancelInstallRequest {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub operation_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ActivateBundleRequest {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub deployment_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub bundle_digest: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RollbackBundleRequest {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub deployment_name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RollbackBundleResponse {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub active_bundle_digest: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SmokeTestDeploymentRequest {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub deployment_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub input_text: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SmokeTestDeploymentResponse {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub active_bundle_digest: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub output_text: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EmptyDeploymentResponse {
+    #[prost(string, tag = "1")]
+    pub protocol_version: ::prost::alloc::string::String,
+}
+/// Generated client implementations.
+pub mod bundle_deployment_service_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    /// Versioned bundle deployment is intentionally separate from live pipeline
+    /// sessions and black-box test control.
+    #[derive(Debug, Clone)]
+    pub struct BundleDeploymentServiceClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl BundleDeploymentServiceClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
+    impl<T> BundleDeploymentServiceClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> BundleDeploymentServiceClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            BundleDeploymentServiceClient::new(
+                InterceptedService::new(inner, interceptor),
+            )
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        pub async fn get_deployment_capabilities(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeploymentCapabilitiesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeploymentJsonResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/GetDeploymentCapabilities",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "GetDeploymentCapabilities",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_deployments(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListDeploymentsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeploymentJsonResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/ListDeployments",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "ListDeployments",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn preflight_bundle(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BundlePreflightRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeploymentJsonResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/PreflightBundle",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "PreflightBundle",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn negotiate_missing_blobs(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MissingBlobsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::MissingBlobsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/NegotiateMissingBlobs",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "NegotiateMissingBlobs",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn upload_blob(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::UploadBlobChunk>,
+        ) -> std::result::Result<
+            tonic::Response<super::UploadBlobResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/UploadBlob",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "UploadBlob",
+                    ),
+                );
+            self.inner.client_streaming(req, path, codec).await
+        }
+        pub async fn install_bundle(
+            &mut self,
+            request: impl tonic::IntoRequest<super::InstallBundleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeploymentJsonResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/InstallBundle",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "InstallBundle",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_install_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::InstallStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeploymentJsonResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/GetInstallStatus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "GetInstallStatus",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn cancel_install(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CancelInstallRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::EmptyDeploymentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/CancelInstall",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "CancelInstall",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn activate_bundle(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ActivateBundleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::EmptyDeploymentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/ActivateBundle",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "ActivateBundle",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn rollback_bundle(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RollbackBundleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RollbackBundleResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/RollbackBundle",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "RollbackBundle",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn smoke_test_deployment(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SmokeTestDeploymentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SmokeTestDeploymentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.BundleDeploymentService/SmokeTestDeployment",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "remotemedia.v1.BundleDeploymentService",
+                        "SmokeTestDeployment",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod bundle_deployment_service_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with BundleDeploymentServiceServer.
+    #[async_trait]
+    pub trait BundleDeploymentService: std::marker::Send + std::marker::Sync + 'static {
+        async fn get_deployment_capabilities(
+            &self,
+            request: tonic::Request<super::DeploymentCapabilitiesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeploymentJsonResponse>,
+            tonic::Status,
+        >;
+        async fn list_deployments(
+            &self,
+            request: tonic::Request<super::ListDeploymentsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeploymentJsonResponse>,
+            tonic::Status,
+        >;
+        async fn preflight_bundle(
+            &self,
+            request: tonic::Request<super::BundlePreflightRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeploymentJsonResponse>,
+            tonic::Status,
+        >;
+        async fn negotiate_missing_blobs(
+            &self,
+            request: tonic::Request<super::MissingBlobsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::MissingBlobsResponse>,
+            tonic::Status,
+        >;
+        async fn upload_blob(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::UploadBlobChunk>>,
+        ) -> std::result::Result<
+            tonic::Response<super::UploadBlobResponse>,
+            tonic::Status,
+        >;
+        async fn install_bundle(
+            &self,
+            request: tonic::Request<super::InstallBundleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeploymentJsonResponse>,
+            tonic::Status,
+        >;
+        async fn get_install_status(
+            &self,
+            request: tonic::Request<super::InstallStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DeploymentJsonResponse>,
+            tonic::Status,
+        >;
+        async fn cancel_install(
+            &self,
+            request: tonic::Request<super::CancelInstallRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::EmptyDeploymentResponse>,
+            tonic::Status,
+        >;
+        async fn activate_bundle(
+            &self,
+            request: tonic::Request<super::ActivateBundleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::EmptyDeploymentResponse>,
+            tonic::Status,
+        >;
+        async fn rollback_bundle(
+            &self,
+            request: tonic::Request<super::RollbackBundleRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RollbackBundleResponse>,
+            tonic::Status,
+        >;
+        async fn smoke_test_deployment(
+            &self,
+            request: tonic::Request<super::SmokeTestDeploymentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SmokeTestDeploymentResponse>,
+            tonic::Status,
+        >;
+    }
+    /// Versioned bundle deployment is intentionally separate from live pipeline
+    /// sessions and black-box test control.
+    #[derive(Debug)]
+    pub struct BundleDeploymentServiceServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> BundleDeploymentServiceServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>>
+    for BundleDeploymentServiceServer<T>
+    where
+        T: BundleDeploymentService,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/remotemedia.v1.BundleDeploymentService/GetDeploymentCapabilities" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetDeploymentCapabilitiesSvc<T: BundleDeploymentService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::UnaryService<super::DeploymentCapabilitiesRequest>
+                    for GetDeploymentCapabilitiesSvc<T> {
+                        type Response = super::DeploymentJsonResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeploymentCapabilitiesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::get_deployment_capabilities(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetDeploymentCapabilitiesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.BundleDeploymentService/ListDeployments" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListDeploymentsSvc<T: BundleDeploymentService>(pub Arc<T>);
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::UnaryService<super::ListDeploymentsRequest>
+                    for ListDeploymentsSvc<T> {
+                        type Response = super::DeploymentJsonResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListDeploymentsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::list_deployments(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListDeploymentsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.BundleDeploymentService/PreflightBundle" => {
+                    #[allow(non_camel_case_types)]
+                    struct PreflightBundleSvc<T: BundleDeploymentService>(pub Arc<T>);
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::UnaryService<super::BundlePreflightRequest>
+                    for PreflightBundleSvc<T> {
+                        type Response = super::DeploymentJsonResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::BundlePreflightRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::preflight_bundle(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PreflightBundleSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.BundleDeploymentService/NegotiateMissingBlobs" => {
+                    #[allow(non_camel_case_types)]
+                    struct NegotiateMissingBlobsSvc<T: BundleDeploymentService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::UnaryService<super::MissingBlobsRequest>
+                    for NegotiateMissingBlobsSvc<T> {
+                        type Response = super::MissingBlobsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::MissingBlobsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::negotiate_missing_blobs(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = NegotiateMissingBlobsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.BundleDeploymentService/UploadBlob" => {
+                    #[allow(non_camel_case_types)]
+                    struct UploadBlobSvc<T: BundleDeploymentService>(pub Arc<T>);
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::ClientStreamingService<super::UploadBlobChunk>
+                    for UploadBlobSvc<T> {
+                        type Response = super::UploadBlobResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::UploadBlobChunk>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::upload_blob(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UploadBlobSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.client_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.BundleDeploymentService/InstallBundle" => {
+                    #[allow(non_camel_case_types)]
+                    struct InstallBundleSvc<T: BundleDeploymentService>(pub Arc<T>);
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::UnaryService<super::InstallBundleRequest>
+                    for InstallBundleSvc<T> {
+                        type Response = super::DeploymentJsonResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::InstallBundleRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::install_bundle(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = InstallBundleSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.BundleDeploymentService/GetInstallStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetInstallStatusSvc<T: BundleDeploymentService>(pub Arc<T>);
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::UnaryService<super::InstallStatusRequest>
+                    for GetInstallStatusSvc<T> {
+                        type Response = super::DeploymentJsonResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::InstallStatusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::get_install_status(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetInstallStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.BundleDeploymentService/CancelInstall" => {
+                    #[allow(non_camel_case_types)]
+                    struct CancelInstallSvc<T: BundleDeploymentService>(pub Arc<T>);
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::UnaryService<super::CancelInstallRequest>
+                    for CancelInstallSvc<T> {
+                        type Response = super::EmptyDeploymentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CancelInstallRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::cancel_install(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CancelInstallSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.BundleDeploymentService/ActivateBundle" => {
+                    #[allow(non_camel_case_types)]
+                    struct ActivateBundleSvc<T: BundleDeploymentService>(pub Arc<T>);
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::UnaryService<super::ActivateBundleRequest>
+                    for ActivateBundleSvc<T> {
+                        type Response = super::EmptyDeploymentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ActivateBundleRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::activate_bundle(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ActivateBundleSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.BundleDeploymentService/RollbackBundle" => {
+                    #[allow(non_camel_case_types)]
+                    struct RollbackBundleSvc<T: BundleDeploymentService>(pub Arc<T>);
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::UnaryService<super::RollbackBundleRequest>
+                    for RollbackBundleSvc<T> {
+                        type Response = super::RollbackBundleResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RollbackBundleRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::rollback_bundle(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RollbackBundleSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.BundleDeploymentService/SmokeTestDeployment" => {
+                    #[allow(non_camel_case_types)]
+                    struct SmokeTestDeploymentSvc<T: BundleDeploymentService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: BundleDeploymentService,
+                    > tonic::server::UnaryService<super::SmokeTestDeploymentRequest>
+                    for SmokeTestDeploymentSvc<T> {
+                        type Response = super::SmokeTestDeploymentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SmokeTestDeploymentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as BundleDeploymentService>::smoke_test_deployment(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SmokeTestDeploymentSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for BundleDeploymentServiceServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "remotemedia.v1.BundleDeploymentService";
+    impl<T> tonic::server::NamedService for BundleDeploymentServiceServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}

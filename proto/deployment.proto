@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package remotemedia.v1;
+
+// Versioned bundle deployment is intentionally separate from live pipeline
+// sessions and black-box test control.
+service BundleDeploymentService {
+  rpc GetDeploymentCapabilities(DeploymentCapabilitiesRequest)
+      returns (DeploymentJsonResponse);
+  rpc ListDeployments(ListDeploymentsRequest) returns (DeploymentJsonResponse);
+  rpc PreflightBundle(BundlePreflightRequest) returns (DeploymentJsonResponse);
+  rpc NegotiateMissingBlobs(MissingBlobsRequest) returns (MissingBlobsResponse);
+  rpc UploadBlob(stream UploadBlobChunk) returns (UploadBlobResponse);
+  rpc InstallBundle(InstallBundleRequest) returns (DeploymentJsonResponse);
+  rpc GetInstallStatus(InstallStatusRequest) returns (DeploymentJsonResponse);
+  rpc CancelInstall(CancelInstallRequest) returns (EmptyDeploymentResponse);
+  rpc ActivateBundle(ActivateBundleRequest) returns (EmptyDeploymentResponse);
+  rpc RollbackBundle(RollbackBundleRequest) returns (RollbackBundleResponse);
+  rpc SmokeTestDeployment(SmokeTestDeploymentRequest)
+      returns (SmokeTestDeploymentResponse);
+}
+
+message DeploymentCapabilitiesRequest {
+  string protocol_version = 1;
+}
+
+message ListDeploymentsRequest {
+  string protocol_version = 1;
+}
+
+message DeploymentJsonResponse {
+  string protocol_version = 1;
+  bytes canonical_json = 2;
+}
+
+message BundlePreflightRequest {
+  string protocol_version = 1;
+  bytes candidates_json = 2;
+}
+
+message BlobIdentity {
+  string digest = 1;
+  uint64 size = 2;
+}
+
+message MissingBlobsRequest {
+  string protocol_version = 1;
+  repeated BlobIdentity blobs = 2;
+}
+
+message MissingBlobsResponse {
+  string protocol_version = 1;
+  repeated BlobIdentity missing = 2;
+}
+
+message UploadBlobChunk {
+  string protocol_version = 1;
+  BlobIdentity blob = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+}
+
+message UploadBlobResponse {
+  string protocol_version = 1;
+  string digest = 2;
+  uint64 committed_size = 3;
+}
+
+message InstallBundleRequest {
+  string protocol_version = 1;
+  string operation_id = 2;
+  bytes revision_json = 3;
+  uint64 total_bytes = 4;
+}
+
+message InstallStatusRequest {
+  string protocol_version = 1;
+  string operation_id = 2;
+}
+
+message CancelInstallRequest {
+  string protocol_version = 1;
+  string operation_id = 2;
+}
+
+message ActivateBundleRequest {
+  string protocol_version = 1;
+  string deployment_name = 2;
+  string bundle_digest = 3;
+}
+
+message RollbackBundleRequest {
+  string protocol_version = 1;
+  string deployment_name = 2;
+}
+
+message RollbackBundleResponse {
+  string protocol_version = 1;
+  string active_bundle_digest = 2;
+}
+
+message SmokeTestDeploymentRequest {
+  string protocol_version = 1;
+  string deployment_name = 2;
+  string input_text = 3;
+}
+
+message SmokeTestDeploymentResponse {
+  string protocol_version = 1;
+  string active_bundle_digest = 2;
+  string output_text = 3;
+}
+
+message EmptyDeploymentResponse {
+  string protocol_version = 1;
+}
