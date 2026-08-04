@@ -198,6 +198,10 @@ pub(crate) struct StreamSession {
     /// plugin stays valid across chunks.
     pub(crate) embedded_cas_guard: Option<crate::embedded_plugin::CasGuard>,
 
+    /// Guard keeping a materialized embedded Python venv (shipped via
+    /// `embedded_python_env`) on disk for the session lifetime.
+    pub(crate) embedded_python_env_guard: Option<crate::embedded_plugin::PythonEnvGuard>,
+
     /// Expected next sequence number
     next_sequence: u64,
 
@@ -262,12 +266,14 @@ impl StreamSession {
         manifest: Manifest,
         recommended_chunk_size: u64,
         embedded_cas_guard: Option<crate::embedded_plugin::CasGuard>,
+        embedded_python_env_guard: Option<crate::embedded_plugin::PythonEnvGuard>,
     ) -> Self {
         let now = Instant::now();
         Self {
             session_id,
             manifest,
             embedded_cas_guard,
+            embedded_python_env_guard,
             next_sequence: 0,
             chunks_processed: 0,
             total_items: 0,
@@ -924,9 +930,31 @@ async fn handle_stream_init(
     // without a prior deploy. Held for the session lifetime.
     let embedded_cas_guard = if !init.embedded_plugins.is_empty() {
         Some(
-            crate::embedded_plugin::materialize_embedded_plugins(&init.embedded_plugins, &mut manifest)
-                .map_err(|e| ServiceError::Validation(e))?,
+            crate::embedded_plugin::materialize_embedded_plugins(
+                &init.embedded_plugins,
+                &mut manifest,
+            )
+            .map_err(|e| ServiceError::Validation(e))?,
         )
+    } else {
+        None
+    };
+
+    // Materialize an embedded (frozen) Python wheelhouse shipped inline with
+    // the init into a venv and record it on the manifest, so Python nodes run
+    // against the prebuilt env (no network, no resolution). Held for the
+    // session lifetime.
+    let embedded_python_env_guard = if let Some(py) = init.embedded_python_env.as_ref() {
+        let decoded = crate::embedded_plugin::decode_embedded_python_env(py);
+        let (venv_python, guard) =
+            crate::embedded_plugin::materialize_embedded_python_env(&decoded)
+                .map_err(ServiceError::Validation)?;
+        manifest.python_env = Some(remotemedia_core::manifest::ManifestPythonEnv {
+            explicit_venv: Some(venv_python),
+            scope: Some(remotemedia_core::python::env_manager::EnvScope::PerPipeline),
+            ..Default::default()
+        });
+        Some(guard)
     } else {
         None
     };
@@ -952,6 +980,7 @@ async fn handle_stream_init(
         manifest,
         recommended_chunk_size,
         embedded_cas_guard,
+        embedded_python_env_guard,
     )));
 
     // Store session

@@ -182,6 +182,43 @@ impl PipelineExecutionService for ExecutionServiceImpl {
             None
         };
 
+        // Materialize an embedded (frozen) Python wheelhouse shipped inline
+        // with the request into a venv, and record it on the manifest so the
+        // multiprocess executor uses it directly (no network, no resolution).
+        let _py_env_guard = if let Some(py) = req.embedded_python_env.as_ref() {
+            let decoded = crate::embedded_plugin::decode_embedded_python_env(py);
+            match crate::embedded_plugin::materialize_embedded_python_env(&decoded) {
+                Ok((venv_python, guard)) => {
+                    manifest.python_env = Some(remotemedia_core::manifest::ManifestPythonEnv {
+                        explicit_venv: Some(venv_python),
+                        scope: Some(remotemedia_core::python::env_manager::EnvScope::PerPipeline),
+                        ..Default::default()
+                    });
+                    Some(guard)
+                }
+                Err(e) => {
+                    self.metrics
+                        .record_request_end("ExecutePipeline", "error", start_time);
+                    self.metrics.record_error("python_env");
+                    let error_response = ErrorResponse {
+                        error_type: ErrorType::Validation as i32,
+                        message: e,
+                        failing_node_id: String::new(),
+                        context: "Embedded Python environment materialization failed".to_string(),
+                        stack_trace: String::new(),
+                    };
+                    let response = ExecuteResponse {
+                        outcome: Some(crate::generated::execute_response::Outcome::Error(
+                            error_response,
+                        )),
+                    };
+                    return Ok(Response::new(response));
+                }
+            }
+        } else {
+            None
+        };
+
         let manifest = Arc::new(manifest);
 
         // Validate manifest

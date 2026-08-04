@@ -629,6 +629,18 @@ impl SessionRouter {
                         );
                     }
                 }
+                // A server-materialized embedded (frozen) venv wins over any
+                // dep resolution: point the node straight at it.
+                if let Some(ref explicit_venv) = py_env.explicit_venv {
+                    if !explicit_venv.is_empty() {
+                        if let Some(obj) = params.as_object_mut() {
+                            obj.insert(
+                                "__python_explicit_venv__".to_string(),
+                                serde_json::json!(explicit_venv),
+                            );
+                        }
+                    }
+                }
             }
             let effective_scope = node_spec
                 .python_env

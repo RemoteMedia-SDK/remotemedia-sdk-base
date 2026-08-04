@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use remotemedia_core::manifest::{Manifest, PluginSpec, PluginSpecExplicit};
+use remotemedia_core::transport::client::EmbeddedPythonEnv;
 
 use crate::generated::EmbeddedPluginBlob;
 
@@ -47,8 +48,7 @@ pub fn materialize_embedded_plugins(
             return Err("embedded plugin blob with empty digest".to_string());
         }
         let path = cas.join(format!("{digest}.so"));
-        std::fs::write(&path, &blob.content)
-            .map_err(|e| format!("write plugin {digest}: {e}"))?;
+        std::fs::write(&path, &blob.content).map_err(|e| format!("write plugin {digest}: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -90,6 +90,157 @@ pub fn embedded_digest_of(spec: &PluginSpec) -> Option<String> {
         .strip_prefix("embedded:")
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty())
+}
+
+/// Removes a materialized Python environment (venv + wheelhouse) when dropped
+/// (best effort). Hold the guard for as long as the venv must stay usable —
+/// the whole request for unary execution, the whole session for streaming.
+pub struct PythonEnvGuard(PathBuf);
+
+impl PythonEnvGuard {
+    /// Root temp dir holding `wheels/` and `venv/`.
+    pub fn root(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for PythonEnvGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Relative path of the python binary inside a venv for this platform.
+fn venv_python_rel() -> &'static str {
+    if cfg!(windows) {
+        "Scripts/python.exe"
+    } else {
+        "bin/python"
+    }
+}
+
+/// Materialize an embedded (frozen) Python wheelhouse into a fresh venv.
+///
+/// Writes each wheel to a content-addressed wheels dir, creates a venv with
+/// `python3 -m venv`, then installs the wheels with `pip --no-index` (fully
+/// offline — no network, no dependency resolution against an index).
+///
+/// Returns `(path_to_venv_python, guard)`; the guard removes the temp tree on
+/// drop.
+pub fn materialize_embedded_python_env(
+    env: &EmbeddedPythonEnv,
+) -> Result<(String, PythonEnvGuard), String> {
+    let root =
+        std::env::temp_dir().join(format!("rm-pyenv-{}-{}", std::process::id(), uuid_suffix()));
+    let wheels_dir = root.join("wheels");
+    let venv_dir = root.join("venv");
+    std::fs::create_dir_all(&wheels_dir)
+        .map_err(|e| format!("create wheels dir {wheels_dir:?}: {e}"))?;
+
+    // Guard from here on so early returns clean up the partial tree.
+    let guard = PythonEnvGuard(root.clone());
+
+    let mut wheel_paths: Vec<PathBuf> = Vec::with_capacity(env.wheels.len());
+    for wheel in &env.wheels {
+        let digest = wheel.digest.trim();
+        if digest.is_empty() {
+            return Err(format!(
+                "embedded python wheel '{}' has empty digest",
+                wheel.filename
+            ));
+        }
+        let filename = if wheel.filename.trim().is_empty() {
+            format!("{}.whl", wheel.name)
+        } else {
+            wheel.filename.clone()
+        };
+        let path = wheels_dir.join(format!("{digest}-{filename}"));
+        std::fs::write(&path, &wheel.content)
+            .map_err(|e| format!("write wheel {filename}: {e}"))?;
+        wheel_paths.push(path);
+    }
+
+    // Create the venv.
+    let out = std::process::Command::new("python3")
+        .arg("-m")
+        .arg("venv")
+        .arg(&venv_dir)
+        .output()
+        .map_err(|e| format!("spawn `python3 -m venv`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "python3 -m venv {venv_dir:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+
+    let venv_python = venv_dir.join(venv_python_rel());
+
+    // Install the wheels offline.
+    if !wheel_paths.is_empty() {
+        let mut cmd = std::process::Command::new(&venv_python);
+        cmd.arg("-m")
+            .arg("pip")
+            .arg("install")
+            .arg("--no-index")
+            .arg("--disable-pip-version-check")
+            .arg("--find-links")
+            .arg(&wheels_dir);
+        for path in &wheel_paths {
+            cmd.arg(path);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("spawn pip install in embedded venv: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "offline pip install of embedded wheels failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+
+    Ok((venv_python.to_string_lossy().into_owned(), guard))
+}
+
+/// Convert the wire (proto) embedded python env into the decoded core type.
+pub fn decode_embedded_python_env(py: &crate::generated::EmbeddedPythonEnv) -> EmbeddedPythonEnv {
+    use remotemedia_core::transport::client::{EmbeddedInterpreter, EmbeddedWheel};
+    EmbeddedPythonEnv {
+        interpreter: EmbeddedInterpreter {
+            implementation: py
+                .interpreter
+                .as_ref()
+                .map(|i| i.implementation.clone())
+                .unwrap_or_default(),
+            version: py
+                .interpreter
+                .as_ref()
+                .map(|i| i.version.clone())
+                .unwrap_or_default(),
+            abi: py
+                .interpreter
+                .as_ref()
+                .map(|i| i.abi.clone())
+                .unwrap_or_default(),
+            accelerator: py
+                .interpreter
+                .as_ref()
+                .map(|i| i.accelerator.clone())
+                .unwrap_or_default(),
+        },
+        wheel_set_digest: py.wheel_set_digest.clone(),
+        wheels: py
+            .wheels
+            .iter()
+            .map(|w| EmbeddedWheel {
+                name: w.name.clone(),
+                filename: w.filename.clone(),
+                digest: w.digest.clone(),
+                content: w.content.clone(),
+            })
+            .collect(),
+    }
 }
 
 /// Small entropy suffix to avoid temp-dir collisions.

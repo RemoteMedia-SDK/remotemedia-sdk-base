@@ -160,6 +160,13 @@ pub struct ManifestPythonEnv {
     /// Extra dependencies added to all nodes in this pipeline.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_deps: Vec<String>,
+
+    /// Path to a prebuilt virtual environment that the server materialized from
+    /// an embedded (frozen) Python wheelhouse shipped inline with the request.
+    /// When set, the multiprocess executor uses this venv directly instead of
+    /// creating/resolving one. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit_venv: Option<String>,
 }
 
 /// Python environment settings declared on a single node.

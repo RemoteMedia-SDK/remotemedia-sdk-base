@@ -2655,7 +2655,49 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 .get("__python_env_scope_context__")
                 .and_then(|value| value.as_str());
 
-            match env_mgr.ensure_env_scoped(&merged, scope_context).await {
+            // A prebuilt venv materialized by the server from an embedded
+            // (frozen) wheelhouse short-circuits provisioning entirely: use it
+            // as-is, with no venv creation, resolution, or network access.
+            let explicit_venv = ctx
+                .params
+                .get("__python_explicit_venv__")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let env_result = if let Some(explicit) = explicit_venv {
+                let raw = std::path::PathBuf::from(explicit);
+                // Accept either the venv root or the python binary inside it.
+                let (root, python_executable) = if raw.is_dir() {
+                    let rel = if cfg!(windows) {
+                        "Scripts/python.exe"
+                    } else {
+                        "bin/python"
+                    };
+                    (raw.clone(), raw.join(rel))
+                } else {
+                    let root = raw
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| raw.clone());
+                    (root, raw.clone())
+                };
+                tracing::info!(
+                    node_id = %ctx.node_id,
+                    python = %python_executable.display(),
+                    "Using prebuilt embedded Python environment (no provisioning)"
+                );
+                Ok(crate::python::env_manager::VenvInfo {
+                    path: root,
+                    python_executable,
+                    cache_key: "embedded-explicit-venv".to_string(),
+                })
+            } else {
+                env_mgr.ensure_env_scoped(&merged, scope_context).await
+            };
+
+            match env_result {
                 Ok(venv_info) => {
                     tracing::info!(
                         node_id = %ctx.node_id,
