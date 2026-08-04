@@ -146,6 +146,7 @@ impl PipelineClient for WebRtcPipelineClient {
         &self,
         _manifest: Arc<Manifest>,
         _input: TransportData,
+        _embedded_plugins: &[(String, Vec<u8>)],
     ) -> remotemedia_core::Result<TransportData> {
         // TODO: Implement WebRTC execution
         //

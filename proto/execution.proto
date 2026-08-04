@@ -81,6 +81,27 @@ message ExecuteRequest {
   // Client protocol version (e.g., "v1")
   // Service validates compatibility and returns ERROR_TYPE_VERSION_MISMATCH if incompatible
   string client_version = 4;
+
+  // Self-contained native plugin blobs (frozen into a portable pipeline
+  // bundle) shipped alongside the manifest so the server can dlopen them
+  // without a prior deploy or a resolvable filesystem path.
+  //
+  // Each entry carries the plugin's sha256 digest (matching the bundle lock's
+  // artifact_digest) and its raw bytes. When the manifest's plugin specs use
+  // the `embedded:<digest>` shorthand, the server materializes each blob into
+  // a content-addressed file and rewrites those specs to point at it before
+  // loading plugins.
+  repeated EmbeddedPluginBlob embedded_plugins = 5;
+}
+
+// A native plugin blob shipped inline with an ExecuteRequest so the server
+// can load it without a prior deploy.
+message EmbeddedPluginBlob {
+  // sha256 hex digest of `content` (matches the bundle lock artifact_digest).
+  string digest = 1;
+
+  // Raw plugin bytes (cdylib .so / .dylib / .dll).
+  bytes content = 2;
 }
 
 // Response from pipeline execution (unchanged from Feature 003)

@@ -53,7 +53,7 @@ use crate::generated::{
     execute_response::Outcome, pipeline_execution_service_client::PipelineExecutionServiceClient,
     stream_control::Command, stream_request::Request as StreamRequestKind,
     stream_response::Response as StreamResponseKind, streaming_pipeline_service_client::
-        StreamingPipelineServiceClient, DataChunk, ExecuteRequest, ExecuteResponse,
+        StreamingPipelineServiceClient, DataChunk, EmbeddedPluginBlob, ExecuteRequest, ExecuteResponse,
     ExecutionStatus, PipelineManifest, StreamControl, StreamInit, StreamRequest, StreamResponse,
 };
 
@@ -212,6 +212,7 @@ impl PipelineClient for GrpcPipelineClient {
         &self,
         manifest: Arc<Manifest>,
         input: TransportData,
+        embedded_plugins: &[(String, Vec<u8>)],
     ) -> Result<TransportData> {
         let proto_manifest = Self::manifest_to_proto(&manifest)?;
         let input_node = Self::input_node_id(&manifest)?;
@@ -219,11 +220,20 @@ impl PipelineClient for GrpcPipelineClient {
         let mut data_inputs = std::collections::HashMap::new();
         data_inputs.insert(input_node, transport_data_to_data_buffer(&input));
 
+        let mut embedded = Vec::with_capacity(embedded_plugins.len());
+        for (digest, content) in embedded_plugins {
+            embedded.push(EmbeddedPluginBlob {
+                digest: digest.clone(),
+                content: content.clone(),
+            });
+        }
+
         let request = ExecuteRequest {
             manifest: Some(proto_manifest),
             data_inputs,
             resource_limits: None,
             client_version: "v1".to_string(),
+            embedded_plugins: embedded,
         };
 
         let channel = self.get_channel().await?;
