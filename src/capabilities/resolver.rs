@@ -1167,7 +1167,7 @@ mod tests {
         ctx.node_types
             .insert("resample".to_string(), "FastResampleNode".to_string());
         ctx.node_types
-            .insert("whisper".to_string(), "RustWhisperNode".to_string());
+            .insert("whisper".to_string(), "WhisperCpp".to_string());
 
         // Add connections
         for (from, to) in &connections {
@@ -1383,7 +1383,7 @@ mod tests {
         ctx.node_types
             .insert("resample2".to_string(), "FastResampleNode".to_string());
         ctx.node_types
-            .insert("whisper".to_string(), "RustWhisperNode".to_string());
+            .insert("whisper".to_string(), "WhisperCpp".to_string());
 
         ctx.add_connection("mic", "resample1");
         ctx.add_connection("resample1", "resample2");
@@ -1459,7 +1459,7 @@ mod tests {
         ctx.node_types
             .insert("mic".to_string(), "MicInput".to_string());
         ctx.node_types
-            .insert("whisper".to_string(), "RustWhisperNode".to_string());
+            .insert("whisper".to_string(), "WhisperCpp".to_string());
 
         ctx.add_connection("mic", "whisper");
 

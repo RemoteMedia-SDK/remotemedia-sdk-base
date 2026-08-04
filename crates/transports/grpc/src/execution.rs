@@ -173,6 +173,33 @@ impl PipelineExecutionService for ExecutionServiceImpl {
             return Ok(Response::new(response));
         }
 
+        // Load any manifest-declared plugins (cdylib dlopen / source-python)
+        // before executing, so node types like RustWhisperNode are
+        // registered. Without this the unary path never loads plugins and
+        // reports "Unknown node type". The streaming path does the same in
+        // streaming.rs.
+        if let Err(e) = self.executor.ensure_plugins_loaded(&manifest).await {
+            self.metrics
+                .record_request_end("ExecutePipeline", "error", start_time);
+            self.metrics.record_error("plugin_load");
+
+            let error_response = ErrorResponse {
+                error_type: ErrorType::Validation as i32,
+                message: e.to_string(),
+                failing_node_id: String::new(),
+                context: "Plugin loading failed".to_string(),
+                stack_trace: String::new(),
+            };
+
+            let response = ExecuteResponse {
+                outcome: Some(crate::generated::execute_response::Outcome::Error(
+                    error_response,
+                )),
+            };
+
+            return Ok(Response::new(response));
+        }
+
         // Convert first data input to TransportData
         // For unary execution, we expect exactly one input
         let input = if let Some((node_id, data_buffer)) = req.data_inputs.into_iter().next() {
