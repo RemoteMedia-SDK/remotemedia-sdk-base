@@ -338,6 +338,7 @@ fn status(error: DeploymentError) -> Status {
         | DeploymentError::OffsetMismatch { .. }
         | DeploymentError::InvalidName(_)
         | DeploymentError::InvalidAssetSource(_)
+        | DeploymentError::InvalidRuntimePath(_)
         | DeploymentError::State(_) => Status::invalid_argument(error.to_string()),
         DeploymentError::NotInstalled(_)
         | DeploymentError::NoPreviousRevision(_)
