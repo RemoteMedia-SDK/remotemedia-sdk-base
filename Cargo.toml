@@ -33,14 +33,14 @@ jsonschema = "0.29"
 # `use remotemedia_core::data::RuntimeData` call sites keep working.
 # The `schemars` feature opts the wire enums into JsonSchema for the
 # manifest validator.
-remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b0c04076f2e6432c448c69a59d0ee577f15b8662", features = ["schemars"] }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3", features = ["schemars"] }
 
 # Python venv provisioning. Extracted from `crates/core/src/python/env_manager/`
 # into its own crate so loadable-node plugins (dlopen'd cdylibs) can call
 # `ensure_env(&deps)` without dragging all of `remotemedia-core` through the
 # ABI boundary. The old import path (`remotemedia_core::python::env_manager`)
 # continues to work via a thin re-export shim at `src/python/env_manager.rs`.
-remotemedia-py-env = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b0c04076f2e6432c448c69a59d0ee577f15b8662" }
+remotemedia-py-env = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3" }
 
 # Skinny trait surface that loadable-node plugins implement against.
 # Owns the leaf types (NodeSchema, MediaCapabilities, capability
@@ -48,7 +48,7 @@ remotemedia-py-env = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plu
 # AnySessionState). Core re-exports them from their original module
 # paths so existing callers (`use remotemedia_core::nodes::Tick`) keep
 # working.
-remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b0c04076f2e6432c448c69a59d0ee577f15b8662" }
+remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3" }
 
 # Skinny LLM primitives (per-session history, ToolSpec, streaming
 # tool-call accumulation + dispatch). Lives in its own crate so
@@ -57,16 +57,16 @@ remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plu
 # `MultimodalLLMNode`. Core re-exports it from the historical module
 # paths (`crate::llm::history`, `crate::llm::tool_dispatch`,
 # `crate::nodes::tool_spec`) so existing imports keep working.
-remotemedia-modality = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b0c04076f2e6432c448c69a59d0ee577f15b8662", features = ["llm"] }
+remotemedia-modality = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3", features = ["llm"] }
 
 # Proc-macros for NodeConfig
-remotemedia-core-derive = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b0c04076f2e6432c448c69a59d0ee577f15b8662" }
+remotemedia-core-derive = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3" }
 
 # In-process loadable native plugins (gated behind `loadable` feature).
 # Plugin authors depend on `loadable-node-abi` directly so they don't
 # pull all of core; core depends on it (optionally) for the host-side
 # `LoadableNodeBundle` adapter.
-loadable-node-abi = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b0c04076f2e6432c448c69a59d0ee577f15b8662", optional = true }
+loadable-node-abi = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3", optional = true }
 abi_stable = { version = "0.11", optional = true }
 async-ffi = { version = "0.5", features = ["abi_stable"], optional = true }
 # Self-describing binary serializer for the loadable wire format —
@@ -79,7 +79,7 @@ rmp-serde = { version = "1" }
 # resolve `::remotemedia_plugin_sdk::...` paths so a wrapper cdylib
 # (see `examples/silero-vad-loadable/`) can re-export in-tree nodes
 # through `plugin_export!()`.
-remotemedia-plugin-sdk = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b0c04076f2e6432c448c69a59d0ee577f15b8662", optional = true }
+remotemedia-plugin-sdk = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3", optional = true }
 
 # Async trait support
 async-trait = "0.1"
