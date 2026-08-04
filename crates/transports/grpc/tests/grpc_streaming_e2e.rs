@@ -118,6 +118,7 @@ fn create_test_manifest() -> PipelineManifest {
             output_types: vec![], // Output any type
         }],
         connections: vec![],
+        manifest_json: vec![],
     }
 }
 /// Create test video frame as DataBuffer (2x2 RGB24)
@@ -184,6 +185,7 @@ async fn test_grpc_streaming_video_pipeline() {
             resource_limits: None,
             client_version: "test-v1.0".to_string(),
             expected_chunk_size: 0, // Use server default
+            output_taps: Vec::new(),
         })),
     };
 
@@ -393,6 +395,7 @@ async fn test_grpc_streaming_multiple_sessions() {
                     resource_limits: None,
                     client_version: "session1".to_string(),
                     expected_chunk_size: 0,
+                    output_taps: Vec::new(),
                 })),
             })
             .await
@@ -455,6 +458,7 @@ async fn test_grpc_streaming_multiple_sessions() {
                     resource_limits: None,
                     client_version: "session2".to_string(),
                     expected_chunk_size: 0,
+                    output_taps: Vec::new(),
                 })),
             })
             .await

@@ -118,6 +118,15 @@ message PipelineManifest {
   // Connections between nodes (directed edges)
   // Forms a directed acyclic graph (DAG)
   repeated Connection connections = 4;
+
+  // Complete RemoteMedia manifest JSON.
+  //
+  // When present, this is the authoritative representation and preserves
+  // runtime fields that the legacy protobuf projection cannot express (for
+  // example plugins, python_env, is_output_node, and newer node metadata).
+  // New clients SHOULD populate only this field. Legacy clients may continue
+  // using fields 1-4.
+  bytes manifest_json = 5;
 }
 
 // Pipeline metadata (unchanged from Feature 003)

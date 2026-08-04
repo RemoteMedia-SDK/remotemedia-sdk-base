@@ -29,9 +29,14 @@
 //! - `GRPC_MAX_MEMORY_MB`: Maximum memory per execution in MB (default: `100`)
 //! - `GRPC_MAX_TIMEOUT_SEC`: Maximum execution timeout in seconds (default: `5`)
 //! - `GRPC_JSON_LOGGING`: Enable JSON structured logging (default: `true`)
+//! - `GRPC_PLUGIN_POLICY`: `permissive` or `local-only` (default: `permissive`)
+//! - `GRPC_PLUGIN_ROOTS`: Platform-separated allowed roots in local-only mode
+//! - `GRPC_MANIFEST_BASE_DIR`: Base directory for relative manifest plugin paths
 //! - `RUST_LOG`: Logging level (default: `info`)
 
 use remotemedia_grpc::{init_tracing, GrpcServerBuilder};
+#[allow(unused_imports)]
+use remotemedia_python_nodes as _python_nodes_link;
 use tracing::info;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

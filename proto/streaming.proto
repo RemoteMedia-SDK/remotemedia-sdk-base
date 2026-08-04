@@ -85,6 +85,12 @@ message StreamInit {
   // For video: frames per chunk (usually 1)
   // Helps service optimize buffer allocation
   uint64 expected_chunk_size = 5;
+
+  // Optional SessionControl output taps forwarded as ChunkResult entries.
+  // Each value is a node id (for example "__system__" or "coordinator").
+  // Forwarded keys use the "__tap__." prefix so they cannot collide with
+  // manifest sink node ids. Empty preserves the legacy sink-only behavior.
+  repeated string output_taps = 6;
 }
 
 // ============================================================================

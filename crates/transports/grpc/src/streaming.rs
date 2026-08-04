@@ -31,6 +31,7 @@ use crate::generated::{
     ExecutionMetrics, StreamClosed, StreamControl, StreamInit, StreamMetrics, StreamReady,
     StreamRequest, StreamResponse,
 };
+use crate::manifest_wire::{decode_manifest, PluginPolicy};
 use crate::metrics::ServiceMetrics;
 use crate::session_router::{DataPacket, SessionRouter};
 use crate::ServiceError;
@@ -40,7 +41,10 @@ use remotemedia_core::{
     data::RuntimeData,
     manifest::Manifest,
     nodes::{python_streaming::PythonStreamingNode, StreamingNode, StreamingNodeRegistry},
-    transport::PipelineExecutor,
+    transport::{
+        session_control::{ControlAddress, SessionControl},
+        PipelineExecutor,
+    },
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,6 +95,7 @@ pub struct StreamingServiceImpl {
     /// Pipeline executor (encapsulates scheduler, node registry, and drift metrics)
     /// (Migrated from PipelineRunner per spec 026)
     executor: Arc<PipelineExecutor>,
+    plugin_policy: PluginPolicy,
 
     /// Global node cache (shared across all sessions)
     /// Key: "{node_type}:{json_params_hash}", Value: cached node with timestamp
@@ -109,22 +114,32 @@ impl StreamingServiceImpl {
         metrics: Arc<ServiceMetrics>,
         executor: Arc<PipelineExecutor>,
     ) -> Self {
+        Self::new_with_policy(
+            auth_config,
+            limits,
+            metrics,
+            executor,
+            PluginPolicy::permissive(),
+        )
+    }
+
+    pub fn new_with_policy(
+        auth_config: crate::auth::AuthConfig,
+        limits: crate::limits::ResourceLimits,
+        metrics: Arc<ServiceMetrics>,
+        executor: Arc<PipelineExecutor>,
+        plugin_policy: PluginPolicy,
+    ) -> Self {
         let global_node_cache: Arc<RwLock<HashMap<String, CachedNode>>> =
             Arc::new(RwLock::new(HashMap::new()));
-
-        // Spawn background task to periodically clean up expired cache entries
         let cache_for_cleanup = global_node_cache.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(CACHE_CLEANUP_INTERVAL_SECS));
-
             loop {
                 interval.tick().await;
-
-                // Clean up expired cache entries
                 let mut cache = cache_for_cleanup.write().await;
                 let before_count = cache.len();
-
                 cache.retain(|key, cached_node| {
                     let age_secs = cached_node.last_used.elapsed().as_secs();
                     let keep = age_secs < GLOBAL_NODE_CACHE_TTL_SECS;
@@ -133,7 +148,6 @@ impl StreamingServiceImpl {
                     }
                     keep
                 });
-
                 let removed_count = before_count - cache.len();
                 if removed_count > 0 {
                     info!(
@@ -151,6 +165,7 @@ impl StreamingServiceImpl {
             limits,
             metrics,
             executor,
+            plugin_policy,
             global_node_cache,
             #[cfg(feature = "multiprocess")]
             multiprocess_executor: None,
@@ -462,13 +477,8 @@ impl crate::StreamingPipelineService for StreamingServiceImpl {
         #[cfg(feature = "multiprocess")]
         let multiprocess_executor = self.multiprocess_executor.clone();
 
-        // Get registry from PipelineExecutor (spec 026 migration)
-        // Note: streaming_registry is created from executor's internal registry
-        let streaming_registry = {
-            let registry_guard = self.executor.registry();
-            let registry = futures::executor::block_on(registry_guard.read());
-            Arc::new(registry.clone())
-        };
+        let executor = self.executor.clone();
+        let plugin_policy = self.plugin_policy.clone();
         let global_node_cache = self.global_node_cache.clone();
 
         // Spawn async task to handle bidirectional streaming
@@ -479,7 +489,8 @@ impl crate::StreamingPipelineService for StreamingServiceImpl {
                 tx.clone(),
                 sessions,
                 metrics,
-                streaming_registry,
+                executor,
+                plugin_policy,
                 global_node_cache,
                 multiprocess_executor,
             )
@@ -491,7 +502,8 @@ impl crate::StreamingPipelineService for StreamingServiceImpl {
                 tx.clone(),
                 sessions,
                 metrics,
-                streaming_registry,
+                executor,
+                plugin_policy,
                 global_node_cache,
             )
             .await;
@@ -528,7 +540,8 @@ async fn handle_stream(
     tx: tokio::sync::mpsc::Sender<Result<StreamResponse, Status>>,
     sessions: Arc<RwLock<HashMap<String, Arc<Mutex<StreamSession>>>>>,
     metrics: Arc<ServiceMetrics>,
-    streaming_registry: Arc<StreamingNodeRegistry>,
+    executor: Arc<PipelineExecutor>,
+    plugin_policy: PluginPolicy,
     global_node_cache: Arc<RwLock<HashMap<String, CachedNode>>>,
     #[cfg(feature = "multiprocess")] multiprocess_executor: Option<Arc<MultiprocessExecutor>>,
 ) -> Result<(), ServiceError> {
@@ -551,9 +564,19 @@ async fn handle_stream(
                 }
 
                 debug!("Processing StreamInit");
-                let (new_session_id, ready) = handle_stream_init(init, &sessions).await?;
+                let output_taps = validate_output_taps(&init.output_taps)?;
+                let (new_session_id, ready) =
+                    handle_stream_init(init, &sessions, &executor, &plugin_policy).await?;
                 session_id = new_session_id.clone();
                 session = Some(sessions.read().await.get(&session_id).unwrap().clone());
+
+                // Manifest-declared plugins are resolved before taking the
+                // per-session registry snapshot used by SessionRouter.
+                let streaming_registry = {
+                    let registry = executor.registry();
+                    let guard = registry.read().await;
+                    Arc::new(guard.clone())
+                };
 
                 // Create and start the SessionRouter for this session
                 let sess = session.as_ref().unwrap();
@@ -578,11 +601,22 @@ async fn handle_stream(
                     router.set_multiprocess_executor(mp_executor.clone());
                 }
 
+                // This streaming path constructs SessionRouter directly rather
+                // than through PipelineExecutor::cold_build_session, so it must
+                // install the per-session control bus itself. Do this before
+                // node initialization: source-Python nodes can publish blips
+                // and progress while initialize() is still running, and output
+                // taps must be attachable as soon as StreamReady is emitted.
+                let control = SessionControl::new(session_id.clone());
+                router.attach_control(control.clone());
+                executor.control_bus().register(control);
+
                 // 🔥 Pre-initialize all nodes before streaming starts
                 // CRITICAL: Do this WITHOUT holding the session lock to avoid deadlock
                 // (get_or_create_node needs to acquire the lock)
                 info!("🔥 Pre-initializing nodes for session '{}'", session_id);
                 router.pre_initialize_all_nodes().await.map_err(|e| {
+                    executor.control_bus().unregister(&session_id);
                     error!("Failed to pre-initialize nodes: {}", e);
                     ServiceError::Internal(format!("Node pre-initialization failed: {}", e))
                 })?;
@@ -618,6 +652,59 @@ async fn handle_stream(
                 tx.send(Ok(response)).await.map_err(|_| {
                     ServiceError::Internal("Failed to send StreamReady".to_string())
                 })?;
+
+                if !output_taps.is_empty() {
+                    let control = executor.control_bus().get(&session_id).ok_or_else(|| {
+                        ServiceError::Internal(format!(
+                            "session control unavailable for '{}'",
+                            session_id
+                        ))
+                    })?;
+                    for tap in output_taps {
+                        let tap_tx = tx.clone();
+                        let output_key = format!("__tap__.{tap}");
+                        if tap == "__system__" {
+                            let mut receiver = control.subscribe_system();
+                            tokio::spawn(async move {
+                                while let Some(data) = receiver.recv().await {
+                                    if send_tap_result(&tap_tx, &output_key, data).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+                        } else {
+                            let mut receiver = control
+                                .subscribe(&ControlAddress::node_out(tap.clone()))
+                                .map_err(|error| {
+                                    ServiceError::Validation(format!(
+                                        "could not subscribe output tap '{tap}': {error}"
+                                    ))
+                                })?;
+                            tokio::spawn(async move {
+                                loop {
+                                    match receiver.recv().await {
+                                        Ok(data) => {
+                                            if send_tap_result(&tap_tx, &output_key, data)
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                            count,
+                                        )) => {
+                                            warn!(tap = %output_key, dropped = count, "gRPC output tap lagged");
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            break
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
             }
 
             Some(StreamRequestType::DataChunk(data_chunk)) => {
@@ -743,6 +830,7 @@ async fn handle_stream(
             sess_guard.shutdown_router().await;
             sess_guard.clear_node_cache();
         }
+        executor.control_bus().unregister(&session_id);
         metrics.record_stream_end();
         info!(session_id = %session_id, "Session disconnected");
     }
@@ -750,10 +838,60 @@ async fn handle_stream(
     Ok(())
 }
 
+fn validate_output_taps(taps: &[String]) -> Result<Vec<String>, ServiceError> {
+    if taps.len() > 16 {
+        return Err(ServiceError::Validation(
+            "at most 16 output_taps may be requested".to_string(),
+        ));
+    }
+    let mut unique = Vec::new();
+    for tap in taps {
+        let tap = tap.trim();
+        if tap.is_empty()
+            || tap.len() > 128
+            || !tap
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(ServiceError::Validation(format!(
+                "invalid output tap '{tap}'"
+            )));
+        }
+        if !unique.iter().any(|existing| existing == tap) {
+            unique.push(tap.to_string());
+        }
+    }
+    Ok(unique)
+}
+
+async fn send_tap_result(
+    tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, Status>>,
+    output_key: &str,
+    data: RuntimeData,
+) -> Result<(), ()> {
+    let mut outputs = HashMap::new();
+    outputs.insert(
+        output_key.to_string(),
+        crate::adapters::runtime_data_to_data_buffer(&data),
+    );
+    tx.send(Ok(StreamResponse {
+        response: Some(StreamResponseType::Result(ChunkResult {
+            sequence: 0,
+            data_outputs: outputs,
+            processing_time_ms: 0.0,
+            total_items_processed: 0,
+        })),
+    }))
+    .await
+    .map_err(|_| ())
+}
+
 /// Handle StreamInit message
 async fn handle_stream_init(
     init: StreamInit,
     sessions: &Arc<RwLock<HashMap<String, Arc<Mutex<StreamSession>>>>>,
+    executor: &Arc<PipelineExecutor>,
+    plugin_policy: &PluginPolicy,
 ) -> Result<(String, StreamReady), ServiceError> {
     // Validate client version (basic check)
     if init.client_version.is_empty() {
@@ -767,7 +905,11 @@ async fn handle_stream_init(
         .manifest
         .ok_or_else(|| ServiceError::Validation("manifest required in StreamInit".to_string()))?;
 
-    let manifest = deserialize_manifest_from_proto(&manifest_proto)?;
+    let manifest = decode_manifest(&manifest_proto, plugin_policy)?;
+    executor
+        .ensure_plugins_loaded(&manifest)
+        .await
+        .map_err(|error| ServiceError::Validation(error.to_string()))?;
 
     // Generate unique session ID
     let session_id = Uuid::new_v4().to_string();
@@ -1257,49 +1399,4 @@ async fn handle_stream_control(
     );
 
     Ok(closed)
-}
-
-/// Helper: Deserialize protobuf PipelineManifest to runtime Manifest
-fn deserialize_manifest_from_proto(
-    proto: &crate::generated::PipelineManifest,
-) -> Result<Manifest, ServiceError> {
-    // Convert to JSON for existing Manifest parser
-    let json_str = serde_json::json!({
-        "version": proto.version,
-        "metadata": serde_json::json!({
-            "name": proto.metadata.as_ref().map(|m| m.name.clone()).unwrap_or_default(),
-            "description": proto.metadata.as_ref().map(|m| m.description.clone()).unwrap_or_default(),
-            "created_at": proto.metadata.as_ref().map(|m| m.created_at.clone()).unwrap_or_else(|| "2025-10-28T00:00:00Z".to_string()),
-        }),
-        "nodes": proto.nodes.iter().map(|n| {
-            serde_json::json!({
-                "id": n.id,
-                "node_type": n.node_type,
-                "params": serde_json::from_str::<serde_json::Value>(&n.params)
-                    .unwrap_or(serde_json::json!({})),
-                "runtime_hint": match n.runtime_hint {
-                    0 => "auto",
-                    1 => "rust_python",
-                    2 => "cpython",
-                    3 => "cpython_wasm",
-                    _ => "auto",
-                },
-                "metadata": serde_json::json!({
-                    "name": n.node_type,
-                    "description": "",
-                    "created_at": "2025-10-28T00:00:00Z",
-                })
-            })
-        }).collect::<Vec<_>>(),
-        "connections": proto.connections.iter().map(|c| {
-            serde_json::json!({
-                "from": c.from,
-                "to": c.to
-            })
-        }).collect::<Vec<_>>()
-    })
-    .to_string();
-
-    serde_json::from_str(&json_str)
-        .map_err(|e| ServiceError::Validation(format!("Failed to parse manifest: {}", e)))
 }

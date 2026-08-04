@@ -21,6 +21,7 @@ remotemedia-bundle-deployment = { path = "../../bundle-deployment" }
 # gRPC dependencies
 tonic = { workspace = true }
 tonic-web = { workspace = true }
+tonic-health = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
@@ -36,6 +37,7 @@ futures = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 
 # Async trait support
 async-trait = { workspace = true }
@@ -57,6 +59,7 @@ clap = { version = "4.5", features = ["derive", "env"], optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3.8"
 
 # Pulled in for the `control_bus_test_server` example so Python node
 # types (LFM2TextNode, KokoroTTSNode, ...) get inventory-registered
@@ -72,6 +75,9 @@ protobuf-src = { workspace = true }
 [features]
 # Default features: basic gRPC pipeline execution and streaming
 default = []
+
+# Runtime loading and manifest resolution for native node plugins.
+loadable = ["remotemedia-core/loadable", "remotemedia-core/python-source-plugin"]
 
 # Forward executor features from runtime-core
 multiprocess = ["remotemedia-core/multiprocess"]

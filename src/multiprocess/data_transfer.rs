@@ -171,16 +171,38 @@ pub fn to_python_wire(data: &RuntimeData, session_id: &str) -> Vec<u8> {
             metadata,
         } => {
             let wire_type = WireDataType::ControlMessage;
+            let (kind, type_fields) = match message_type {
+                remotemedia_types::ControlMessageType::CancelSpeculation {
+                    from_timestamp,
+                    to_timestamp,
+                } => (
+                    "cancel_speculation",
+                    serde_json::json!({
+                        "from_timestamp": from_timestamp,
+                        "to_timestamp": to_timestamp,
+                    }),
+                ),
+                remotemedia_types::ControlMessageType::BatchHint {
+                    suggested_batch_size,
+                } => (
+                    "batch_hint",
+                    serde_json::json!({"suggested_batch_size": suggested_batch_size}),
+                ),
+                remotemedia_types::ControlMessageType::DeadlineWarning { deadline_us } => (
+                    "deadline_warning",
+                    serde_json::json!({"deadline_us": deadline_us}),
+                ),
+            };
             let payload = serde_json::json!({
-                "type": match message_type {
-                    remotemedia_types::ControlMessageType::CancelSpeculation { .. } => "cancel_speculation",
-                    remotemedia_types::ControlMessageType::BatchHint { .. } => "batch_hint",
-                    remotemedia_types::ControlMessageType::DeadlineWarning { .. } => "deadline_warning",
-                },
+                "type": kind,
                 "segment_id": segment_id,
                 "timestamp_ms": timestamp_ms,
                 "metadata": metadata,
             });
+            let mut payload = payload.as_object().cloned().unwrap_or_default();
+            if let Some(type_fields) = type_fields.as_object() {
+                payload.extend(type_fields.clone());
+            }
             return finish_wire(
                 wire_type,
                 session_id,

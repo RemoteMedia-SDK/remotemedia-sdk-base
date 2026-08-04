@@ -13,10 +13,11 @@ use crate::{
     generated::{
         pipeline_execution_service_server::PipelineExecutionService, ErrorResponse, ErrorType,
         ExecuteRequest, ExecuteResponse, ExecutionMetrics as ProtoExecutionMetrics,
-        ExecutionResult as ProtoExecutionResult, ExecutionStatus,
-        PipelineManifest as ProtoPipelineManifest, VersionInfo, VersionRequest, VersionResponse,
+        ExecutionResult as ProtoExecutionResult, ExecutionStatus, VersionInfo, VersionRequest,
+        VersionResponse,
     },
     limits::ResourceLimits,
+    manifest_wire::{decode_manifest, PluginPolicy},
     metrics::ServiceMetrics,
     ServiceError,
 };
@@ -37,6 +38,7 @@ pub struct ExecutionServiceImpl {
     metrics: Arc<ServiceMetrics>,
     /// Pipeline executor encapsulates scheduler, node registry, and drift metrics
     executor: Arc<PipelineExecutor>,
+    plugin_policy: PluginPolicy,
 }
 
 impl ExecutionServiceImpl {
@@ -49,54 +51,29 @@ impl ExecutionServiceImpl {
     ) -> Self {
         tracing::info!("ExecutionServiceImpl initialized with PipelineExecutor");
 
+        Self::new_with_policy(
+            auth_config,
+            limits,
+            metrics,
+            executor,
+            PluginPolicy::permissive(),
+        )
+    }
+
+    pub fn new_with_policy(
+        auth_config: AuthConfig,
+        limits: ResourceLimits,
+        metrics: Arc<ServiceMetrics>,
+        executor: Arc<PipelineExecutor>,
+        plugin_policy: PluginPolicy,
+    ) -> Self {
         Self {
             auth_config,
             limits,
             metrics,
             executor,
+            plugin_policy,
         }
-    }
-
-    /// Convert protobuf PipelineManifest to runtime Manifest
-    fn deserialize_manifest(
-        &self,
-        proto_manifest: &ProtoPipelineManifest,
-    ) -> Result<Manifest, ServiceError> {
-        // Convert to JSON string for existing Manifest parser
-        let json_str = serde_json::json!({
-            "version": proto_manifest.version,
-            "metadata": {
-                "name": proto_manifest.metadata.as_ref().map(|m| m.name.clone()).unwrap_or_else(|| "test".to_string()),
-                "description": proto_manifest.metadata.as_ref().and_then(|m| Some(m.description.clone())),
-                "created_at": proto_manifest.metadata.as_ref().and_then(|m| Some(m.created_at.clone()))
-            },
-            "nodes": proto_manifest.nodes.iter().map(|n| {
-                serde_json::json!({
-                    "id": n.id,
-                    "node_type": n.node_type,
-                    "params": serde_json::from_str::<serde_json::Value>(&n.params)
-                        .unwrap_or(serde_json::json!({})),
-                    "runtime_hint": match n.runtime_hint {
-                        0 => "auto", // Unspecified -> Auto
-                        1 => "rust_python",
-                        2 => "cpython",
-                        3 => "cpython_wasm",
-                        4 => "auto",
-                        _ => "auto",
-                    }
-                })
-            }).collect::<Vec<_>>(),
-            "connections": proto_manifest.connections.iter().map(|c| {
-                serde_json::json!({
-                    "from": c.from,
-                    "to": c.to
-                })
-            }).collect::<Vec<_>>()
-        })
-        .to_string();
-
-        serde_json::from_str(&json_str)
-            .map_err(|e| ServiceError::Validation(format!("Failed to parse manifest: {}", e)))
     }
 
     /// Validate manifest structure
@@ -148,7 +125,7 @@ impl PipelineExecutionService for ExecutionServiceImpl {
             .ok_or_else(|| Status::invalid_argument("Manifest is required"))?;
 
         // Deserialize manifest
-        let manifest = match self.deserialize_manifest(&proto_manifest) {
+        let manifest = match decode_manifest(&proto_manifest, &self.plugin_policy) {
             Ok(m) => Arc::new(m),
             Err(e) => {
                 self.metrics
