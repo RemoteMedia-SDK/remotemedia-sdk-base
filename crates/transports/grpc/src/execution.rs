@@ -31,6 +31,8 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{error, info};
 
+use crate::embedded_plugin::materialize_embedded_plugins;
+
 /// ExecutePipeline service implementation
 pub struct ExecutionServiceImpl {
     auth_config: AuthConfig,
@@ -125,8 +127,8 @@ impl PipelineExecutionService for ExecutionServiceImpl {
             .ok_or_else(|| Status::invalid_argument("Manifest is required"))?;
 
         // Deserialize manifest
-        let manifest = match decode_manifest(&proto_manifest, &self.plugin_policy) {
-            Ok(m) => Arc::new(m),
+        let mut manifest = match decode_manifest(&proto_manifest, &self.plugin_policy) {
+            Ok(m) => m,
             Err(e) => {
                 self.metrics
                     .record_request_end("ExecutePipeline", "error", start_time);
@@ -150,6 +152,38 @@ impl PipelineExecutionService for ExecutionServiceImpl {
             }
         };
 
+        // Materialize any inline plugin blobs shipped with the request
+        // (portable pipeline bundles) into a content-addressed temp dir and
+        // rewrite `embedded:<digest>` plugin specs to point at them, so the
+        // executor can dlopen the plugin without a prior deploy.
+        let _cas_guard = if !req.embedded_plugins.is_empty() {
+            match materialize_embedded_plugins(&req.embedded_plugins, &mut manifest) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    self.metrics
+                        .record_request_end("ExecutePipeline", "error", start_time);
+                    self.metrics.record_error("plugin_load");
+                    let error_response = ErrorResponse {
+                        error_type: ErrorType::Validation as i32,
+                        message: e.to_string(),
+                        failing_node_id: String::new(),
+                        context: "Embedded plugin materialization failed".to_string(),
+                        stack_trace: String::new(),
+                    };
+                    let response = ExecuteResponse {
+                        outcome: Some(crate::generated::execute_response::Outcome::Error(
+                            error_response,
+                        )),
+                    };
+                    return Ok(Response::new(response));
+                }
+            }
+        } else {
+            None
+        };
+
+        let manifest = Arc::new(manifest);
+
         // Validate manifest
         if let Err(e) = self.validate_manifest(&manifest) {
             self.metrics
@@ -161,6 +195,33 @@ impl PipelineExecutionService for ExecutionServiceImpl {
                 message: e.to_string(),
                 failing_node_id: String::new(),
                 context: "Manifest validation failed".to_string(),
+                stack_trace: String::new(),
+            };
+
+            let response = ExecuteResponse {
+                outcome: Some(crate::generated::execute_response::Outcome::Error(
+                    error_response,
+                )),
+            };
+
+            return Ok(Response::new(response));
+        }
+
+        // Load any manifest-declared plugins (cdylib dlopen / source-python)
+        // before executing, so node types like RustWhisperNode are
+        // registered. Without this the unary path never loads plugins and
+        // reports "Unknown node type". The streaming path does the same in
+        // streaming.rs.
+        if let Err(e) = self.executor.ensure_plugins_loaded(&manifest).await {
+            self.metrics
+                .record_request_end("ExecutePipeline", "error", start_time);
+            self.metrics.record_error("plugin_load");
+
+            let error_response = ErrorResponse {
+                error_type: ErrorType::Validation as i32,
+                message: e.to_string(),
+                failing_node_id: String::new(),
+                context: "Plugin loading failed".to_string(),
                 stack_trace: String::new(),
             };
 

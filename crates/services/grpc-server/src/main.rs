@@ -40,6 +40,14 @@ use remotemedia_python_nodes as _python_nodes_link;
 use tracing::info;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Build the server (including the bundle-deployment service init) in a
+    // synchronous context. The deployment service constructs a
+    // `reqwest::blocking::Client`, which spins up and tears down a tokio
+    // runtime internally; doing that inside an existing async runtime panics
+    // with "Cannot drop a runtime in a context where blocking is not allowed".
+    // Building here — before the server runtime exists — avoids that.
+    let server = GrpcServerBuilder::new().from_env().build()?;
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(num_cpus::get())
         .thread_name("remotemedia-worker")
@@ -47,9 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     runtime.block_on(async {
-        // Build server from environment variables (reads GRPC_BIND_ADDRESS, etc.)
-        let server = GrpcServerBuilder::new().from_env().build()?;
-
         // Initialize tracing after from_env() so we can respect GRPC_JSON_LOGGING
         // Note: init_tracing reads GRPC_JSON_LOGGING env var directly
         let json_logging = std::env::var("GRPC_JSON_LOGGING")

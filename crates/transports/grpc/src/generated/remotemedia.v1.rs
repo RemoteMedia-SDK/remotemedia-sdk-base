@@ -957,6 +957,28 @@ pub struct ExecuteRequest {
     /// Service validates compatibility and returns ERROR_TYPE_VERSION_MISMATCH if incompatible
     #[prost(string, tag = "4")]
     pub client_version: ::prost::alloc::string::String,
+    /// Self-contained native plugin blobs (frozen into a portable pipeline
+    /// bundle) shipped alongside the manifest so the server can dlopen them
+    /// without a prior deploy or a resolvable filesystem path.
+    ///
+    /// Each entry carries the plugin's sha256 digest (matching the bundle lock's
+    /// artifact_digest) and its raw bytes. When the manifest's plugin specs use
+    /// the `embedded:<digest>` shorthand, the server materializes each blob into
+    /// a content-addressed file and rewrites those specs to point at it before
+    /// loading plugins.
+    #[prost(message, repeated, tag = "5")]
+    pub embedded_plugins: ::prost::alloc::vec::Vec<EmbeddedPluginBlob>,
+}
+/// A native plugin blob shipped inline with an ExecuteRequest so the server
+/// can load it without a prior deploy.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EmbeddedPluginBlob {
+    /// sha256 hex digest of `content` (matches the bundle lock artifact_digest).
+    #[prost(string, tag = "1")]
+    pub digest: ::prost::alloc::string::String,
+    /// Raw plugin bytes (cdylib .so / .dylib / .dll).
+    #[prost(bytes = "vec", tag = "2")]
+    pub content: ::prost::alloc::vec::Vec<u8>,
 }
 /// Response from pipeline execution (unchanged from Feature 003)
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1708,6 +1730,13 @@ pub struct StreamInit {
     /// manifest sink node ids. Empty preserves the legacy sink-only behavior.
     #[prost(string, repeated, tag = "6")]
     pub output_taps: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Self-contained native plugin blobs (frozen into a portable pipeline
+    /// bundle) shipped alongside the manifest so the server can dlopen them
+    /// without a prior deploy or a resolvable filesystem path. See
+    /// ExecuteRequest.embedded_plugins for the contract; the same `embedded:<digest>`
+    /// shorthand rewrites apply here.
+    #[prost(message, repeated, tag = "7")]
+    pub embedded_plugins: ::prost::alloc::vec::Vec<EmbeddedPluginBlob>,
 }
 /// Generic streaming message that replaces AudioChunk
 ///

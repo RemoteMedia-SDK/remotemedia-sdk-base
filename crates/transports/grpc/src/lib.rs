@@ -31,6 +31,7 @@ pub mod client;
 pub mod control;
 pub mod deployment;
 pub mod execution;
+pub mod embedded_plugin;
 pub mod limits;
 pub mod metrics;
 pub mod plugin;

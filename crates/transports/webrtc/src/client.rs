@@ -146,6 +146,7 @@ impl PipelineClient for WebRtcPipelineClient {
         &self,
         _manifest: Arc<Manifest>,
         _input: TransportData,
+        _embedded_plugins: &[(String, Vec<u8>)],
     ) -> remotemedia_core::Result<TransportData> {
         // TODO: Implement WebRTC execution
         //
@@ -177,6 +178,7 @@ impl PipelineClient for WebRtcPipelineClient {
     async fn create_stream_session(
         &self,
         _manifest: Arc<Manifest>,
+        _embedded_plugins: &[(String, Vec<u8>)],
     ) -> remotemedia_core::Result<Box<dyn ClientStreamSession>> {
         // TODO: Implement WebRTC streaming
         //
