@@ -172,6 +172,7 @@ pub enum AcceleratorBackend {
     Cuda { version: String },
     Rocm { version: String },
     Metal,
+    Vulkan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
