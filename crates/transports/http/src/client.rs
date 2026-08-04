@@ -214,6 +214,7 @@ impl PipelineClient for HttpPipelineClient {
     async fn create_stream_session(
         &self,
         manifest: Arc<Manifest>,
+        _embedded_plugins: &[(String, Vec<u8>)],
     ) -> remotemedia_core::Result<Box<dyn ClientStreamSession>> {
         let url = format!("{}/stream", self.base_url);
 

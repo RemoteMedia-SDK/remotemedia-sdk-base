@@ -193,6 +193,11 @@ pub(crate) struct StreamSession {
     /// Parsed pipeline manifest
     pub(crate) manifest: Manifest,
 
+    /// Guard keeping any inline plugin blobs (shipped via `embedded_plugins`)
+    /// materialized on disk for the session lifetime. Held so the dlopened
+    /// plugin stays valid across chunks.
+    pub(crate) embedded_cas_guard: Option<crate::embedded_plugin::CasGuard>,
+
     /// Expected next sequence number
     next_sequence: u64,
 
@@ -252,11 +257,17 @@ pub(crate) struct StreamSession {
 
 impl StreamSession {
     /// Create new session from StreamInit request
-    fn new(session_id: String, manifest: Manifest, recommended_chunk_size: u64) -> Self {
+    fn new(
+        session_id: String,
+        manifest: Manifest,
+        recommended_chunk_size: u64,
+        embedded_cas_guard: Option<crate::embedded_plugin::CasGuard>,
+    ) -> Self {
         let now = Instant::now();
         Self {
             session_id,
             manifest,
+            embedded_cas_guard,
             next_sequence: 0,
             chunks_processed: 0,
             total_items: 0,
@@ -905,7 +916,21 @@ async fn handle_stream_init(
         .manifest
         .ok_or_else(|| ServiceError::Validation("manifest required in StreamInit".to_string()))?;
 
-    let manifest = decode_manifest(&manifest_proto, plugin_policy)?;
+    let mut manifest = decode_manifest(&manifest_proto, plugin_policy)?;
+
+    // Materialize any inline plugin blobs shipped with the init (portable
+    // pipeline bundles) into a content-addressed temp dir and rewrite
+    // `embedded:<digest>` plugin specs, so the executor can dlopen the plugin
+    // without a prior deploy. Held for the session lifetime.
+    let embedded_cas_guard = if !init.embedded_plugins.is_empty() {
+        Some(
+            crate::embedded_plugin::materialize_embedded_plugins(&init.embedded_plugins, &mut manifest)
+                .map_err(|e| ServiceError::Validation(e))?,
+        )
+    } else {
+        None
+    };
+
     executor
         .ensure_plugins_loaded(&manifest)
         .await
@@ -926,6 +951,7 @@ async fn handle_stream_init(
         session_id.clone(),
         manifest,
         recommended_chunk_size,
+        embedded_cas_guard,
     )));
 
     // Store session

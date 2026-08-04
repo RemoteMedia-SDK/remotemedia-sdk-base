@@ -91,6 +91,13 @@ message StreamInit {
   // Forwarded keys use the "__tap__." prefix so they cannot collide with
   // manifest sink node ids. Empty preserves the legacy sink-only behavior.
   repeated string output_taps = 6;
+
+  // Self-contained native plugin blobs (frozen into a portable pipeline
+  // bundle) shipped alongside the manifest so the server can dlopen them
+  // without a prior deploy or a resolvable filesystem path. See
+  // ExecuteRequest.embedded_plugins for the contract; the same `embedded:<digest>`
+  // shorthand rewrites apply here.
+  repeated EmbeddedPluginBlob embedded_plugins = 7;
 }
 
 // ============================================================================

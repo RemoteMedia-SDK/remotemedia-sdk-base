@@ -117,6 +117,9 @@ pub trait PipelineClient: Send + Sync {
     /// # Arguments
     ///
     /// * `manifest` - Pipeline configuration (shared across session)
+    /// * `embedded_plugins` - Optional native plugin blobs (digest, bytes) to
+    ///   ship inline so the server can load them without a resolvable path or
+    ///   a prior deploy (used when running a portable pipeline bundle).
     ///
     /// # Returns
     ///
@@ -130,6 +133,7 @@ pub trait PipelineClient: Send + Sync {
     async fn create_stream_session(
         &self,
         manifest: Arc<Manifest>,
+        embedded_plugins: &[(String, Vec<u8>)],
     ) -> Result<Box<dyn ClientStreamSession>>;
 
     /// Check if remote endpoint is healthy

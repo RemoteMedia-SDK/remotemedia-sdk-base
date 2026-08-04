@@ -267,9 +267,18 @@ impl PipelineClient for GrpcPipelineClient {
     async fn create_stream_session(
         &self,
         manifest: Arc<Manifest>,
+        embedded_plugins: &[(String, Vec<u8>)],
     ) -> Result<Box<dyn ClientStreamSession>> {
         let proto_manifest = Self::manifest_to_proto(&manifest)?;
         let input_node = Self::input_node_id(&manifest)?;
+
+        let mut embedded = Vec::with_capacity(embedded_plugins.len());
+        for (digest, content) in embedded_plugins {
+            embedded.push(EmbeddedPluginBlob {
+                digest: digest.clone(),
+                content: content.clone(),
+            });
+        }
 
         let init = StreamInit {
             manifest: Some(proto_manifest),
@@ -278,6 +287,7 @@ impl PipelineClient for GrpcPipelineClient {
             client_version: "v1".to_string(),
             expected_chunk_size: 0,
             output_taps: Vec::new(),
+            embedded_plugins: embedded,
         };
 
         let channel = self.get_channel().await?;
