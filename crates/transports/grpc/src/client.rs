@@ -39,7 +39,7 @@
 
 use async_trait::async_trait;
 use remotemedia_core::manifest::Manifest;
-use remotemedia_core::transport::client::{ClientStreamSession, PipelineClient};
+use remotemedia_core::transport::client::{ClientStreamSession, EmbeddedPythonEnv, PipelineClient};
 use remotemedia_core::transport::TransportData;
 use remotemedia_core::{Error, Result};
 use std::sync::Arc;
@@ -53,7 +53,9 @@ use crate::generated::{
     execute_response::Outcome, pipeline_execution_service_client::PipelineExecutionServiceClient,
     stream_control::Command, stream_request::Request as StreamRequestKind,
     stream_response::Response as StreamResponseKind, streaming_pipeline_service_client::
-        StreamingPipelineServiceClient, DataChunk, EmbeddedPluginBlob, ExecuteRequest, ExecuteResponse,
+        StreamingPipelineServiceClient, DataChunk, EmbeddedPluginBlob, EmbeddedInterpreter as ProtoEmbeddedInterpreter,
+    EmbeddedPythonEnv as ProtoEmbeddedPythonEnv, EmbeddedWheel as ProtoEmbeddedWheel,
+    ExecuteRequest, ExecuteResponse,
     ExecutionStatus, PipelineManifest, StreamControl, StreamInit, StreamRequest, StreamResponse,
 };
 
@@ -213,6 +215,7 @@ impl PipelineClient for GrpcPipelineClient {
         manifest: Arc<Manifest>,
         input: TransportData,
         embedded_plugins: &[(String, Vec<u8>)],
+        embedded_python_env: Option<&EmbeddedPythonEnv>,
     ) -> Result<TransportData> {
         let proto_manifest = Self::manifest_to_proto(&manifest)?;
         let input_node = Self::input_node_id(&manifest)?;
@@ -228,12 +231,33 @@ impl PipelineClient for GrpcPipelineClient {
             });
         }
 
+        let proto_python_env = embedded_python_env.map(|env| ProtoEmbeddedPythonEnv {
+            interpreter: Some(ProtoEmbeddedInterpreter {
+                implementation: env.interpreter.implementation.clone(),
+                version: env.interpreter.version.clone(),
+                abi: env.interpreter.abi.clone(),
+                accelerator: env.interpreter.accelerator.clone(),
+            }),
+            wheel_set_digest: env.wheel_set_digest.clone(),
+            wheels: env
+                .wheels
+                .iter()
+                .map(|w| ProtoEmbeddedWheel {
+                    name: w.name.clone(),
+                    filename: w.filename.clone(),
+                    digest: w.digest.clone(),
+                    content: w.content.clone(),
+                })
+                .collect(),
+        });
+
         let request = ExecuteRequest {
             manifest: Some(proto_manifest),
             data_inputs,
             resource_limits: None,
             client_version: "v1".to_string(),
             embedded_plugins: embedded,
+            embedded_python_env: proto_python_env,
         };
 
         let channel = self.get_channel().await?;
@@ -268,6 +292,7 @@ impl PipelineClient for GrpcPipelineClient {
         &self,
         manifest: Arc<Manifest>,
         embedded_plugins: &[(String, Vec<u8>)],
+        embedded_python_env: Option<&EmbeddedPythonEnv>,
     ) -> Result<Box<dyn ClientStreamSession>> {
         let proto_manifest = Self::manifest_to_proto(&manifest)?;
         let input_node = Self::input_node_id(&manifest)?;
@@ -280,6 +305,26 @@ impl PipelineClient for GrpcPipelineClient {
             });
         }
 
+        let proto_python_env = embedded_python_env.map(|env| ProtoEmbeddedPythonEnv {
+            interpreter: Some(ProtoEmbeddedInterpreter {
+                implementation: env.interpreter.implementation.clone(),
+                version: env.interpreter.version.clone(),
+                abi: env.interpreter.abi.clone(),
+                accelerator: env.interpreter.accelerator.clone(),
+            }),
+            wheel_set_digest: env.wheel_set_digest.clone(),
+            wheels: env
+                .wheels
+                .iter()
+                .map(|w| ProtoEmbeddedWheel {
+                    name: w.name.clone(),
+                    filename: w.filename.clone(),
+                    digest: w.digest.clone(),
+                    content: w.content.clone(),
+                })
+                .collect(),
+        });
+
         let init = StreamInit {
             manifest: Some(proto_manifest),
             data_inputs: std::collections::HashMap::new(),
@@ -288,6 +333,7 @@ impl PipelineClient for GrpcPipelineClient {
             expected_chunk_size: 0,
             output_taps: Vec::new(),
             embedded_plugins: embedded,
+            embedded_python_env: proto_python_env,
         };
 
         let channel = self.get_channel().await?;

@@ -40,7 +40,7 @@
 
 use async_trait::async_trait;
 use remotemedia_core::manifest::Manifest;
-use remotemedia_core::transport::client::{ClientStreamSession, PipelineClient};
+use remotemedia_core::transport::client::{ClientStreamSession, EmbeddedPythonEnv, PipelineClient};
 use remotemedia_core::transport::TransportData;
 use std::sync::Arc;
 
@@ -147,6 +147,7 @@ impl PipelineClient for WebRtcPipelineClient {
         _manifest: Arc<Manifest>,
         _input: TransportData,
         _embedded_plugins: &[(String, Vec<u8>)],
+        _embedded_python_env: Option<&EmbeddedPythonEnv>,
     ) -> remotemedia_core::Result<TransportData> {
         // TODO: Implement WebRTC execution
         //
@@ -179,6 +180,7 @@ impl PipelineClient for WebRtcPipelineClient {
         &self,
         _manifest: Arc<Manifest>,
         _embedded_plugins: &[(String, Vec<u8>)],
+        _embedded_python_env: Option<&EmbeddedPythonEnv>,
     ) -> remotemedia_core::Result<Box<dyn ClientStreamSession>> {
         // TODO: Implement WebRTC streaming
         //

@@ -98,6 +98,12 @@ message StreamInit {
   // ExecuteRequest.embedded_plugins for the contract; the same `embedded:<digest>`
   // shorthand rewrites apply here.
   repeated EmbeddedPluginBlob embedded_plugins = 7;
+
+  // Self-contained Python environment (frozen wheelhouse) shipped inline
+  // with the init so the server can build a venv and run Python nodes
+  // without a prior deploy or a resolvable filesystem path. See
+  // ExecuteRequest.embedded_python_env for the contract. Optional.
+  EmbeddedPythonEnv embedded_python_env = 8;
 }
 
 // ============================================================================

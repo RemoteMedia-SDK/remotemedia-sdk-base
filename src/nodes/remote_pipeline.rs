@@ -852,7 +852,7 @@ impl RemotePipelineNode {
 
                 let result = tokio::time::timeout(
                     timeout_duration,
-                    client.execute_unary(manifest.clone(), input.clone()),
+                    client.execute_unary(manifest.clone(), input.clone(), &[], None),
                 )
                 .await;
 

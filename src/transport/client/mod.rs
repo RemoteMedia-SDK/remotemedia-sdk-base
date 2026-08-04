@@ -41,6 +41,9 @@ pub mod retry;
 // Re-export key types
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 pub use load_balancer::{Endpoint, EndpointPool, LoadBalanceStrategy};
+pub use crate::transport::embedded_python_env::{
+    EmbeddedInterpreter, EmbeddedPythonEnv, EmbeddedWheel,
+};
 pub use retry::{RetryConfig, RetryExecutor};
 
 /// Transport protocol type
@@ -92,6 +95,9 @@ pub trait PipelineClient: Send + Sync {
     /// * `embedded_plugins` - Optional native plugin blobs (digest, bytes) to
     ///   ship inline so the server can load them without a resolvable path or
     ///   a prior deploy (used when running a portable pipeline bundle).
+    /// * `embedded_python_env` - Optional frozen Python wheelhouse shipped
+    ///   inline so the server can materialize a self-contained Python
+    ///   environment without network access.
     ///
     /// # Returns
     ///
@@ -108,6 +114,7 @@ pub trait PipelineClient: Send + Sync {
         manifest: Arc<Manifest>,
         input: TransportData,
         embedded_plugins: &[(String, Vec<u8>)],
+        embedded_python_env: Option<&EmbeddedPythonEnv>,
     ) -> Result<TransportData>;
 
     /// Create a streaming session with the remote server
@@ -120,6 +127,9 @@ pub trait PipelineClient: Send + Sync {
     /// * `embedded_plugins` - Optional native plugin blobs (digest, bytes) to
     ///   ship inline so the server can load them without a resolvable path or
     ///   a prior deploy (used when running a portable pipeline bundle).
+    /// * `embedded_python_env` - Optional frozen Python wheelhouse shipped
+    ///   inline so the server can materialize a self-contained Python
+    ///   environment without network access.
     ///
     /// # Returns
     ///
@@ -134,6 +144,7 @@ pub trait PipelineClient: Send + Sync {
         &self,
         manifest: Arc<Manifest>,
         embedded_plugins: &[(String, Vec<u8>)],
+        embedded_python_env: Option<&EmbeddedPythonEnv>,
     ) -> Result<Box<dyn ClientStreamSession>>;
 
     /// Check if remote endpoint is healthy

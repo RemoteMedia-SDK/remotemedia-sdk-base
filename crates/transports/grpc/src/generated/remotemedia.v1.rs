@@ -968,6 +968,12 @@ pub struct ExecuteRequest {
     /// loading plugins.
     #[prost(message, repeated, tag = "5")]
     pub embedded_plugins: ::prost::alloc::vec::Vec<EmbeddedPluginBlob>,
+    /// Self-contained Python environment (frozen wheelhouse) shipped inline
+    /// with the request so the server can build a venv and run Python nodes
+    /// without a prior deploy or a resolvable filesystem path. Parallel to
+    /// `embedded_plugins`. Optional; absent when the bundle has no Python env.
+    #[prost(message, optional, tag = "6")]
+    pub embedded_python_env: ::core::option::Option<EmbeddedPythonEnv>,
 }
 /// A native plugin blob shipped inline with an ExecuteRequest so the server
 /// can load it without a prior deploy.
@@ -979,6 +985,52 @@ pub struct EmbeddedPluginBlob {
     /// Raw plugin bytes (cdylib .so / .dylib / .dll).
     #[prost(bytes = "vec", tag = "2")]
     pub content: ::prost::alloc::vec::Vec<u8>,
+}
+/// A single frozen Python wheel shipped inline with a request so the
+/// server can materialize it into a venv without a prior deploy.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EmbeddedWheel {
+    /// Distribution name (PEP 503 normalized, e.g. "remotemedia-client").
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Wheel filename (e.g. "remotemedia_client-0.2.0-py3-none-any.whl").
+    #[prost(string, tag = "2")]
+    pub filename: ::prost::alloc::string::String,
+    /// sha256 hex digest of `content`.
+    #[prost(string, tag = "3")]
+    pub digest: ::prost::alloc::string::String,
+    /// Raw wheel bytes.
+    #[prost(bytes = "vec", tag = "4")]
+    pub content: ::prost::alloc::vec::Vec<u8>,
+}
+/// Locked interpreter target the wheels were frozen against.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EmbeddedInterpreter {
+    /// Implementation tag, e.g. "cp" (CPython) or "pp" (PyPy).
+    #[prost(string, tag = "1")]
+    pub implementation: ::prost::alloc::string::String,
+    /// Python version, e.g. "3.11".
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    /// ABI tag, e.g. "cp311".
+    #[prost(string, tag = "3")]
+    pub abi: ::prost::alloc::string::String,
+    /// Accelerator backend, e.g. "cpu", "cuda", "rocm".
+    #[prost(string, tag = "4")]
+    pub accelerator: ::prost::alloc::string::String,
+}
+/// Self-contained Python environment (frozen wheelhouse) shipped inline
+/// with a request so the server can build a venv without a prior deploy
+/// or a resolvable filesystem path. Parallel to EmbeddedPluginBlob.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EmbeddedPythonEnv {
+    #[prost(message, optional, tag = "1")]
+    pub interpreter: ::core::option::Option<EmbeddedInterpreter>,
+    /// Single sha256 hex digest covering the ordered wheel set.
+    #[prost(string, tag = "2")]
+    pub wheel_set_digest: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub wheels: ::prost::alloc::vec::Vec<EmbeddedWheel>,
 }
 /// Response from pipeline execution (unchanged from Feature 003)
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1737,6 +1789,12 @@ pub struct StreamInit {
     /// shorthand rewrites apply here.
     #[prost(message, repeated, tag = "7")]
     pub embedded_plugins: ::prost::alloc::vec::Vec<EmbeddedPluginBlob>,
+    /// Self-contained Python environment (frozen wheelhouse) shipped inline
+    /// with the init so the server can build a venv and run Python nodes
+    /// without a prior deploy or a resolvable filesystem path. See
+    /// ExecuteRequest.embedded_python_env for the contract. Optional.
+    #[prost(message, optional, tag = "8")]
+    pub embedded_python_env: ::core::option::Option<EmbeddedPythonEnv>,
 }
 /// Generic streaming message that replaces AudioChunk
 ///

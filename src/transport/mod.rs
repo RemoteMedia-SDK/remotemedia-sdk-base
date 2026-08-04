@@ -30,6 +30,7 @@ pub mod cancel_gate;
 pub mod client;
 pub mod control_transport;
 pub mod data;
+pub mod embedded_python_env;
 pub mod pacer;
 pub mod perf_aggregator;
 pub mod plugin_registry;

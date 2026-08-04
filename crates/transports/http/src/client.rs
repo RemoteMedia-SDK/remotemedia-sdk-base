@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use remotemedia_core::manifest::Manifest;
+use remotemedia_core::transport::client::EmbeddedPythonEnv;
 use remotemedia_core::transport::{ClientStreamSession, PipelineClient, TransportData};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -155,6 +156,7 @@ impl PipelineClient for HttpPipelineClient {
         manifest: Arc<Manifest>,
         input: TransportData,
         _embedded_plugins: &[(String, Vec<u8>)],
+        _embedded_python_env: Option<&EmbeddedPythonEnv>,
     ) -> remotemedia_core::Result<TransportData> {
         let url = format!("{}/execute", self.base_url);
 
@@ -215,6 +217,7 @@ impl PipelineClient for HttpPipelineClient {
         &self,
         manifest: Arc<Manifest>,
         _embedded_plugins: &[(String, Vec<u8>)],
+        _embedded_python_env: Option<&EmbeddedPythonEnv>,
     ) -> remotemedia_core::Result<Box<dyn ClientStreamSession>> {
         let url = format!("{}/stream", self.base_url);
 

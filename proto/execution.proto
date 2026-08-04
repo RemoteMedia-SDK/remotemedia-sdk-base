@@ -92,6 +92,12 @@ message ExecuteRequest {
   // a content-addressed file and rewrites those specs to point at it before
   // loading plugins.
   repeated EmbeddedPluginBlob embedded_plugins = 5;
+
+  // Self-contained Python environment (frozen wheelhouse) shipped inline
+  // with the request so the server can build a venv and run Python nodes
+  // without a prior deploy or a resolvable filesystem path. Parallel to
+  // `embedded_plugins`. Optional; absent when the bundle has no Python env.
+  EmbeddedPythonEnv embedded_python_env = 6;
 }
 
 // A native plugin blob shipped inline with an ExecuteRequest so the server
@@ -102,6 +108,41 @@ message EmbeddedPluginBlob {
 
   // Raw plugin bytes (cdylib .so / .dylib / .dll).
   bytes content = 2;
+}
+
+// A single frozen Python wheel shipped inline with a request so the
+// server can materialize it into a venv without a prior deploy.
+message EmbeddedWheel {
+  // Distribution name (PEP 503 normalized, e.g. "remotemedia-client").
+  string name = 1;
+  // Wheel filename (e.g. "remotemedia_client-0.2.0-py3-none-any.whl").
+  string filename = 2;
+  // sha256 hex digest of `content`.
+  string digest = 3;
+  // Raw wheel bytes.
+  bytes content = 4;
+}
+
+// Locked interpreter target the wheels were frozen against.
+message EmbeddedInterpreter {
+  // Implementation tag, e.g. "cp" (CPython) or "pp" (PyPy).
+  string implementation = 1;
+  // Python version, e.g. "3.11".
+  string version = 2;
+  // ABI tag, e.g. "cp311".
+  string abi = 3;
+  // Accelerator backend, e.g. "cpu", "cuda", "rocm".
+  string accelerator = 4;
+}
+
+// Self-contained Python environment (frozen wheelhouse) shipped inline
+// with a request so the server can build a venv without a prior deploy
+// or a resolvable filesystem path. Parallel to EmbeddedPluginBlob.
+message EmbeddedPythonEnv {
+  EmbeddedInterpreter interpreter = 1;
+  // Single sha256 hex digest covering the ordered wheel set.
+  string wheel_set_digest = 2;
+  repeated EmbeddedWheel wheels = 3;
 }
 
 // Response from pipeline execution (unchanged from Feature 003)
