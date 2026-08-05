@@ -978,6 +978,44 @@ impl SessionRouter {
         // version/ABI skew with the Rust iceoryx2 service →
         // ServiceInCorruptedState on the Python node's IPC channel.
         let mut node_params = spec.params.clone();
+        // Stamp a per-node scope context so the managed-venv cache keys each
+        // node independently. Without this, the cache key is only
+        // (python_version + merged deps), so two nodes with identical deps
+        // silently share a venv and a manifest edit that changes a node's deps
+        // can be masked by a reused cache entry. Honor the manifest's
+        // python_env.scope policy (Global / PerPipeline / PerNode), defaulting
+        // to PerNode so a node never inherits another node's venv.
+        let node_scope_context = {
+            let policy = session
+                .manifest
+                .python_env
+                .as_ref()
+                .and_then(|e| e.scope.clone())
+                .unwrap_or(remotemedia_core::python::env_manager::EnvScope::PerNode);
+            // Scope on STABLE node identity, NOT the per-session id. The cache
+            // key already folds in (python_version + merged deps), so including
+            // the session id would make every new stream rebuild every venv and
+            // defeat cross-session reuse. Node id + type is sufficient to isolate
+            // one node's venv from another's while remaining deterministic.
+            match policy {
+                remotemedia_core::python::env_manager::EnvScope::Global => String::new(),
+                remotemedia_core::python::env_manager::EnvScope::PerPipeline => {
+                    // Best-effort stable pipeline id: manifest metadata name when
+                    // present, else fall back to the session id for this run.
+                    let pid = session.manifest.metadata.name.clone();
+                    format!("pipeline:{}", pid)
+                }
+                remotemedia_core::python::env_manager::EnvScope::PerNode => {
+                    format!("node:{};type:{}", spec.id, spec.node_type)
+                }
+            }
+        };
+        if let Some(obj) = node_params.as_object_mut() {
+            obj.insert(
+                "__python_env_scope_context__".to_string(),
+                serde_json::json!(node_scope_context),
+            );
+        }
         if let Some(ref py_env) = session.manifest.python_env {
             if let Some(obj) = node_params.as_object_mut() {
                 if let Some(ref pv) = py_env.python_version {
