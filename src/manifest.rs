@@ -167,6 +167,12 @@ pub struct ManifestPythonEnv {
     /// creating/resolving one. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explicit_venv: Option<String>,
+
+    /// Local wheel directories offered to the managed uv environment system as
+    /// offline `--find-links` sources. Populated by the server when a request
+    /// ships an embedded (frozen) Python wheelhouse.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub find_links: Vec<std::path::PathBuf>,
 }
 
 /// Python environment settings declared on a single node.

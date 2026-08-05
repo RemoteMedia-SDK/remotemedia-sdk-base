@@ -92,64 +92,107 @@ pub fn embedded_digest_of(spec: &PluginSpec) -> Option<String> {
         .filter(|d| !d.is_empty())
 }
 
-/// Removes a materialized Python environment (venv + wheelhouse) when dropped
-/// (best effort). Hold the guard for as long as the venv must stay usable —
-/// the whole request for unary execution, the whole session for streaming.
-pub struct PythonEnvGuard(PathBuf);
+/// Wires a shipped (frozen) wheelhouse into the managed uv environment system
+/// for the lifetime of a request or stream session.
+///
+/// Materialization writes the wheels to a persistent, content-addressed cache
+/// dir and prepends that dir to the process-wide `UV_FIND_LINKS`, which `uv`
+/// consults natively when resolving dependencies. The guard restores the
+/// previous `UV_FIND_LINKS` value on drop so the wiring stays request-scoped.
+///
+/// The guard deliberately does NOT delete the wheel cache dir: it is
+/// content-addressed by `wheel_set_digest` and reused across requests.
+pub struct PythonEnvGuard {
+    wheels_dir: PathBuf,
+    prev_find_links: Option<std::ffi::OsString>,
+}
 
 impl PythonEnvGuard {
-    /// Root temp dir holding `wheels/` and `venv/`.
+    /// Directory holding the extracted wheels (the `--find-links` source).
+    pub fn wheels_dir(&self) -> &std::path::Path {
+        &self.wheels_dir
+    }
+
+    /// Backwards-compatible alias for [`Self::wheels_dir`].
     pub fn root(&self) -> &std::path::Path {
-        &self.0
+        &self.wheels_dir
     }
 }
 
 impl Drop for PythonEnvGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        match &self.prev_find_links {
+            Some(prev) => std::env::set_var(UV_FIND_LINKS, prev),
+            None => std::env::remove_var(UV_FIND_LINKS),
+        }
     }
 }
 
-/// Relative path of the python binary inside a venv for this platform.
-fn venv_python_rel() -> &'static str {
-    if cfg!(windows) {
-        "Scripts/python.exe"
-    } else {
-        "bin/python"
+/// Env var `uv` reads for additional local/remote wheel sources.
+const UV_FIND_LINKS: &str = "UV_FIND_LINKS";
+
+/// Root of the persistent wheel cache: `~/.cache/remotemedia/python-wheels`.
+fn wheel_cache_root() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".cache")
+        .join("remotemedia")
+        .join("python-wheels")
+}
+
+/// Normalize the distribution portion of a wheel filename per PEP 503/427.
+///
+/// Newer pip/uv reject wheels whose distribution name is not normalized
+/// (`-` and `.` must be `_` in the filename's first segment).
+fn normalized_wheel_filename(filename: &str) -> String {
+    // Wheel filenames are `{dist}-{version}-...`. The distribution part may
+    // itself contain hyphens/dots, so the version boundary is the first `-`
+    // followed by a digit.
+    let bytes = filename.as_bytes();
+    let split = (0..bytes.len()).find(|&i| {
+        bytes[i] == b'-'
+            && bytes
+                .get(i + 1)
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+    });
+    match split {
+        Some(i) => {
+            let dist = filename[..i].replace(['-', '.'], "_");
+            format!("{dist}{}", &filename[i..])
+        }
+        None => filename.to_string(),
     }
 }
 
-/// Materialize an embedded (frozen) Python wheelhouse into a fresh venv.
+/// Materialize an embedded (frozen) Python wheelhouse as an offline
+/// `--find-links` source for the managed uv environment system.
 ///
-/// Writes each wheel to a content-addressed wheels dir, creates a venv with
-/// `python3 -m venv`, then installs the wheels with `pip --no-index` (fully
-/// offline — no network, no dependency resolution against an index).
+/// Writes every shipped wheel into
+/// `~/.cache/remotemedia/python-wheels/<wheel_set_digest>/` (persistent,
+/// content-addressed, reused across requests), then prepends that dir to the
+/// process `UV_FIND_LINKS` so `uv pip install` resolves the shipped wheels
+/// without touching the network.
 ///
-/// Returns `(path_to_venv_python, guard)`; the guard removes the temp tree on
-/// drop.
+/// Returns `(wheels_dir, guard)`. The guard restores the previous
+/// `UV_FIND_LINKS` on drop; hold it for the request / session lifetime.
 pub fn materialize_embedded_python_env(
     env: &EmbeddedPythonEnv,
-) -> Result<(String, PythonEnvGuard), String> {
-    let root =
-        std::env::temp_dir().join(format!("rm-pyenv-{}-{}", std::process::id(), uuid_suffix()));
-    let wheels_dir = root.join("wheels");
-    let venv_dir = root.join("venv");
+) -> Result<(PathBuf, PythonEnvGuard), String> {
+    let digest = env.wheel_set_digest.trim().replace(['/', ':'], "_");
+    if digest.is_empty() {
+        return Err("embedded python env has empty wheel_set_digest".to_string());
+    }
+    if env.wheels.is_empty() {
+        return Err("embedded python env contains no wheels".to_string());
+    }
+
+    let wheels_dir = wheel_cache_root().join(&digest);
     std::fs::create_dir_all(&wheels_dir)
-        .map_err(|e| format!("create wheels dir {wheels_dir:?}: {e}"))?;
+        .map_err(|e| format!("create wheel cache dir {wheels_dir:?}: {e}"))?;
 
-    // Guard from here on so early returns clean up the partial tree.
-    let guard = PythonEnvGuard(root.clone());
-
-    let mut wheel_paths: Vec<PathBuf> = Vec::with_capacity(env.wheels.len());
     for wheel in &env.wheels {
-        // Use the original wheel filename for the on-disk file. Do NOT prefix
-        // with the digest: a `sha256:<hex>-` prefix makes pip's `--find-links`
-        // scanner mis-parse the filename as a hash requirement
-        // (`sha256:<hex>==<name>`), breaking the install. The digest is still
-        // validated for non-empty content below; the explicit path passed to
-        // `pip install` is what actually selects the wheel.
-        let digest = wheel.digest.trim();
-        if digest.is_empty() {
+        if wheel.digest.trim().is_empty() {
             return Err(format!(
                 "embedded python wheel '{}' has empty digest",
                 wheel.filename
@@ -160,53 +203,40 @@ pub fn materialize_embedded_python_env(
         } else {
             wheel.filename.clone()
         };
+        let filename = if filename.ends_with(".whl") {
+            normalized_wheel_filename(&filename)
+        } else {
+            format!("{}.whl", normalized_wheel_filename(&filename))
+        };
         let path = wheels_dir.join(&filename);
         std::fs::write(&path, &wheel.content)
             .map_err(|e| format!("write wheel {filename}: {e}"))?;
-        wheel_paths.push(path);
     }
 
-    // Create the venv.
-    let out = std::process::Command::new("python3")
-        .arg("-m")
-        .arg("venv")
-        .arg(&venv_dir)
-        .output()
-        .map_err(|e| format!("spawn `python3 -m venv`: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "python3 -m venv {venv_dir:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
+    let guard = wire_uv_find_links(&wheels_dir);
+    Ok((wheels_dir, guard))
+}
 
-    let venv_python = venv_dir.join(venv_python_rel());
-
-    // Install the wheels offline.
-    if !wheel_paths.is_empty() {
-        let mut cmd = std::process::Command::new(&venv_python);
-        cmd.arg("-m")
-            .arg("pip")
-            .arg("install")
-            .arg("--no-index")
-            .arg("--disable-pip-version-check")
-            .arg("--find-links")
-            .arg(&wheels_dir);
-        for path in &wheel_paths {
-            cmd.arg(path);
+/// Prepend `wheels_dir` to the process `UV_FIND_LINKS`, returning a guard that
+/// restores the previous value on drop.
+fn wire_uv_find_links(wheels_dir: &std::path::Path) -> PythonEnvGuard {
+    let prev = std::env::var_os(UV_FIND_LINKS);
+    let entry = wheels_dir.to_string_lossy().into_owned();
+    let combined = match prev.as_ref().map(|v| v.to_string_lossy().into_owned()) {
+        Some(existing) if !existing.trim().is_empty() => {
+            if existing.split(' ').any(|p| p == entry) {
+                existing
+            } else {
+                format!("{entry} {existing}")
+            }
         }
-        let out = cmd
-            .output()
-            .map_err(|e| format!("spawn pip install in embedded venv: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "offline pip install of embedded wheels failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
+        _ => entry,
+    };
+    std::env::set_var(UV_FIND_LINKS, combined);
+    PythonEnvGuard {
+        wheels_dir: wheels_dir.to_path_buf(),
+        prev_find_links: prev,
     }
-
-    Ok((venv_python.to_string_lossy().into_owned(), guard))
 }
 
 /// Convert the wire (proto) embedded python env into the decoded core type.
@@ -257,4 +287,72 @@ fn uuid_suffix() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{nanos:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remotemedia_core::transport::client::{EmbeddedInterpreter, EmbeddedWheel};
+
+    #[test]
+    fn normalizes_distribution_part_of_wheel_filename() {
+        assert_eq!(
+            normalized_wheel_filename("my-pkg-1.0.0-py3-none-any.whl"),
+            "my_pkg-1.0.0-py3-none-any.whl"
+        );
+        assert_eq!(
+            normalized_wheel_filename("numpy-2.0.0-cp311-cp311-linux_x86_64.whl"),
+            "numpy-2.0.0-cp311-cp311-linux_x86_64.whl"
+        );
+    }
+
+    #[test]
+    fn materialize_writes_wheels_and_wires_find_links() {
+        let tmp = std::env::temp_dir().join(format!("rm-pyenv-test-{}", uuid_suffix()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("HOME", &tmp);
+        std::env::remove_var(UV_FIND_LINKS);
+
+        let env = EmbeddedPythonEnv {
+            interpreter: EmbeddedInterpreter {
+                implementation: "cpython".to_string(),
+                version: "3.11".to_string(),
+                abi: "cp311".to_string(),
+                accelerator: String::new(),
+            },
+            wheel_set_digest: "deadbeef".to_string(),
+            wheels: vec![EmbeddedWheel {
+                name: "my-pkg".to_string(),
+                filename: "my-pkg-1.0.0-py3-none-any.whl".to_string(),
+                digest: "abc123".to_string(),
+                content: b"dummy-wheel".to_vec(),
+            }],
+        };
+
+        let (dir, guard) = materialize_embedded_python_env(&env).expect("materialize");
+        assert!(dir.ends_with("deadbeef"));
+        let written = dir.join("my_pkg-1.0.0-py3-none-any.whl");
+        assert_eq!(std::fs::read(&written).unwrap(), b"dummy-wheel".to_vec());
+        assert_eq!(
+            std::env::var(UV_FIND_LINKS).unwrap(),
+            dir.to_string_lossy().into_owned()
+        );
+
+        drop(guard);
+        // Guard restores (here: clears) UV_FIND_LINKS but keeps the cache dir.
+        assert!(std::env::var_os(UV_FIND_LINKS).is_none());
+        assert!(written.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn materialize_rejects_empty_wheelhouse() {
+        let env = EmbeddedPythonEnv {
+            interpreter: EmbeddedInterpreter::default(),
+            wheel_set_digest: "cafe".to_string(),
+            wheels: Vec::new(),
+        };
+        assert!(materialize_embedded_python_env(&env).is_err());
+    }
 }

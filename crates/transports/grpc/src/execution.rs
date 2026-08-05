@@ -188,10 +188,16 @@ impl PipelineExecutionService for ExecutionServiceImpl {
         let _py_env_guard = if let Some(py) = req.embedded_python_env.as_ref() {
             let decoded = crate::embedded_plugin::decode_embedded_python_env(py);
             match crate::embedded_plugin::materialize_embedded_python_env(&decoded) {
-                Ok((venv_python, guard)) => {
+                Ok((wheels_dir, guard)) => {
+                    // The guard already wired `UV_FIND_LINKS` for the request
+                    // lifetime; record the same source on the manifest so the
+                    // managed uv env system resolves the shipped wheels offline.
+                    let python_version = Some(decoded.interpreter.version.clone())
+                        .filter(|v| !v.trim().is_empty());
                     manifest.python_env = Some(remotemedia_core::manifest::ManifestPythonEnv {
-                        explicit_venv: Some(venv_python),
+                        python_version,
                         scope: Some(remotemedia_core::python::env_manager::EnvScope::PerPipeline),
+                        find_links: vec![wheels_dir],
                         ..Default::default()
                     });
                     Some(guard)

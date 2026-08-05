@@ -946,12 +946,17 @@ async fn handle_stream_init(
     // session lifetime.
     let embedded_python_env_guard = if let Some(py) = init.embedded_python_env.as_ref() {
         let decoded = crate::embedded_plugin::decode_embedded_python_env(py);
-        let (venv_python, guard) =
+        let (wheels_dir, guard) =
             crate::embedded_plugin::materialize_embedded_python_env(&decoded)
                 .map_err(ServiceError::Validation)?;
+        // The guard wires `UV_FIND_LINKS` for the session lifetime and restores
+        // the previous value when the session (and guard) is dropped.
+        let python_version =
+            Some(decoded.interpreter.version.clone()).filter(|v| !v.trim().is_empty());
         manifest.python_env = Some(remotemedia_core::manifest::ManifestPythonEnv {
-            explicit_venv: Some(venv_python),
+            python_version,
             scope: Some(remotemedia_core::python::env_manager::EnvScope::PerPipeline),
+            find_links: vec![wheels_dir],
             ..Default::default()
         });
         Some(guard)
