@@ -21,7 +21,7 @@ use crate::{
 
 use async_trait::async_trait;
 use remotemedia_bundle::{
-    AcceleratorBackend, CompatibilityRange, RuntimeCapabilities, BUNDLE_SCHEMA_VERSION,
+    AcceleratorBackend, CompatibilityRange, PythonTarget, RuntimeCapabilities, BUNDLE_SCHEMA_VERSION,
 };
 use remotemedia_bundle_deployment::{
     ActivationRegistry, ContentStore, DeploymentService, ReqwestExternalAssetTransport,
@@ -112,7 +112,7 @@ impl GrpcServer {
             .named_layer(
                 PipelineExecutionServiceServer::new(execution_service)
                     .max_decoding_message_size(10 * 1024 * 1024)
-                    .max_encoding_message_size(10 * 1024 * 1024),
+                    .max_encoding_message_size(10 * 1024 * 1024)
             );
 
         let streaming_service = tower::ServiceBuilder::new()
@@ -122,7 +122,7 @@ impl GrpcServer {
             .named_layer(
                 StreamingPipelineServiceServer::new(streaming_service)
                     .max_decoding_message_size(10 * 1024 * 1024)
-                    .max_encoding_message_size(10 * 1024 * 1024),
+                    .max_encoding_message_size(10 * 1024 * 1024)
             );
 
         let control_service = tower::ServiceBuilder::new()
@@ -206,7 +206,7 @@ impl GrpcServer {
             .named_layer(
                 PipelineExecutionServiceServer::new(execution_service)
                     .max_decoding_message_size(10 * 1024 * 1024)
-                    .max_encoding_message_size(10 * 1024 * 1024),
+                    .max_encoding_message_size(10 * 1024 * 1024)
             );
 
         let streaming_service = tower::ServiceBuilder::new()
@@ -216,7 +216,7 @@ impl GrpcServer {
             .named_layer(
                 StreamingPipelineServiceServer::new(streaming_service)
                     .max_decoding_message_size(10 * 1024 * 1024)
-                    .max_encoding_message_size(10 * 1024 * 1024),
+                    .max_encoding_message_size(10 * 1024 * 1024)
             );
 
         let control_service = tower::ServiceBuilder::new()
@@ -354,7 +354,7 @@ fn deployment_service_from_env(
             minimum: env!("CARGO_PKG_VERSION").to_owned(),
             maximum_exclusive: None,
         },
-        python: Vec::new(),
+        python: python_targets_from_env(),
         accelerators: vec![AcceleratorBackend::Cpu],
         memory_bytes,
         available_cache_bytes: cache_bytes,
@@ -382,6 +382,7 @@ fn deployment_service_from_env(
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error>> {
+
     match std::env::var(name) {
         Ok(value) => Ok(value
             .parse()
@@ -545,4 +546,32 @@ impl StreamSession for SessionHandleWrapper {
     fn is_active(&self) -> bool {
         self.0.is_active()
     }
+}
+
+/// Advertise the Python ABIs this runtime can host, read from
+/// `REMOTEMEDIA_PYTHON_ABIS`. The variable is a comma-separated list of
+/// `implementation:version:abi` triples, e.g. `cpython:3.12:cp312`. When unset,
+/// no Python capability is advertised (the target rejects Python-bearing
+/// bundles during capability negotiation). The gRPC server provisions venvs at
+/// activation via the bundled `uv`, which can fetch any declared interpreter,
+/// so an operator sets this to match the wheels frozen into the bundle.
+fn python_targets_from_env() -> Vec<PythonTarget> {
+    let Ok(raw) = std::env::var("REMOTEMEDIA_PYTHON_ABIS") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|entry| {
+            let mut parts = entry.splitn(3, ':');
+            let implementation = parts.next()?.to_owned();
+            let version = parts.next()?.to_owned();
+            let abi = parts.next()?.to_owned();
+            Some(PythonTarget {
+                implementation,
+                version,
+                abi,
+            })
+        })
+        .collect()
 }
