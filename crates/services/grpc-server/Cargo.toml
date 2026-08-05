@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Transport library
-remotemedia-grpc = { path = "../../transports/grpc", default-features = true, features = ["multiprocess", "loadable"] }
+remotemedia-grpc = { path = "../../transports/grpc", default-features = true, features = ["multiprocess", "loadable", "bundled-uv-embedded"] }
 
 # Bundle deployment service (install/activate .rmpkg artifacts)
 remotemedia-bundle = { path = "../../bundle" }

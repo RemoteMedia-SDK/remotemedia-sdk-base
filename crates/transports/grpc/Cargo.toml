@@ -87,6 +87,12 @@ multiprocess = ["remotemedia-core/multiprocess"]
 # than the SystemBackend's `python -m venv + pip install` fallback.
 bundled-uv = ["remotemedia-core/bundled-uv"]
 
+# Embed a uv binary into the artifact at build time (requires UV_BINARY_PATH
+# to be set; build.rs panics otherwise). At runtime the UvBackend extracts it
+# to ~/.config/remotemedia/bin/uv, so no system `uv` and no network download
+# is required. Mirrors the napi/FFI deploy path which enables this by default.
+bundled-uv-embedded = ["remotemedia-core/bundled-uv-embedded"]
+
 # CLI integration (clap argument parsing)
 cli = ["dep:clap"]
 
