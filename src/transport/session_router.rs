@@ -641,6 +641,18 @@ impl SessionRouter {
                         }
                     }
                 }
+                // Thread the embedded wheelhouse (find-links) to the executor so the
+                // managed venv resolves the server-frozen `iceoryx2` (and other
+                // pinned deps) offline, instead of fetching a possibly ABI-
+                // incompatible version from PyPI.
+                if !py_env.find_links.is_empty() {
+                    if let Some(obj) = params.as_object_mut() {
+                        obj.insert(
+                            "__python_find_links__".to_string(),
+                            serde_json::json!(py_env.find_links),
+                        );
+                    }
+                }
             }
             let effective_scope = node_spec
                 .python_env

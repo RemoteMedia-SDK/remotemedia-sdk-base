@@ -111,8 +111,8 @@ impl GrpcServer {
             .into_inner()
             .named_layer(
                 PipelineExecutionServiceServer::new(execution_service)
-                    .max_decoding_message_size(10 * 1024 * 1024) // 10MB for large video frames
-                    .max_encoding_message_size(10 * 1024 * 1024), // 10MB
+                    .max_decoding_message_size(10 * 1024 * 1024)
+                    .max_encoding_message_size(10 * 1024 * 1024),
             );
 
         let streaming_service = tower::ServiceBuilder::new()
@@ -121,8 +121,8 @@ impl GrpcServer {
             .into_inner()
             .named_layer(
                 StreamingPipelineServiceServer::new(streaming_service)
-                    .max_decoding_message_size(10 * 1024 * 1024) // 10MB for large video frames
-                    .max_encoding_message_size(10 * 1024 * 1024), // 10MB
+                    .max_decoding_message_size(10 * 1024 * 1024)
+                    .max_encoding_message_size(10 * 1024 * 1024),
             );
 
         let control_service = tower::ServiceBuilder::new()
@@ -205,8 +205,8 @@ impl GrpcServer {
             .into_inner()
             .named_layer(
                 PipelineExecutionServiceServer::new(execution_service)
-                    .max_decoding_message_size(10 * 1024 * 1024) // 10MB for large video frames
-                    .max_encoding_message_size(10 * 1024 * 1024), // 10MB
+                    .max_decoding_message_size(10 * 1024 * 1024)
+                    .max_encoding_message_size(10 * 1024 * 1024),
             );
 
         let streaming_service = tower::ServiceBuilder::new()
@@ -215,8 +215,8 @@ impl GrpcServer {
             .into_inner()
             .named_layer(
                 StreamingPipelineServiceServer::new(streaming_service)
-                    .max_decoding_message_size(10 * 1024 * 1024) // 10MB for large video frames
-                    .max_encoding_message_size(10 * 1024 * 1024), // 10MB
+                    .max_decoding_message_size(10 * 1024 * 1024)
+                    .max_encoding_message_size(10 * 1024 * 1024),
             );
 
         let control_service = tower::ServiceBuilder::new()

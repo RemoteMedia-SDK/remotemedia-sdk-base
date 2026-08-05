@@ -2602,6 +2602,66 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
         // This updates the process manager's spawn config with the venv python
         // before any spawn calls below.
         if let Some(ref env_mgr) = self.env_manager {
+            // Honor the manifest's python_env (python_version + find_links) for
+            // this node. The executor's `PythonEnvManager` is built from the
+            // server-wide `MultiprocessConfig.python_env` (runtime.toml), which
+            // does NOT carry the manifest's `python_version`. If we used it as-is,
+            // the venv would be built with the default interpreter (e.g. 3.11)
+            // instead of the manifest's (e.g. 3.12). A version skew there makes
+            // `iceoryx2` resolve to an ABI-incompatible build -> the Python
+            // subprocess opens the server's shared-memory service with the wrong
+            // layout and crashes with `ServiceInCorruptedState`. So override the
+            // per-node manager config from the manifest when present.
+            let manifest_python_version = ctx
+                .params
+                .get("__python_version__")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from);
+            let manifest_find_links: Vec<std::path::PathBuf> = ctx
+                .params
+                .get("__python_find_links__")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(std::path::PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Build a per-node manager with the manifest overrides applied on top
+            // of the server-wide config. Falls back to the server-wide manager
+            // when the manifest omits the keys.
+            let node_env_mgr: std::sync::Arc<crate::python::env_manager::PythonEnvManager> = {
+                let mut cfg = self.config.python_env.clone();
+                let mut overridden = false;
+                if let Some(pv) = &manifest_python_version {
+                    cfg.python_version = pv.clone();
+                    overridden = true;
+                }
+                if !manifest_find_links.is_empty() {
+                    cfg.find_links = manifest_find_links.clone();
+                    overridden = true;
+                }
+                if overridden {
+                    match crate::python::env_manager::PythonEnvManager::new(cfg) {
+                        Ok(mgr) => std::sync::Arc::new(mgr),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                node_id = %ctx.node_id,
+                                "Failed to build per-node Python env manager from manifest; using server-wide config"
+                            );
+                            env_mgr.clone()
+                        }
+                    }
+                } else {
+                    env_mgr.clone()
+                }
+            };
+            let env_mgr = node_env_mgr;
+
             // Pre-discover node-declared deps (via @python_requires decorator)
             // by running a lightweight Python probe BEFORE spawning the real process.
             // This ensures the managed venv includes all required packages upfront.
@@ -2757,6 +2817,19 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                             .env_vars
                             .insert("LD_LIBRARY_PATH".to_string(), String::new());
                     }
+
+                    // Lock out the Python user-site (e.g. ~/.local) for managed-venv
+                    // subprocesses. A stale `iceoryx2` in the host user-site (e.g.
+                    // 0.9.0) would shadow the venv's pinned `iceoryx2` (0.9.3) on
+                    // `import iceoryx2`. Any version skew between the venv's iceoryx2
+                    // and the Rust server's iceoryx2 corrupts the shared-memory
+                    // service the server pre-creates, surfacing as
+                    // `ServiceInCorruptedState` on the node's first channel open.
+                    // PYTHONNOUSERSITE=1 makes the venv hermetic so only the pinned
+                    // iceoryx2 is ever imported.
+                    spawn_cfg
+                        .env_vars
+                        .insert("PYTHONNOUSERSITE".to_string(), "1".to_string());
                 }
                 Err(e) => {
                     tracing::warn!(

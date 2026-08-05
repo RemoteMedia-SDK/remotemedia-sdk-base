@@ -969,12 +969,45 @@ impl SessionRouter {
 
         // Pass session_id for multiprocess execution
         let session_id = Some(session.session_id.clone());
+
+        // Stamp manifest-level Python env info (python_version + embedded
+        // wheelhouse find-links) onto the node's params so the multiprocess
+        // executor can build its venv with the manifest's interpreter version
+        // and resolve pinned deps (e.g. iceoryx2) offline. Without this, the
+        // executor falls back to the server-wide default interpreter and a
+        // version/ABI skew with the Rust iceoryx2 service →
+        // ServiceInCorruptedState on the Python node's IPC channel.
+        let mut node_params = spec.params.clone();
+        if let Some(ref py_env) = session.manifest.python_env {
+            if let Some(obj) = node_params.as_object_mut() {
+                if let Some(ref pv) = py_env.python_version {
+                    obj.insert("__python_version__".to_string(), serde_json::json!(pv));
+                }
+                if !py_env.find_links.is_empty() {
+                    obj.insert(
+                        "__python_find_links__".to_string(),
+                        serde_json::json!(py_env.find_links),
+                    );
+                }
+            }
+        }
+        // Also stamp the node's own declared python_deps (e.g. kokoro, soundfile)
+        // so the venv builder provisions them even if the @python_requires probe
+        // does not run for this node.
+        if let Some(obj) = node_params.as_object_mut() {
+            if let Some(ref deps) = spec.python_deps {
+                if !deps.is_empty() {
+                    obj.insert("__python_deps__".to_string(), serde_json::json!(deps));
+                }
+            }
+        }
+
         let node = self
             .registry
             .create_node(
                 &spec.node_type,
                 node_id.to_string(),
-                &spec.params,
+                &node_params,
                 session_id,
             )
             .map_err(|e| Status::internal(format!("Failed to create node '{}': {}", node_id, e)))?;
