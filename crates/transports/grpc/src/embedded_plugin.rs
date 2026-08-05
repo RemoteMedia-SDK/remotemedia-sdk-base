@@ -142,6 +142,12 @@ pub fn materialize_embedded_python_env(
 
     let mut wheel_paths: Vec<PathBuf> = Vec::with_capacity(env.wheels.len());
     for wheel in &env.wheels {
+        // Use the original wheel filename for the on-disk file. Do NOT prefix
+        // with the digest: a `sha256:<hex>-` prefix makes pip's `--find-links`
+        // scanner mis-parse the filename as a hash requirement
+        // (`sha256:<hex>==<name>`), breaking the install. The digest is still
+        // validated for non-empty content below; the explicit path passed to
+        // `pip install` is what actually selects the wheel.
         let digest = wheel.digest.trim();
         if digest.is_empty() {
             return Err(format!(
@@ -154,7 +160,7 @@ pub fn materialize_embedded_python_env(
         } else {
             wheel.filename.clone()
         };
-        let path = wheels_dir.join(format!("{digest}-{filename}"));
+        let path = wheels_dir.join(&filename);
         std::fs::write(&path, &wheel.content)
             .map_err(|e| format!("write wheel {filename}: {e}"))?;
         wheel_paths.push(path);
