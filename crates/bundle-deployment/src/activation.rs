@@ -18,6 +18,9 @@ pub struct DeploymentRevision {
     pub content_digests: BTreeSet<String>,
     #[serde(default)]
     pub external_assets: Vec<AssetDescriptor>,
+    /// Every asset declared by the bundle lock (embedded and external).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<AssetDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_runtime: Option<NativeRuntimeClosure>,
 }
@@ -234,6 +237,7 @@ mod tests {
             manifest_digest: None,
             content_digests: BTreeSet::from([content.to_owned()]),
             external_assets: Vec::new(),
+            assets: Vec::new(),
             native_runtime: None,
         }
     }

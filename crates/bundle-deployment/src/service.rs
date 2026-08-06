@@ -251,7 +251,10 @@ impl DeploymentService {
             }
             self.set_status(operation_id, phase, 0, None);
             if phase == ProvisioningPhase::FetchingAssets {
-                if let Err(error) = self.fetch_external_assets(&revision) {
+                if let Err(error) = self
+                    .fetch_external_assets(&revision)
+                    .and_then(|()| self.verify_embedded_assets(&revision))
+                {
                     let diagnostic = bounded_diagnostic(&error.to_string());
                     self.set_status(
                         operation_id,
@@ -263,7 +266,10 @@ impl DeploymentService {
                 }
             }
             if phase == ProvisioningPhase::Loading {
-                if revision.native_runtime.is_some() || !revision.external_assets.is_empty() {
+                if revision.native_runtime.is_some()
+                    || !revision.external_assets.is_empty()
+                    || revision.assets.iter().any(is_embedded_asset)
+                {
                     let mut closure = revision.native_runtime.clone().unwrap_or(
                         remotemedia_bundle::NativeRuntimeClosure {
                             files: Vec::new(),
@@ -281,6 +287,7 @@ impl DeploymentService {
                     if let Err(error) = self
                         .content
                         .materialize_native_runtime(&revision.bundle_digest, &closure)
+                        .and_then(|_| self.materialize_embedded_assets(&revision))
                     {
                         let diagnostic = bounded_diagnostic(&error.to_string());
                         self.set_status(
@@ -357,13 +364,78 @@ impl DeploymentService {
         Ok(())
     }
 
+    /// Embedded asset bytes ship inside the .rmpkg and land in the CAS at
+    /// upload time; verify each one is present and content-addressed correctly
+    /// before the runtime is loaded.
+    fn verify_embedded_assets(&self, revision: &DeploymentRevision) -> Result<(), DeploymentError> {
+        for asset in revision.assets.iter().filter(|asset| is_embedded_asset(asset)) {
+            let bytes = self.content.read(&asset.digest)?;
+            verify_embedded_asset_bytes(asset, &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Copy embedded asset bytes out of the CAS into the release directory so
+    /// manifest asset paths can point at stable on-disk files.
+    fn materialize_embedded_assets(
+        &self,
+        revision: &DeploymentRevision,
+    ) -> Result<(), DeploymentError> {
+        let embedded: Vec<_> = revision
+            .assets
+            .iter()
+            .filter(|asset| is_embedded_asset(asset))
+            .collect();
+        if embedded.is_empty() {
+            return Ok(());
+        }
+        let release = self
+            .content
+            .native_runtime_release(&revision.bundle_digest)?;
+        let assets_dir = release.join("assets");
+        std::fs::create_dir_all(&assets_dir)?;
+        for asset in embedded {
+            if asset.name.is_empty()
+                || asset.name.contains('/')
+                || asset.name.contains('\\')
+                || asset.name.starts_with('.')
+            {
+                return Err(DeploymentError::Provisioning(format!(
+                    "invalid embedded asset name: {}",
+                    asset.name
+                )));
+            }
+            let bytes = self.content.read(&asset.digest)?;
+            verify_embedded_asset_bytes(asset, &bytes)?;
+            let destination = assets_dir.join(&asset.name);
+            if destination.exists() {
+                continue;
+            }
+            std::fs::write(&destination, &bytes)?;
+        }
+        Ok(())
+    }
+
     fn resolve_native_plugin_paths(
         &self,
         revision: &DeploymentRevision,
         manifest: Vec<u8>,
     ) -> Result<Vec<u8>, DeploymentError> {
+        let assets: &[remotemedia_bundle::AssetDescriptor] = if revision.assets.is_empty() {
+            &revision.external_assets
+        } else {
+            &revision.assets
+        };
         let Some(closure) = &revision.native_runtime else {
-            return Ok(manifest);
+            if assets.is_empty() {
+                return Ok(manifest);
+            }
+            let release = self
+                .content
+                .native_runtime_release(&revision.bundle_digest)?;
+            let mut value: serde_json::Value = serde_json::from_slice(&manifest)?;
+            Self::resolve_asset_paths(&mut value, &release, assets);
+            return Ok(remotemedia_bundle::canonical_json(&value)?);
         };
         let release = self.content.native_runtime_release(&revision.bundle_digest)?;
         let plugin_paths: Vec<_> = closure
@@ -388,7 +460,7 @@ impl DeploymentService {
         for (plugin, path) in plugins.iter_mut().zip(plugin_paths) {
             *plugin = serde_json::json!({"path": path});
         }
-        Self::resolve_asset_paths(&mut value, &release, &revision.external_assets);
+        Self::resolve_asset_paths(&mut value, &release, assets);
         Ok(remotemedia_bundle::canonical_json(&value)?)
     }
 
@@ -435,6 +507,39 @@ fn resolve_asset_paths(
             operation.status.diagnostic = diagnostic;
         }
     }
+}
+
+fn is_embedded_asset(asset: &remotemedia_bundle::AssetDescriptor) -> bool {
+    matches!(
+        asset.storage,
+        remotemedia_bundle::AssetStorage::Embedded { .. }
+    )
+}
+
+fn verify_embedded_asset_bytes(
+    asset: &remotemedia_bundle::AssetDescriptor,
+    bytes: &[u8],
+) -> Result<(), DeploymentError> {
+    if bytes.len() as u64 != asset.size {
+        return Err(DeploymentError::SizeMismatch {
+            expected: asset.size,
+            actual: bytes.len() as u64,
+        });
+    }
+    let actual = sha256_digest(bytes);
+    let normalize = |digest: &str| {
+        digest
+            .trim()
+            .trim_start_matches("sha256:")
+            .to_ascii_lowercase()
+    };
+    if normalize(&actual) != normalize(&asset.digest) {
+        return Err(DeploymentError::Provisioning(format!(
+            "embedded asset {} digest mismatch: expected {}, got {}",
+            asset.name, asset.digest, actual
+        )));
+    }
+    Ok(())
 }
 
 fn bounded_diagnostic(value: &str) -> String {
@@ -546,6 +651,7 @@ mod tests {
             manifest_digest: None,
             content_digests: BTreeSet::new(),
             external_assets: Vec::new(),
+            assets: Vec::new(),
             native_runtime: None,
         }
     }
@@ -593,6 +699,7 @@ mod tests {
             manifest_digest: None,
             content_digests: BTreeSet::new(),
             external_assets: Vec::new(),
+            assets: Vec::new(),
             native_runtime: Some(remotemedia_bundle::NativeRuntimeClosure {
                 files: vec![remotemedia_bundle::NativeRuntimeFile {
                     digest: format!("sha256:{}", "e".repeat(64)),
@@ -700,6 +807,7 @@ mod tests {
             manifest_digest: None,
             content_digests: BTreeSet::new(),
             external_assets: vec![asset.clone()],
+            assets: vec![asset.clone()],
             native_runtime: None,
         };
 
@@ -714,6 +822,75 @@ mod tests {
                 .unwrap()
                 .phase,
             ProvisioningPhase::Ready
+        );
+    }
+
+    #[test]
+    fn install_materializes_embedded_assets_and_resolves_manifest_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"embedded-model-weights".to_vec();
+        let digest = sha256_digest(&bytes);
+        let content = ContentStore::open(temp.path().join("cas")).unwrap();
+        let mut upload = content
+            .begin_upload(DescriptorIdentity {
+                digest: digest.clone(),
+                size: bytes.len() as u64,
+            })
+            .unwrap();
+        upload.append(0, &bytes).unwrap();
+        upload.finish().unwrap();
+
+        let manifest = br#"{"nodes":[{"model":"./models/model.bin"}]}"#.to_vec();
+        let manifest_digest = sha256_digest(&manifest);
+        let mut upload = content
+            .begin_upload(DescriptorIdentity {
+                digest: manifest_digest.clone(),
+                size: manifest.len() as u64,
+            })
+            .unwrap();
+        upload.append(0, &manifest).unwrap();
+        upload.finish().unwrap();
+
+        let asset = AssetDescriptor {
+            name: "model.bin".to_owned(),
+            digest: digest.clone(),
+            size: bytes.len() as u64,
+            cache_key: "model.bin".to_owned(),
+            license: None,
+            storage: remotemedia_bundle::AssetStorage::Embedded,
+        };
+        let service = DeploymentService::new(
+            TokenAuthenticator::new(b"secret"),
+            service_capabilities(),
+            content.clone(),
+            ActivationRegistry::open(temp.path().join("state")).unwrap(),
+        );
+        let bundle_digest = format!("sha256:{}", "c".repeat(64));
+        let revision = DeploymentRevision {
+            bundle_digest: bundle_digest.clone(),
+            variant_digest: "variant".to_owned(),
+            manifest_digest: Some(manifest_digest.clone()),
+            content_digests: BTreeSet::from([manifest_digest, digest]),
+            external_assets: Vec::new(),
+            assets: vec![asset.clone()],
+            native_runtime: None,
+        };
+        service
+            .install(b"secret", "embedded-install", revision, 0, |_| Ok(()))
+            .unwrap();
+        service
+            .activate(b"secret", "embedded", &bundle_digest)
+            .unwrap();
+
+        let release = content.native_runtime_release(&bundle_digest).unwrap();
+        let materialized = release.join("assets").join("model.bin");
+        assert_eq!(std::fs::read(&materialized).unwrap(), bytes);
+
+        let (_, resolved) = service.active_manifest(b"secret", "embedded").unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&resolved).unwrap();
+        assert_eq!(
+            value["nodes"][0]["model"],
+            serde_json::Value::String(materialized.to_string_lossy().into_owned())
         );
     }
 
