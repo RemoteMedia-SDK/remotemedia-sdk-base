@@ -534,6 +534,15 @@ pub fn register_default_python_nodes() {
             .with_category("test"),
     );
 
+    register_python_node(
+        PythonNodeConfig::new("ArdyMotionNode")
+            .with_multi_output(true)
+            .with_description("Persistent ARDY Core Horizon8 constrained office motion")
+            .with_category("avatar")
+            .accepts(["json", "text"])
+            .produces(["json"]),
+    );
+
     // Avatar / motion nodes
     register_python_node(
         PythonNodeConfig::new("KimodoMotionNode")
