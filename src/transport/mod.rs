@@ -37,6 +37,8 @@ pub mod plugin_registry;
 pub mod session;
 pub mod session_control;
 pub mod session_recorder;
+pub mod avatar_session;
+mod managed_ardy;
 pub mod session_router;
 pub mod shared_session;
 pub mod warm_session_pool;

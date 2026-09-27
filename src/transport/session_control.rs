@@ -413,6 +413,9 @@ impl Default for NodeState {
 /// handed to the router via `attach_control`.
 pub struct SessionControl {
     session_id: String,
+    /// Latest office observation, read at the start of an LLM turn. This is
+    /// replaceable state, not a queued input that could stall the media router.
+    office_observation: parking_lot::RwLock<Option<serde_json::Value>>,
     /// Broadcasts a node output to every subscriber of (node_id, port).
     /// `broadcast::Sender` is cheap to clone; slow receivers lag, not block.
     taps: DashMap<TapKey, broadcast::Sender<RuntimeData>>,
@@ -586,6 +589,7 @@ impl SessionControl {
 
         Arc::new(Self {
             session_id: session_id.into(),
+            office_observation: parking_lot::RwLock::new(None),
             taps: DashMap::new(),
             intercepts: DashMap::new(),
             input_tx: RwLock::new(None),
@@ -661,6 +665,18 @@ impl SessionControl {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub(crate) fn set_office_observation(&self, state: serde_json::Value) -> Result<()> {
+        if state.to_string().len() > 65536 {
+            return Err(crate::Error::Execution("office observation exceeds 64 KiB".into()));
+        }
+        *self.office_observation.write() = Some(state);
+        Ok(())
+    }
+
+    pub(crate) fn office_observation(&self) -> Option<serde_json::Value> {
+        self.office_observation.read().clone()
     }
 
     /// Wire the router's input channel so `publish` can reach nodes.

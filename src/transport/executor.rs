@@ -487,6 +487,7 @@ impl PipelineSessionHost for PipelineExecutor {
 /// - **Schema validation**: Manifest validation before execution
 /// - **Metrics**: Prometheus-format metrics export
 pub struct PipelineExecutor {
+    managed_ardy_daemons: super::managed_ardy::ManagedArdyDaemons,
     /// Configuration
     config: ExecutorConfig,
     /// Node registry for creating nodes (wrapped in RwLock for mutable access)
@@ -572,6 +573,7 @@ impl PipelineExecutor {
         };
 
         Ok(Self {
+            managed_ardy_daemons: Default::default(),
             config,
             registry,
             scheduler,
@@ -1123,6 +1125,7 @@ impl PipelineExecutor {
         tracing::info!("cold_build_session: validate_manifest ok");
         let manifest = self.negotiate_capabilities(manifest).await?;
         tracing::info!("cold_build_session: negotiate_capabilities ok");
+        let manifest = Arc::new(self.managed_ardy_daemons.prepare(&manifest).await?);
 
         let session_id = self.generate_session_id();
 
@@ -1176,6 +1179,17 @@ impl PipelineExecutor {
         )
         .await;
 
+        let avatar_bridge = match crate::transport::avatar_session::AvatarSessionBridge::attach(
+            &manifest,
+            control.clone(),
+        ) {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                self.control_bus.unregister(&session_id);
+                return Err(error);
+            }
+        };
+
         // Get input sender before moving router
         let input_tx = router.get_input_sender();
         // Snapshot the perf aggregator handle before the router is
@@ -1214,6 +1228,7 @@ impl PipelineExecutor {
         let bus = self.control_bus.clone();
         let unregister_sid = session_id.clone();
         let task_handle = tokio::spawn(async move {
+            let _avatar_bridge = avatar_bridge;
             let result = router.run_after_init().await;
             if let Err(ref e) = result {
                 tracing::error!(
