@@ -207,6 +207,7 @@ fn lfm2_audio_manifest() -> Manifest {
             python_version: Some("3.12".to_string()),
             scope: None,
             extra_deps: Vec::new(),
+            ..Default::default()
         }),
         ..Default::default()
     }

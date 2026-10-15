@@ -186,6 +186,8 @@ async fn test_grpc_streaming_video_pipeline() {
             client_version: "test-v1.0".to_string(),
             expected_chunk_size: 0, // Use server default
             output_taps: Vec::new(),
+            embedded_plugins: Vec::new(),
+            embedded_python_env: None,
         })),
     };
 
@@ -396,6 +398,8 @@ async fn test_grpc_streaming_multiple_sessions() {
                     client_version: "session1".to_string(),
                     expected_chunk_size: 0,
                     output_taps: Vec::new(),
+                    embedded_plugins: Vec::new(),
+                    embedded_python_env: None,
                 })),
             })
             .await
@@ -459,6 +463,8 @@ async fn test_grpc_streaming_multiple_sessions() {
                     client_version: "session2".to_string(),
                     expected_chunk_size: 0,
                     output_taps: Vec::new(),
+                    embedded_plugins: Vec::new(),
+                    embedded_python_env: None,
                 })),
             })
             .await

@@ -60,6 +60,8 @@ async fn run_manifest(endpoint: &str, name: &str, node_id: &str, text: &str) -> 
                 client_version: "v1".to_string(),
                 expected_chunk_size: 1,
                 output_taps: Vec::new(),
+                embedded_plugins: Vec::new(),
+                embedded_python_env: None,
             })),
         })
         .await
