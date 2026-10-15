@@ -61,7 +61,7 @@ use serde_json::Value;
 use crate::data::RuntimeData;
 use crate::nodes::{
     AsyncNodeWrapper, AsyncStreamingNode, InitializeContextRead, NodeRuntimeContextRead,
-    StreamingNode, StreamingNodeFactory, StreamingNodeRegistry,
+    PacingNature, StreamingNode, StreamingNodeFactory, StreamingNodeRegistry, Tick,
 };
 use crate::Error;
 
@@ -141,6 +141,7 @@ impl LoadableNodeBundle {
                 Arc::new(LoadableFactoryAdapter {
                     inner: f,
                     node_type,
+                    schema: None,
                 }) as Arc<dyn StreamingNodeFactory>
             })
             .collect();
@@ -210,20 +211,37 @@ pub fn wrap_ffi_factory<F>(factory: F) -> Arc<dyn StreamingNodeFactory>
 where
     F: FfiNodeFactory + 'static,
 {
+    wrap_ffi_factory_metadata(factory, None)
+}
+
+/// Register an in-process plugin with its authored schema. The FFI vtable does
+/// not carry schemas; keeping metadata here lets transports negotiate tracks
+/// before creating the node, without changing the binary plugin ABI.
+pub fn wrap_ffi_factory_with_schema<F>(factory: F, schema: crate::nodes::schema::NodeSchema) -> Arc<dyn StreamingNodeFactory>
+where F: FfiNodeFactory + 'static {
+    wrap_ffi_factory_metadata(factory, Some(schema))
+}
+
+fn wrap_ffi_factory_metadata<F>(factory: F, schema: Option<crate::nodes::schema::NodeSchema>) -> Arc<dyn StreamingNodeFactory>
+where F: FfiNodeFactory + 'static {
     let boxed: FfiNodeFactoryBox = FfiNodeFactory_TO::from_value(factory, TD_Opaque);
     let node_type = boxed.node_type().into_string();
     Arc::new(LoadableFactoryAdapter {
         inner: boxed,
         node_type,
+        schema,
     })
 }
 
 struct LoadableFactoryAdapter {
     inner: FfiNodeFactoryBox,
     node_type: String,
+    schema: Option<crate::nodes::schema::NodeSchema>,
 }
 
 impl StreamingNodeFactory for LoadableFactoryAdapter {
+    fn schema(&self) -> Option<crate::nodes::schema::NodeSchema> { self.schema.clone() }
+
     fn node_type(&self) -> &str {
         &self.node_type
     }
@@ -246,8 +264,26 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
             }
         };
 
+        let pacing: Value = serde_json::from_str(ffi_node.pacing().as_str())
+            .map_err(|e| Error::Execution(format!("invalid plugin pacing: {e}")))?;
+        let rate = pacing["rate_hz"]
+            .as_u64()
+            .filter(|r| *r > 0 && *r <= u32::MAX as u64)
+            .ok_or_else(|| Error::Execution("invalid plugin pacing rate".into()))?
+            as u32;
+        let nature = match pacing["nature"].as_str() {
+            Some("reactive") => PacingNature::Reactive,
+            Some("outbound") => PacingNature::ClockedToOutboundMedia,
+            Some("wall") => PacingNature::SourceWall(rate),
+            _ => return Err(Error::Execution("unknown plugin pacing nature".into())),
+        };
+        let clocked_media_addr = serde_json::from_value(pacing["clocked_media_addr"].clone())
+            .map_err(|e| Error::Execution(format!("invalid plugin clock address: {e}")))?;
         Ok(Box::new(AsyncNodeWrapper(Arc::new(LoadableNodeAdapter {
             inner: ffi_node,
+            nature,
+            rate,
+            clocked_media_addr,
             node_type: self.node_type.clone(),
             node_id,
         }))))
@@ -256,6 +292,9 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
 
 struct LoadableNodeAdapter {
     inner: FfiNodeBox,
+    nature: PacingNature,
+    rate: u32,
+    clocked_media_addr: Option<(String, String)>,
     node_type: String,
     node_id: String,
 }
@@ -264,6 +303,59 @@ struct LoadableNodeAdapter {
 impl AsyncStreamingNode for LoadableNodeAdapter {
     fn node_type(&self) -> &str {
         &self.node_type
+    }
+
+    fn pacing_nature(&self) -> PacingNature {
+        self.nature
+    }
+    fn fallback_rate_hz(&self) -> u32 {
+        self.rate
+    }
+    fn clocked_media_addr(&self) -> Option<(String, String)> {
+        self.clocked_media_addr.clone()
+    }
+
+    async fn tick(
+        &self,
+        tick: Tick,
+        session_id: Option<String>,
+        callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
+    ) -> Result<(), Error> {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let sink = OutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
+        let future = self.inner.tick(
+            loadable_node_abi::FfiTick {
+                clock_id: tick.clock_id.into(),
+                pts_us: tick.pts_us,
+                frame_idx: tick.frame_idx,
+                deadline_us: tick.deadline_us,
+            },
+            session_id.unwrap_or_default().into(),
+            sink,
+        );
+
+        self.drain_outputs(future, rx, callback).await.map(|_| ())
+    }
+
+    async fn process_control_message(
+        &self,
+        message: RuntimeData,
+        session_id: Option<String>,
+    ) -> Result<bool, Error> {
+        let bytes = rmp_serde::to_vec_named(&message)
+            .map_err(|e| Error::Execution(format!("rmp encode control: {e}")))?;
+        match self
+            .inner
+            .process_control_message(bytes.into(), session_id.unwrap_or_default().into())
+            .await
+        {
+            RResult::ROk(handled) => Ok(handled),
+            RResult::RErr(e) => Err(Error::from_plugin(
+                e.into_string(),
+                &self.node_id,
+                &self.node_type,
+            )),
+        }
     }
 
     /// Forward initialization across the FFI boundary so lazy-load
@@ -372,6 +464,40 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         // The future captures `sink` by value (FfiFuture is `'static`),
         // so there's no borrow on `self`.
         let ffi_fut = self.inner.process_streaming(RVec::from(req_bytes), sink);
+        self.drain_outputs(ffi_fut, frame_rx, callback).await
+    }
+
+    /// Ctx-aware streaming entry point — same per-frame FFI path,
+    /// just derives `session_id` from the runtime context (matches
+    /// the trait's default delegation contract).
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+        callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        let session_id = if ctx.session_id().is_empty() {
+            None
+        } else {
+            Some(ctx.session_id().to_string())
+        };
+        self.process_streaming(data, session_id, callback).await
+    }
+}
+
+impl LoadableNodeAdapter {
+    async fn drain_outputs<F>(
+        &self,
+        ffi_fut: async_ffi::FfiFuture<RResult<usize, RString>>,
+        mut frame_rx: tokio::sync::mpsc::Receiver<RVec<u8>>,
+        mut callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
         tokio::pin!(ffi_fut);
 
         let mut count = 0usize;
@@ -425,24 +551,55 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
             )),
         }
     }
+}
 
-    /// Ctx-aware streaming entry point — same per-frame FFI path,
-    /// just derives `session_id` from the runtime context (matches
-    /// the trait's default delegation contract).
-    async fn process_streaming_with_ctx<F>(
-        &self,
-        data: RuntimeData,
-        ctx: &dyn NodeRuntimeContextRead,
-        callback: F,
-    ) -> Result<usize, Error>
-    where
-        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
-    {
-        let session_id = if ctx.session_id().is_empty() {
-            None
-        } else {
-            Some(ctx.session_id().to_string())
-        };
-        self.process_streaming(data, session_id, callback).await
+#[cfg(all(test, feature = "loadable-export"))]
+mod clock_contract_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use remotemedia_plugin_sdk::adapter::StreamingNodeFfiAdapter;
+
+    struct ClockFixture(Arc<AtomicU64>);
+    #[async_trait::async_trait]
+    impl AsyncStreamingNode for ClockFixture {
+        fn node_type(&self) -> &str { "ClockFixture" }
+        async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> { Ok(data) }
+        fn pacing_nature(&self) -> PacingNature { PacingNature::ClockedToOutboundMedia }
+        fn fallback_rate_hz(&self) -> u32 { 20 }
+        fn clocked_media_addr(&self) -> Option<(String, String)> { Some(("video".into(), "avatar".into())) }
+        async fn tick(&self, tick: Tick, session_id: Option<String>, mut callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>) -> Result<(), Error> {
+            callback(RuntimeData::Json(serde_json::json!({"pts":tick.pts_us, "frame":tick.frame_idx,
+                "clock":tick.clock_id, "deadline":tick.deadline_us, "session":session_id})))
+        }
+        async fn process_control_message(&self, data: RuntimeData, session: Option<String>) -> Result<bool, Error> {
+            assert_eq!(session.as_deref(), Some("session"));
+            assert!(matches!(data, RuntimeData::Json(v) if v["__aux_port__"] == "shutdown"));
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+    struct FixtureFactory(Arc<AtomicU64>);
+    impl FfiNodeFactory for FixtureFactory {
+        fn node_type(&self) -> RString { "ClockFixture".into() }
+        fn create(&self, _: RString) -> RResult<FfiNodeBox, RString> {
+            ROk(loadable_node_abi::FfiNode_TO::from_value(StreamingNodeFfiAdapter::new(ClockFixture(self.0.clone())), TD_Opaque))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clock_and_shutdown_survive_both_plugin_adapters() {
+        let controls = Arc::new(AtomicU64::new(0));
+        let factory = wrap_ffi_factory(FixtureFactory(controls.clone()));
+        let node = factory.create("clock".into(), &serde_json::json!({}), Some("session".into())).unwrap();
+        assert_eq!(node.pacing_nature(), PacingNature::ClockedToOutboundMedia);
+        assert_eq!(node.fallback_rate_hz(), 20);
+        assert_eq!(node.clocked_media_addr(), Some(("video".into(), "avatar".into())));
+        let ctx = crate::nodes::NodeRuntimeContext::for_session("session", "clock",
+            crate::transport::session_control::SessionControl::new("session"), Arc::new(()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        node.tick(Tick { clock_id:"video:avatar".into(), pts_us:50000, frame_idx:1, deadline_us:60000 }, &ctx, Box::new(move |out| { tx.send(out).unwrap(); Ok(()) })).await.unwrap();
+        assert!(matches!(rx.recv().await, Some(RuntimeData::Json(v)) if v == serde_json::json!({"pts":50000,"frame":1,"clock":"video:avatar","deadline":60000,"session":"session"})));
+        assert!(node.process_control_message(RuntimeData::Json(serde_json::json!({"__aux_port__":"shutdown","payload":{}})), &ctx).await.unwrap());
+        assert_eq!(controls.load(Ordering::SeqCst), 1);
     }
 }

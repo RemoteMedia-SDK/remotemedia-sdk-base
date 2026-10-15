@@ -25,9 +25,11 @@ tower = { version = "0.4", features = ["util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 
-
 # JNI support
 jni = { version = "0.21", default-features = false }
+
+# gRPC UDS streaming
+futures-util = { version = "0.3", features = ["sink"] }
 
 android_logger = "0.15"
 log = "0.4"

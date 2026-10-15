@@ -204,6 +204,26 @@ impl PerTrackDispatcher {
                     }
                 }
             }
+            RuntimeData::Json(value) if value.get("kind").and_then(|v| v.as_str()) == Some("speech_end") => {
+                // Enqueue behind the preceding audio in each per-track shard.
+                // Only then may the encoder pad the last partial codec frame.
+                let senders: Vec<_> = {
+                    let shards = self.audio_txs.lock().await;
+                    if let Some(id) = extract_stream_id(&transport_data.data) {
+                        shards.get(id).cloned().into_iter().collect()
+                    } else {
+                        shards.values().cloned().collect()
+                    }
+                };
+                for tx in senders {
+                    if tx.send(transport_data.clone()).await.is_err() {
+                        warn!("audio shard closed before speech_end (peer {})", self.peer_id);
+                    }
+                }
+                if let Err(e) = Self::send_data_channel(&self.data_channel, &transport_data.data).await {
+                    error!("data channel send failed (peer {}): {}", self.peer_id, e);
+                }
+            }
             RuntimeData::Json(_) | RuntimeData::Text(_) => {
                 if let Err(e) =
                     Self::send_data_channel(&self.data_channel, &transport_data.data).await
@@ -243,6 +263,14 @@ impl PerTrackDispatcher {
             let mut first = true;
             let mut chunk_idx: u64 = 0;
             while let Some(td) = rx.recv().await {
+                if matches!(&td.data, RuntimeData::Json(v) if v.get("kind").and_then(|k| k.as_str()) == Some("speech_end")) {
+                    if let Some(track) = registry.get_audio_track(&stream).await {
+                        if let Err(e) = track.finish_audio().await {
+                            warn!("audio speech_end flush failed for '{}' (peer {}): {}", stream, peer, e);
+                        }
+                    }
+                    continue;
+                }
                 let RuntimeData::Audio {
                     samples,
                     sample_rate,

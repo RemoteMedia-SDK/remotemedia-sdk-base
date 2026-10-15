@@ -402,6 +402,7 @@ const NODE_FANOUT_CAPACITY: usize = 1024;
 /// lifetime of the session. Built in [`SessionRouter::spawn_pipeline_tasks`]
 /// and torn down in [`SessionRouter::teardown_pipeline_tasks`].
 struct PipelineTasks {
+    shutdown: tokio::sync::watch::Sender<bool>,
     /// Input sender for each node (keyed by node id). The router pushes
     /// source-bound and `to_node`-addressed packets through these.
     input_txs: HashMap<String, mpsc::Sender<RuntimeData>>,
@@ -1090,7 +1091,7 @@ impl SessionRouter {
         // job here is to shovel input packets into the right source node's
         // input channel. Each node's bounded input mpsc provides natural
         // backpressure back through `input_rx`.
-        loop {
+        let explicit_close = loop {
             let ingress_start = std::time::Instant::now();
             tokio::select! {
                 biased;
@@ -1099,14 +1100,18 @@ impl SessionRouter {
                     match result {
                         Some(packet) => {
                             self.probes.ingress.record_since(ingress_start);
-                            self.route_input(packet, &pipeline.input_txs).await;
+                            tokio::select! {
+                                biased;
+                                _ = shutdown_rx.recv() => break true,
+                                _ = self.route_input(packet, &pipeline.input_txs) => {}
+                            }
                         }
                         None => {
                             tracing::warn!(
                                 "Session {}: Input channel closed (all senders dropped), shutting down pipeline",
                                 self.session_id
                             );
-                            break;
+                            break false;
                         }
                     }
                 }
@@ -1125,15 +1130,15 @@ impl SessionRouter {
                             );
                         }
                     }
-                    break;
+                    break true;
                 }
             }
-        }
+        };
 
         // Graceful teardown. Dropping every source input_tx cascades through
         // the pipeline: each node's main task exits when its input_rx
         // closes, which drops its fan_tx, which closes the next hop.
-        Self::teardown_pipeline_tasks(pipeline).await;
+        Self::teardown_pipeline_tasks(pipeline, explicit_close).await;
 
         // Stop the perf flush task before the control bus is signalled
         // closed. Any pending snapshot is dropped — by this point the
@@ -1163,6 +1168,7 @@ impl SessionRouter {
     /// fine; after this call the router's only remaining role is shovelling
     /// packets into the source nodes' input channels.
     fn spawn_pipeline_tasks(&mut self) -> PipelineTasks {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
         let mut input_txs: HashMap<String, mpsc::Sender<RuntimeData>> = HashMap::new();
         let mut input_rxs: HashMap<String, mpsc::Receiver<RuntimeData>> = HashMap::new();
 
@@ -1316,13 +1322,18 @@ impl SessionRouter {
                 self.control.clone(),
                 self.probes.clone(),
                 self.perf.clone(),
+                shutdown.subscribe(),
             );
 
             handles.push(main_handle);
             handles.push(fan_handle);
         }
 
-        PipelineTasks { input_txs, handles }
+        PipelineTasks {
+            input_txs,
+            handles,
+            shutdown,
+        }
     }
 
     /// Spawn the two tasks that drive a single node:
@@ -1352,6 +1363,7 @@ impl SessionRouter {
         control: Option<Arc<SessionControl>>,
         probes: Arc<crate::metrics::RtProbeSet>,
         perf: Arc<PerfAggregator>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> (JoinHandle<()>, JoinHandle<()>) {
         let (fan_tx, mut fan_rx) = mpsc::channel::<RuntimeData>(NODE_FANOUT_CAPACITY);
 
@@ -1360,75 +1372,83 @@ impl SessionRouter {
         let fan_session_id = session_id.clone();
         let fan_control = control.clone();
         let fan_probes = probes.clone();
+        let mut fan_shutdown = shutdown.clone();
         let fan_handle = tokio::spawn(async move {
-            while let Some(out) = fan_rx.recv().await {
-                let kept = match &fan_control {
-                    Some(ctrl) => ctrl.on_node_output(&fan_node_id, None, out).await,
-                    None => Some(out),
-                };
-                let Some(kept) = kept else { continue };
-                let kept_desc = if node_trace_enabled() {
-                    Some(describe_runtime_data(&kept))
-                } else {
-                    None
-                };
+            let forward = async move {
+                while let Some(out) = fan_rx.recv().await {
+                    let kept = match &fan_control {
+                        Some(ctrl) => ctrl.on_node_output(&fan_node_id, None, out).await,
+                        None => Some(out),
+                    };
+                    let Some(kept) = kept else { continue };
+                    let kept_desc = if node_trace_enabled() {
+                        Some(describe_runtime_data(&kept))
+                    } else {
+                        None
+                    };
 
-                // Fan out to successors first. Bounded `send` awaits on
-                // full, providing real backpressure all the way back to
-                // the node's callback (via `fan_tx` filling up).
-                for tx in &successor_txs {
-                    if let Some(desc) = kept_desc.as_deref() {
-                        tracing::info!(
-                            session_id = %fan_session_id,
-                            node_id = %fan_node_id,
-                            output = %desc,
-                            "node output forwarded to successor"
-                        );
-                        log::info!(
-                            "Session {}: node '{}' output forwarded to successor: {}",
-                            fan_session_id,
-                            fan_node_id,
-                            desc
-                        );
+                    // Fan out to successors first. Bounded `send` awaits on
+                    // full, providing real backpressure all the way back to
+                    // the node's callback (via `fan_tx` filling up).
+                    for tx in &successor_txs {
+                        if let Some(desc) = kept_desc.as_deref() {
+                            tracing::info!(
+                                session_id = %fan_session_id,
+                                node_id = %fan_node_id,
+                                output = %desc,
+                                "node output forwarded to successor"
+                            );
+                            log::info!(
+                                "Session {}: node '{}' output forwarded to successor: {}",
+                                fan_session_id,
+                                fan_node_id,
+                                desc
+                            );
+                        }
+                        if tx.send(kept.clone()).await.is_err() {
+                            tracing::debug!(
+                                "Session {}: node '{}' successor closed; drop",
+                                fan_session_id,
+                                fan_node_id
+                            );
+                        }
                     }
-                    if tx.send(kept.clone()).await.is_err() {
-                        tracing::debug!(
-                            "Session {}: node '{}' successor closed; drop",
-                            fan_session_id,
-                            fan_node_id
-                        );
+
+                    // Sinks: also forward to the client. Routed by RuntimeData
+                    // kind so a slow Video consumer never head-of-line-blocks
+                    // Audio (or vice versa) — see [`ClientOutputRouter`].
+                    if let Some(ref out_router) = client_tx {
+                        if let Some(desc) = kept_desc.as_deref() {
+                            tracing::info!(
+                                session_id = %fan_session_id,
+                                node_id = %fan_node_id,
+                                output = %desc,
+                                "sink output forwarded to client"
+                            );
+                            log::info!(
+                                "Session {}: sink '{}' output forwarded to client: {}",
+                                fan_session_id,
+                                fan_node_id,
+                                desc
+                            );
+                        }
+                        let egress_start = std::time::Instant::now();
+                        let res = out_router.send(kept).await;
+                        fan_probes.egress.record_since(egress_start);
+                        if res.is_err() {
+                            tracing::warn!(
+                                "Session {}: sink '{}' client channel closed",
+                                fan_session_id,
+                                fan_node_id
+                            );
+                        }
                     }
                 }
-
-                // Sinks: also forward to the client. Routed by RuntimeData
-                // kind so a slow Video consumer never head-of-line-blocks
-                // Audio (or vice versa) — see [`ClientOutputRouter`].
-                if let Some(ref out_router) = client_tx {
-                    if let Some(desc) = kept_desc.as_deref() {
-                        tracing::info!(
-                            session_id = %fan_session_id,
-                            node_id = %fan_node_id,
-                            output = %desc,
-                            "sink output forwarded to client"
-                        );
-                        log::info!(
-                            "Session {}: sink '{}' output forwarded to client: {}",
-                            fan_session_id,
-                            fan_node_id,
-                            desc
-                        );
-                    }
-                    let egress_start = std::time::Instant::now();
-                    let res = out_router.send(kept).await;
-                    fan_probes.egress.record_since(egress_start);
-                    if res.is_err() {
-                        tracing::warn!(
-                            "Session {}: sink '{}' client channel closed",
-                            fan_session_id,
-                            fan_node_id
-                        );
-                    }
-                }
+            };
+            tokio::select! {
+                biased;
+                _ = fan_shutdown.changed() => {},
+                _ = forward => {},
             }
         });
 
@@ -1461,7 +1481,10 @@ impl SessionRouter {
         // for the protection-counter mechanics; nodes opt in by
         // taking a `ProtectGuard` from `ctx.cancel_gate.protect()`.
         let cancel = Arc::new(crate::transport::CancelGate::new());
-        let (filt_tx, mut filt_rx) = mpsc::channel::<RuntimeData>(NODE_FANOUT_CAPACITY);
+        let (filt_tx, mut filt_rx) = mpsc::channel::<(u64, RuntimeData)>(NODE_FANOUT_CAPACITY);
+        let (control_tx, mut control_rx) = mpsc::channel::<RuntimeData>(16);
+        let input_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let filter_generation = input_generation.clone();
         let filter_cancel = Arc::clone(&cancel);
         let filter_node_id = node_id.clone();
         let filter_session_id = session_id.clone();
@@ -1469,6 +1492,10 @@ impl SessionRouter {
             while let Some(input) = input_rx.recv().await {
                 if let Some(port) = aux_port_of(&input) {
                     if port == BARGE_IN_PORT {
+                        // Invalidate queued work before waking the active call.
+                        // ProtectGuard preserves an irreversible in-flight call,
+                        // but cancellation still supersedes its queued inputs.
+                        filter_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                         // Try to fire the cancel. If a node currently
                         // holds a `ProtectGuard` (e.g. the chat
                         // backend mid-non-cancelable-tool-call) the
@@ -1504,7 +1531,7 @@ impl SessionRouter {
                         // `Ok(false)`, so this is a free no-op.
                         // Avatar M2.6 wires this through to the
                         // Audio2FaceLipSyncNode + SyntheticLipSyncNode.
-                        if filt_tx.send(input).await.is_err() {
+                        if control_tx.send(input).await.is_err() {
                             break;
                         }
                         continue;
@@ -1513,7 +1540,8 @@ impl SessionRouter {
                     // handlers (e.g. `_handle_aux_port` in Python
                     // nodes) still receive them.
                 }
-                if filt_tx.send(input).await.is_err() {
+                let generation = filter_generation.load(std::sync::atomic::Ordering::Acquire);
+                if filt_tx.send((generation, input)).await.is_err() {
                     break;
                 }
             }
@@ -1671,7 +1699,17 @@ impl SessionRouter {
                 })
             };
 
-            while let Some(input) = filt_rx.recv().await {
+            loop {
+                let input = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => break,
+                    Some(control) = control_rx.recv() => control,
+                    input = filt_rx.recv() => match input {
+                        Some((generation, input)) if generation == input_generation.load(std::sync::atomic::Ordering::Acquire) => input,
+                        Some(_) => continue,
+                        None => break,
+                    },
+                };
                 if node_trace_enabled() {
                     tracing::info!(
                         session_id = %main_session_id,
@@ -1950,6 +1988,7 @@ impl SessionRouter {
 
                 let cancelled = tokio::select! {
                     biased;
+                    _ = shutdown.changed() => break,
                     _ = main_cancel.notified() => {
                         tracing::info!(
                             session_id = %main_session_id,
@@ -2023,7 +2062,20 @@ impl SessionRouter {
             // Filter task ends when input_rx closes (its sender drops
             // after the last source emits None). Await it so we don't
             // leak it on shutdown.
+            filter_handle.abort();
             let _ = filter_handle.await;
+            if let Err(error) = node_ref
+                .process_control_message(
+                    crate::transport::session_control::wrap_aux_port(
+                        "shutdown",
+                        RuntimeData::Json(serde_json::json!({})),
+                    ),
+                    &bound_ctx,
+                )
+                .await
+            {
+                tracing::error!(node = %main_node_id, %error, "node shutdown failed");
+            }
         });
 
         (main_handle, fan_handle)
@@ -2092,8 +2144,15 @@ impl SessionRouter {
     }
 
     /// Await every spawned task after dropping the router's own input_txs.
-    async fn teardown_pipeline_tasks(pipeline: PipelineTasks) {
-        let PipelineTasks { input_txs, handles } = pipeline;
+    async fn teardown_pipeline_tasks(pipeline: PipelineTasks, explicit_close: bool) {
+        let PipelineTasks {
+            input_txs,
+            handles,
+            shutdown,
+        } = pipeline;
+        if explicit_close {
+            shutdown.send_replace(true);
+        }
         // Drop the router's copies of every node's input sender; each source
         // node sees `input_rx.recv()` return `None` and exits, cascading
         // through the graph.
@@ -2295,6 +2354,154 @@ impl SessionRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BlockingCloseNode {
+        started: Arc<tokio::sync::Notify>,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::nodes::AsyncStreamingNode for BlockingCloseNode {
+        fn node_type(&self) -> &str {
+            "BlockingCloseNode"
+        }
+        async fn process(&self, data: RuntimeData) -> crate::Result<RuntimeData> {
+            Ok(data)
+        }
+        async fn process_streaming<F>(
+            &self,
+            data: RuntimeData,
+            _session: Option<String>,
+            mut callback: F,
+        ) -> crate::Result<usize>
+        where
+            F: FnMut(RuntimeData) -> crate::Result<()> + Send,
+        {
+            if matches!(&data, RuntimeData::Text(text) if text != "start") {
+                callback(data)?;
+                return Ok(1);
+            }
+            for _ in 0..8 {
+                callback(RuntimeData::Json(serde_json::json!({"pending":true})))?;
+            }
+            self.started.notify_one();
+            std::future::pending().await
+        }
+        async fn process_control_message(
+            &self,
+            data: RuntimeData,
+            _session: Option<String>,
+        ) -> crate::Result<bool> {
+            if matches!(
+                aux_port_of(&data).as_deref(),
+                Some("shutdown" | BARGE_IN_PORT)
+            ) {
+                self.stopped
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn barge_preempts_queued_inputs_and_preserves_fresh_input() {
+        let manifest = create_test_manifest(vec![("A", "BlockingCloseNode")], vec![]);
+        let (output, mut received) = ClientOutputRouter::new(32);
+        let (mut router, _) = SessionRouter::new(
+            "barge-queue".into(),
+            Arc::new(manifest),
+            Arc::new(StreamingNodeRegistry::new()),
+            output,
+        )
+        .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        router.cached_nodes.insert(
+            "A".into(),
+            Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(
+                BlockingCloseNode {
+                    started: started.clone(),
+                    stopped: stopped.clone(),
+                },
+            ))),
+        );
+        let pipeline = router.spawn_pipeline_tasks();
+        let input = &pipeline.input_txs["A"];
+        input.send(RuntimeData::Text("start".into())).await.unwrap();
+        started.notified().await;
+        for _ in 0..8 {
+            input
+                .send(RuntimeData::Text("obsolete speech".into()))
+                .await
+                .unwrap();
+        }
+        input
+            .send(crate::transport::session_control::wrap_aux_port(
+                BARGE_IN_PORT,
+                RuntimeData::Json(serde_json::json!({})),
+            ))
+            .await
+            .unwrap();
+        input
+            .send(RuntimeData::Text("fresh speech".into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let packet = received.data_rx.recv().await.unwrap();
+                if let RuntimeData::Text(text) = packet {
+                    assert_eq!(text, "fresh speech", "cancelled queue must not replay");
+                    assert!(
+                        stopped.load(std::sync::atomic::Ordering::Acquire),
+                        "control precedes fresh work"
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        SessionRouter::teardown_pipeline_tasks(pipeline, true).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_close_cancels_generation_and_full_sink_then_runs_shutdown() {
+        let manifest = create_test_manifest(vec![("A", "BlockingCloseNode")], vec![]);
+        let (output, _unread) = ClientOutputRouter::new(1);
+        let (mut router, _) = SessionRouter::new(
+            "close-test".into(),
+            Arc::new(manifest),
+            Arc::new(StreamingNodeRegistry::new()),
+            output,
+        )
+        .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        router.cached_nodes.insert(
+            "A".into(),
+            Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(
+                BlockingCloseNode {
+                    started: started.clone(),
+                    stopped: stopped.clone(),
+                },
+            ))),
+        );
+        let pipeline = router.spawn_pipeline_tasks();
+        pipeline.input_txs["A"]
+            .send(RuntimeData::Text("start".into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            SessionRouter::teardown_pipeline_tasks(pipeline, true),
+        )
+        .await
+        .unwrap();
+        assert!(stopped.load(std::sync::atomic::Ordering::Acquire));
+    }
     use crate::manifest::{Connection, ManifestMetadata, NodeManifest};
 
     fn create_test_manifest(nodes: Vec<(&str, &str)>, connections: Vec<(&str, &str)>) -> Manifest {

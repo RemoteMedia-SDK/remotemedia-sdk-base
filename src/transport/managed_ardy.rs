@@ -23,6 +23,7 @@ struct Config {
 struct SceneConfig {
     profile: PathBuf,
     avatar: PathBuf,
+    renderer_geometry: Option<PathBuf>,
 }
 struct Daemon {
     child: Child,
@@ -75,20 +76,23 @@ impl ManagedArdyDaemons {
                 daemons.insert(key.clone(), start(&config).await?);
             }
             node.params["ardy_socket"] = daemons[&key].socket.to_string_lossy().into_owned().into();
-            if config.scene.is_some() {
-                scene_bindings.push((node.id.clone(), daemons[&key].directory.join("scene.key")));
+            if let Some(scene) = &config.scene {
+                scene_bindings.push((node.id.clone(), daemons[&key].directory.join("scene.key"), scene.renderer_geometry.clone()));
             }
             node.params
                 .as_object_mut()
                 .unwrap()
                 .remove("managed_daemon");
         }
-        for (motion_node, key_file) in scene_bindings {
+        for (motion_node, key_file, geometry_file) in scene_bindings {
             let mut bound = false;
             for renderer in &mut prepared.nodes {
                 if renderer.node_type == "CcRenderNode"
                     && renderer.params.pointer("/avatar_session/motion_node").and_then(|v| v.as_str()) == Some(motion_node.as_str()) {
                     renderer.params["scene_key_file"] = key_file.to_string_lossy().into_owned().into();
+                    if let Some(path) = &geometry_file {
+                        renderer.params["scene_geometry_file"] = path.to_string_lossy().into_owned().into();
+                    }
                     bound = true;
                 }
             }

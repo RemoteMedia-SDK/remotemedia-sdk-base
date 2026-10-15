@@ -1,6 +1,9 @@
 package com.remotemedia.android
 
 import android.content.Context
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioTrack
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.Json
@@ -700,9 +703,42 @@ class PipelineManager(private val context: Context) {
                 Log.i(TAG, "Manifest requires glibc runtime. Starting Sproot container...")
                 val socketPath = sprootController.start()
                 if (socketPath == null) {
-                    throw NativeException("Failed to boot guest Debian Sproot runner container")
+                    throw NativeException("Failed to boot guest Debian Sproot container")
                 }
                 NativeInterface.nativeSetSprootSocketPath(socketPath)
+                    
+                // Start Sproot data stream with callback
+                if (sessionHandle != 0L) {
+                    // Extract session ID from manifest or generate one
+                    val sessionId = extractSessionId(currentManifest!!)
+                    // Use first glibc node as the node ID for the data stream
+                    val nodeId = findGlibcNodeId(currentManifest!!) ?: "sproot-node"
+                    val callback = object : NativeInterface.SprootDataCallback {
+                        override fun onDataReceived(sessionId: String, nodeId: String, data: ByteArray) {
+                            scope.launch {
+                                handleSprootDataReceived(sessionId, nodeId, data)
+                            }
+                        }
+                            
+                        override fun onDataSent(sessionId: String, nodeId: String, success: Boolean) {
+                            if (!success) {
+                                Log.w(TAG, "Failed to send data to Sproot node: $nodeId")
+                            }
+                        }
+                            
+                        override fun onStreamError(sessionId: String, error: String) {
+                            Log.e(TAG, "Sproot data stream error: $error")
+                            onError?.invoke("Sproot stream error: $error")
+                        }
+                    }
+                        
+                    NativeInterface.nativeStartSprootDataStream(
+                        sessionHandle, 
+                        sessionId, 
+                        nodeId, 
+                        callback
+                    )
+                }
             } else {
                 // Ensure no lingering socket path is configured in JNI for in-process runs
                 Log.i(TAG, "Manifest doesn't require glibc runtime, unsetting nativeSprocketSocketPath.")
@@ -768,7 +804,16 @@ class PipelineManager(private val context: Context) {
             onError?.invoke("Not streaming")
             return@withContext false
         }
-        NativeInterface.nativeSendInputAudio(sessionHandle, pcmData, sampleRate, channels)
+        
+        // Check if we're in Sproot mode
+        val isSproot = currentManifest?.let { requiresSproot(it) } == true
+        if (isSproot) {
+            // Send via Sproot gRPC stream
+            NativeInterface.nativeSendSprootData(sessionHandle, pcmData, sampleRate, channels)
+        } else {
+            // Native in-process mode
+            NativeInterface.nativeSendInputAudio(sessionHandle, pcmData, sampleRate, channels)
+        }
     }
 
     /**
@@ -930,5 +975,125 @@ class PipelineManager(private val context: Context) {
             Log.e(TAG, "Failed to parse manifest to check for glibc/sproot requirements", e)
             false
         }
+        }
     }
-}
+
+    /**
+     * Extract session ID from manifest metadata or generate a UUID
+     */
+    private fun extractSessionId(manifestJson: String): String {
+        return try {
+            val json = Json { ignoreUnknownKeys = true }
+                .decodeFromString(JsonElement.serializer(), manifestJson)
+            val jsonObject = json as? JsonObject ?: return java.util.UUID.randomUUID().toString()
+            val metadata = jsonObject["metadata"] as? JsonObject
+            (metadata?.get("session_id") as? JsonPrimitive)?.content 
+                ?: java.util.UUID.randomUUID().toString()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to extract session ID from manifest", e)
+            java.util.UUID.randomUUID().toString()
+        }
+    }
+
+    /**
+     * Find the first node ID that requires glibc runtime
+     */
+    private fun findGlibcNodeId(manifestJson: String): String? {
+        return try {
+            val json = Json { ignoreUnknownKeys = true }
+                .decodeFromString(JsonElement.serializer(), manifestJson)
+            val jsonObject = json as? JsonObject ?: return null
+            val nodes = jsonObject["nodes"] as? JsonArray ?: return null
+            for (nodeElement in nodes) {
+                val nodeObj = nodeElement as? JsonObject ?: continue
+                val nodeId = (nodeObj["id"] as? JsonPrimitive)?.content ?: continue
+                val params = nodeObj["params"] as? JsonObject ?: continue
+                val pythonRuntime = (params["python_runtime"] as? JsonPrimitive)?.content
+                if (pythonRuntime == "glibc") {
+                    return nodeId
+                }
+            }
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to find glibc node ID in manifest", e)
+            null
+        }
+    }
+
+    /**
+     * Handle Sproot data received from gRPC stream
+     */
+    private fun handleSprootDataReceived(sessionId: String, nodeId: String, data: ByteArray) {
+        Log.d(TAG, "Sproot data received: session=$sessionId, node=$nodeId, bytes=${data.size}")
+        
+        // Forward to output handler based on data type
+        // For audio data, send to audio output/speaker
+        // For text data, send to text handler
+        // This is a simplified implementation - a full implementation would
+        // properly deserialize the RuntimeData and route to appropriate handlers
+        try {
+            val json = Json { ignoreUnknownKeys = true }
+                .decodeFromString(JsonElement.serializer(), String(data))
+            val jsonObject = json as? JsonObject
+            
+            // Check if it's audio data
+            if (jsonObject?.get("audio") != null) {
+                // Route to audio output
+                routeAudioOutput(jsonObject)
+            } else if (jsonObject?.get("text") != null) {
+                // Route to text handler
+                routeTextOutput(jsonObject)
+            } else {
+                // Generic output
+                onOutput?.invoke("Sproot data received: $nodeId")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse Sproot data, treating as raw: ${e.message}")
+            onOutput?.invoke("Sproot raw data received: ${data.size} bytes")
+        }
+    }
+
+    private val audioTrack: AudioTrack by lazy {
+        val bufferSize = AudioTrack.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        AudioTrack(
+            AudioManager.STREAM_VOICE_CALL,
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            bufferSize,
+            AudioTrack.MODE_STREAM
+        ).also { it.play() }
+    }
+
+    private fun routeAudioOutput(jsonData: JsonObject) {
+        // Extract audio PCM data and send to audio output
+        val audioElement = jsonData["audio"]
+        if (audioElement is JsonObject) {
+            val pcmElement = audioElement["pcm"]
+            if (pcmElement is JsonArray) {
+                val pcmBytes = pcmElement.map { (it as JsonPrimitive).content.toByte() }.toByteArray()
+                if (pcmBytes.isNotEmpty()) {
+                    audioTrack.write(pcmBytes, 0, pcmBytes.size)
+                    Log.d(TAG, "Played ${pcmBytes.size} bytes of audio via AudioTrack")
+                }
+            }
+        } else if (audioElement is JsonArray) {
+            // Handle array of samples directly
+            val pcmBytes = audioElement.map { (it as JsonPrimitive).content.toByte() }.toByteArray()
+            if (pcmBytes.isNotEmpty()) {
+                audioTrack.write(pcmBytes, 0, pcmBytes.size)
+                Log.d(TAG, "Played ${pcmBytes.size} bytes of audio via AudioTrack")
+            }
+        }
+    }
+
+    private fun routeTextOutput(jsonData: JsonObject) {
+        // Extract text and send to text handler
+        val text = (jsonData["text"] as? JsonPrimitive)?.content ?: ""
+        Log.d(TAG, "Routing text output from Sproot: $text")
+        onOutput?.invoke("Sproot text: $text")
+    }

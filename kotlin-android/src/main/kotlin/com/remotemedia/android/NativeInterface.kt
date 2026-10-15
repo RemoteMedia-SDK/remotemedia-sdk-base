@@ -112,9 +112,35 @@ object NativeInterface {
     @JvmStatic
     external fun nativeSetSprootSocketPath(path: String): Boolean
 
+    // Send audio/data to Sproot gRPC stream (outbound)
+    @JvmStatic
+    external fun nativeSendSprootData(
+        sessionHandle: Long,
+        nodeId: String,
+        pcmData: ByteArray,
+        sampleRate: Int,
+        channels: Int
+    ): Boolean
+
+    // Start Sproot data stream gRPC bidirectional streaming
+    @JvmStatic
+    external fun nativeStartSprootDataStream(
+        sessionHandle: Long,
+        sessionId: String,
+        nodeId: String,
+        callback: SprootDataCallback
+    ): Boolean
+
     // Create a new Hermes profile
     @JvmStatic
     external fun nativeCreateHermesProfile(profileName: String, profileDir: String): Boolean
+}
+
+/** Callback interface for Sproot data streaming */
+interface SprootDataCallback {
+    fun onDataReceived(sessionId: String, nodeId: String, data: ByteArray)
+    fun onDataSent(sessionId: String, nodeId: String, success: Boolean)
+    fun onStreamError(sessionId: String, error: String)
 }
 
 /** Parses node list from native JSON */

@@ -525,6 +525,24 @@ impl AsyncStreamingNode for MultimodalLLMNode {
         "MultimodalLLMNode"
     }
 
+    async fn process_control_message(
+        &self,
+        message: RuntimeData,
+        session_id: Option<String>,
+    ) -> Result<bool, Error> {
+        if crate::transport::session_control::aux_port_of(&message).as_deref()
+            == Some("scene_context")
+        {
+            if let RuntimeData::Json(envelope) = message {
+                return self.backend.consume_scene_context(
+                    session_id.as_deref().unwrap_or("default"),
+                    &RuntimeData::Json(envelope["payload"].clone()),
+                );
+            }
+        }
+        Ok(false)
+    }
+
     async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
         let api_key = self.resolve_api_key();
         let base_url = self.resolve_base_url();
@@ -612,6 +630,15 @@ impl AsyncStreamingNode for MultimodalLLMNode {
             .as_any()
             .downcast_ref::<crate::nodes::NodeRuntimeContext>()
             .map(|c| Arc::clone(&c.cancel_gate));
+        if let Some(context) = ctx
+            .as_any()
+            .downcast_ref::<crate::nodes::NodeRuntimeContext>()
+        {
+            self.backend.refresh_office_observation(
+                sid.as_deref().unwrap_or("default"),
+                &context.control,
+            )?;
+        }
         self.dispatch_streaming(data, sid, cancel_gate, callback)
             .await
     }
@@ -629,6 +656,9 @@ impl MultimodalLLMNode {
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
         let sid = session_id.unwrap_or_else(|| "default".to_string());
+        if self.backend.consume_scene_context(&sid, &data)? {
+            return Ok(0);
+        }
         let needs_metadata = !matches!(self.config.output_mode, LlmOutputMode::Text);
         let needs_embedding = matches!(self.config.output_mode, LlmOutputMode::TextWithEmbedding);
 

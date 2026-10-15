@@ -140,6 +140,23 @@ impl AsyncStreamingNode for PythonStreamingNode {
         &self.node_type
     }
 
+    async fn process_control_message(
+        &self,
+        message: RuntimeData,
+        session_id: Option<String>,
+    ) -> Result<bool, Error> {
+        if crate::transport::session_control::aux_port_of(&message).as_deref()
+            != Some(crate::transport::session_control::BARGE_IN_PORT)
+        {
+            return Ok(false);
+        }
+        // Cancelling the host future does not reset state in the Python worker.
+        // Forward the reserved envelope so TTS advances its speech epoch too.
+        self.process_streaming(message, session_id, |_| Ok(()))
+            .await?;
+        Ok(true)
+    }
+
     async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
         // Store the control bus handle so ensure_initialized can pass it
         // to the MultiprocessExecutor for progress forwarding. Reach

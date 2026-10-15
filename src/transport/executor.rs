@@ -320,7 +320,12 @@ impl SessionHandle {
     }
 
     /// Wait for the session to complete
-    pub async fn wait(self) -> Result<()> {
+    pub async fn wait(mut self) -> Result<()> {
+        // `wait` consumes the handle: nobody can receive through these fields
+        // afterward. Release them now so a final sink send cannot deadlock join.
+        self.output_audio_rx = None;
+        self.output_video_rx = None;
+        self.output_data_rx = None;
         self.task_handle
             .await
             .map_err(|e| crate::Error::Execution(format!("Session task panicked: {}", e)))?
@@ -488,6 +493,7 @@ impl PipelineSessionHost for PipelineExecutor {
 /// - **Metrics**: Prometheus-format metrics export
 pub struct PipelineExecutor {
     managed_ardy_daemons: super::managed_ardy::ManagedArdyDaemons,
+    managed_llama_servers: crate::llm::managed_server::ManagedLlamaServers,
     /// Configuration
     config: ExecutorConfig,
     /// Node registry for creating nodes (wrapped in RwLock for mutable access)
@@ -573,6 +579,7 @@ impl PipelineExecutor {
         };
 
         Ok(Self {
+            managed_llama_servers: Default::default(),
             managed_ardy_daemons: Default::default(),
             config,
             registry,
@@ -1125,6 +1132,7 @@ impl PipelineExecutor {
         tracing::info!("cold_build_session: validate_manifest ok");
         let manifest = self.negotiate_capabilities(manifest).await?;
         tracing::info!("cold_build_session: negotiate_capabilities ok");
+        let manifest = self.managed_llama_servers.prepare(&manifest).await?;
         let manifest = Arc::new(self.managed_ardy_daemons.prepare(&manifest).await?);
 
         let session_id = self.generate_session_id();

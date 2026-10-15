@@ -21,6 +21,7 @@ pub mod chat_backend;
 pub mod data_url;
 pub mod gemini_profile;
 pub mod history;
+pub mod managed_server;
 pub mod provider;
 pub mod tool_dispatch;
 pub mod traits;

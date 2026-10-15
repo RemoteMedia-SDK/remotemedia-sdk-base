@@ -152,7 +152,7 @@ impl FeedbackMailbox {
     }
 
     fn observe(&self, value: Value) {
-        if value.get("request_id").is_some() {
+        if value.get("request_id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()) {
             if let Err(error) = self.queries.try_send(value) {
                 tracing::error!(%error, "office scene query feedback unavailable");
             }
@@ -163,7 +163,7 @@ impl FeedbackMailbox {
 }
 impl SceneFeedback {
     async fn forward(&mut self, value: &Value, control: &SessionControl) -> Result<()> {
-        if value["kind"] == "waypoint_path" {
+        if value["kind"] == "waypoint_path" && value.get("request_id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()) {
             if let Some(llm) = &self.llm_node {
                 control.publish(&ControlAddress::node_in(llm), RuntimeData::Json(json!({
                     "kind":"office_tool_result", "request_id":value["request_id"],
@@ -191,7 +191,7 @@ impl SceneFeedback {
                     }
                 }
             }
-            if let Some(id) = value.get("request_id") {
+            if let Some(id) = value.get("request_id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
                 // run_bridge already refreshed the bounded system observation.
                 // Repeating the whole home here can exceed a 16K context even
                 // after older history is pruned.
@@ -208,6 +208,25 @@ impl SceneFeedback {
 /// Keep authoritative interaction coordinates; renderer geometry and historical
 /// events are redundant with world keypoints and separately delivered outcomes.
 fn interaction_state(office: &Value) -> Value {
+    if office.get("scene_capabilities").is_some() {
+        // Outcome planning needs identities, capabilities and actual progress,
+        // not legacy avatar anchors, mesh data or per-joint coordinates.
+        let mut state = serde_json::Map::new();
+        for key in ["motion", "motion_error", "scene_lifecycle", "scene_capabilities", "occupied_hands"] {
+            if let Some(value) = office.get(key) { state.insert(key.into(), value.clone()); }
+        }
+        state.insert("avatar".into(), json!({"ready":office["avatar"]["ready"],
+            "displayed_pts_ms":office["avatar"]["displayed_pts_ms"],
+            "native_stream":office["avatar"]["native_stream"],
+            "native_seat":office["avatar"]["native_seat"]}));
+        let objects: Vec<_> = office["objects"].as_array().into_iter().flatten().map(|object| json!({
+            "id":object["id"], "label":object["label"], "position":object["position"],
+            "dynamic":object["dynamic"], "graspable":!object["grasp"].is_null(),
+            "seat_surface":!object["seat_surface_part"].is_null()
+        })).collect();
+        state.insert("objects".into(), Value::Array(objects));
+        return Value::Object(state);
+    }
     let mut state = office.clone();
     if let Some(object) = state.as_object_mut() {
         object.remove("events");
@@ -310,6 +329,35 @@ async fn run_bridge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn ui_refresh_with_null_correlation_cannot_start_an_llm_turn() {
+        let control = SessionControl::new("ui-refresh");
+        let (tx, mut rx) = mpsc::channel(8);
+        control.attach_input_sender(tx).await;
+        let mut feedback = SceneFeedback { llm_node: Some("llm".into()), last_event_sequence: 0 };
+        for id in [Value::Null, json!(""), json!(12)] {
+            feedback.forward(&json!({"kind":"scene_state", "request_id":id,
+                "state":{"office":{"events":[]}}}), &control).await.unwrap();
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_planner_projection_preserves_capabilities_and_ownership_without_body_anchors() {
+        let scene = json!({"scene_capabilities":{"operations":["navigate"]},
+            "motion":{"session_id":"a","seed":42,"generation_revision":3},
+            "avatar":{"ready":true,"displayed_pts_ms":1200,"wrists":[1,2,3]},
+            "occupied_hands":[["right","mug"]], "world_keypoints":{"chair":{"seat_pelvis":[0,1,0]}},
+            "objects":[{"id":"chair","label":"Chair","position":[0,0,0],"seat_surface_part":0,"parts":[1,2,3]}]});
+        let result = interaction_state(&scene);
+        assert_eq!(result["motion"], scene["motion"]);
+        assert_eq!(result["occupied_hands"], scene["occupied_hands"]);
+        assert_eq!(result["objects"][0]["seat_surface"], true);
+        assert!(result.get("world_keypoints").is_none());
+        assert!(result["avatar"].get("wrists").is_none());
+        assert!(result["objects"][0].get("parts").is_none());
+    }
+
     #[tokio::test]
     async fn waypoint_reply_reaches_llm_with_correlation_and_failure_details() {
         let control = SessionControl::new("waypoint-feedback");

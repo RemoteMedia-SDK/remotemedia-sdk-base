@@ -11,6 +11,7 @@ use crate::nodes::{
 };
 use async_trait::async_trait;
 use remotemedia_traits::runtime_context::{InitializeContextRead, NodeRuntimeContextRead};
+use serde_json::Value;
 // `parking_lot::Mutex` chosen deliberately: all locking sites in this
 // file cover pure synchronous CPU work (rubato resampling, atomic config
 // field updates). We never hold these locks across an `.await`, so the
@@ -20,6 +21,8 @@ use parking_lot::Mutex;
 
 pub struct ResampleStreamingNode {
     inner: Mutex<FastResampleNode>,
+    tail: Mutex<Option<RuntimeData>>,
+    speech_epoch: Mutex<u64>,
     target_rate: u32,
     /// When set, force-stamps this `stream_id` onto every emitted Audio
     /// chunk regardless of the input's value. Used by the avatar pipeline
@@ -32,6 +35,8 @@ impl ResampleStreamingNode {
     pub fn new(inner: FastResampleNode, target_rate: u32) -> Self {
         Self {
             inner: Mutex::new(inner),
+            tail: Mutex::new(None),
+            speech_epoch: Mutex::new(0),
             target_rate,
             output_stream_id: None,
         }
@@ -91,122 +96,121 @@ impl AsyncStreamingNode for ResampleStreamingNode {
         };
         let out_stream_id = self.output_stream_id.clone().or(in_stream_id);
 
-        // Lock and process - need to chunk input for FftFixedIn resampler
+        // The resampler already buffers arbitrary input sizes. Padding each
+        // incoming chunk here lengthened speech and moved face timestamps backwards.
         let mut inner = self.inner.lock();
-
-        // FftFixedIn requires fixed chunk sizes - split input into chunks
-        let chunk_size = 1024; // Match Medium quality chunk size
-        let total_samples = f32_samples.len();
-
-        if total_samples <= chunk_size {
-            // Small enough to process directly
-            let audio_data = AudioData::new(
-                crate::audio::buffer::AudioBuffer::new_f32(f32_samples.into_vec()),
-                input_sample_rate,
-                input_channels as usize,
-            );
-
-            let resampled = inner.process_audio(audio_data)?;
-            drop(inner); // Release lock early
-
-            // Convert f32 samples to bytes
-            let f32_samples = resampled
-                .buffer
-                .as_f32()
-                .ok_or_else(|| Error::Execution("Resampler output must be F32".into()))?;
-
-            let _num_samples = f32_samples.len() as u64; // TODO: Use for metadata
-
-            let _bytes: Vec<u8> = f32_samples.iter().flat_map(|&f| f.to_le_bytes()).collect(); // TODO: Support byte format output
-
-            // Return resampled audio as RuntimeData
-            return Ok(RuntimeData::Audio {
-                samples: f32_samples.to_vec().into(),
-                sample_rate: resampled.sample_rate,
-                channels: resampled.channels as u32,
-                stream_id: out_stream_id,
-                timestamp_us: in_ts_us,
-                arrival_ts_us: in_arrival_us,
-                metadata: in_meta,
-            });
-        }
-
-        // Large buffer - process in chunks. Downgraded to `debug!` since
-        // this fires once per long input and was otherwise noisy in hot
-        // streaming paths.
-        tracing::debug!(
-            "Resampling large buffer: {} samples in chunks of {}",
-            total_samples,
-            chunk_size
-        );
-        // Pre-size the output Vec. FftFixedIn output length is
-        // `chunk_size * target/source` per input chunk, rounded; we
-        // estimate the total with ceil(total / chunk_size) * chunk_size
-        // upper-bounded at input size * 2 to avoid pathological growth.
-        // A small over-estimate is fine — `extend_from_slice` uses the
-        // reserve, no reallocation in steady state.
-        let num_chunks = (total_samples + chunk_size - 1) / chunk_size;
-        let mut all_output_samples: Vec<f32> = Vec::with_capacity(num_chunks * chunk_size * 2);
-        // Reusable scratch buffer for the padded last chunk. Only grows
-        // to chunk_size once; subsequent iterations reuse the alloc.
-        let mut chunk_vec: Vec<f32> = Vec::with_capacity(chunk_size);
-
-        for chunk_start in (0..total_samples).step_by(chunk_size) {
-            let chunk_end = (chunk_start + chunk_size).min(total_samples);
-            let chunk_samples = &f32_samples[chunk_start..chunk_end];
-
-            chunk_vec.clear();
-            chunk_vec.extend_from_slice(chunk_samples);
-            if chunk_vec.len() < chunk_size {
-                chunk_vec.resize(chunk_size, 0.0);
+        if let Some(epoch) = in_meta
+            .as_ref()
+            .and_then(|m| m.get("speech_epoch"))
+            .and_then(Value::as_u64)
+        {
+            let mut current = self.speech_epoch.lock();
+            if epoch > *current {
+                inner.reset();
+                self.tail.lock().take();
+                *current = epoch;
+            } else if epoch < *current {
+                return Ok(RuntimeData::Audio {
+                    samples: Vec::new().into(),
+                    sample_rate: self.target_rate,
+                    channels: input_channels,
+                    stream_id: out_stream_id,
+                    timestamp_us: in_ts_us,
+                    arrival_ts_us: in_arrival_us,
+                    metadata: in_meta,
+                });
             }
-
-            // FastResampleNode::process_audio takes ownership of the
-            // AudioBuffer, so we must hand it an owned Vec. Swap our
-            // scratch Vec out and replace with an empty one that will
-            // grow back to capacity on the next iteration; this keeps
-            // the allocation churn to one realloc per call rather than
-            // per chunk.
-            let owned_chunk = std::mem::take(&mut chunk_vec);
-            chunk_vec = Vec::with_capacity(chunk_size);
-
-            let chunk_data = AudioData::new(
-                crate::audio::buffer::AudioBuffer::new_f32(owned_chunk),
-                input_sample_rate,
-                input_channels as usize,
-            );
-
-            let resampled_chunk = inner.process_audio(chunk_data)?;
-            let chunk_out = resampled_chunk
-                .buffer
-                .as_f32()
-                .ok_or_else(|| Error::Execution("Resampler output must be F32".into()))?;
-
-            all_output_samples.extend_from_slice(chunk_out);
         }
-
-        drop(inner); // Release lock
-
-        let num_samples = all_output_samples.len();
-        tracing::debug!(
-            "Resampling complete: {} input samples -> {} output samples",
-            total_samples,
-            num_samples
-        );
-
-        // Use stored target rate
-        let target_rate = self.target_rate;
-
-        // Return resampled audio (carry-through metadata + stream_id)
+        let buffered_us = inner.buffered_duration_us();
+        let resampled = inner.process_audio(AudioData::new(
+            crate::audio::buffer::AudioBuffer::new_f32(f32_samples.into_vec()),
+            input_sample_rate,
+            input_channels as usize,
+        ))?;
+        let samples = resampled.buffer.as_f32().unwrap().to_vec();
+        let timestamp_us = in_ts_us.map(|pts| pts.saturating_sub(buffered_us));
+        let mut metadata = in_meta;
+        if let Some(meta) = metadata.as_mut() {
+            if let Some(pts) = meta.get("pts_us").and_then(Value::as_u64) {
+                meta["pts_us"] = pts.saturating_sub(buffered_us).into();
+            }
+        }
+        let duration_us =
+            samples.len() as u64 * 1_000_000 / input_channels as u64 / self.target_rate as u64;
+        let mut tail_meta = metadata.clone();
+        if let Some(meta) = tail_meta.as_mut() {
+            if let Some(pts) = meta.get("pts_us").and_then(Value::as_u64) {
+                meta["pts_us"] = (pts + duration_us).into();
+            }
+        }
+        *self.tail.lock() = Some(RuntimeData::Audio {
+            samples: Vec::new().into(),
+            sample_rate: self.target_rate,
+            channels: input_channels,
+            stream_id: out_stream_id.clone(),
+            timestamp_us: timestamp_us.map(|pts| pts + duration_us),
+            arrival_ts_us: in_arrival_us,
+            metadata: tail_meta,
+        });
         Ok(RuntimeData::Audio {
-            samples: all_output_samples.into(),
-            sample_rate: target_rate,
+            samples: samples.into(),
+            sample_rate: self.target_rate,
             channels: input_channels,
             stream_id: out_stream_id,
-            timestamp_us: in_ts_us,
+            timestamp_us,
             arrival_ts_us: in_arrival_us,
-            metadata: in_meta,
+            metadata,
         })
+    }
+
+    async fn process_streaming<F>(
+        &self,
+        data: RuntimeData,
+        _session_id: Option<String>,
+        mut callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        let envelope = match &data {
+            RuntimeData::Json(v) => Some(v.clone()),
+            RuntimeData::Text(t) => {
+                serde_json::from_str::<Value>(crate::data::split_text_str(t).1).ok()
+            }
+            _ => None,
+        };
+        let mut count = 0;
+        if let Some(end) = envelope.filter(|v| v["kind"] == "speech_end") {
+            // Keep epoch validation and flushing atomic with audio ingestion.
+            // A delayed end marker must never flush a newer utterance.
+            let tail = {
+                let mut inner = self.inner.lock();
+                let mut current = self.speech_epoch.lock();
+                let epoch = end["speech_epoch"].as_u64().unwrap_or(*current);
+                if epoch < *current {
+                    return Ok(0);
+                }
+                if epoch > *current {
+                    inner.reset();
+                    self.tail.lock().take();
+                    *current = epoch;
+                }
+                let output = inner.flush_audio()?;
+                let mut tail = self.tail.lock().take();
+                if let Some(RuntimeData::Audio { samples, .. }) = &mut tail {
+                    *samples = output.buffer.as_f32().unwrap().to_vec().into();
+                }
+                tail
+            };
+            if let Some(tail) = tail {
+                callback(tail)?;
+                count += 1;
+            }
+            callback(data)?;
+        } else {
+            callback(self.process(data).await?)?;
+        }
+        Ok(count + 1)
     }
 }
 
@@ -639,5 +643,116 @@ impl StreamingNode for AutoResampleStreamingNodeWrapper {
 
     fn capability_behavior(&self) -> crate::capabilities::CapabilityBehavior {
         crate::capabilities::CapabilityBehavior::Adaptive
+    }
+}
+
+#[cfg(test)]
+mod speech_timeline_tests {
+    use super::*;
+
+    async fn resample(chunks: &[usize]) -> (Vec<f32>, Vec<u64>) {
+        let node = ResampleStreamingNode::new(
+            FastResampleNode::new(24000, 16000, ResampleQuality::Medium, 1).unwrap(),
+            16000,
+        );
+        let mut audio = Vec::new();
+        let mut timestamps = Vec::new();
+        let mut input_frames = 0usize;
+        for &length in chunks {
+            let input = RuntimeData::Audio {
+                samples: (input_frames..input_frames + length)
+                    .map(|i| (i as f32 * 0.031).sin())
+                    .collect::<Vec<_>>()
+                    .into(),
+                sample_rate: 24000,
+                channels: 1,
+                stream_id: None,
+                timestamp_us: None,
+                arrival_ts_us: None,
+                metadata: Some(
+                    serde_json::json!({"pts_us":input_frames as u64 * 1_000_000 / 24000, "speech_epoch":0}),
+                ),
+            };
+            input_frames += length;
+            node.process_streaming(input, None, |out| {
+                if let RuntimeData::Audio {
+                    samples, metadata, ..
+                } = out
+                {
+                    if !samples.is_empty() {
+                        timestamps.push(metadata.unwrap()["pts_us"].as_u64().unwrap());
+                    }
+                    audio.extend_from_slice(samples.as_slice());
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        node.process_streaming(
+            RuntimeData::Json(serde_json::json!({"kind":"speech_end", "speech_epoch":0})),
+            None,
+            |out| {
+                if let RuntimeData::Audio {
+                    samples, metadata, ..
+                } = out
+                {
+                    if !samples.is_empty() {
+                        timestamps.push(metadata.unwrap()["pts_us"].as_u64().unwrap());
+                    }
+                    audio.extend_from_slice(samples.as_slice());
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        (audio, timestamps)
+    }
+
+    #[tokio::test]
+    async fn chunk_boundaries_do_not_pad_speech_or_drop_its_tail() {
+        let (whole, _) = resample(&[10010]).await;
+        let (chunked, pts) = resample(&[1001; 10]).await;
+        assert_eq!(whole.len(), 10010 * 16000 / 24000);
+        assert_eq!(whole, chunked);
+        assert!(pts.windows(2).all(|p| p[0] <= p[1]));
+    }
+
+    #[tokio::test]
+    async fn stale_end_marker_does_not_flush_new_epoch() {
+        let node = ResampleStreamingNode::new(
+            FastResampleNode::new(24000, 16000, ResampleQuality::Medium, 1).unwrap(),
+            16000,
+        );
+        let audio = RuntimeData::Audio {
+            samples: vec![0.25; 100].into(),
+            sample_rate: 24000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: Some(serde_json::json!({"speech_epoch": 2, "pts_us": 0})),
+        };
+        node.process(audio).await.unwrap();
+        let end = |epoch| {
+            RuntimeData::Json(serde_json::json!({"kind":"speech_end", "speech_epoch":epoch}))
+        };
+        assert_eq!(
+            node.process_streaming(end(1), None, |_| panic!("stale marker emitted output"))
+                .await
+                .unwrap(),
+            0
+        );
+        let mut frames = 0;
+        node.process_streaming(end(2), None, |out| {
+            if let RuntimeData::Audio { samples, .. } = out {
+                frames += samples.len();
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(frames, 100 * 16000 / 24000);
     }
 }

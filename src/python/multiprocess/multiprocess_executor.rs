@@ -1892,6 +1892,11 @@ sys.stdout.flush()
         let node_id_clone = node_id.to_string();
         let session_id_clone = session_id.to_string();
         let control = self.get_control();
+        let process = self.sessions.read().await
+            .get(session_id)
+            .and_then(|session| session.node_processes.get(node_id))
+            .cloned()
+            .ok_or_else(|| Error::Execution(format!("Missing process for node {node_id}")))?;
 
         // Control channel was already created in initialize() before spawning Python
         // Now poll for the READY signal - need direct iceoryx2 subscriber (not RuntimeData wrapper)
@@ -1917,6 +1922,15 @@ sys.stdout.flush()
 
                 poll_count += 1;
                 if poll_count % 100 == 0 {
+                    let status = handle.block_on(async { process.status.read().await.clone() });
+                    if matches!(status, super::process_manager::ProcessStatus::Error(_)
+                        | super::process_manager::ProcessStatus::Stopped
+                        | super::process_manager::ProcessStatus::Stopping)
+                    {
+                        return Err(Error::Execution(format!(
+                            "Node {node_id_clone} exited before readiness: {status:?}"
+                        )));
+                    }
                     tracing::debug!(
                         "Control channel poll #{} - still waiting for READY",
                         poll_count
@@ -2002,7 +2016,7 @@ sys.stdout.flush()
                     }
                     None => {
                         // No data yet, yield to scheduler
-                        std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                 }
             }

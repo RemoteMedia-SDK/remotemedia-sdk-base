@@ -2,12 +2,13 @@
   "version": "1",
   "metadata": {
     "name": "hermes-profile-import-test",
-    "description": "Test manifest for Hermes profile import on Android"
+    "description": "Test manifest for managed venv in Sproot container",
+    "default_python_runtime": "glibc"
   },
   "nodes": [
     {
-      "id": "hermes_profile_import",
-      "node_type": "HermesProfileImportPlugin",
+      "id": "sproot_test",
+      "node_type": "SprootManagedTestPlugin",
       "params": {},
       "is_streaming": false
     }

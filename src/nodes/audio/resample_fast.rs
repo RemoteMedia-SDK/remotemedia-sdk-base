@@ -37,6 +37,10 @@ impl ResampleQuality {
 pub struct FastResampleNode {
     resampler: SincFixedOut<f32>,
     target_rate: u32,
+    source_rate: u32,
+    received_frames: u64,
+    emitted_frames: u64,
+    delay_remaining: usize,
     #[allow(dead_code)] // Used for initialization, runtime channels derived from input data
     channels: usize,
     // Ring buffer to accumulate input samples across calls (per channel)
@@ -53,6 +57,11 @@ impl FastResampleNode {
         quality: ResampleQuality,
         channels: usize,
     ) -> Result<Self> {
+        if source_rate == 0 || target_rate == 0 || channels == 0 {
+            return Err(Error::Execution(
+                "resampler rates and channels must be positive".into(),
+            ));
+        }
         let chunk_size = quality.chunk_size();
         let sinc_len = quality.sinc_len();
         let resample_ratio = target_rate as f64 / source_rate as f64;
@@ -79,13 +88,55 @@ impl FastResampleNode {
         )
         .map_err(|e| Error::Execution(format!("Failed to create resampler: {}", e)))?;
 
+        let delay_remaining = resampler.output_delay();
         Ok(Self {
             resampler,
             target_rate,
+            source_rate,
+            received_frames: 0,
+            emitted_frames: 0,
+            delay_remaining,
             channels,
             input_buffer: vec![Vec::with_capacity(chunk_size * 4); channels],
             chunk_buffer: vec![Vec::with_capacity(chunk_size * 2); channels],
         })
+    }
+    /// Difference between the next input and output positions, for timestamp propagation.
+    pub(crate) fn buffered_duration_us(&self) -> u64 {
+        (self.received_frames * 1_000_000 / self.source_rate as u64)
+            .saturating_sub(self.emitted_frames * 1_000_000 / self.target_rate as u64)
+    }
+
+    /// Finish an utterance without exposing filter padding as audible duration.
+    pub(crate) fn flush_audio(&mut self) -> Result<AudioData> {
+        let remaining = (self.received_frames * self.target_rate as u64 / self.source_rate as u64)
+            .saturating_sub(self.emitted_frames) as usize
+            * self.channels;
+        let mut samples = Vec::new();
+        while samples.len() < remaining {
+            let padding = self.resampler.input_frames_next();
+            let output = self.process_audio(AudioData::new(
+                AudioBuffer::new_f32(vec![0.0; padding * self.channels]),
+                self.source_rate,
+                self.channels,
+            ))?;
+            samples.extend_from_slice(output.buffer.as_f32().unwrap());
+        }
+        samples.truncate(remaining);
+        self.reset();
+        Ok(AudioData::new(
+            AudioBuffer::new_f32(samples),
+            self.target_rate,
+            self.channels,
+        ))
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.resampler.reset();
+        self.input_buffer.iter_mut().for_each(Vec::clear);
+        self.received_frames = 0;
+        self.emitted_frames = 0;
+        self.delay_remaining = self.resampler.output_delay();
     }
 }
 
@@ -102,7 +153,14 @@ impl FastAudioNode for FastResampleNode {
             .ok_or_else(|| Error::Execution("Resample requires F32 format".into()))?;
 
         let channels = input.channels;
+        if channels != self.channels
+            || input.sample_rate != self.source_rate
+            || samples.len() % channels != 0
+        {
+            return Err(Error::Execution("resampler input format changed".into()));
+        }
         let input_frames = samples.len() / channels;
+        self.received_frames += input_frames as u64;
 
         tracing::debug!(
             "Resampler input: {} frames, {} channels, {} samples, rate: {} Hz, first 3 samples: [{:.6}, {:.6}, {:.6}]",
@@ -202,6 +260,12 @@ impl FastAudioNode for FastResampleNode {
             self.input_buffer[0].len()
         );
 
+        let skip = self
+            .delay_remaining
+            .min(all_output_samples.len() / channels);
+        all_output_samples.drain(..skip * channels);
+        self.delay_remaining -= skip;
+        self.emitted_frames += (all_output_samples.len() / channels) as u64;
         Ok(AudioData::new(
             AudioBuffer::new_f32(all_output_samples),
             self.target_rate,

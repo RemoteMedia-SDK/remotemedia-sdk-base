@@ -16,17 +16,19 @@ use std::sync::Arc;
 #[cfg(feature = "inprocess")]
 use crate::inprocess_node::DynamicInProcessPythonNodeFactory;
 
-/// A dynamic factory that creates Python nodes based on registry configuration
+#[cfg(feature = "multiprocess")]
 struct DynamicPythonNodeFactory {
     config: PythonNodeConfig,
 }
 
+#[cfg(feature = "multiprocess")]
 impl DynamicPythonNodeFactory {
     fn new(config: PythonNodeConfig) -> Self {
         Self { config }
     }
 }
 
+#[cfg(feature = "multiprocess")]
 impl StreamingNodeFactory for DynamicPythonNodeFactory {
     fn create(
         &self,
@@ -150,9 +152,19 @@ impl NodeProvider for PythonNodesProvider {
                 continue;
             }
 
-            // Default to multiprocess
-            registry.register(Arc::new(DynamicPythonNodeFactory::new(config)));
-            tracing::debug!(node_type = %node_type, "Registered dynamic MULTIPROCESS Python node factory");
+            #[cfg(feature = "multiprocess")]
+            {
+                registry.register(Arc::new(DynamicPythonNodeFactory::new(config)));
+                tracing::debug!(node_type = %node_type, "Registered dynamic MULTIPROCESS Python node factory");
+                continue;
+            }
+
+            #[cfg(not(any(feature = "inprocess", feature = "multiprocess")))]
+            {
+                // Neither inprocess nor multiprocess feature enabled
+                // Python nodes cannot be created without an execution mode
+                tracing::warn!(node_type = %node_type, "Python node registered but no execution mode feature enabled (inprocess or multiprocess)");
+            }
         }
     }
 
@@ -211,15 +223,18 @@ mod tests {
 
     #[test]
     fn test_schema_generation() {
-        let config = PythonNodeConfig::new("SchemaTestNode")
-            .with_description("Test description")
-            .with_category("test")
-            .accepts(["audio", "text"])
-            .produces(["json"]);
+        #[cfg(feature = "multiprocess")]
+        {
+            let config = PythonNodeConfig::new("SchemaTestNode")
+                .with_description("Test description")
+                .with_category("test")
+                .accepts(["audio", "text"])
+                .produces(["json"]);
 
-        let factory = DynamicPythonNodeFactory::new(config);
-        let schema = factory.schema().unwrap();
+            let factory = DynamicPythonNodeFactory::new(config);
+            let schema = factory.schema().unwrap();
 
-        assert_eq!(schema.node_type, "SchemaTestNode");
+            assert_eq!(schema.node_type, "SchemaTestNode");
+        }
     }
 }

@@ -1,0 +1,8 @@
+schema: default
+title: Android RemoteMedia Scaling Entry via Microdroid VM Runner
+description: Extend `kotlin-android` to run RemoteMedia scaling/pipeline entry/runner logic inside a Microdroid VM and connect over vsock instead of executing Python nodes inside the Android app process.
+status: draft
+owners: []
+created: 2026-06-10
+updated: 2026-06-10
+risk: high

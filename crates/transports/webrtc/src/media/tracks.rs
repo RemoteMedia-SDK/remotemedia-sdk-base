@@ -72,6 +72,45 @@ use tokio::sync::RwLock as AsyncRwLock;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
+/// Codec-frame assembly across arbitrary PCM callback boundaries. Padding is
+/// reserved for an explicit utterance end, never an input chunk boundary.
+struct AudioPcmPacketizer {
+    frame_size: usize,
+    pending: std::collections::VecDeque<f32>,
+}
+
+impl AudioPcmPacketizer {
+    fn new(frame_size: usize) -> Self {
+        assert!(frame_size > 0);
+        Self { frame_size, pending: std::collections::VecDeque::new() }
+    }
+
+    fn append(&mut self, samples: &[f32]) {
+        self.pending.extend(samples.iter().copied());
+    }
+
+    fn next_frame(&mut self) -> Option<Vec<f32>> {
+        (self.pending.len() >= self.frame_size)
+            .then(|| self.pending.drain(..self.frame_size).collect())
+    }
+
+    #[cfg(test)]
+    fn push(&mut self, samples: &[f32]) -> Vec<(Vec<f32>, usize)> {
+        self.append(samples);
+        std::iter::from_fn(|| self.next_frame().map(|pcm| (pcm, self.frame_size))).collect()
+    }
+
+    fn finish(&mut self) -> Option<(Vec<f32>, usize)> {
+        if self.pending.is_empty() { return None; }
+        let real = self.pending.len();
+        let mut pcm: Vec<f32> = self.pending.drain(..).collect();
+        pcm.resize(self.frame_size, 0.0);
+        Some((pcm, real))
+    }
+
+    fn clear(&mut self) { self.pending.clear(); }
+}
+
 /// Audio track for WebRTC
 ///
 /// Manages audio encoding/decoding and RTP transmission.
@@ -91,6 +130,9 @@ pub struct AudioTrack {
     /// in `send_audio`; `parking_lot::RwLockReadGuard` is `!Send` and
     /// would break `tokio::spawn` shipping of the containing future.
     sender: Arc<AsyncRwLock<Option<AudioSender>>>,
+
+    /// Serializes PCM assembly, encoding, and enqueue across concurrent callers.
+    packetizer: tokio::sync::Mutex<AudioPcmPacketizer>,
 
     /// RTP timestamp (in sample units). Sync parking_lot — only
     /// `u32` reads/writes; no guard ever lives across an await.
@@ -123,6 +165,9 @@ impl AudioTrack {
             decoder,
             // Async RwLock: see field doc — guard held across await.
             sender: Arc::new(AsyncRwLock::new(Some(sender))),
+            packetizer: tokio::sync::Mutex::new(AudioPcmPacketizer::new(
+                (config.sample_rate as usize * 20) / 1000,
+            )),
             timestamp: Arc::new(RwLock::new(0)),
         })
     }
@@ -157,32 +202,24 @@ impl AudioTrack {
         // on line 148, so parking_lot is safe and ~1 CAS per acquire
         // uncontended.
 
-        // Check if encoder needs to be recreated for different sample rate
-        {
-            let encoder = self.encoder.read();
-            if encoder.config.sample_rate != sample_rate {
-                drop(encoder);
-                let old_rate = self.encoder.read().config.sample_rate;
-                info!(
-                    "Sample rate changed from {} to {} Hz, recreating encoder",
-                    old_rate, sample_rate
-                );
-
-                let mut encoder_write = self.encoder.write();
-                let new_config = crate::media::audio::AudioEncoderConfig {
-                    sample_rate,
-                    channels: encoder_write.config.channels,
-                    bitrate: encoder_write.config.bitrate,
-                    complexity: encoder_write.config.complexity,
-                    ring_buffer_capacity: encoder_write.config.ring_buffer_capacity,
-                };
-                *encoder_write = crate::media::audio::AudioEncoder::new(new_config)?;
-                info!("Encoder recreated with sample rate: {} Hz", sample_rate);
-            }
-        }
-
-        let frame_size = (sample_rate as usize * 20) / 1000; // 20ms frame
+        // Serialize assembly through enqueue across concurrent producers and cancellation.
+        let mut packetizer = self.packetizer.lock().await;
         let frame_duration = Duration::from_millis(20);
+        let old_rate = self.encoder.read().config.sample_rate;
+        let replacement = if old_rate != sample_rate {
+            let encoder = self.encoder.read();
+            let config = crate::media::audio::AudioEncoderConfig {
+                sample_rate,
+                channels: encoder.config.channels,
+                bitrate: encoder.config.bitrate,
+                complexity: encoder.config.complexity,
+                ring_buffer_capacity: encoder.config.ring_buffer_capacity,
+            };
+            Some(crate::media::audio::AudioEncoder::new(config)?)
+        } else {
+            None
+        };
+        let frame_size = (sample_rate as usize * 20) / 1000; // 20ms Opus frame
 
         trace!(
             "AudioTrack: Enqueuing {} samples as {}sample frames @ {}Hz (duration: {:.2}s)",
@@ -201,27 +238,22 @@ impl AudioTrack {
             .as_ref()
             .ok_or_else(|| Error::MediaTrackError("AudioSender not initialized".to_string()))?;
 
+        if let Some(replacement) = replacement {
+            // End the previous format once, before replacing its encoder.
+            if let Some((pcm, _real)) = packetizer.finish() {
+                let encoded = self.encoder.write().encode(&pcm)?;
+                sender.enqueue_frame(encoded, pcm.len() as u32, frame_duration).await?;
+            }
+            *self.encoder.write() = replacement;
+            *packetizer = AudioPcmPacketizer::new(frame_size);
+            info!("Sample rate changed from {} to {} Hz, recreating encoder", old_rate, sample_rate);
+        }
+
         let mut frames_enqueued = 0;
-
-        // Process audio in chunks and enqueue frames
-        for chunk in samples.chunks(frame_size) {
-            // Opus requires exact frame sizes - pad last chunk if needed
-            let samples_to_encode: Vec<f32> = if chunk.len() < frame_size {
-                let mut padded = chunk.to_vec();
-                padded.resize(frame_size, 0.0); // Pad with silence
-                padded
-            } else {
-                chunk.to_vec()
-            };
-
-            // Encode this chunk. Write-lock is taken, `encode` is
-            // synchronous, lock released before the `.await` below.
-            let encoded = self.encoder.write().encode(&samples_to_encode)?;
-
-            // Enqueue frame into ring buffer (non-blocking)
-            sender
-                .enqueue_frame(encoded, chunk.len() as u32, frame_duration)
-                .await?;
+        packetizer.append(&samples);
+        while let Some(pcm) = packetizer.next_frame() {
+            let encoded = self.encoder.write().encode(&pcm)?;
+            sender.enqueue_frame(encoded, pcm.len() as u32, frame_duration).await?;
             frames_enqueued += 1;
         }
 
@@ -231,6 +263,19 @@ impl AudioTrack {
             sender.buffer_len()
         );
 
+        Ok(())
+    }
+
+    /// Encode the final partial frame once at an explicit speech boundary.
+    pub async fn finish_audio(&self) -> Result<()> {
+        let mut packetizer = self.packetizer.lock().await;
+        if let Some((pcm, _real)) = packetizer.finish() {
+            let sender_guard = self.sender.read().await;
+            let sender = sender_guard.as_ref().ok_or_else(||
+                Error::MediaTrackError("AudioSender not initialized".to_string()))?;
+            let encoded = self.encoder.write().encode(&pcm)?;
+            sender.enqueue_frame(encoded, pcm.len() as u32, Duration::from_millis(20)).await?;
+        }
         Ok(())
     }
 
@@ -267,7 +312,7 @@ impl AudioTrack {
         Ok(samples)
     }
 
-    /// Drain any queued TTS audio from the sender ring buffer
+    /// Drain queued TTS packets and discard any incomplete PCM frame
     /// without stopping the sender thread.
     ///
     /// Used on barge-in: the user started speaking while the
@@ -276,6 +321,8 @@ impl AudioTrack {
     /// the user until the ring buffer drains. Returns the number
     /// of frames that were dropped.
     pub async fn flush_send_buffer(&self) -> usize {
+        let mut packetizer = self.packetizer.lock().await;
+        packetizer.clear();
         if let Some(sender) = self.sender.read().await.as_ref() {
             sender.flush_buffer()
         } else {
@@ -714,6 +761,68 @@ mod tests {
         let config = AudioEncoderConfig::default();
         let audio_track = AudioTrack::new(track, config);
         assert!(audio_track.is_ok());
+    }
+
+    #[test]
+    fn audio_packetization_must_not_depend_on_input_chunk_boundaries() {
+        // One second of the 48 kHz PCM emitted by a 30 fps renderer after resampling.
+        // Both feeds carry exactly the same samples in the same order.
+        let pcm = vec![0.25_f32; 48_000];
+        let mut whole = AudioPcmPacketizer::new(960);
+        let contiguous = whole.push(&pcm);
+        let mut stream = AudioPcmPacketizer::new(960);
+        let per_tick: Vec<_> = pcm.chunks(1_600).flat_map(|chunk| stream.push(chunk)).collect();
+        let stats = |frames: &Vec<(Vec<f32>, usize)>| {
+            (
+                frames.len(),
+                frames.iter().map(|(pcm, _)| pcm.len()).sum::<usize>(),
+                frames
+                    .iter()
+                    .map(|(pcm, original)| pcm.len() - original)
+                    .sum::<usize>(),
+            )
+        };
+        assert_eq!(stats(&contiguous), (50, 48_000, 0));
+        assert_eq!(stats(&per_tick), stats(&contiguous),
+            "splitting identical PCM into 30 fps callbacks must not add encoded silence or playback time");
+    }
+
+    #[test]
+    fn aligned_opus_chunks_are_a_control() {
+        let pcm = vec![0.25_f32; 48_000];
+        let mut stream = AudioPcmPacketizer::new(960);
+        let frames: Vec<_> = pcm.chunks(960).flat_map(|chunk| stream.push(chunk)).collect();
+        assert_eq!(frames.len(), 50);
+        assert!(frames.iter().all(|(frame, original)| frame.len() == 960 && *original == 960));
+    }
+
+    #[test]
+    fn sixteen_khz_thirty_fps_chunks_expose_the_same_padding() {
+        let pcm = vec![0.25_f32; 16_000];
+        let mut start = 0;
+        let mut stream = AudioPcmPacketizer::new(320);
+        let mut frames = Vec::new();
+        for tick in 0..30 {
+            let end = (tick + 1) * 16_000 / 30;
+            frames.extend(stream.push(&pcm[start..end]));
+            start = end;
+        }
+        assert_eq!(start, pcm.len());
+        assert_eq!(frames.len(), 50);
+        assert_eq!(frames.iter().map(|(f, _)| f.len()).sum::<usize>(), 16_000);
+        assert!(frames.iter().all(|(f, original)| f.len() == *original));
+    }
+
+    #[test]
+    fn packetizer_pads_only_at_explicit_end_and_discards_on_cancel() {
+        let mut stream = AudioPcmPacketizer::new(960);
+        assert!(stream.push(&vec![0.25; 1_600]).len() == 1);
+        assert_eq!(stream.finish().map(|(_, real)| real), Some(640));
+        assert!(stream.finish().is_none());
+        assert!(stream.push(&vec![0.5; 500]).is_empty());
+        stream.clear();
+        assert!(stream.push(&vec![0.75; 460]).is_empty());
+        assert!(stream.finish().is_some_and(|(f, real)| real == 460 && f[0] == 0.75));
     }
 
     #[tokio::test]
