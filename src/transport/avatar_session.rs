@@ -16,6 +16,9 @@ use tokio::{
 struct BridgeConfig {
     motion_node: String,
     llm_node: Option<String>,
+    /// Deterministic goal producer (e.g. the home-life planner); exclusive with `llm_node`.
+    #[serde(default)]
+    planner_node: Option<String>,
     #[serde(default = "timeout_secs")]
     request_timeout_secs: u64,
 }
@@ -69,12 +72,14 @@ impl AvatarSessionBridge {
         let owner = owners[0];
         let config: BridgeConfig = serde_json::from_value(owner.params["avatar_session"].clone())
             .map_err(|e| Error::Execution(e.to_string()))?;
+        let missing = |node: &Option<String>| {
+            node.as_ref().is_some_and(|id| !manifest.nodes.iter().any(|n| &n.id == id))
+        };
         if config.request_timeout_secs == 0
             || !manifest.nodes.iter().any(|n| n.id == config.motion_node)
-            || config
-                .llm_node
-                .as_ref()
-                .is_some_and(|id| !manifest.nodes.iter().any(|n| &n.id == id))
+            || missing(&config.llm_node)
+            || missing(&config.planner_node)
+            || (config.llm_node.is_some() && config.planner_node.is_some())
         {
             return Err(Error::Execution(
                 "invalid avatar_session node references or timeout".into(),
@@ -96,6 +101,47 @@ impl AvatarSessionBridge {
                     .await;
             }
         }))))
+    }
+}
+
+/// Planner backpressure must never delay motion acknowledgements either. Only
+/// the newest outcome projection is kept; it never carries body coordinates.
+struct PlannerMailbox {
+    latest: watch::Sender<Option<Value>>,
+    task: JoinHandle<()>,
+}
+impl Drop for PlannerMailbox {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl PlannerMailbox {
+    fn start(planner: String, control: Arc<SessionControl>) -> Self {
+        let (latest, mut snapshots) = watch::channel::<Option<Value>>(None);
+        let task = tokio::spawn(async move {
+            let mut close = control.close_subscriber();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = close.recv() => return,
+                    changed = snapshots.changed() => if changed.is_err() { return },
+                }
+                let Some(state) = snapshots.borrow_and_update().clone() else { continue };
+                let observation = json!({"kind":"office_observation", "state":state});
+                if let Err(error) = control
+                    .publish(&ControlAddress::node_in(&planner), RuntimeData::Json(observation))
+                    .await
+                {
+                    tracing::error!(%error, "office planner feedback stopped; motion continues");
+                    return;
+                }
+            }
+        });
+        Self { latest, task }
+    }
+
+    fn observe(&self, state: Value) {
+        self.latest.send_replace(Some(state));
     }
 }
 
@@ -219,9 +265,15 @@ fn interaction_state(office: &Value) -> Value {
             "displayed_pts_ms":office["avatar"]["displayed_pts_ms"],
             "native_stream":office["avatar"]["native_stream"],
             "native_seat":office["avatar"]["native_seat"]}));
+        // Named keypoints take precedence over legacy anchors (e.g. the plate's rim grasp).
+        let has_role = |object: &Value, role: &str| {
+            object["keypoints"].as_object().is_some_and(|points| points.values().any(|p| p["role"] == role))
+        };
         let objects: Vec<_> = office["objects"].as_array().into_iter().flatten().map(|object| json!({
             "id":object["id"], "label":object["label"], "position":object["position"],
-            "dynamic":object["dynamic"], "graspable":!object["grasp"].is_null(),
+            "dynamic":object["dynamic"],
+            "graspable":!object["grasp"].is_null() || has_role(object, "grasp"),
+            "placement":!object["surface"].is_null() || has_role(object, "placement"),
             "seat_surface":!object["seat_surface_part"].is_null()
         })).collect();
         state.insert("objects".into(), Value::Array(objects));
@@ -256,6 +308,22 @@ fn interaction_state(office: &Value) -> Value {
 async fn run_bridge(
     config: &BridgeConfig,
     control: &Arc<SessionControl>,
+    scene: broadcast::Receiver<RuntimeData>,
+    motion: broadcast::Receiver<RuntimeData>,
+) -> Result<()> {
+    let result = bridge_loop(config, control, scene, motion).await;
+    // Stopping drops the latest-wins mailbox, so report the terminal reason
+    // directly; a planner must never keep presenting a stopped step as running.
+    if let (Err(error), Some(planner)) = (&result, &config.planner_node) {
+        let observation = json!({"kind":"office_observation", "state":{"motion_error":error.to_string()}});
+        let _ = control.publish(&ControlAddress::node_in(planner), RuntimeData::Json(observation)).await;
+    }
+    result
+}
+
+async fn bridge_loop(
+    config: &BridgeConfig,
+    control: &Arc<SessionControl>,
     mut scene: broadcast::Receiver<RuntimeData>,
     mut motion: broadcast::Receiver<RuntimeData>,
 ) -> Result<()> {
@@ -266,6 +334,10 @@ async fn run_bridge(
         .llm_node
         .as_ref()
         .map(|llm| FeedbackMailbox::start(llm.clone(), control.clone()));
+    let planner = config
+        .planner_node
+        .as_ref()
+        .map(|node| PlannerMailbox::start(node.clone(), control.clone()));
     loop {
         let (from_renderer, data) = tokio::select! {
             _ = close.recv() => return Ok(()),
@@ -314,7 +386,11 @@ async fn run_bridge(
             }
             Some("scene_state" | "waypoint_path") => {
                 if let Some(office) = value.pointer("/state/office") {
-                    control.set_office_observation(interaction_state(office))?;
+                    let state = interaction_state(office);
+                    if let Some(planner) = &planner {
+                        planner.observe(state.clone());
+                    }
+                    control.set_office_observation(state)?;
                 }
                 if let Some(feedback) = &feedback {
                     feedback.observe(value);
@@ -353,6 +429,11 @@ mod tests {
         assert_eq!(result["motion"], scene["motion"]);
         assert_eq!(result["occupied_hands"], scene["occupied_hands"]);
         assert_eq!(result["objects"][0]["seat_surface"], true);
+        assert_eq!(result["objects"][0]["graspable"], false);
+        let plate = json!({"scene_capabilities":{"operations":["grasp"]}, "objects":[{"id":"plate","grasp":null,
+            "surface":null, "keypoints":{"rim_grasp":{"role":"grasp","position":[0,0,0.15]}}}]});
+        assert_eq!(interaction_state(&plate)["objects"][0]["graspable"], true);
+        assert_eq!(interaction_state(&plate)["objects"][0]["placement"], false);
         assert!(result.get("world_keypoints").is_none());
         assert!(result["avatar"].get("wrists").is_none());
         assert!(result["objects"][0].get("parts").is_none());
@@ -424,7 +505,7 @@ mod tests {
         control.attach_input_sender(tx).await;
         let (scene_tx, scene) = broadcast::channel(8);
         let (motion_tx, motion) = broadcast::channel(8);
-        let config = BridgeConfig { motion_node:"ardy".into(), llm_node:None, request_timeout_secs:1 };
+        let config = BridgeConfig { motion_node:"ardy".into(), llm_node:None, planner_node:None, request_timeout_secs:1 };
         let c = control.clone();
         let task = tokio::spawn(async move { run_bridge(&config, &c, scene, motion).await });
         let first = format!("  {}  ", goal(1, 0));
@@ -453,6 +534,55 @@ mod tests {
         }
         assert!(tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap()
             .unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn planner_receives_latest_outcome_projection_without_body_state() {
+        let control = SessionControl::new("planner");
+        let (tx, mut rx) = mpsc::channel(8);
+        control.attach_input_sender(tx).await;
+        let (scene_tx, scene) = broadcast::channel(8);
+        let (motion_tx, motion) = broadcast::channel(8);
+        let config = BridgeConfig { motion_node:"ardy".into(), llm_node:None,
+            planner_node:Some("home".into()), request_timeout_secs:1 };
+        let c = control.clone();
+        let task = tokio::spawn(async move { run_bridge(&config, &c, scene, motion).await });
+        let office = json!({"scene_capabilities":{"operations":["navigate"]},
+            "scene_lifecycle":{"complete":true}, "occupied_hands":[["right","plate"]],
+            "avatar":{"ready":true,"displayed_pts_ms":5,"wrists":[1,2,3],"pelvis":[0,1,0]},
+            "objects":[{"id":"sofa","label":"Sofa","surface":[0,0.5,0],"seat_surface_part":0,"parts":[1]}]});
+        scene_tx.send(RuntimeData::Json(json!({"kind":"scene_state","state":{"office":office}}))).unwrap();
+        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(packet.to_node.as_deref(), Some("home"));
+        let RuntimeData::Json(value) = packet.data else { panic!("expected planner observation") };
+        assert_eq!(value["kind"], "office_observation");
+        assert_eq!(value["state"]["scene_lifecycle"]["complete"], true);
+        assert_eq!(value["state"]["occupied_hands"], json!([["right","plate"]]));
+        assert_eq!(value["state"]["objects"][0]["placement"], true);
+        assert!(value["state"]["avatar"].get("wrists").is_none() && value["state"]["avatar"].get("pelvis").is_none());
+        assert!(value["state"]["objects"][0].get("parts").is_none());
+        motion_tx.send(RuntimeData::Json(json!({"kind":"motion_error","error":"root validation rejected"}))).unwrap();
+        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.unwrap().unwrap();
+        let RuntimeData::Json(value) = packet.data else { panic!("expected planner failure") };
+        assert_eq!(packet.to_node.as_deref(), Some("home"));
+        assert!(value["state"]["motion_error"].as_str().unwrap().contains("root validation rejected"));
+        assert!(tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn planner_node_must_exist_and_exclude_llm_producer() {
+        let manifest = |session: Value| -> Manifest { serde_json::from_value(json!({"version":"v1",
+            "metadata":{"name":"home"}, "connections":[], "nodes":[
+                {"id":"renderer","node_type":"CcRenderNode","params":{"avatar_session":session}},
+                {"id":"ardy","node_type":"ArdyMotionNode","params":{}},
+                {"id":"llm","node_type":"MultimodalLLMNode","params":{}},
+                {"id":"home","node_type":"HomeLifeNode","params":{}}]})).unwrap() };
+        for session in [json!({"motion_node":"ardy","planner_node":"missing"}),
+                        json!({"motion_node":"ardy","planner_node":"home","llm_node":"llm"})] {
+            assert!(AvatarSessionBridge::attach(&manifest(session), SessionControl::new("home")).is_err());
+        }
+        assert!(AvatarSessionBridge::attach(&manifest(json!({"motion_node":"ardy","planner_node":"home"})),
+            SessionControl::new("home")).unwrap().is_some());
     }
 
     #[tokio::test]

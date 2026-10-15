@@ -543,6 +543,15 @@ pub fn register_default_python_nodes() {
             .produces(["json"]),
     );
 
+    register_python_node(
+        PythonNodeConfig::new("HomeLifeNode")
+            .with_multi_output(true)
+            .with_description("Needs-driven home task planner emitting closed motion goals")
+            .with_category("avatar")
+            .accepts(["json", "text"])
+            .produces(["json"]),
+    );
+
     // Avatar / motion nodes
     register_python_node(
         PythonNodeConfig::new("KimodoMotionNode")
