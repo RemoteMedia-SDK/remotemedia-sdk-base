@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # SDK dependencies
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../", default-features = false, features = ["inprocess-python", "loadable"] }
-remotemedia-python-nodes = { path = "../../crates/python-nodes", features = ["inprocess"] }
+remotemedia-python-nodes = { path = "../../crates/python-nodes", default-features = false, features = ["inprocess"] }
 remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk", features = ["inprocess-python"] }
 remotemedia-litert-nodes = { path = "../../../remotemedia-litert-nodes", default-features = false, features = ["whisper"] }
 litert-lm-loadable-plugin = { path = "../../../litert-lm-loadable-plugin", default-features = false }

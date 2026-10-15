@@ -30,7 +30,7 @@ futures.workspace = true
 inventory.workspace = true
 
 [features]
-default = []
+default = ["multiprocess"]
 # Python multiprocess execution with iceoryx2 IPC (not available on Android/Sproot)
 multiprocess = ["remotemedia-core/multiprocess"]
 # Feature flags for specific Python node families
