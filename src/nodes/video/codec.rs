@@ -247,9 +247,13 @@ impl VideoEncoderBackend for FFmpegEncoder {
             // straight to the software encoder.
             //
             // VP8 has no NVENC equivalent; the list collapses to libvpx.
+            //
+            // `h264_mf` (Windows Media Foundation) is the last H.264
+            // resort: the MSVC FFmpeg build from setup-ffmpeg.ps1 has no
+            // libx264/NVENC, while Windows always has MF's software encoder.
             let candidates: &[&str] = match (self.config.codec, self.config.hardware_accel) {
-                (VideoCodec::H264, true) => &["h264_nvenc", "libx264"],
-                (VideoCodec::H264, false) => &["libx264"],
+                (VideoCodec::H264, true) => &["h264_nvenc", "libx264", "h264_mf"],
+                (VideoCodec::H264, false) => &["libx264", "h264_mf"],
                 (VideoCodec::Av1, true) => &["av1_nvenc", "libaom-av1"],
                 (VideoCodec::Av1, false) => &["libaom-av1"],
                 (VideoCodec::Vp8, _) => &["libvpx"],
@@ -306,6 +310,14 @@ impl VideoEncoderBackend for FFmpegEncoder {
                             },
                         )
                         .set_option("tune", "zerolatency"),
+                    // Media Foundation: CBR for the remote-display
+                    // scenario, no B-frames. Software MFT: hardware MFTs
+                    // (NVIDIA's included) only negotiate NV12, and this
+                    // encoder is fed yuv420p.
+                    "h264_mf" => b
+                        .set_option("rate_control", "cbr")
+                        .set_option("scenario", "display_remoting")
+                        .set_option("bf", "0"),
                     _ => b,
                 };
 
