@@ -1,0 +1,23 @@
+[package]
+name = "loadable-session-rpc-contract"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+remotemedia-sdk-base = { path = "../..", features = ["loadable"] }
+remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk" }
+session-rpc-example = { path = "../../../remotemedia-plugin-sdk/examples/session-rpc" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+serde_json = "1"
+
+[patch."https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk"]
+loadable-node-abi = { path = "../../../remotemedia-plugin-sdk/crates/loadable-node-abi" }
+remotemedia-types = { path = "../../../remotemedia-plugin-sdk/crates/types" }
+remotemedia-traits = { path = "../../../remotemedia-plugin-sdk/crates/traits" }
+remotemedia-py-env = { path = "../../../remotemedia-plugin-sdk/crates/py-env-manager" }
+remotemedia-modality = { path = "../../../remotemedia-plugin-sdk/crates/modality" }
+remotemedia-core-derive = { path = "../../../remotemedia-plugin-sdk/crates/core-derive" }
+remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk" }

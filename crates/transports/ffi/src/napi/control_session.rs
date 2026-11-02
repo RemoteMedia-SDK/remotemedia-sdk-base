@@ -135,6 +135,7 @@ impl NapiAttachedSession {
             .await
             .map_err(|e| Error::from_reason(format!("subscribe failed: {e}")))?;
         Ok(NapiSubscription {
+            rpc: addr.port.as_deref() == Some("__reply__"),
             rx: Arc::new(Mutex::new(rx)),
         })
     }
@@ -214,6 +215,7 @@ impl NapiAttachedSession {
 /// - Throws when the upstream channel closes (session ended).
 #[napi]
 pub struct NapiSubscription {
+    rpc: bool,
     rx: Arc<Mutex<broadcast::Receiver<RuntimeData>>>,
 }
 
@@ -229,6 +231,9 @@ impl NapiSubscription {
         };
         match result {
             Ok(rd) => Ok(Some(NapiRuntimeData { inner: rd })),
+            Err(RecvError::Lagged(count)) if self.rpc => Err(Error::from_reason(format!(
+                "RPC reply subscription lagged by {count} frames; pending calls cannot complete reliably"
+            ))),
             Err(RecvError::Lagged(_)) => Ok(None),
             Err(RecvError::Closed) => Err(Error::from_reason("tap channel closed")),
         }

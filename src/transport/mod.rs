@@ -26,19 +26,20 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 // Re-export submodules
+pub mod avatar_session;
 pub mod cancel_gate;
 pub mod client;
 pub mod control_transport;
 pub mod data;
 pub mod embedded_python_env;
+mod managed_ardy;
 pub mod pacer;
 pub mod perf_aggregator;
 pub mod plugin_registry;
+mod rpc_dispatch;
 pub mod session;
 pub mod session_control;
 pub mod session_recorder;
-pub mod avatar_session;
-mod managed_ardy;
 pub mod session_router;
 pub mod shared_session;
 pub mod warm_session_pool;

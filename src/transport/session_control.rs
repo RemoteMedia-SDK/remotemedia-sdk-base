@@ -73,7 +73,53 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
+
+/// Owns RPC invocation lifetime for one control attachment. Closing or dropping
+/// it cancels its calls, independently of reply subscribers or session lifetime.
+pub struct RpcCallScope {
+    id: u64,
+    closed: watch::Sender<bool>,
+}
+
+impl Default for RpcCallScope {
+    fn default() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            closed: watch::channel(false).0,
+        }
+    }
+}
+
+impl RpcCallScope {
+    pub fn close(&self) {
+        self.closed.send_replace(true);
+    }
+    fn caller(&self) -> RpcCaller {
+        RpcCaller {
+            id: self.id,
+            closed: self.closed.subscribe(),
+        }
+    }
+}
+
+impl Drop for RpcCallScope {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+pub(super) struct RpcCaller {
+    pub id: u64,
+    pub closed: watch::Receiver<bool>,
+}
+
+pub(super) struct RpcInvocation {
+    pub method: String,
+    pub data: RuntimeData,
+    pub caller: Option<RpcCaller>,
+}
 
 // Capacity of the per-(node,port) output broadcast channel.
 // Slow subscribers get `RecvError::Lagged` and skip ahead — never block the
@@ -425,6 +471,7 @@ pub struct SessionControl {
     /// Handle to the router's input channel so `publish` can inject packets.
     /// Set by `attach_input_sender` after the router is constructed.
     input_tx: RwLock<Option<mpsc::Sender<DataPacket>>>,
+    rpc_inputs: DashMap<String, mpsc::Sender<RpcInvocation>>,
     /// Monotonic sequence for injected packets (kept separate from the
     /// transport's own sequence to make out-of-band traffic identifiable).
     inject_seq: std::sync::atomic::AtomicU64,
@@ -593,6 +640,7 @@ impl SessionControl {
             taps: DashMap::new(),
             intercepts: DashMap::new(),
             input_tx: RwLock::new(None),
+            rpc_inputs: DashMap::new(),
             inject_seq: std::sync::atomic::AtomicU64::new(0),
             close_tx,
             node_states: DashMap::new(),
@@ -669,7 +717,9 @@ impl SessionControl {
 
     pub(crate) fn set_office_observation(&self, state: serde_json::Value) -> Result<()> {
         if state.to_string().len() > 65536 {
-            return Err(crate::Error::Execution("office observation exceeds 64 KiB".into()));
+            return Err(crate::Error::Execution(
+                "office observation exceeds 64 KiB".into(),
+            ));
         }
         *self.office_observation.write() = Some(state);
         Ok(())
@@ -783,6 +833,23 @@ impl SessionControl {
         }
     }
 
+    pub(super) fn register_rpc(&self, node_id: &str) -> mpsc::Receiver<RpcInvocation> {
+        let (tx, rx) = mpsc::channel(32);
+        self.rpc_inputs.insert(node_id.to_string(), tx);
+        rx
+    }
+
+    pub(super) fn publish_rpc_reply(&self, node_id: &str, data: RuntimeData) -> Result<()> {
+        let key = (node_id.to_string(), Some("__reply__".to_string()));
+        let tap = self
+            .taps
+            .get(&key)
+            .ok_or_else(|| crate::Error::Execution("RPC reply subscriber closed".into()))?;
+        tap.send(data)
+            .map_err(|_| crate::Error::Execution("RPC reply subscriber closed".into()))?;
+        Ok(())
+    }
+
     /// Inject data into a node's input port.
     ///
     /// When `addr.port` is `Some(port_name)` — i.e. the client is writing
@@ -805,10 +872,56 @@ impl SessionControl {
     /// `addr.port == None` means the main rail — payload is forwarded
     /// unchanged, preserving the existing wire behavior.
     pub async fn publish(&self, addr: &ControlAddress, data: RuntimeData) -> Result<()> {
+        self.publish_inner(addr, data, None).await
+    }
+
+    /// Publish from a control attachment. Its RPCs end when the scope closes;
+    /// media injection and session lifetime retain their existing behavior.
+    pub async fn publish_scoped(
+        &self,
+        addr: &ControlAddress,
+        data: RuntimeData,
+        scope: &RpcCallScope,
+    ) -> Result<()> {
+        self.publish_inner(addr, data, Some(scope.caller())).await
+    }
+
+    async fn publish_inner(
+        &self,
+        addr: &ControlAddress,
+        data: RuntimeData,
+        caller: Option<RpcCaller>,
+    ) -> Result<()> {
         if addr.direction != Direction::In {
             return Err(crate::Error::Execution(
                 "publish requires Direction::In".into(),
             ));
+        }
+        // Dedicated native RPC bypasses the media/router ingress queues entirely.
+        if let (Some(port), RuntimeData::Json(payload)) = (&addr.port, &data) {
+            if payload.get("corr_id").is_some() {
+                let rpc = self
+                    .rpc_inputs
+                    .get(&addr.node_id)
+                    .map(|entry| entry.value().clone());
+                if let Some(tx) = rpc {
+                    serde_json::from_value::<remotemedia_traits::rpc::RpcId>(
+                        payload["corr_id"].clone(),
+                    )
+                    .map_err(|e| {
+                        crate::Error::Execution(format!("invalid RPC correlation: {e}"))
+                    })?;
+                    return tx
+                        .try_send(RpcInvocation {
+                            method: port.clone(),
+                            data,
+                            caller,
+                        })
+                        .map_err(|e| {
+                            crate::Error::Execution(format!("RPC input unavailable: {e}"))
+                        });
+                }
+            }
         }
         let tx_guard = self.input_tx.read().await;
         let tx = tx_guard.as_ref().ok_or_else(|| {

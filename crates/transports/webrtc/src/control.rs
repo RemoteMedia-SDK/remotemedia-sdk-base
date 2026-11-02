@@ -40,7 +40,7 @@ use remotemedia_core::data::RuntimeData;
 #[cfg(feature = "grpc-signaling")]
 use remotemedia_core::transport::session_control::{
     CloseReason, ControlAddress as CoreAddress, ControlEvent as CoreEvent, Direction,
-    InterceptDecision as CoreDecision, NodeState, SessionControl, SessionControlBus,
+    InterceptDecision as CoreDecision, NodeState, RpcCallScope, SessionControl, SessionControlBus,
 };
 
 #[cfg(feature = "grpc-signaling")]
@@ -146,7 +146,13 @@ pub async fn attach_control_channel(
         let forwarders_close = Arc::clone(&forwarders_close);
         Box::pin(async move {
             let mut guard = state_close.lock().await;
-            if let AttachState::Attached { close_watcher, .. } = &*guard {
+            if let AttachState::Attached {
+                close_watcher,
+                rpc_scope,
+                ..
+            } = &*guard
+            {
+                rpc_scope.close();
                 close_watcher.abort();
             }
             *guard = AttachState::Closed;
@@ -164,6 +170,7 @@ enum AttachState {
     AwaitingHello,
     Attached {
         ctrl: Arc<SessionControl>,
+        rpc_scope: Arc<RpcCallScope>,
         // JoinHandle on the close-watcher task. Aborted when the data channel
         // closes so we don't leave a dangling task trying to send SessionClosed.
         close_watcher: tokio::task::JoinHandle<()>,
@@ -270,6 +277,7 @@ async fn handle_inbound(
 
             *guard = AttachState::Attached {
                 ctrl,
+                rpc_scope: Arc::new(RpcCallScope::default()),
                 close_watcher,
             };
             return;
@@ -280,8 +288,10 @@ async fn handle_inbound(
     }
 
     // Borrow Ctrl out of the state to dispatch.
-    let ctrl = match &*guard {
-        AttachState::Attached { ctrl, .. } => Arc::clone(ctrl),
+    let (ctrl, rpc_scope) = match &*guard {
+        AttachState::Attached {
+            ctrl, rpc_scope, ..
+        } => (Arc::clone(ctrl), Arc::clone(rpc_scope)),
         _ => return,
     };
     drop(guard);
@@ -299,7 +309,7 @@ async fn handle_inbound(
     }
 
     // Dispatch the frame.
-    if let Err(err) = dispatch_frame(frame, &ctrl, out_tx, forwarders).await {
+    if let Err(err) = dispatch_frame(frame, &ctrl, out_tx, forwarders, &rpc_scope).await {
         let _ = out_tx
             .send(ControlEvent {
                 event: Some(PbEvent::Error(err)),
@@ -317,6 +327,7 @@ async fn dispatch_frame(
     ctrl: &Arc<SessionControl>,
     out_tx: &mpsc::Sender<ControlEvent>,
     forwarders: &Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    rpc_scope: &RpcCallScope,
 ) -> Result<(), ErrorEvent> {
     match frame.op {
         Some(PbOp::Subscribe(sub)) => {
@@ -331,7 +342,24 @@ async fn dispatch_frame(
             let pb_addr = core_addr_to_pb(&core);
             let tx = out_tx.clone();
             let task = tokio::spawn(async move {
-                while let Ok(data) = rx.recv().await {
+                loop {
+                    let data = match rx.recv().await {
+                        Ok(data) => data,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count))
+                            if core.port.as_deref() == Some("__reply__") =>
+                        {
+                            let event = ControlEvent {
+                                event: Some(PbEvent::Error(error_inner(
+                                    ControlErrorCode::Internal,
+                                    format!("RPC reply subscription lagged by {count} frames"),
+                                    Some(core.clone()),
+                                ))),
+                            };
+                            let _ = tx.send(event).await;
+                            break;
+                        }
+                        Err(_) => break,
+                    };
                     let buf = crate::adapters::runtime_data_to_data_buffer(&data);
                     let _ = tx
                         .send(ControlEvent {
@@ -360,13 +388,15 @@ async fn dispatch_frame(
             })?;
             let rt = pb_to_runtime_data(data)
                 .map_err(|e| error_inner(ControlErrorCode::Internal, e, Some(core.clone())))?;
-            ctrl.publish(&core, rt).await.map_err(|e| {
-                error_inner(
-                    ControlErrorCode::Internal,
-                    e.to_string(),
-                    Some(core.clone()),
-                )
-            })?;
+            ctrl.publish_scoped(&core, rt, rpc_scope)
+                .await
+                .map_err(|e| {
+                    error_inner(
+                        ControlErrorCode::Internal,
+                        e.to_string(),
+                        Some(core.clone()),
+                    )
+                })?;
             Ok(())
         }
 

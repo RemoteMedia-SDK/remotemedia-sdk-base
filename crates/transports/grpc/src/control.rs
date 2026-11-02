@@ -31,7 +31,7 @@ use crate::generated::{
 
 use remotemedia_core::transport::session_control::{
     CloseReason, ControlAddress as CoreAddress, ControlEvent as CoreEvent, Direction,
-    InterceptDecision as CoreDecision, NodeState, SessionControl, SessionControlBus,
+    InterceptDecision as CoreDecision, NodeState, RpcCallScope, SessionControl, SessionControlBus,
 };
 
 use std::pin::Pin;
@@ -133,6 +133,7 @@ async fn run_attach_loop(
 ) {
     // Watch for session-close. First fire ends this attach.
     let mut close_rx = ctrl.close_subscriber();
+    let rpc_scope = RpcCallScope::default();
 
     // Dedicated forwarder tasks for taps/intercepts. We hold their
     // JoinHandles so we can abort on shutdown.
@@ -140,6 +141,7 @@ async fn run_attach_loop(
 
     loop {
         tokio::select! {
+            _ = out_tx.closed() => break,
             // Client → server frame.
             frame = in_stream.next() => {
                 let frame = match frame {
@@ -159,6 +161,7 @@ async fn run_attach_loop(
                     frame,
                     &out_tx,
                     &mut forwarders,
+                    &rpc_scope,
                 )
                 .await
                 {
@@ -207,6 +210,7 @@ async fn handle_inbound_frame(
     frame: ControlFrame,
     out_tx: &mpsc::Sender<Result<ControlEvent, Status>>,
     forwarders: &mut Vec<tokio::task::JoinHandle<()>>,
+    rpc_scope: &RpcCallScope,
 ) -> Result<(), ErrorEvent> {
     match frame.op {
         Some(PbOp::Hello(_)) => Err(error(
@@ -228,7 +232,24 @@ async fn handle_inbound_frame(
             let pb_addr = core_addr_to_pb(&core);
             let tx = out_tx.clone();
             let task = tokio::spawn(async move {
-                while let Ok(data) = rx.recv().await {
+                loop {
+                    let data = match rx.recv().await {
+                        Ok(data) => data,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count))
+                            if core.port.as_deref() == Some("__reply__") =>
+                        {
+                            let event = ControlEvent {
+                                event: Some(PbEvent::Error(error(
+                                    ControlErrorCode::Internal,
+                                    format!("RPC reply subscription lagged by {count} frames"),
+                                    Some(core.clone()),
+                                ))),
+                            };
+                            let _ = tx.send(Ok(event)).await;
+                            break;
+                        }
+                        Err(_) => break,
+                    };
                     let pb = match runtime_data_to_pb(&data) {
                         Some(b) => b,
                         None => continue,
@@ -267,13 +288,15 @@ async fn handle_inbound_frame(
             })?;
             let rt = pb_to_runtime_data(data)
                 .map_err(|e| error(ControlErrorCode::Internal, e, Some(core.clone())))?;
-            ctrl.publish(&core, rt).await.map_err(|e| {
-                error(
-                    ControlErrorCode::Internal,
-                    e.to_string(),
-                    Some(core.clone()),
-                )
-            })?;
+            ctrl.publish_scoped(&core, rt, rpc_scope)
+                .await
+                .map_err(|e| {
+                    error(
+                        ControlErrorCode::Internal,
+                        e.to_string(),
+                        Some(core.clone()),
+                    )
+                })?;
             Ok(())
         }
 

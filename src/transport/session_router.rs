@@ -1483,6 +1483,13 @@ impl SessionRouter {
         let cancel = Arc::new(crate::transport::CancelGate::new());
         let (filt_tx, mut filt_rx) = mpsc::channel::<(u64, RuntimeData)>(NODE_FANOUT_CAPACITY);
         let (control_tx, mut control_rx) = mpsc::channel::<RuntimeData>(16);
+        let rpc_rx = if node.rpc_methods().is_empty() {
+            None
+        } else {
+            control
+                .as_ref()
+                .map(|control| control.register_rpc(&node_id))
+        };
         let input_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let filter_generation = input_generation.clone();
         let filter_cancel = Arc::clone(&cancel);
@@ -1586,6 +1593,15 @@ impl SessionRouter {
             // calls inside the node would have no effect on the real
             // barge path.
             .with_cancel_gate(Arc::clone(&cancel));
+
+            let rpc_handle = rpc_rx.map(|rx| {
+                super::rpc_dispatch::RpcTask(tokio::spawn(super::rpc_dispatch::run(
+                    node.clone(),
+                    bound_ctx.clone(),
+                    rx,
+                    shutdown.clone(),
+                )))
+            });
 
             // Capability transient channel: subscribe to every address the
             // node declared interest in, drain into `on_capability_update`.
@@ -2062,6 +2078,10 @@ impl SessionRouter {
             // Filter task ends when input_rx closes (its sender drops
             // after the last source emits None). Await it so we don't
             // leak it on shutdown.
+            if let Some(mut handle) = rpc_handle {
+                handle.0.abort();
+                let _ = (&mut handle.0).await;
+            }
             filter_handle.abort();
             let _ = filter_handle.await;
             if let Err(error) = node_ref
