@@ -182,7 +182,9 @@ nix = { version = "0.30.1", features = ["signal", "process"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.52", features = ["Win32_System_ProcessStatus", "Win32_Foundation"] }
+# JobObjects/Threading/ToolHelp/Security: Python node workers live in a
+# kill-on-close job, so they never outlive the host (process_manager.rs).
+windows = { version = "0.52", features = ["Win32_System_ProcessStatus", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security"] }
 
 # Error handling
 anyhow = "1.0.100"

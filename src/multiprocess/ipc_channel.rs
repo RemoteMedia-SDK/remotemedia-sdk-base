@@ -149,6 +149,22 @@ impl ChannelRegistry {
     pub fn cleanup_stale_iceoryx2_state() {
         use std::fs;
 
+        // Every platform (the file sweep below only knows Linux's
+        // /tmp/iceoryx2): iceoryx2's own cleanup of nodes whose process died,
+        // with their ports and shared memory, so a crashed run's samples are
+        // never delivered to the next run's identically named
+        // `session_0_*` ports.
+        let state = iceoryx2::node::Node::<iceoryx2::service::ipc::Service>::try_cleanup_dead_nodes(
+            iceoryx2::config::Config::global_config(),
+        );
+        if state.cleanups + state.failed_cleanups > 0 {
+            tracing::info!(
+                "iceoryx2: removed {} dead node(s), {} could not be removed",
+                state.cleanups,
+                state.failed_cleanups
+            );
+        }
+
         // Remove orphaned node_monitor files — these are the source of
         // InternalError when a new node can't reconcile stale monitor state.
         // Only remove monitors where the corresponding numeric node directory

@@ -1364,6 +1364,10 @@ sys.stdout.flush()
 
         let mut cmd = tokio::process::Command::new(python);
         cmd.args(["-c", &script]);
+        #[cfg(windows)]
+        if let Some(flags) = super::process_manager::no_window_flag() {
+            cmd.creation_flags(flags);
+        }
         if !python_path_env.is_empty() {
             cmd.env("PYTHONPATH", &python_path_env);
         }

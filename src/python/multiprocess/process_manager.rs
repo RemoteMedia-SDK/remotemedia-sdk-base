@@ -364,6 +364,16 @@ impl ProcessManager {
             }
         }
 
+        // No console window per Python node when the host is a GUI app, and
+        // start suspended: it joins the kill-on-close job before it can run
+        // (a venv's python.exe is a launcher that starts the real
+        // interpreter, which must be born inside the job too).
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(no_window_flag().unwrap_or(0) | win_job::CREATE_SUSPENDED);
+        }
+
         // Configure I/O
         command.stdin(Stdio::piped()); // Always need stdin for params
         let capture_output = spawn_config.capture_output;
@@ -381,6 +391,12 @@ impl ProcessManager {
             .map_err(|e| Error::Execution(format!("Failed to spawn process: {}", e)))?;
 
         let pid = child.id();
+
+        // Windows has no parent-death signal: without the job, a worker
+        // outlives a host that exits or crashes and keeps answering on the
+        // next run's `session_0_*` channels.
+        #[cfg(windows)]
+        win_job::adopt_and_resume(&child);
 
         // Capture stderr for logging if process crashes
         let stderr_handle = if capture_output {
@@ -680,5 +696,100 @@ mod tests {
 
         let processes = manager.get_processes().await;
         assert!(processes.is_empty());
+    }
+}
+
+/// `CREATE_NO_WINDOW` when this process has no console of its own (a GUI app
+/// such as face-desktop), so each child (python, uv) does not open a console
+/// window; `None` in a console app, whose children keep sharing its console.
+#[cfg(windows)]
+pub(crate) fn no_window_flag() -> Option<u32> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> *mut core::ffi::c_void;
+    }
+    // SAFETY: takes no arguments; returns this process's console window or null.
+    unsafe { GetConsoleWindow() }.is_null().then_some(0x0800_0000)
+}
+
+/// Python node workers on Windows live in one job object that kills its
+/// members when its last handle closes. This process holds that handle for
+/// its lifetime, so the workers (and whatever they start) end with it, even
+/// on a crash; the Linux equivalent is `PR_SET_PDEATHSIG` above.
+#[cfg(windows)]
+mod win_job {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    pub(super) const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+    /// The job, created on first use; its handle is never closed (the OS
+    /// closes it when this process ends, which kills the members). `None`
+    /// if it could not be set up.
+    fn job() -> Option<HANDLE> {
+        static JOB: OnceLock<Option<isize>> = OnceLock::new();
+        JOB.get_or_init(|| unsafe {
+            let job = CreateJobObjectW(None, PCWSTR::null()).ok()?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if let Err(e) = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) {
+                tracing::warn!("Python workers may outlive this process: job setup failed: {e}");
+                let _ = CloseHandle(job);
+                return None;
+            }
+            Some(job.0)
+        })
+        .map(HANDLE)
+    }
+
+    /// Put the (suspended) `child` in the job, then let it run.
+    pub(super) fn adopt_and_resume(child: &std::process::Child) {
+        if let Some(job) = job() {
+            let process = HANDLE(child.as_raw_handle() as isize);
+            // SAFETY: both handles are valid for the duration of the call.
+            if let Err(e) = unsafe { AssignProcessToJobObject(job, process) } {
+                tracing::warn!("Python worker {} may outlive this process: {e}", child.id());
+            }
+        }
+        resume(child.id());
+    }
+
+    /// Resume every thread of `pid` (a CREATE_SUSPENDED process has one).
+    fn resume(pid: u32) {
+        // SAFETY: plain Toolhelp/thread calls on handles we open and close here.
+        unsafe {
+            let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else {
+                tracing::error!("cannot resume Python worker {pid}: thread snapshot failed");
+                return;
+            };
+            let mut entry = THREADENTRY32 { dwSize: std::mem::size_of::<THREADENTRY32>() as u32, ..Default::default() };
+            let mut ok = Thread32First(snap, &mut entry).is_ok();
+            while ok {
+                if entry.th32OwnerProcessID == pid {
+                    if let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
+                        ResumeThread(thread);
+                        let _ = CloseHandle(thread);
+                    }
+                }
+                ok = Thread32Next(snap, &mut entry).is_ok();
+            }
+            let _ = CloseHandle(snap);
+        }
     }
 }

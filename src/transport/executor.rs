@@ -502,6 +502,13 @@ pub struct PipelineExecutor {
     scheduler: Arc<StreamingScheduler>,
     /// Session counter for ID generation
     session_counter: std::sync::atomic::AtomicU64,
+    /// Random tag of this executor instance, part of every generated
+    /// session ID. Session IDs name the multiprocess nodes' iceoryx2
+    /// channels (`{session}_{node}_input`, also built by the Python worker
+    /// from `--session-id`), which are system-wide: a bare counter would make
+    /// every process's first session `session_0`, so two hosts (or a host and
+    /// a previous one's leftover workers) would share channels.
+    instance_tag: String,
     /// Shared pipeline sessions keyed by logical room/session key.
     shared_sessions: Arc<RwLock<HashMap<String, Arc<SharedPipelineSession>>>>,
     /// Process-wide control bus for client-side pub/sub/intercept.
@@ -585,6 +592,7 @@ impl PipelineExecutor {
             registry,
             scheduler,
             session_counter: std::sync::atomic::AtomicU64::new(0),
+            instance_tag: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
             shared_sessions: Arc::new(RwLock::new(HashMap::new())),
             control_bus,
             default_pool: std::sync::Mutex::new(None),
@@ -762,12 +770,13 @@ impl PipelineExecutor {
         &self.registry
     }
 
-    /// Generate a unique session ID
+    /// Generate a session ID unique across processes:
+    /// `{prefix}_{instance tag}_{n}` (see `instance_tag`).
     pub fn generate_session_id(&self) -> String {
         let count = self
             .session_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        format!("{}_{}", self.config.session_id_prefix, count)
+        format!("{}_{}_{}", self.config.session_id_prefix, self.instance_tag, count)
     }
 
     /// Register a custom node factory
@@ -1359,6 +1368,15 @@ mod tests {
 
         assert_ne!(id1, id2);
         assert!(id1.starts_with("session_"));
+    }
+
+    /// Two executors (as in two processes) never hand out the same ID, so
+    /// their multiprocess nodes' iceoryx2 channels can't collide.
+    #[test]
+    fn test_session_ids_differ_between_executors() {
+        let a = PipelineExecutor::new().unwrap();
+        let b = PipelineExecutor::new().unwrap();
+        assert_ne!(a.generate_session_id(), b.generate_session_id());
     }
 
     #[test]
