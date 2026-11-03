@@ -70,6 +70,15 @@ pub struct AudioBufferAccumulatorNode {
     /// Emit a CancelSpeculation control message when speech starts.
     emit_cancel_on_speech_start: bool,
 
+    /// Speech that starts within this many ms of the last emitted
+    /// utterance is treated as its continuation: the previous utterance's
+    /// audio is restored and emitted again together with the new speech
+    /// (a barge-in on an assistant's reply re-hears the whole turn). 0
+    /// turns it off, for pipelines that act on every utterance once, such
+    /// as speech-to-speech voice conversion, where a re-emitted utterance
+    /// would be spoken twice.
+    continuation_merge_ms: u32,
+
     /// Buffer states per session
     states: Arc<Mutex<std::collections::HashMap<String, BufferState>>>,
 
@@ -95,6 +104,9 @@ pub struct AudioBufferAccumulatorNode {
 /// capture still gets its pre-roll.
 const MAX_PENDING_AGE_MS: u128 = 500;
 
+/// Default `continuation_merge_ms`.
+pub const DEFAULT_CONTINUATION_MERGE_MS: u32 = 3000;
+
 impl AudioBufferAccumulatorNode {
     pub fn new(
         min_utterance_duration_ms: Option<u32>,
@@ -105,9 +117,16 @@ impl AudioBufferAccumulatorNode {
             min_utterance_duration_ms: min_utterance_duration_ms.unwrap_or(250),
             max_utterance_duration_ms: max_utterance_duration_ms.unwrap_or(30000),
             emit_cancel_on_speech_start: emit_cancel_on_speech_start.unwrap_or(true),
+            continuation_merge_ms: DEFAULT_CONTINUATION_MERGE_MS,
             states: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pending_audio: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// See `continuation_merge_ms` (default [`DEFAULT_CONTINUATION_MERGE_MS`]; 0 = off).
+    pub fn with_continuation_merge_ms(mut self, ms: u32) -> Self {
+        self.continuation_merge_ms = ms;
+        self
     }
 
     fn convert_audio_to_f32(&self, audio_buf: &ProtoAudioBuffer) -> Result<Vec<f32>> {
@@ -301,8 +320,7 @@ impl AudioBufferAccumulatorNode {
             let mut restored = false;
             if let Some(emitted_at) = state.last_emitted_at {
                 let elapsed_ms = emitted_at.elapsed().as_millis();
-                if elapsed_ms < 3000 {
-                    // 3.0 seconds continuation threshold
+                if elapsed_ms < self.continuation_merge_ms as u128 {
                     tracing::info!(
                         "[AudioBuffer] Session {}: Early user barge-in/continuation detected ({}ms since last utterance) — restoring previous audio buffer ({} samples) for combined turn",
                         session_id,
@@ -681,5 +699,51 @@ impl AudioBufferAccumulatorNode {
         self.states.lock().clear();
         self.pending_audio.lock().clear();
         tracing::info!("[AudioBufferAccumulator] States reset");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    type Pending = HashMap<String, Vec<(Vec<f32>, u32, u32, std::time::Instant)>>;
+
+    fn vad(node: &AudioBufferAccumulatorNode, states: &mut HashMap<String, BufferState>, start: bool) -> Vec<RuntimeData> {
+        let ev = serde_json::json!({ "is_speech_start": start, "is_speech_end": !start });
+        node.handle_vad_event(&ev, "s", states, &mut Pending::new()).unwrap()
+    }
+
+    /// Say one second of speech: start, audio, end. Returns the samples emitted.
+    fn utterance(node: &AudioBufferAccumulatorNode, states: &mut HashMap<String, BufferState>, level: f32) -> usize {
+        vad(node, states, true);
+        let st = states.get_mut("s").unwrap();
+        st.sample_rate = 16_000;
+        st.accumulated_samples.extend(std::iter::repeat(level).take(16_000));
+        vad(node, states, false)
+            .iter()
+            .map(|d| match d {
+                RuntimeData::Audio { samples, .. } => samples.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn quick_restart_re_emits_previous_utterance_by_default() {
+        let node = AudioBufferAccumulatorNode::new(None, None, Some(false));
+        let mut states = HashMap::new();
+        assert_eq!(utterance(&node, &mut states, 0.5), 16_000);
+        // Within 3 s: the turn continues, the first second comes again.
+        assert_eq!(utterance(&node, &mut states, 0.5), 32_000);
+    }
+
+    #[test]
+    fn merge_off_emits_each_utterance_once() {
+        let node = AudioBufferAccumulatorNode::new(None, None, Some(false)).with_continuation_merge_ms(0);
+        let mut states = HashMap::new();
+        for _ in 0..3 {
+            assert_eq!(utterance(&node, &mut states, 0.5), 16_000);
+        }
     }
 }
