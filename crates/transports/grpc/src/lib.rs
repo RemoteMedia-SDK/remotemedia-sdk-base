@@ -29,6 +29,7 @@ pub mod auth;
 pub mod builder;
 pub mod client;
 pub mod control;
+pub use control::{serve_control, serve_control_with_incoming, ControlServiceImpl};
 pub mod deployment;
 pub mod execution;
 pub mod embedded_plugin;

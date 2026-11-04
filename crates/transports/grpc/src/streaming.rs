@@ -626,17 +626,23 @@ async fn handle_stream(
                 // taps must be attachable as soon as StreamReady is emitted.
                 let control = SessionControl::new(session_id.clone());
                 router.attach_control(control.clone());
-                executor.control_bus().register(control);
+                // Discovery metadata (openspec: add-live-pipeline-observer);
+                // the router attached its descriptor + telemetry above.
+                control.set_transport_info("grpc", None);
+                executor.control_bus().register(control.clone());
 
                 // 🔥 Pre-initialize all nodes before streaming starts
                 // CRITICAL: Do this WITHOUT holding the session lock to avoid deadlock
                 // (get_or_create_node needs to acquire the lock)
                 info!("🔥 Pre-initializing nodes for session '{}'", session_id);
                 router.pre_initialize_all_nodes().await.map_err(|e| {
-                    executor.control_bus().unregister(&session_id);
+                    executor
+                        .control_bus()
+                        .unregister_with(&session_id, Some(e.to_string()));
                     error!("Failed to pre-initialize nodes: {}", e);
                     ServiceError::Internal(format!("Node pre-initialization failed: {}", e))
                 })?;
+                control.set_phase(remotemedia_core::transport::session_control::SessionPhase::Active);
                 info!("✅ All nodes ready, starting router");
 
                 // Get the input sender before starting
@@ -733,9 +739,12 @@ async fn handle_stream(
                 let chunk_start = Instant::now();
                 debug!(sequence = data_chunk.sequence, "Processing DataChunk");
 
-                // Feed the chunk to the session router
-                let mut sess_guard = sess.lock().await;
-                if let Some(router_input) = &sess_guard.router_input {
+                // Feed the chunk to the session router. Clone the sender and
+                // release the session lock before the (bounded, awaited) send:
+                // the router takes this lock to lazily create node tasks, so
+                // holding it across a full-queue send deadlocks the session.
+                let router_input = sess.lock().await.router_input.clone();
+                if let Some(router_input) = router_input {
                     // Convert DataBuffer to RuntimeData with arrival timestamp (spec 026)
                     use crate::adapters::{data_buffer_to_runtime_data_with_arrival, now_micros};
                     let arrival_ts = Some(now_micros());
@@ -775,8 +784,7 @@ async fn handle_stream(
                         ServiceError::Internal(format!("Failed to send to router: {}", e))
                     })?;
 
-                    sess_guard.chunks_processed += 1;
-                    drop(sess_guard);
+                    sess.lock().await.chunks_processed += 1;
 
                     let latency = chunk_start.elapsed().as_secs_f64();
                     metrics.record_chunk_processed(&session_id, latency);

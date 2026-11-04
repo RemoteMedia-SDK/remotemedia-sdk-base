@@ -144,6 +144,7 @@ impl PyAttachedSession {
                 Py::new(
                     py,
                     PySubscription {
+                        rpc: addr.port.as_deref() == Some("__reply__"),
                         rx: Arc::new(Mutex::new(rx)),
                     },
                 )
@@ -176,6 +177,7 @@ impl PyAttachedSession {
                 Py::new(
                     py,
                     PySubscription {
+                        rpc: addr.port.as_deref() == Some("__reply__"),
                         rx: Arc::new(Mutex::new(rx)),
                     },
                 )
@@ -434,6 +436,7 @@ impl PyInterceptSession {
 /// - Raises `StopAsyncIteration` when the tap channel is closed (session ended).
 #[pyclass]
 pub struct PySubscription {
+    rpc: bool,
     rx: Arc<Mutex<broadcast::Receiver<remotemedia_core::data::RuntimeData>>>,
 }
 
@@ -447,6 +450,7 @@ impl PySubscription {
     /// - Err(StopAsyncIteration) — channel closed, session is gone
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rx = Arc::clone(&self.rx);
+        let rpc = self.rpc;
         future_into_py(py, async move {
             use tokio::sync::broadcast::error::RecvError;
             let result = {
@@ -460,6 +464,9 @@ impl PySubscription {
                     // before passing to Data._from_runtime_dict.
                     Ok(runtime_data_to_python(py, &rd)?)
                 }),
+                Err(RecvError::Lagged(count)) if rpc => Err(PyRuntimeError::new_err(format!(
+                    "RPC reply subscription lagged by {count} frames; pending calls cannot complete reliably"
+                ))),
                 Err(RecvError::Lagged(_)) => {
                     // The broadcast buffer was full; signal that a frame was
                     // dropped so the caller can handle lag (retry is fine).

@@ -72,6 +72,10 @@ pub use validation::{get_all_schemas, get_node_schema, SchemaValidator, Validati
 // Transport abstraction layer
 pub mod transport;
 
+// Live pipeline telemetry: descriptors, counters, snapshots
+// (openspec: add-live-pipeline-observer).
+pub mod telemetry;
+
 // Re-export core modules from existing runtime
 // NOTE: For Phase 2, these are stub re-exports
 // In later phases, we'll copy the actual implementations from runtime/

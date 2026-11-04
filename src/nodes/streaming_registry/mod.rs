@@ -347,12 +347,21 @@ impl StreamingNodeFactory for AudioBufferAccumulatorNodeFactory {
             .or(params.get("emit_cancel_on_speech_start"))
             .and_then(|v| v.as_bool());
 
+        let continuation_merge_ms = params
+            .get("continuationMergeMs")
+            .or(params.get("continuation_merge_ms"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
         use crate::nodes::SyncNodeWrapper;
-        let node = AudioBufferAccumulatorNode::new(
+        let mut node = AudioBufferAccumulatorNode::new(
             min_duration_ms,
             max_duration_ms,
             emit_cancel_on_speech_start,
         );
+        if let Some(ms) = continuation_merge_ms {
+            node = node.with_continuation_merge_ms(ms);
+        }
         Ok(Box::new(SyncNodeWrapper(node)))
     }
 

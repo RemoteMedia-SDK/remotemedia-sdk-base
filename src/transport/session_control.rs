@@ -73,7 +73,53 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
+
+/// Owns RPC invocation lifetime for one control attachment. Closing or dropping
+/// it cancels its calls, independently of reply subscribers or session lifetime.
+pub struct RpcCallScope {
+    id: u64,
+    closed: watch::Sender<bool>,
+}
+
+impl Default for RpcCallScope {
+    fn default() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            closed: watch::channel(false).0,
+        }
+    }
+}
+
+impl RpcCallScope {
+    pub fn close(&self) {
+        self.closed.send_replace(true);
+    }
+    fn caller(&self) -> RpcCaller {
+        RpcCaller {
+            id: self.id,
+            closed: self.closed.subscribe(),
+        }
+    }
+}
+
+impl Drop for RpcCallScope {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+pub(super) struct RpcCaller {
+    pub id: u64,
+    pub closed: watch::Receiver<bool>,
+}
+
+pub(super) struct RpcInvocation {
+    pub method: String,
+    pub data: RuntimeData,
+    pub caller: Option<RpcCaller>,
+}
 
 // Capacity of the per-(node,port) output broadcast channel.
 // Slow subscribers get `RecvError::Lagged` and skip ahead — never block the
@@ -267,6 +313,96 @@ pub const PERF_PORT: &str = "__perf__";
 /// together into a per-turn timeline. Use [`publish_timeline_event`].
 pub const TIMELINE_PORT: &str = "__timeline__";
 
+/// Reserved tap channel name for cumulative per-node / per-edge telemetry
+/// snapshots ([`crate::telemetry::TelemetrySnapshot`]). Published by the
+/// session's telemetry publisher only while somebody subscribes to
+/// `__telemetry__.out`. Superset of `__perf__` (which keeps its historical
+/// per-window schema for existing HUDs).
+pub const TELEMETRY_PORT: &str = "__telemetry__";
+
+/// Reserved tap channel for system lifecycle / progress / error events.
+pub const SYSTEM_PORT: &str = "__system__";
+
+/// Coarse lifecycle phase of a session, for discovery.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPhase {
+    /// Registered; nodes are initializing.
+    #[default]
+    Initializing,
+    /// Fully initialized and parked in a warm pool, not yet serving a client.
+    Warm,
+    /// Serving.
+    Active,
+    /// Being torn down.
+    Closing,
+}
+
+impl SessionPhase {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Warm,
+            2 => Self::Active,
+            3 => Self::Closing,
+            _ => Self::Initializing,
+        }
+    }
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Initializing => 0,
+            Self::Warm => 1,
+            Self::Active => 2,
+            Self::Closing => 3,
+        }
+    }
+}
+
+/// Discovery summary of one registered session.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub pipeline_name: String,
+    pub created_at_ms: u64,
+    /// Transport kind (`grpc`, `webrtc`, `http`, `ui`, `ffi`, ...), if known.
+    pub transport: Option<String>,
+    /// Transport-specific origin (peer id, remote address), if known.
+    pub origin: Option<String>,
+    pub phase: SessionPhase,
+    pub node_count: u32,
+    /// Whether hot-path telemetry counters are available for this session.
+    pub has_telemetry: bool,
+}
+
+/// Session lifecycle events broadcast by [`SessionControlBus::watch`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum SessionLifecycleEvent {
+    Created { session: SessionSummary },
+    Updated { session: SessionSummary },
+    Closed {
+        session_id: String,
+        reason: Option<String>,
+        ts_ms: u64,
+    },
+}
+
+/// Shared between the bus and every registered control so that lifecycle
+/// mutations and `watch()` snapshots are serialized (no missed events).
+struct LifecycleHub {
+    tx: broadcast::Sender<SessionLifecycleEvent>,
+    lock: parking_lot::Mutex<()>,
+}
+
+/// Capacity of the lifecycle broadcast. A lagging watcher should `list()`.
+const LIFECYCLE_CAPACITY: usize = 1024;
+
+#[derive(Clone, Debug, Default)]
+struct SessionMeta {
+    transport: Option<String>,
+    origin: Option<String>,
+}
+
 /// Publish a one-shot debug marker on `__timeline__.out` so the UI can
 /// thread together a wall-clock timeline of pipeline events for the
 /// current turn (tool calls, motion-intent dispatch, animation start,
@@ -425,6 +561,7 @@ pub struct SessionControl {
     /// Handle to the router's input channel so `publish` can inject packets.
     /// Set by `attach_input_sender` after the router is constructed.
     input_tx: RwLock<Option<mpsc::Sender<DataPacket>>>,
+    rpc_inputs: DashMap<String, mpsc::Sender<RpcInvocation>>,
     /// Monotonic sequence for injected packets (kept separate from the
     /// transport's own sequence to make out-of-band traffic identifiable).
     inject_seq: std::sync::atomic::AtomicU64,
@@ -495,6 +632,18 @@ pub struct SessionControl {
     /// Cap for `system_retained`. Atomic so it can be tuned at runtime
     /// from any thread without locking the buffer.
     system_retained_cap: std::sync::atomic::AtomicUsize,
+
+    // ─── Discovery / telemetry (openspec: add-live-pipeline-observer) ────
+    created_at_ms: u64,
+    /// Running topology. Replaceable: refined once nodes are initialized
+    /// (pacing labels).
+    descriptor: parking_lot::RwLock<Option<Arc<crate::telemetry::SessionDescriptor>>>,
+    /// Hot-path counters, when the session runs on the core router.
+    telemetry: std::sync::OnceLock<Arc<crate::telemetry::SessionTelemetry>>,
+    meta: parking_lot::RwLock<SessionMeta>,
+    phase: std::sync::atomic::AtomicU8,
+    /// Set while registered on a bus; used to announce `Updated` events.
+    lifecycle: parking_lot::RwLock<Option<Arc<LifecycleHub>>>,
 }
 
 /// Per-frame clock event published by an outbound RTP sender.
@@ -593,6 +742,7 @@ impl SessionControl {
             taps: DashMap::new(),
             intercepts: DashMap::new(),
             input_tx: RwLock::new(None),
+            rpc_inputs: DashMap::new(),
             inject_seq: std::sync::atomic::AtomicU64::new(0),
             close_tx,
             node_states: DashMap::new(),
@@ -603,7 +753,129 @@ impl SessionControl {
                 retained_cap,
             )),
             system_retained_cap: std::sync::atomic::AtomicUsize::new(retained_cap),
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            descriptor: parking_lot::RwLock::new(None),
+            telemetry: std::sync::OnceLock::new(),
+            meta: parking_lot::RwLock::new(SessionMeta::default()),
+            phase: std::sync::atomic::AtomicU8::new(SessionPhase::Initializing.as_u8()),
+            lifecycle: parking_lot::RwLock::new(None),
         })
+    }
+
+    // ─── Discovery / telemetry ─────────────────────────────────────────────
+
+    /// Wall-clock creation time (ms since epoch).
+    pub fn created_at_ms(&self) -> u64 {
+        self.created_at_ms
+    }
+
+    /// Running topology, if the session builder attached one.
+    pub fn descriptor(&self) -> Option<Arc<crate::telemetry::SessionDescriptor>> {
+        self.descriptor.read().clone()
+    }
+
+    /// Attach or replace the topology descriptor. Announces `Updated`.
+    pub fn set_descriptor(&self, descriptor: Arc<crate::telemetry::SessionDescriptor>) {
+        self.mutate_and_announce(|this| {
+            *this.descriptor.write() = Some(descriptor);
+        });
+    }
+
+    /// Hot-path telemetry handle, when available.
+    pub fn telemetry(&self) -> Option<Arc<crate::telemetry::SessionTelemetry>> {
+        self.telemetry.get().cloned()
+    }
+
+    /// Attach the session's telemetry. First call wins. Existing node-state
+    /// overrides are mirrored into the telemetry state cache.
+    pub fn set_telemetry(&self, telemetry: Arc<crate::telemetry::SessionTelemetry>) {
+        if self.telemetry.set(telemetry.clone()).is_ok() {
+            for entry in self.node_states.iter() {
+                telemetry.set_cached_state(entry.key(), *entry.value());
+            }
+        }
+    }
+
+    /// Record which transport serves this session. Announces `Updated`.
+    pub fn set_transport_info(&self, transport: impl Into<String>, origin: Option<String>) {
+        let transport = transport.into();
+        self.mutate_and_announce(|this| {
+            let mut meta = this.meta.write();
+            meta.transport = Some(transport);
+            if origin.is_some() {
+                meta.origin = origin;
+            }
+        });
+    }
+
+    /// Current lifecycle phase.
+    pub fn phase(&self) -> SessionPhase {
+        SessionPhase::from_u8(self.phase.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Change the lifecycle phase. Announces `Updated` when it changes.
+    pub fn set_phase(&self, phase: SessionPhase) {
+        if self.phase() == phase {
+            return;
+        }
+        self.mutate_and_announce(|this| {
+            this.phase
+                .store(phase.as_u8(), std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    /// Discovery summary.
+    pub fn summary(&self) -> SessionSummary {
+        let desc = self.descriptor.read();
+        let meta = self.meta.read();
+        SessionSummary {
+            session_id: self.session_id.clone(),
+            pipeline_name: desc
+                .as_ref()
+                .map(|d| d.pipeline_name.clone())
+                .unwrap_or_default(),
+            created_at_ms: self.created_at_ms,
+            transport: meta.transport.clone(),
+            origin: meta.origin.clone(),
+            phase: self.phase(),
+            node_count: desc.as_ref().map(|d| d.nodes.len() as u32).unwrap_or(0),
+            has_telemetry: self.telemetry.get().is_some(),
+        }
+    }
+
+    /// Apply `f` and, if registered on a bus, broadcast `Updated` — under the
+    /// bus's lifecycle lock so a concurrent `watch()` can't miss it.
+    fn mutate_and_announce(&self, f: impl FnOnce(&Self)) {
+        let hub = self.lifecycle.read().clone();
+        match hub {
+            Some(hub) => {
+                let _guard = hub.lock.lock();
+                f(self);
+                let _ = hub.tx.send(SessionLifecycleEvent::Updated {
+                    session: self.summary(),
+                });
+            }
+            None => f(self),
+        }
+    }
+
+    /// Publish a `__system__` event to live subscribers **without** adding it
+    /// to the retained replay ring. Used for high-volume events (runtime
+    /// `node_error`) that must not evict lifecycle history.
+    pub fn publish_system_ephemeral(&self, data: RuntimeData) {
+        let key: TapKey = (SYSTEM_PORT.to_string(), None);
+        if let Some(sender) = self.taps.get(&key) {
+            // Hold the retained-ring lock so ordering relative to
+            // subscribe_system's snapshot stays consistent.
+            let _buf = self
+                .system_retained
+                .lock()
+                .expect("system_retained mutex poisoned");
+            let _ = sender.send(data);
+        }
     }
 
     /// Install the flush-audio hook. Called by the transport layer at
@@ -633,12 +905,19 @@ impl SessionControl {
     /// coordinate with the data plane separately — this is a best-effort
     /// toggle, not a barrier.
     pub fn set_node_state(&self, node_id: impl Into<String>, state: NodeState) {
-        self.node_states.insert(node_id.into(), state);
+        let node_id = node_id.into();
+        if let Some(t) = self.telemetry.get() {
+            t.set_cached_state(&node_id, state);
+        }
+        self.node_states.insert(node_id, state);
     }
 
     /// Reset a node to the default `Enabled` state (removes the override).
     pub fn clear_node_state(&self, node_id: &str) {
         self.node_states.remove(node_id);
+        if let Some(t) = self.telemetry.get() {
+            t.set_cached_state(node_id, NodeState::Enabled);
+        }
     }
 
     /// Current state for a node. Nodes without an explicit override are
@@ -669,7 +948,9 @@ impl SessionControl {
 
     pub(crate) fn set_office_observation(&self, state: serde_json::Value) -> Result<()> {
         if state.to_string().len() > 65536 {
-            return Err(crate::Error::Execution("office observation exceeds 64 KiB".into()));
+            return Err(crate::Error::Execution(
+                "office observation exceeds 64 KiB".into(),
+            ));
         }
         *self.office_observation.write() = Some(state);
         Ok(())
@@ -783,6 +1064,23 @@ impl SessionControl {
         }
     }
 
+    pub(super) fn register_rpc(&self, node_id: &str) -> mpsc::Receiver<RpcInvocation> {
+        let (tx, rx) = mpsc::channel(32);
+        self.rpc_inputs.insert(node_id.to_string(), tx);
+        rx
+    }
+
+    pub(super) fn publish_rpc_reply(&self, node_id: &str, data: RuntimeData) -> Result<()> {
+        let key = (node_id.to_string(), Some("__reply__".to_string()));
+        let tap = self
+            .taps
+            .get(&key)
+            .ok_or_else(|| crate::Error::Execution("RPC reply subscriber closed".into()))?;
+        tap.send(data)
+            .map_err(|_| crate::Error::Execution("RPC reply subscriber closed".into()))?;
+        Ok(())
+    }
+
     /// Inject data into a node's input port.
     ///
     /// When `addr.port` is `Some(port_name)` — i.e. the client is writing
@@ -805,10 +1103,56 @@ impl SessionControl {
     /// `addr.port == None` means the main rail — payload is forwarded
     /// unchanged, preserving the existing wire behavior.
     pub async fn publish(&self, addr: &ControlAddress, data: RuntimeData) -> Result<()> {
+        self.publish_inner(addr, data, None).await
+    }
+
+    /// Publish from a control attachment. Its RPCs end when the scope closes;
+    /// media injection and session lifetime retain their existing behavior.
+    pub async fn publish_scoped(
+        &self,
+        addr: &ControlAddress,
+        data: RuntimeData,
+        scope: &RpcCallScope,
+    ) -> Result<()> {
+        self.publish_inner(addr, data, Some(scope.caller())).await
+    }
+
+    async fn publish_inner(
+        &self,
+        addr: &ControlAddress,
+        data: RuntimeData,
+        caller: Option<RpcCaller>,
+    ) -> Result<()> {
         if addr.direction != Direction::In {
             return Err(crate::Error::Execution(
                 "publish requires Direction::In".into(),
             ));
+        }
+        // Dedicated native RPC bypasses the media/router ingress queues entirely.
+        if let (Some(port), RuntimeData::Json(payload)) = (&addr.port, &data) {
+            if payload.get("corr_id").is_some() {
+                let rpc = self
+                    .rpc_inputs
+                    .get(&addr.node_id)
+                    .map(|entry| entry.value().clone());
+                if let Some(tx) = rpc {
+                    serde_json::from_value::<remotemedia_traits::rpc::RpcId>(
+                        payload["corr_id"].clone(),
+                    )
+                    .map_err(|e| {
+                        crate::Error::Execution(format!("invalid RPC correlation: {e}"))
+                    })?;
+                    return tx
+                        .try_send(RpcInvocation {
+                            method: port.clone(),
+                            data,
+                            caller,
+                        })
+                        .map_err(|e| {
+                            crate::Error::Execution(format!("RPC input unavailable: {e}"))
+                        });
+                }
+            }
         }
         let tx_guard = self.input_tx.read().await;
         let tx = tx_guard.as_ref().ok_or_else(|| {
@@ -1255,9 +1599,22 @@ pub enum FrameOutcome {
 ///
 /// The `PipelineExecutor` is the natural owner of this bus; `create_session`
 /// inserts, `terminate_session` removes.
-#[derive(Default)]
 pub struct SessionControlBus {
     sessions: DashMap<String, Arc<SessionControl>>,
+    lifecycle: Arc<LifecycleHub>,
+}
+
+impl Default for SessionControlBus {
+    fn default() -> Self {
+        let (tx, _) = broadcast::channel(LIFECYCLE_CAPACITY);
+        Self {
+            sessions: DashMap::new(),
+            lifecycle: Arc::new(LifecycleHub {
+                tx,
+                lock: parking_lot::Mutex::new(()),
+            }),
+        }
+    }
 }
 
 impl SessionControlBus {
@@ -1266,15 +1623,74 @@ impl SessionControlBus {
     }
 
     /// Register a new session. Typically called by the executor right after
-    /// `SessionRouter::new`.
+    /// `SessionRouter::new`. Announces `Created` to watchers.
     pub fn register(&self, control: Arc<SessionControl>) {
+        let _guard = self.lifecycle.lock.lock();
+        *control.lifecycle.write() = Some(self.lifecycle.clone());
+        let summary = control.summary();
         self.sessions.insert(control.session_id.clone(), control);
+        let _ = self
+            .lifecycle
+            .tx
+            .send(SessionLifecycleEvent::Created { session: summary });
     }
 
     /// Remove a session (on shutdown / termination). All active subscribers
-    /// drop their receivers naturally.
+    /// drop their receivers naturally. Announces `Closed`.
     pub fn unregister(&self, session_id: &str) {
-        self.sessions.remove(session_id);
+        self.unregister_with(session_id, None);
+    }
+
+    /// Like [`Self::unregister`] but records why the session closed (e.g. an
+    /// initialization error) in the `Closed` event.
+    pub fn unregister_with(&self, session_id: &str, reason: Option<String>) {
+        let _guard = self.lifecycle.lock.lock();
+        if let Some((_, control)) = self.sessions.remove(session_id) {
+            control.phase.store(
+                SessionPhase::Closing.as_u8(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            *control.lifecycle.write() = None;
+            let ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let _ = self.lifecycle.tx.send(SessionLifecycleEvent::Closed {
+                session_id: session_id.to_string(),
+                reason,
+                ts_ms,
+            });
+        }
+    }
+
+    /// Summaries of every registered session, oldest first.
+    pub fn list(&self) -> Vec<SessionSummary> {
+        let mut out: Vec<SessionSummary> =
+            self.sessions.iter().map(|e| e.value().summary()).collect();
+        out.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        out
+    }
+
+    /// Atomic snapshot + live lifecycle stream. Every session is reported
+    /// exactly once: either in the snapshot or as a later `Created`. On
+    /// `RecvError::Lagged` the caller should re-`list()`.
+    pub fn watch(&self) -> (Vec<SessionSummary>, broadcast::Receiver<SessionLifecycleEvent>) {
+        let _guard = self.lifecycle.lock.lock();
+        let rx = self.lifecycle.tx.subscribe();
+        (self.list(), rx)
+    }
+
+    /// Number of registered sessions.
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
     }
 
     /// Look up a session's control handle. Transport handler calls this
@@ -1932,5 +2348,155 @@ mod tests {
             missing.len(),
             missing,
         );
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn register_list_unregister_emit_lifecycle() {
+        let bus = SessionControlBus::new();
+        let (initial, mut rx) = bus.watch();
+        assert!(initial.is_empty());
+
+        let a = SessionControl::new("a");
+        bus.register(a.clone());
+        match rx.try_recv().unwrap() {
+            SessionLifecycleEvent::Created { session } => {
+                assert_eq!(session.session_id, "a");
+                assert_eq!(session.phase, SessionPhase::Initializing);
+            }
+            other => panic!("expected created, got {other:?}"),
+        }
+
+        a.set_transport_info("webrtc", Some("peer-1".into()));
+        a.set_phase(SessionPhase::Active);
+        let mut updates = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let SessionLifecycleEvent::Updated { session } = ev {
+                updates += 1;
+                assert_eq!(session.transport.as_deref(), Some("webrtc"));
+            }
+        }
+        assert_eq!(updates, 2);
+        // Setting the same phase again is a no-op.
+        a.set_phase(SessionPhase::Active);
+        assert!(rx.try_recv().is_err());
+
+        let listed = bus.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].phase, SessionPhase::Active);
+        assert_eq!(listed[0].origin.as_deref(), Some("peer-1"));
+
+        bus.unregister_with("a", Some("init failed: boom".into()));
+        match rx.try_recv().unwrap() {
+            SessionLifecycleEvent::Closed { session_id, reason, .. } => {
+                assert_eq!(session_id, "a");
+                assert_eq!(reason.as_deref(), Some("init failed: boom"));
+            }
+            other => panic!("expected closed, got {other:?}"),
+        }
+        assert!(bus.list().is_empty());
+        // Unregistered controls no longer announce.
+        a.set_phase(SessionPhase::Closing);
+        assert!(rx.try_recv().is_err());
+        // Unknown session: no event.
+        bus.unregister("nope");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn lifecycle_events_serialize_with_event_tag() {
+        let ev = SessionLifecycleEvent::Closed {
+            session_id: "s".into(),
+            reason: None,
+            ts_ms: 1,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["event"], "closed");
+        let back: SessionLifecycleEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn watch_never_misses_or_duplicates_concurrent_registrations() {
+        const N: usize = 1000;
+        let bus = SessionControlBus::new();
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let mut writers = Vec::new();
+        for t in 0..4 {
+            let bus = bus.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..N / 4 {
+                    bus.register(SessionControl::new(format!("s-{t}-{i}")));
+                }
+            }));
+        }
+        barrier.wait();
+        // Watch while registrations are in flight.
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        let (snapshot, mut rx) = bus.watch();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let mut seen: std::collections::HashMap<String, usize> = snapshot
+            .into_iter()
+            .map(|s| (s.session_id, 1))
+            .collect();
+        loop {
+            match rx.try_recv() {
+                Ok(SessionLifecycleEvent::Created { session }) => {
+                    *seen.entry(session.session_id).or_default() += 1;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    panic!("lagged by {n}; capacity too small for test")
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        assert_eq!(seen.len(), N, "every session seen");
+        assert!(seen.values().all(|&c| c == 1), "no duplicates");
+    }
+
+    #[test]
+    fn node_state_changes_mirror_into_telemetry_cache() {
+        use crate::executor::{PipelineGraph, SchedulerConfig, StreamingScheduler};
+        use crate::manifest::{Manifest, NodeManifest};
+        let m = Manifest {
+            nodes: vec![NodeManifest {
+                id: "n".into(),
+                node_type: "X".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let g = PipelineGraph::from_manifest(&m).unwrap();
+        let reg = crate::nodes::StreamingNodeRegistry::new();
+        let d = crate::telemetry::SessionDescriptor::build("s", &m, &g, &reg, Default::default());
+        let tel = Arc::new(crate::telemetry::SessionTelemetry::new(
+            &d,
+            Arc::new(StreamingScheduler::new(SchedulerConfig::default())),
+            Arc::new(crate::transport::perf_aggregator::PerfAggregator::new(
+                "s".into(),
+                false,
+                1000,
+            )),
+        ));
+        let ctrl = SessionControl::new("s");
+        // State set before telemetry is attached is synced on attach.
+        ctrl.set_node_state("n", NodeState::Disabled);
+        ctrl.set_telemetry(tel.clone());
+        assert_eq!(tel.node(0).node_state(), NodeState::Disabled);
+        ctrl.set_node_state("n", NodeState::Bypass);
+        assert_eq!(tel.node(0).node_state(), NodeState::Bypass);
+        ctrl.clear_node_state("n");
+        assert_eq!(tel.node(0).node_state(), NodeState::Enabled);
+        assert!(ctrl.summary().has_telemetry);
     }
 }

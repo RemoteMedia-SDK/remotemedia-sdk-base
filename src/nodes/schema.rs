@@ -353,6 +353,11 @@ pub fn create_builtin_schema_registry() -> NodeSchemaRegistry {
                         "type": "boolean",
                         "description": "Emit cancel when new speech starts",
                         "default": false
+                    },
+                    "continuation_merge_ms": {
+                        "type": "integer",
+                        "description": "Speech starting within this many ms of the last utterance continues it: the previous utterance's audio is emitted again with the new speech. 0 = off (each utterance emitted once).",
+                        "default": 3000
                     }
                 }
             })),

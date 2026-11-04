@@ -23,17 +23,23 @@ use crate::generated::control_event::Event as PbEvent;
 use crate::generated::control_frame::Op as PbOp;
 use crate::generated::intercept_decision::Decision as PbDecision;
 use crate::generated::pipeline_control_server::PipelineControl;
+use crate::generated::session_lifecycle::Event as PbLifecycle;
 use crate::generated::{
     Attached, CloseReasonCode, ControlAddress as PbAddress, ControlDirection, ControlErrorCode,
-    ControlEvent, ControlFrame, ErrorEvent, InterceptRequest as PbInterceptRequest,
-    NodeState as PbNodeState, SessionClosed, TapEvent,
+    ControlEvent, ControlFrame, DescribeSessionRequest, DescribeSessionResponse, Empty,
+    ErrorEvent, InterceptRequest as PbInterceptRequest, ListSessionsRequest,
+    ListSessionsResponse, NodeState as PbNodeState, SessionClosed, SessionClosedInfo,
+    SessionLifecycle, SessionSummaryPb, TapEvent, WatchSessionsRequest,
 };
 
+use remotemedia_core::telemetry::{TelemetryLevel, SCHEMA_VERSION as OBSERVER_SCHEMA_VERSION};
 use remotemedia_core::transport::session_control::{
     CloseReason, ControlAddress as CoreAddress, ControlEvent as CoreEvent, Direction,
-    InterceptDecision as CoreDecision, NodeState, SessionControl, SessionControlBus,
+    InterceptDecision as CoreDecision, NodeState, RpcCallScope, SessionControl, SessionControlBus,
+    SessionLifecycleEvent, SessionPhase, SessionSummary, SYSTEM_PORT,
 };
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,24 +59,175 @@ const OUTBOUND_EVENT_CAPACITY: usize = 256;
 #[derive(Clone)]
 pub struct ControlServiceImpl {
     bus: Arc<SessionControlBus>,
+    /// Optional bearer token every request must carry
+    /// (`authorization: Bearer <token>`). `None` = unauthenticated, which
+    /// matches the historical behaviour of `Attach`.
+    token: Option<Arc<str>>,
 }
 
 impl ControlServiceImpl {
     pub fn new(bus: Arc<SessionControlBus>) -> Self {
-        Self { bus }
+        Self { bus, token: None }
+    }
+
+    /// Require `authorization: Bearer <token>` on every RPC.
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        let token: String = token.into();
+        self.token = (!token.is_empty()).then(|| Arc::from(token.as_str()));
+        self
+    }
+
+    fn check_auth<T>(&self, req: &Request<T>) -> Result<(), Status> {
+        let Some(expected) = &self.token else {
+            return Ok(());
+        };
+        let got = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
+        match got {
+            Some(t) if t == expected.as_ref() => Ok(()),
+            _ => Err(Status::unauthenticated("missing or invalid bearer token")),
+        }
     }
 }
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<ControlEvent, Status>> + Send + 'static>>;
+type LifecycleStream =
+    Pin<Box<dyn Stream<Item = Result<SessionLifecycle, Status>> + Send + 'static>>;
+
+fn phase_str(p: SessionPhase) -> &'static str {
+    match p {
+        SessionPhase::Initializing => "initializing",
+        SessionPhase::Warm => "warm",
+        SessionPhase::Active => "active",
+        SessionPhase::Closing => "closing",
+    }
+}
+
+fn summary_to_pb(s: SessionSummary) -> SessionSummaryPb {
+    SessionSummaryPb {
+        session_id: s.session_id,
+        pipeline_name: s.pipeline_name,
+        created_at_ms: s.created_at_ms,
+        transport: s.transport.unwrap_or_default(),
+        phase: phase_str(s.phase).to_string(),
+        node_count: s.node_count,
+        origin: s.origin.unwrap_or_default(),
+        has_telemetry: s.has_telemetry,
+    }
+}
+
+fn list_response(sessions: Vec<SessionSummary>) -> ListSessionsResponse {
+    ListSessionsResponse {
+        sessions: sessions.into_iter().map(summary_to_pb).collect(),
+        observer_schema_version: OBSERVER_SCHEMA_VERSION as u32,
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
 
 #[tonic::async_trait]
 impl PipelineControl for ControlServiceImpl {
     type AttachStream = EventStream;
+    type WatchSessionsStream = LifecycleStream;
+
+    async fn list_sessions(
+        &self,
+        request: Request<ListSessionsRequest>,
+    ) -> Result<Response<ListSessionsResponse>, Status> {
+        self.check_auth(&request)?;
+        Ok(Response::new(list_response(self.bus.list())))
+    }
+
+    async fn describe_session(
+        &self,
+        request: Request<DescribeSessionRequest>,
+    ) -> Result<Response<DescribeSessionResponse>, Status> {
+        self.check_auth(&request)?;
+        let sid = request.into_inner().session_id;
+        let ctrl = self
+            .bus
+            .get(&sid)
+            .ok_or_else(|| Status::not_found(format!("session '{sid}' not found")))?;
+        let descriptor = ctrl
+            .descriptor()
+            .ok_or_else(|| Status::not_found(format!("session '{sid}' has no descriptor")))?;
+        let descriptor_json = serde_json::to_string(descriptor.as_ref())
+            .map_err(|e| Status::internal(format!("descriptor serialization: {e}")))?;
+        Ok(Response::new(DescribeSessionResponse {
+            descriptor_json,
+            schema_version: OBSERVER_SCHEMA_VERSION as u32,
+        }))
+    }
+
+    async fn watch_sessions(
+        &self,
+        request: Request<WatchSessionsRequest>,
+    ) -> Result<Response<Self::WatchSessionsStream>, Status> {
+        self.check_auth(&request)?;
+        let bus = self.bus.clone();
+        let (tx, rx) = mpsc::channel::<Result<SessionLifecycle, Status>>(OUTBOUND_EVENT_CAPACITY);
+        tokio::spawn(async move {
+            let (initial, mut events) = bus.watch();
+            let first = SessionLifecycle {
+                event: Some(PbLifecycle::Initial(list_response(initial))),
+            };
+            if tx.send(Ok(first)).await.is_err() {
+                return;
+            }
+            loop {
+                let msg = tokio::select! {
+                    _ = tx.closed() => return,
+                    ev = events.recv() => ev,
+                };
+                let out = match msg {
+                    Ok(SessionLifecycleEvent::Created { session }) => {
+                        vec![PbLifecycle::Created(summary_to_pb(session))]
+                    }
+                    Ok(SessionLifecycleEvent::Updated { session }) => {
+                        vec![PbLifecycle::Updated(summary_to_pb(session))]
+                    }
+                    Ok(SessionLifecycleEvent::Closed {
+                        session_id,
+                        reason,
+                        ts_ms,
+                    }) => vec![PbLifecycle::Closed(SessionClosedInfo {
+                        session_id,
+                        reason: reason.unwrap_or_default(),
+                        ts_ms,
+                    })],
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Fell behind: tell the client, then re-send a full
+                        // list under a fresh watch.
+                        let (initial, fresh) = bus.watch();
+                        events = fresh;
+                        vec![
+                            PbLifecycle::Resync(Empty {}),
+                            PbLifecycle::Initial(list_response(initial)),
+                        ]
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                };
+                for ev in out {
+                    if tx
+                        .send(Ok(SessionLifecycle { event: Some(ev) }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
 
     async fn attach(
         &self,
         request: Request<Streaming<ControlFrame>>,
     ) -> Result<Response<Self::AttachStream>, Status> {
+        self.check_auth(&request)?;
         let mut in_stream = request.into_inner();
         let (out_tx, out_rx) =
             mpsc::channel::<Result<ControlEvent, Status>>(OUTBOUND_EVENT_CAPACITY);
@@ -106,6 +263,7 @@ impl PipelineControl for ControlServiceImpl {
                 event: Some(PbEvent::Attached(Attached {
                     session_id: session_id.clone(),
                     attach_id: attach_id.clone(),
+                    observer_schema_version: OBSERVER_SCHEMA_VERSION as u32,
                 })),
             },
         )
@@ -133,13 +291,15 @@ async fn run_attach_loop(
 ) {
     // Watch for session-close. First fire ends this attach.
     let mut close_rx = ctrl.close_subscriber();
+    let rpc_scope = RpcCallScope::default();
 
     // Dedicated forwarder tasks for taps/intercepts. We hold their
-    // JoinHandles so we can abort on shutdown.
-    let mut forwarders: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // JoinHandles so we can abort on shutdown / unsubscribe.
+    let mut forwarders = Forwarders::default();
 
     loop {
         tokio::select! {
+            _ = out_tx.closed() => break,
             // Client → server frame.
             frame = in_stream.next() => {
                 let frame = match frame {
@@ -159,6 +319,7 @@ async fn run_attach_loop(
                     frame,
                     &out_tx,
                     &mut forwarders,
+                    &rpc_scope,
                 )
                 .await
                 {
@@ -194,10 +355,29 @@ async fn run_attach_loop(
         }
     }
 
-    for t in forwarders {
-        t.abort();
-    }
+    forwarders.abort_all();
     tracing::debug!(session=%session_id, "attach loop exited");
+}
+
+/// Forwarder tasks owned by one attach. Tap forwarders are keyed by
+/// `(node_id, port)` so `Unsubscribe` can stop them.
+#[derive(Default)]
+struct Forwarders {
+    taps: HashMap<(String, Option<String>), Vec<tokio::task::JoinHandle<()>>>,
+    other: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Forwarders {
+    fn abort_all(&mut self) {
+        for (_, ts) in self.taps.drain() {
+            for t in ts {
+                t.abort();
+            }
+        }
+        for t in self.other.drain(..) {
+            t.abort();
+        }
+    }
 }
 
 // Dispatch one inbound frame. Returns Err(ErrorEvent) for a protocol
@@ -206,7 +386,8 @@ async fn handle_inbound_frame(
     ctrl: &Arc<SessionControl>,
     frame: ControlFrame,
     out_tx: &mpsc::Sender<Result<ControlEvent, Status>>,
-    forwarders: &mut Vec<tokio::task::JoinHandle<()>>,
+    forwarders: &mut Forwarders,
+    rpc_scope: &RpcCallScope,
 ) -> Result<(), ErrorEvent> {
     match frame.op {
         Some(PbOp::Hello(_)) => Err(error(
@@ -217,6 +398,30 @@ async fn handle_inbound_frame(
 
         Some(PbOp::Subscribe(sub)) => {
             let core = pb_addr_to_core(sub.addr, Direction::Out)?;
+            let key = (core.node_id.clone(), core.port.clone());
+            if core.node_id == SYSTEM_PORT && core.port.is_none() {
+                // Replay the retained `__system__` ring first so late
+                // observers see init history (matches WS / in-proc paths).
+                let mut rx = ctrl.subscribe_system();
+                let pb_addr = core_addr_to_pb(&core);
+                let tx = out_tx.clone();
+                let task = tokio::spawn(async move {
+                    while let Some(data) = rx.recv().await {
+                        let Some(pb) = runtime_data_to_pb(&data) else { continue };
+                        let event = ControlEvent {
+                            event: Some(PbEvent::Tap(TapEvent {
+                                addr: Some(pb_addr.clone()),
+                                data: Some(pb),
+                            })),
+                        };
+                        if tx.send(Ok(event)).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                forwarders.taps.entry(key).or_default().push(task);
+                return Ok(());
+            }
             let mut rx = ctrl.subscribe(&core).map_err(|e| {
                 error(
                     ControlErrorCode::Internal,
@@ -228,7 +433,28 @@ async fn handle_inbound_frame(
             let pb_addr = core_addr_to_pb(&core);
             let tx = out_tx.clone();
             let task = tokio::spawn(async move {
-                while let Ok(data) = rx.recv().await {
+                loop {
+                    let data = match rx.recv().await {
+                        Ok(data) => data,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count))
+                            if core.port.as_deref() == Some("__reply__") =>
+                        {
+                            let event = ControlEvent {
+                                event: Some(PbEvent::Error(error(
+                                    ControlErrorCode::Internal,
+                                    format!("RPC reply subscription lagged by {count} frames"),
+                                    Some(core.clone()),
+                                ))),
+                            };
+                            let _ = tx.send(Ok(event)).await;
+                            break;
+                        }
+                        // Telemetry / output taps tolerate skipped frames:
+                        // keep the subscription alive instead of silently
+                        // ending it on the first lag.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
                     let pb = match runtime_data_to_pb(&data) {
                         Some(b) => b,
                         None => continue,
@@ -244,15 +470,18 @@ async fn handle_inbound_frame(
                     }
                 }
             });
-            forwarders.push(task);
+            forwarders.taps.entry(key).or_default().push(task);
             Ok(())
         }
 
-        Some(PbOp::Unsubscribe(_)) => {
-            // The broadcast::Receiver lives inside the forwarder task
-            // above; the client can't cancel an individual sub today
-            // without closing the whole attach. Acknowledge silently —
-            // dropping the attach is the cancellation path.
+        Some(PbOp::Unsubscribe(unsub)) => {
+            // Stop every forwarder this attach opened for the address.
+            let core = pb_addr_to_core(unsub.addr, Direction::Out)?;
+            if let Some(tasks) = forwarders.taps.remove(&(core.node_id, core.port)) {
+                for t in tasks {
+                    t.abort();
+                }
+            }
             Ok(())
         }
 
@@ -267,13 +496,15 @@ async fn handle_inbound_frame(
             })?;
             let rt = pb_to_runtime_data(data)
                 .map_err(|e| error(ControlErrorCode::Internal, e, Some(core.clone())))?;
-            ctrl.publish(&core, rt).await.map_err(|e| {
-                error(
-                    ControlErrorCode::Internal,
-                    e.to_string(),
-                    Some(core.clone()),
-                )
-            })?;
+            ctrl.publish_scoped(&core, rt, rpc_scope)
+                .await
+                .map_err(|e| {
+                    error(
+                        ControlErrorCode::Internal,
+                        e.to_string(),
+                        Some(core.clone()),
+                    )
+                })?;
             Ok(())
         }
 
@@ -319,7 +550,7 @@ async fn handle_inbound_frame(
                     }
                 }
             });
-            forwarders.push(task);
+            forwarders.other.push(task);
             Ok(())
         }
 
@@ -344,6 +575,30 @@ async fn handle_inbound_frame(
 
         Some(PbOp::ClearNodeState(clear)) => {
             ctrl.clear_node_state(&clear.node_id);
+            Ok(())
+        }
+
+        Some(PbOp::SetTelemetry(set)) => {
+            let Some(tel) = ctrl.telemetry() else {
+                return Err(error(
+                    ControlErrorCode::Internal,
+                    "session has no telemetry (not running on the core router)",
+                    None,
+                ));
+            };
+            if !set.level.is_empty() {
+                let level = TelemetryLevel::parse(&set.level).ok_or_else(|| {
+                    error(
+                        ControlErrorCode::Protocol,
+                        format!("unknown telemetry level '{}'", set.level),
+                        None,
+                    )
+                })?;
+                tel.set_level(level);
+            }
+            if set.interval_ms > 0 {
+                tel.set_interval_ms(set.interval_ms);
+            }
             Ok(())
         }
 
@@ -479,4 +734,52 @@ fn error(
 
 async fn send_event(tx: &mpsc::Sender<Result<ControlEvent, Status>>, event: ControlEvent) {
     let _ = tx.send(Ok(event)).await;
+}
+
+
+/// Serve **only** the `PipelineControl` service for `bus` on `addr` (with
+/// gRPC-Web enabled). Lets processes that serve WebRTC / HTTP accept remote
+/// observers (openspec: add-live-pipeline-observer). Returns when the server
+/// stops; spawn it.
+pub async fn serve_control(
+    addr: std::net::SocketAddr,
+    bus: Arc<SessionControlBus>,
+    token: Option<String>,
+) -> Result<(), tonic::transport::Error> {
+    serve_control_with_incoming(
+        tokio_stream::wrappers::TcpListenerStream::new(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("bind control address"),
+        ),
+        bus,
+        token,
+    )
+    .await
+}
+
+/// Like [`serve_control`] but on a pre-bound listener stream (tests bind
+/// port 0 and read the local address first).
+pub async fn serve_control_with_incoming(
+    incoming: tokio_stream::wrappers::TcpListenerStream,
+    bus: Arc<SessionControlBus>,
+    token: Option<String>,
+) -> Result<(), tonic::transport::Error> {
+    let mut svc = ControlServiceImpl::new(bus);
+    if let Some(t) = token {
+        svc = svc.with_token(t);
+    }
+    use tonic::service::LayerExt as _;
+    let svc = tower::ServiceBuilder::new()
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(tonic_web::GrpcWebLayer::new())
+        .into_inner()
+        .named_layer(crate::generated::pipeline_control_server::PipelineControlServer::new(svc));
+    tonic::transport::Server::builder()
+        .accept_http1(true)
+        .tcp_nodelay(true)
+        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+        .add_service(svc)
+        .serve_with_incoming(incoming)
+        .await
 }

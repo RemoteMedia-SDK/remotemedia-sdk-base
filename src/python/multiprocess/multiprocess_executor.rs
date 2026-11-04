@@ -1364,6 +1364,10 @@ sys.stdout.flush()
 
         let mut cmd = tokio::process::Command::new(python);
         cmd.args(["-c", &script]);
+        #[cfg(windows)]
+        if let Some(flags) = super::process_manager::no_window_flag() {
+            cmd.creation_flags(flags);
+        }
         if !python_path_env.is_empty() {
             cmd.env("PYTHONPATH", &python_path_env);
         }
@@ -1624,6 +1628,27 @@ sys.stdout.flush()
                             failed_node,
                             reason
                         );
+
+                        // Surface the crash to observers (openspec:
+                        // add-live-pipeline-observer). Retained so late
+                        // subscribers still see why the session died.
+                        if let Some(ctrl) = crate::transport::session_control::global_bus()
+                            .and_then(|bus| bus.get(&session_id))
+                        {
+                            ctrl.publish_tap(
+                                crate::transport::session_control::SYSTEM_PORT,
+                                None,
+                                crate::data::RuntimeData::Json(serde_json::json!({
+                                    "kind": "node_crashed",
+                                    "node": failed_node,
+                                    "message": reason,
+                                    "ts_ms": std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0),
+                                })),
+                            );
+                        }
 
                         let sessions_weak = sessions_weak_events.clone();
                         tokio::spawn(async move {

@@ -43,10 +43,9 @@ use crate::executor::{
 };
 use crate::manifest::Manifest;
 use crate::nodes::{InitializeContext, StreamingNode, StreamingNodeRegistry};
-use crate::transport::perf_aggregator::{spawn_flush_task, PerfAggregator};
-use crate::transport::session_control::{
-    aux_port_of, CloseReason, SessionControl, BARGE_IN_PORT, PERF_PORT,
-};
+use crate::telemetry::{approx_payload_bytes, QueueCapacity, SessionDescriptor, SessionTelemetry};
+use crate::transport::perf_aggregator::PerfAggregator;
+use crate::transport::session_control::{aux_port_of, CloseReason, SessionControl, BARGE_IN_PORT};
 use crate::{Error, Result};
 use parking_lot::RwLock as DriftRwLock;
 use std::collections::HashMap;
@@ -133,6 +132,18 @@ impl ClientOutputRouter {
             RuntimeData::Audio { .. } => self.audio_tx.send(data).await,
             RuntimeData::Video { .. } => self.video_tx.send(data).await,
             _ => self.data_tx.send(data).await,
+        }
+    }
+
+    /// Non-blocking variant of [`Self::send`].
+    pub fn try_send(
+        &self,
+        data: RuntimeData,
+    ) -> std::result::Result<(), mpsc::error::TrySendError<RuntimeData>> {
+        match &data {
+            RuntimeData::Audio { .. } => self.audio_tx.try_send(data),
+            RuntimeData::Video { .. } => self.video_tx.try_send(data),
+            _ => self.data_tx.try_send(data),
         }
     }
 }
@@ -380,6 +391,14 @@ pub struct SessionRouter {
     /// `record_input`/`record_output` is an inline atomic-load + early
     /// return, so production pays no cost.
     perf: Arc<PerfAggregator>,
+
+    /// Running-topology descriptor (openspec: add-live-pipeline-observer).
+    /// Refined after node init (pacing) and pushed to the control bus.
+    descriptor: SessionDescriptor,
+
+    /// Lock-free per-node / per-edge counters, shared with node tasks and
+    /// the telemetry publisher.
+    telemetry: Arc<SessionTelemetry>,
 }
 
 /// Bounded capacity of each node's input channel.
@@ -398,6 +417,8 @@ const NODE_INPUT_CAPACITY: usize = 16;
 /// normal TTS/VAD burst patterns while still bounding memory growth.
 const NODE_FANOUT_CAPACITY: usize = 1024;
 
+const RELAXED: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxed;
+
 /// Per-node task handles + input sender map, owned by the router for the
 /// lifetime of the session. Built in [`SessionRouter::spawn_pipeline_tasks`]
 /// and torn down in [`SessionRouter::teardown_pipeline_tasks`].
@@ -406,8 +427,27 @@ struct PipelineTasks {
     /// Input sender for each node (keyed by node id). The router pushes
     /// source-bound and `to_node`-addressed packets through these.
     input_txs: HashMap<String, mpsc::Sender<RuntimeData>>,
+    /// Telemetry ingress edge index for each source node.
+    ingress_edges: HashMap<String, usize>,
     /// All spawned tasks (main + fan-out per node). Awaited on shutdown.
     handles: Vec<JoinHandle<()>>,
+}
+
+/// One stream successor of a node: its input channel plus the telemetry edge
+/// index of the connection feeding it.
+struct Successor {
+    tx: mpsc::Sender<RuntimeData>,
+    edge: Option<usize>,
+}
+
+/// Everything a node's tasks need to update telemetry.
+struct NodeTelemetryHandle {
+    tel: Arc<SessionTelemetry>,
+    idx: usize,
+    /// Egress edge (sink → client), when this node forwards to the client.
+    egress_edge: Option<usize>,
+    /// Weak handle on the node's router-side input channel (queue probe).
+    input_weak: mpsc::WeakSender<RuntimeData>,
 }
 
 impl SessionRouter {
@@ -503,6 +543,23 @@ impl SessionRouter {
             PerfAggregator::sample_stride_from_env(),
         ));
 
+        let descriptor = SessionDescriptor::build(
+            &session_id,
+            &manifest,
+            &graph,
+            &registry,
+            QueueCapacity {
+                input: NODE_INPUT_CAPACITY as u32,
+                filter: NODE_FANOUT_CAPACITY as u32,
+                fanout: NODE_FANOUT_CAPACITY as u32,
+            },
+        );
+        let telemetry = Arc::new(SessionTelemetry::new(
+            &descriptor,
+            scheduler.clone(),
+            perf.clone(),
+        ));
+
         let router = Self {
             session_id,
             manifest,
@@ -521,6 +578,8 @@ impl SessionRouter {
             drift_thresholds: drift_thresholds.unwrap_or_default(),
             control: None,
             perf,
+            descriptor,
+            telemetry,
         };
 
         Ok((router, shutdown_tx_clone))
@@ -541,7 +600,30 @@ impl SessionRouter {
             .clone()
             .expect("attach_control must be called before run() consumes input_tx");
         control.attach_input_sender(input_tx).await;
+        control.set_descriptor(Arc::new(self.descriptor.clone()));
+        control.set_telemetry(self.telemetry.clone());
         self.control = Some(control);
+    }
+
+    /// Flag nodes that were spliced into the manifest by capability
+    /// negotiation (or other manifest rewriting) so observers can tell them
+    /// apart from author-written nodes.
+    pub fn mark_inserted_nodes(&mut self, ids: &std::collections::HashSet<String>) {
+        self.descriptor.mark_inserted(ids);
+        if let Some(ctrl) = &self.control {
+            ctrl.set_descriptor(Arc::new(self.descriptor.clone()));
+        }
+    }
+
+    /// The session's running-topology descriptor.
+    pub fn descriptor(&self) -> &SessionDescriptor {
+        &self.descriptor
+    }
+
+    /// The session's telemetry handle. Clone before `run*` consumes the
+    /// router to read counters out-of-band.
+    pub fn telemetry(&self) -> Arc<SessionTelemetry> {
+        self.telemetry.clone()
     }
 
     /// Get the input sender for feeding data to the router.
@@ -788,6 +870,23 @@ impl SessionRouter {
             self.cached_nodes.len()
         );
 
+        // Refine the descriptor now that node instances exist: pacing is a
+        // property of the instance, not the factory.
+        let pacing: HashMap<String, String> = self
+            .cached_nodes
+            .iter()
+            .map(|(id, node)| {
+                (
+                    id.clone(),
+                    crate::telemetry::descriptor::pacing_label(node.pacing_nature()),
+                )
+            })
+            .collect();
+        self.descriptor.set_pacing(&pacing);
+        if let Some(ctrl) = &self.control {
+            ctrl.set_descriptor(Arc::new(self.descriptor.clone()));
+        }
+
         // Pipeline-level "ready": every node is up.
         self.emit_loading_event("ready", Some("Pipeline ready".to_string()));
 
@@ -1018,46 +1117,17 @@ impl SessionRouter {
         // the client `output_tx`. See `spawn_pipeline_tasks` for the wiring.
         let pipeline = self.spawn_pipeline_tasks();
 
-        // Spawn the periodic perf-snapshot flush task. Cheap when
-        // disabled (the task wakes on tick, sees the flag is off,
-        // and goes back to sleep). When enabled and a control bus
-        // is attached, snapshots are published as JSON on the
-        // `__perf__` tap so the frontend HUD can render them.
-        let perf_shutdown = Arc::new(tokio::sync::Notify::new());
-        let perf_flush_handle = if self.perf.is_enabled() {
-            let publish_perf = {
-                let control = self.control.clone();
-                move |snapshot: crate::data::PerfSnapshot| {
-                    if let Some(ctrl) = control.as_ref() {
-                        // Skip serialization when no HUD is attached.
-                        // In-process HDR-histogram aggregation has
-                        // already happened in `flush_snapshot()` (and
-                        // reset its windows), so cross-session backend
-                        // scrapers that read `peek_snapshot()` directly
-                        // still see fresh data; we just avoid building
-                        // a JSON payload that nobody will consume.
-                        // Critical for "perf-tap on by default" at
-                        // 1000s of sessions — JSON of a 10-node
-                        // snapshot is ~3 KB and runs once per window
-                        // per session, dominating cost otherwise.
-                        if ctrl.tap_receiver_count(PERF_PORT, None) == 0 {
-                            return;
-                        }
-                        match serde_json::to_value(&snapshot) {
-                            Ok(v) => ctrl.publish_tap(PERF_PORT, None, RuntimeData::Json(v)),
-                            Err(e) => tracing::warn!("perf: failed to serialize snapshot: {}", e),
-                        }
-                    }
-                }
-            };
-            Some(spawn_flush_task(
-                self.perf.clone(),
-                publish_perf,
-                perf_shutdown.clone(),
-            ))
-        } else {
-            None
-        };
+        // Spawn the telemetry publisher (openspec: add-live-pipeline-observer).
+        // Replaces the old conditional `__perf__` flush task: it runs for
+        // every session, is idle (two atomic loads per tick) when nobody
+        // subscribes, turns latency histograms on while observed, and keeps
+        // publishing the historical `__perf__` schema for existing HUDs.
+        let publisher_shutdown = Arc::new(tokio::sync::Notify::new());
+        let publisher_handle = crate::telemetry::publisher::spawn_publisher(
+            self.telemetry.clone(),
+            self.control.clone(),
+            publisher_shutdown.clone(),
+        );
 
         // Drop router's own input_tx so the transport channel closes when
         // all external senders (SessionHandle) are dropped.
@@ -1103,7 +1173,7 @@ impl SessionRouter {
                             tokio::select! {
                                 biased;
                                 _ = shutdown_rx.recv() => break true,
-                                _ = self.route_input(packet, &pipeline.input_txs) => {}
+                                _ = self.route_input(packet, &pipeline.input_txs, &pipeline.ingress_edges) => {}
                             }
                         }
                         None => {
@@ -1140,13 +1210,11 @@ impl SessionRouter {
         // closes, which drops its fan_tx, which closes the next hop.
         Self::teardown_pipeline_tasks(pipeline, explicit_close).await;
 
-        // Stop the perf flush task before the control bus is signalled
-        // closed. Any pending snapshot is dropped — by this point the
-        // node tasks have stopped emitting events.
-        perf_shutdown.notify_waiters();
-        if let Some(handle) = perf_flush_handle {
-            let _ = handle.await;
-        }
+        // Stop the publisher before the control bus is signalled closed. It
+        // publishes one final snapshot (`final: true`) — node tasks have
+        // stopped by now, so observers see the end state.
+        publisher_shutdown.notify_one();
+        let _ = publisher_handle.await;
 
         // Wake every attached control client so they drain and exit.
         // Idempotent — harmless if no control is attached.
@@ -1193,7 +1261,7 @@ impl SessionRouter {
         // `Snapshot`. Otherwise it's a stream connection (current
         // behavior). The producer fan-out path stays the same; snapshot
         // values bypass it because consumers pull on their own clock.
-        let mut stream_successors: HashMap<String, Vec<mpsc::Sender<RuntimeData>>> = HashMap::new();
+        let mut stream_successors: HashMap<String, Vec<Successor>> = HashMap::new();
         let mut snapshot_inputs: HashMap<
             String,
             HashMap<String, Arc<dyn crate::nodes::ports::SnapshotPort>>,
@@ -1202,7 +1270,7 @@ impl SessionRouter {
             stream_successors.insert(node_id.clone(), Vec::new());
         }
 
-        for conn in &self.manifest.connections {
+        for (conn_idx, conn) in self.manifest.connections.iter().enumerate() {
             // Resolve port kind from the target factory. Fall back to
             // `Stream` (historical default) when the target factory
             // doesn't declare anything for this port name.
@@ -1221,10 +1289,15 @@ impl SessionRouter {
             match to_kind {
                 crate::nodes::ports::PortKind::Stream => {
                     if let Some(tx) = input_txs.get(&conn.to) {
+                        // Edge index == connection index (see
+                        // `SessionDescriptor::build`).
                         stream_successors
                             .entry(conn.from.clone())
                             .or_default()
-                            .push(tx.clone());
+                            .push(Successor {
+                                tx: tx.clone(),
+                                edge: (conn_idx < self.telemetry.edge_count()).then_some(conn_idx),
+                            });
                     }
                 }
                 crate::nodes::ports::PortKind::Snapshot => {
@@ -1298,6 +1371,19 @@ impl SessionRouter {
                 }
             };
             let succ_txs = stream_successors.remove(&node_id).unwrap_or_default();
+            let Some(node_idx) = self.telemetry.node_index(&node_id) else {
+                tracing::error!(
+                    "Session {}: node '{}' missing from telemetry index (bug)",
+                    self.session_id,
+                    node_id
+                );
+                continue;
+            };
+            let input_weak = input_txs
+                .get(&node_id)
+                .map(|tx| tx.downgrade())
+                .expect("input channel created in pass 1");
+            let egress_edge = self.descriptor.egress_edge(&node_id);
             let snap_inputs = snapshot_inputs.remove(&node_id).unwrap_or_default();
             let is_sink = sinks.contains(&node_id);
             let is_output_node = self
@@ -1322,6 +1408,12 @@ impl SessionRouter {
                 self.control.clone(),
                 self.probes.clone(),
                 self.perf.clone(),
+                NodeTelemetryHandle {
+                    tel: self.telemetry.clone(),
+                    idx: node_idx,
+                    egress_edge,
+                    input_weak,
+                },
                 shutdown.subscribe(),
             );
 
@@ -1329,8 +1421,16 @@ impl SessionRouter {
             handles.push(fan_handle);
         }
 
+        let ingress_edges = self
+            .graph
+            .sources
+            .iter()
+            .filter_map(|s| self.descriptor.ingress_edge(s).map(|e| (s.clone(), e)))
+            .collect();
+
         PipelineTasks {
             input_txs,
+            ingress_edges,
             handles,
             shutdown,
         }
@@ -1355,7 +1455,7 @@ impl SessionRouter {
         node_id: String,
         node: Box<dyn StreamingNode>,
         mut input_rx: mpsc::Receiver<RuntimeData>,
-        successor_txs: Vec<mpsc::Sender<RuntimeData>>,
+        successor_txs: Vec<Successor>,
         snapshot_inputs: HashMap<String, Arc<dyn crate::nodes::ports::SnapshotPort>>,
         client_tx: Option<ClientOutputRouter>,
         session_id: String,
@@ -1363,24 +1463,36 @@ impl SessionRouter {
         control: Option<Arc<SessionControl>>,
         probes: Arc<crate::metrics::RtProbeSet>,
         perf: Arc<PerfAggregator>,
+        nt: NodeTelemetryHandle,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> (JoinHandle<()>, JoinHandle<()>) {
         let (fan_tx, mut fan_rx) = mpsc::channel::<RuntimeData>(NODE_FANOUT_CAPACITY);
+        let NodeTelemetryHandle {
+            tel,
+            idx: node_idx,
+            egress_edge,
+            input_weak,
+        } = nt;
 
         // ── Fan-out drain task ─────────────────────────────────────────
         let fan_node_id = node_id.clone();
         let fan_session_id = session_id.clone();
         let fan_control = control.clone();
         let fan_probes = probes.clone();
+        let fan_tel = tel.clone();
         let mut fan_shutdown = shutdown.clone();
         let fan_handle = tokio::spawn(async move {
             let forward = async move {
+                let tel = fan_tel;
                 while let Some(out) = fan_rx.recv().await {
+                    tel.node(node_idx).outputs.fetch_add(1, RELAXED);
                     let kept = match &fan_control {
                         Some(ctrl) => ctrl.on_node_output(&fan_node_id, None, out).await,
                         None => Some(out),
                     };
                     let Some(kept) = kept else { continue };
+                    // One size estimate per output, shared by every edge.
+                    let kept_bytes = approx_payload_bytes(&kept);
                     let kept_desc = if node_trace_enabled() {
                         Some(describe_runtime_data(&kept))
                     } else {
@@ -1390,7 +1502,7 @@ impl SessionRouter {
                     // Fan out to successors first. Bounded `send` awaits on
                     // full, providing real backpressure all the way back to
                     // the node's callback (via `fan_tx` filling up).
-                    for tx in &successor_txs {
+                    for succ in &successor_txs {
                         if let Some(desc) = kept_desc.as_deref() {
                             tracing::info!(
                                 session_id = %fan_session_id,
@@ -1405,7 +1517,31 @@ impl SessionRouter {
                                 desc
                             );
                         }
-                        if tx.send(kept.clone()).await.is_err() {
+                        // try_send first so a full successor is observable as a
+                        // stall; then fall back to the same awaited send as
+                        // before, so delivery and backpressure are unchanged.
+                        let edge = succ.edge.and_then(|e| tel.edge(e));
+                        let delivered = match succ.tx.try_send(kept.clone()) {
+                            Ok(()) => true,
+                            Err(mpsc::error::TrySendError::Full(v)) => {
+                                let stall_start = std::time::Instant::now();
+                                if let Some(e) = edge {
+                                    e.begin_stall();
+                                }
+                                let ok = succ.tx.send(v).await.is_ok();
+                                if let Some(e) = edge {
+                                    e.end_stall(stall_start.elapsed().as_micros() as u64);
+                                }
+                                ok
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => false,
+                        };
+                        match (delivered, edge) {
+                            (true, Some(e)) => e.record_frame(kept_bytes),
+                            (false, Some(e)) => e.record_drop(),
+                            _ => {}
+                        }
+                        if !delivered {
                             tracing::debug!(
                                 "Session {}: node '{}' successor closed; drop",
                                 fan_session_id,
@@ -1433,8 +1569,27 @@ impl SessionRouter {
                             );
                         }
                         let egress_start = std::time::Instant::now();
-                        let res = out_router.send(kept).await;
+                        let edge = egress_edge.and_then(|e| tel.edge(e));
+                        let res = match out_router.try_send(kept) {
+                            Ok(()) => Ok(()),
+                            Err(mpsc::error::TrySendError::Full(v)) => {
+                                if let Some(e) = edge {
+                                    e.begin_stall();
+                                }
+                                let r = out_router.send(v).await.map_err(|_| ());
+                                if let Some(e) = edge {
+                                    e.end_stall(egress_start.elapsed().as_micros() as u64);
+                                }
+                                r
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+                        };
                         fan_probes.egress.record_since(egress_start);
+                        match (&res, edge) {
+                            (Ok(()), Some(e)) => e.record_frame(kept_bytes),
+                            (Err(_), Some(e)) => e.record_drop(),
+                            _ => {}
+                        }
                         if res.is_err() {
                             tracing::warn!(
                                 "Session {}: sink '{}' client channel closed",
@@ -1482,7 +1637,21 @@ impl SessionRouter {
         // taking a `ProtectGuard` from `ctx.cancel_gate.protect()`.
         let cancel = Arc::new(crate::transport::CancelGate::new());
         let (filt_tx, mut filt_rx) = mpsc::channel::<(u64, RuntimeData)>(NODE_FANOUT_CAPACITY);
+        // Weak handles only: telemetry must never keep a channel open.
+        tel.install_queues(
+            node_idx,
+            Box::new(input_weak),
+            Box::new(filt_tx.downgrade()),
+            Box::new(fan_tx.downgrade()),
+        );
         let (control_tx, mut control_rx) = mpsc::channel::<RuntimeData>(16);
+        let rpc_rx = if node.rpc_methods().is_empty() {
+            None
+        } else {
+            control
+                .as_ref()
+                .map(|control| control.register_rpc(&node_id))
+        };
         let input_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let filter_generation = input_generation.clone();
         let filter_cancel = Arc::clone(&cancel);
@@ -1551,7 +1720,18 @@ impl SessionRouter {
         let main_node_id = node_id.clone();
         let main_session_id = session_id.clone();
         let main_cancel = Arc::clone(&cancel);
+        let main_tel = tel;
         let main_handle = tokio::spawn(async move {
+            let tel = main_tel;
+            let cell = tel.node(node_idx);
+            tel.set_alive(node_idx, true);
+            // Read node state from the telemetry cache (one atomic load)
+            // when it mirrors this router's control bus.
+            let use_state_cache = control
+                .as_ref()
+                .and_then(|c| c.telemetry())
+                .map(|t| Arc::ptr_eq(&t, &tel))
+                .unwrap_or(false);
             // Convert the Box<dyn StreamingNode> into an Arc so capability
             // forwarder tasks can hold their own refs alongside the main
             // dispatch path. The Arc is cheap and the trait object's
@@ -1586,6 +1766,15 @@ impl SessionRouter {
             // calls inside the node would have no effect on the real
             // barge path.
             .with_cancel_gate(Arc::clone(&cancel));
+
+            let rpc_handle = rpc_rx.map(|rx| {
+                super::rpc_dispatch::RpcTask(tokio::spawn(super::rpc_dispatch::run(
+                    node.clone(),
+                    bound_ctx.clone(),
+                    rx,
+                    shutdown.clone(),
+                )))
+            });
 
             // Capability transient channel: subscribe to every address the
             // node declared interest in, drain into `on_capability_update`.
@@ -1706,7 +1895,11 @@ impl SessionRouter {
                     Some(control) = control_rx.recv() => control,
                     input = filt_rx.recv() => match input {
                         Some((generation, input)) if generation == input_generation.load(std::sync::atomic::Ordering::Acquire) => input,
-                        Some(_) => continue,
+                        Some(_) => {
+                            // Superseded by a barge-in.
+                            cell.discarded.fetch_add(1, RELAXED);
+                            continue;
+                        }
                         None => break,
                     },
                 };
@@ -1750,21 +1943,31 @@ impl SessionRouter {
                 // Node-state gate (Bypass / Disabled). Per-input, so a
                 // runtime control-bus toggle takes effect on the next
                 // packet.
-                if let Some(ctrl) = &control {
+                {
                     use crate::transport::session_control::NodeState;
-                    match ctrl.node_state(&main_node_id) {
+                    let state = if use_state_cache {
+                        cell.node_state()
+                    } else if let Some(ctrl) = &control {
+                        ctrl.node_state(&main_node_id)
+                    } else {
+                        NodeState::Enabled
+                    };
+                    match state {
                         NodeState::Enabled => {}
                         NodeState::Bypass => {
+                            cell.bypassed.fetch_add(1, RELAXED);
                             if fan_tx.send(input).await.is_err() {
                                 break;
                             }
                             continue;
                         }
                         NodeState::Disabled => {
+                            cell.discarded.fetch_add(1, RELAXED);
                             continue;
                         }
                     }
                 }
+                cell.inputs.fetch_add(1, RELAXED);
 
                 // Perf instrumentation: record one input event,
                 // and per-output latency via the wrapped callback.
@@ -1893,6 +2096,8 @@ impl SessionRouter {
 
                 let use_fast = scheduler.config.is_fast_path(&main_node_id);
                 let node_dispatch_start = std::time::Instant::now();
+                // +1 so that 0 keeps meaning "idle".
+                cell.in_flight_since_us.store(tel.now_us() + 1, RELAXED);
 
                 // Cheap clone of the per-(node, session) ctx built above.
                 // Every field is `Arc`-backed; this keeps the per-dispatch
@@ -2003,6 +2208,16 @@ impl SessionRouter {
                     }
                     r = dispatch_fut => {
                         if let Err(e) = r {
+                            if let Some(ev) = tel.record_error(node_idx, &e.to_string()) {
+                                if let Some(ctrl) = &control {
+                                    crate::telemetry::publisher::publish_node_error(
+                                        ctrl,
+                                        &main_node_id,
+                                        &ev.message,
+                                        ev.count,
+                                    );
+                                }
+                            }
                             tracing::error!(
                                 "Session {}: node '{}' execution error: {}",
                                 main_session_id,
@@ -2041,6 +2256,9 @@ impl SessionRouter {
                 }
                 let _ = cancelled;
 
+                cell.busy_us
+                    .fetch_add(node_dispatch_start.elapsed().as_micros() as u64, RELAXED);
+                cell.in_flight_since_us.store(0, RELAXED);
                 probes.node_out.record_since(node_dispatch_start);
             }
             // input_rx closed: drop fan_tx so the drain task exits once
@@ -2062,6 +2280,10 @@ impl SessionRouter {
             // Filter task ends when input_rx closes (its sender drops
             // after the last source emits None). Await it so we don't
             // leak it on shutdown.
+            if let Some(mut handle) = rpc_handle {
+                handle.0.abort();
+                let _ = (&mut handle.0).await;
+            }
             filter_handle.abort();
             let _ = filter_handle.await;
             if let Err(error) = node_ref
@@ -2076,6 +2298,7 @@ impl SessionRouter {
             {
                 tracing::error!(node = %main_node_id, %error, "node shutdown failed");
             }
+            tel.set_alive(node_idx, false);
         });
 
         (main_handle, fan_handle)
@@ -2088,6 +2311,7 @@ impl SessionRouter {
         &self,
         packet: DataPacket,
         input_txs: &HashMap<String, mpsc::Sender<RuntimeData>>,
+        ingress_edges: &HashMap<String, usize>,
     ) {
         let arrival_ts_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2133,7 +2357,32 @@ impl SessionRouter {
                     describe_runtime_data(&input_data)
                 );
             }
-            if tx.send(input_data.clone()).await.is_err() {
+            let ingress = ingress_edges
+                .get(target)
+                .and_then(|&e| self.telemetry.edge(e));
+            let delivered = match tx.try_send(input_data.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(v)) => {
+                    let stall_start = std::time::Instant::now();
+                    if let Some(e) = ingress {
+                        e.begin_stall();
+                    }
+                    let ok = tx.send(v).await.is_ok();
+                    if let Some(e) = ingress {
+                        e.end_stall(stall_start.elapsed().as_micros() as u64);
+                    }
+                    ok
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            };
+            if let Some(e) = ingress {
+                if delivered {
+                    e.record_frame(approx_payload_bytes(&input_data));
+                } else {
+                    e.record_drop();
+                }
+            }
+            if !delivered {
                 tracing::warn!(
                     "Session {}: node '{}' input channel closed; drop packet",
                     self.session_id,
@@ -2147,6 +2396,7 @@ impl SessionRouter {
     async fn teardown_pipeline_tasks(pipeline: PipelineTasks, explicit_close: bool) {
         let PipelineTasks {
             input_txs,
+            ingress_edges: _,
             handles,
             shutdown,
         } = pipeline;
@@ -2890,3 +3140,7 @@ mod tests {
         assert!(all_stats.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "session_router_telemetry_tests.rs"]
+mod telemetry_tests;

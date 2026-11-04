@@ -51,11 +51,14 @@ use std::sync::Arc;
 use abi_stable::library::{lib_header_from_raw_library, RawLibrary, RootModule};
 use abi_stable::sabi_trait::TD_Opaque;
 use abi_stable::std_types::{RErr, ROk, RResult, RString, RVec};
+use async_ffi::FutureExt;
 use async_trait::async_trait;
 use loadable_node_abi::{
-    FfiNodeBox, FfiNodeFactory, FfiNodeFactoryBox, FfiNodeFactory_TO, NodePluginRef, OutputSink,
-    OutputSinkBox, OutputSink_TO,
+    FfiCallContext, FfiNodeBox, FfiNodeFactory, FfiNodeFactoryBox, FfiNodeFactory_TO,
+    NodePluginRef, OutputSink, OutputSinkBox, OutputSink_TO, RpcReplySink as FfiRpcReplySink,
+    RpcReplySinkBox, RpcReplySink_TO,
 };
+use remotemedia_traits::rpc::{RpcEvent, RpcMethod, RpcMode, RpcReply, RpcRequest, RpcResponder};
 use serde_json::Value;
 
 use crate::data::RuntimeData;
@@ -217,13 +220,23 @@ where
 /// Register an in-process plugin with its authored schema. The FFI vtable does
 /// not carry schemas; keeping metadata here lets transports negotiate tracks
 /// before creating the node, without changing the binary plugin ABI.
-pub fn wrap_ffi_factory_with_schema<F>(factory: F, schema: crate::nodes::schema::NodeSchema) -> Arc<dyn StreamingNodeFactory>
-where F: FfiNodeFactory + 'static {
+pub fn wrap_ffi_factory_with_schema<F>(
+    factory: F,
+    schema: crate::nodes::schema::NodeSchema,
+) -> Arc<dyn StreamingNodeFactory>
+where
+    F: FfiNodeFactory + 'static,
+{
     wrap_ffi_factory_metadata(factory, Some(schema))
 }
 
-fn wrap_ffi_factory_metadata<F>(factory: F, schema: Option<crate::nodes::schema::NodeSchema>) -> Arc<dyn StreamingNodeFactory>
-where F: FfiNodeFactory + 'static {
+fn wrap_ffi_factory_metadata<F>(
+    factory: F,
+    schema: Option<crate::nodes::schema::NodeSchema>,
+) -> Arc<dyn StreamingNodeFactory>
+where
+    F: FfiNodeFactory + 'static,
+{
     let boxed: FfiNodeFactoryBox = FfiNodeFactory_TO::from_value(factory, TD_Opaque);
     let node_type = boxed.node_type().into_string();
     Arc::new(LoadableFactoryAdapter {
@@ -240,7 +253,9 @@ struct LoadableFactoryAdapter {
 }
 
 impl StreamingNodeFactory for LoadableFactoryAdapter {
-    fn schema(&self) -> Option<crate::nodes::schema::NodeSchema> { self.schema.clone() }
+    fn schema(&self) -> Option<crate::nodes::schema::NodeSchema> {
+        self.schema.clone()
+    }
 
     fn node_type(&self) -> &str {
         &self.node_type
@@ -279,7 +294,10 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
         };
         let clocked_media_addr = serde_json::from_value(pacing["clocked_media_addr"].clone())
             .map_err(|e| Error::Execution(format!("invalid plugin clock address: {e}")))?;
+        let rpc_methods: Vec<RpcMethod> = serde_json::from_str(ffi_node.rpc_methods().as_str())
+            .map_err(|e| Error::Execution(format!("invalid plugin RPC descriptors: {e}")))?;
         Ok(Box::new(AsyncNodeWrapper(Arc::new(LoadableNodeAdapter {
+            rpc_methods,
             inner: ffi_node,
             nature,
             rate,
@@ -291,6 +309,7 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
 }
 
 struct LoadableNodeAdapter {
+    rpc_methods: Vec<RpcMethod>,
     inner: FfiNodeBox,
     nature: PacingNature,
     rate: u32,
@@ -303,6 +322,75 @@ struct LoadableNodeAdapter {
 impl AsyncStreamingNode for LoadableNodeAdapter {
     fn node_type(&self) -> &str {
         &self.node_type
+    }
+
+    fn rpc_methods(&self) -> Vec<RpcMethod> {
+        self.rpc_methods.clone()
+    }
+
+    async fn call_rpc(
+        &self,
+        request: RpcRequest,
+        ctx: &dyn NodeRuntimeContextRead,
+        replies: &mut RpcResponder,
+    ) -> Result<(), Error> {
+        let bytes = rmp_serde::to_vec_named(&request)
+            .map_err(|e| Error::Execution(format!("RPC encode: {e}")))?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let sink: RpcReplySinkBox = RpcReplySink_TO::from_value(RpcChannelSink { tx }, TD_Opaque);
+        let future = self.inner.call_rpc(
+            bytes.into(),
+            FfiCallContext {
+                session_id: if ctx.session_id().is_empty() {
+                    None
+                } else {
+                    Some(RString::from(ctx.session_id()))
+                }
+                .into(),
+                node_id: ctx.node_id().into(),
+            },
+            sink,
+        );
+        tokio::pin!(future);
+        let mut result = None;
+        let mut terminal = false;
+        let mode = self
+            .rpc_methods
+            .iter()
+            .find(|m| m.name == request.method)
+            .map(|m| m.mode)
+            .unwrap_or(RpcMode::Reply);
+        loop {
+            tokio::select! {
+                bytes = rx.recv() => match bytes {
+                    None => break,
+                    Some(bytes) => {
+                        let reply: RpcReply = rmp_serde::from_slice(&bytes)
+                            .map_err(|e| Error::Execution(format!("invalid RPC reply: {e}")))?;
+                        if reply.corr_id != request.corr_id || terminal {
+                            return Err(Error::Execution("invalid RPC correlation or reply after termination".into()));
+                        }
+                        match reply.event {
+                            RpcEvent::Value(value) => {
+                                replies.value(value).await?;
+                                terminal = mode == RpcMode::Reply;
+                            },
+                            RpcEvent::End if mode == RpcMode::Stream => terminal = true,
+                            RpcEvent::End => return Err(Error::Execution("unexpected RPC end frame".into())),
+                            RpcEvent::Error(error) => return Err(Error::Execution(error)),
+                        }
+                    }
+                },
+                completed = &mut future, if result.is_none() => result = Some(completed),
+            }
+        }
+        let result = match result {
+            Some(result) => result,
+            None => future.await,
+        };
+        result
+            .into_result()
+            .map_err(|e| Error::from_plugin(e.into_string(), &self.node_id, &self.node_type))
     }
 
     fn pacing_nature(&self) -> PacingNature {
@@ -436,8 +524,8 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
     async fn process_streaming<F>(
         &self,
         data: RuntimeData,
-        _session_id: Option<String>,
-        mut callback: F,
+        session_id: Option<String>,
+        callback: F,
     ) -> Result<usize, Error>
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
@@ -455,7 +543,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         // callback is slow the sink's `push` parks via blocking_send
         // (multi-threaded plugin runtime → safe), propagating real
         // backpressure to the plugin's generator.
-        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<RVec<u8>>(32);
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<RVec<u8>>(32);
         let sink: OutputSinkBox =
             OutputSink_TO::from_value(ChannelSink { tx: frame_tx }, TD_Opaque);
 
@@ -463,7 +551,14 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         // plugin starts generating in parallel with our drain loop.
         // The future captures `sink` by value (FfiFuture is `'static`),
         // so there's no borrow on `self`.
-        let ffi_fut = self.inner.process_streaming(RVec::from(req_bytes), sink);
+        let ffi_fut = self.inner.process_streaming_with_context(
+            RVec::from(req_bytes),
+            FfiCallContext {
+                session_id: session_id.map(RString::from).into(),
+                node_id: self.node_id.clone().into(),
+            },
+            sink,
+        );
         self.drain_outputs(ffi_fut, frame_rx, callback).await
     }
 
@@ -556,22 +651,43 @@ impl LoadableNodeAdapter {
 #[cfg(all(test, feature = "loadable-export"))]
 mod clock_contract_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use remotemedia_plugin_sdk::adapter::StreamingNodeFfiAdapter;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct ClockFixture(Arc<AtomicU64>);
     #[async_trait::async_trait]
     impl AsyncStreamingNode for ClockFixture {
-        fn node_type(&self) -> &str { "ClockFixture" }
-        async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> { Ok(data) }
-        fn pacing_nature(&self) -> PacingNature { PacingNature::ClockedToOutboundMedia }
-        fn fallback_rate_hz(&self) -> u32 { 20 }
-        fn clocked_media_addr(&self) -> Option<(String, String)> { Some(("video".into(), "avatar".into())) }
-        async fn tick(&self, tick: Tick, session_id: Option<String>, mut callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>) -> Result<(), Error> {
-            callback(RuntimeData::Json(serde_json::json!({"pts":tick.pts_us, "frame":tick.frame_idx,
-                "clock":tick.clock_id, "deadline":tick.deadline_us, "session":session_id})))
+        fn node_type(&self) -> &str {
+            "ClockFixture"
         }
-        async fn process_control_message(&self, data: RuntimeData, session: Option<String>) -> Result<bool, Error> {
+        async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
+            Ok(data)
+        }
+        fn pacing_nature(&self) -> PacingNature {
+            PacingNature::ClockedToOutboundMedia
+        }
+        fn fallback_rate_hz(&self) -> u32 {
+            20
+        }
+        fn clocked_media_addr(&self) -> Option<(String, String)> {
+            Some(("video".into(), "avatar".into()))
+        }
+        async fn tick(
+            &self,
+            tick: Tick,
+            session_id: Option<String>,
+            mut callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
+        ) -> Result<(), Error> {
+            callback(RuntimeData::Json(
+                serde_json::json!({"pts":tick.pts_us, "frame":tick.frame_idx,
+                "clock":tick.clock_id, "deadline":tick.deadline_us, "session":session_id}),
+            ))
+        }
+        async fn process_control_message(
+            &self,
+            data: RuntimeData,
+            session: Option<String>,
+        ) -> Result<bool, Error> {
             assert_eq!(session.as_deref(), Some("session"));
             assert!(matches!(data, RuntimeData::Json(v) if v["__aux_port__"] == "shutdown"));
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -580,9 +696,14 @@ mod clock_contract_tests {
     }
     struct FixtureFactory(Arc<AtomicU64>);
     impl FfiNodeFactory for FixtureFactory {
-        fn node_type(&self) -> RString { "ClockFixture".into() }
+        fn node_type(&self) -> RString {
+            "ClockFixture".into()
+        }
         fn create(&self, _: RString) -> RResult<FfiNodeBox, RString> {
-            ROk(loadable_node_abi::FfiNode_TO::from_value(StreamingNodeFfiAdapter::new(ClockFixture(self.0.clone())), TD_Opaque))
+            ROk(loadable_node_abi::FfiNode_TO::from_value(
+                StreamingNodeFfiAdapter::new(ClockFixture(self.0.clone())),
+                TD_Opaque,
+            ))
         }
     }
 
@@ -590,16 +711,67 @@ mod clock_contract_tests {
     async fn clock_and_shutdown_survive_both_plugin_adapters() {
         let controls = Arc::new(AtomicU64::new(0));
         let factory = wrap_ffi_factory(FixtureFactory(controls.clone()));
-        let node = factory.create("clock".into(), &serde_json::json!({}), Some("session".into())).unwrap();
+        let node = factory
+            .create(
+                "clock".into(),
+                &serde_json::json!({}),
+                Some("session".into()),
+            )
+            .unwrap();
         assert_eq!(node.pacing_nature(), PacingNature::ClockedToOutboundMedia);
         assert_eq!(node.fallback_rate_hz(), 20);
-        assert_eq!(node.clocked_media_addr(), Some(("video".into(), "avatar".into())));
-        let ctx = crate::nodes::NodeRuntimeContext::for_session("session", "clock",
-            crate::transport::session_control::SessionControl::new("session"), Arc::new(()));
+        assert_eq!(
+            node.clocked_media_addr(),
+            Some(("video".into(), "avatar".into()))
+        );
+        let ctx = crate::nodes::NodeRuntimeContext::for_session(
+            "session",
+            "clock",
+            crate::transport::session_control::SessionControl::new("session"),
+            Arc::new(()),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        node.tick(Tick { clock_id:"video:avatar".into(), pts_us:50000, frame_idx:1, deadline_us:60000 }, &ctx, Box::new(move |out| { tx.send(out).unwrap(); Ok(()) })).await.unwrap();
-        assert!(matches!(rx.recv().await, Some(RuntimeData::Json(v)) if v == serde_json::json!({"pts":50000,"frame":1,"clock":"video:avatar","deadline":60000,"session":"session"})));
-        assert!(node.process_control_message(RuntimeData::Json(serde_json::json!({"__aux_port__":"shutdown","payload":{}})), &ctx).await.unwrap());
+        node.tick(
+            Tick {
+                clock_id: "video:avatar".into(),
+                pts_us: 50000,
+                frame_idx: 1,
+                deadline_us: 60000,
+            },
+            &ctx,
+            Box::new(move |out| {
+                tx.send(out).unwrap();
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(rx.recv().await, Some(RuntimeData::Json(v)) if v == serde_json::json!({"pts":50000,"frame":1,"clock":"video:avatar","deadline":60000,"session":"session"}))
+        );
+        assert!(node
+            .process_control_message(
+                RuntimeData::Json(serde_json::json!({"__aux_port__":"shutdown","payload":{}})),
+                &ctx
+            )
+            .await
+            .unwrap());
         assert_eq!(controls.load(Ordering::SeqCst), 1);
+    }
+}
+
+struct RpcChannelSink {
+    tx: tokio::sync::mpsc::Sender<RVec<u8>>,
+}
+impl FfiRpcReplySink for RpcChannelSink {
+    fn push(&self, bytes: RVec<u8>) -> async_ffi::FfiFuture<RResult<(), RString>> {
+        let tx = self.tx.clone();
+        async move {
+            match tx.send(bytes).await {
+                Ok(()) => ROk(()),
+                Err(_) => RErr("RPC reply receiver closed".into()),
+            }
+        }
+        .into_ffi()
     }
 }

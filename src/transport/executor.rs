@@ -502,6 +502,13 @@ pub struct PipelineExecutor {
     scheduler: Arc<StreamingScheduler>,
     /// Session counter for ID generation
     session_counter: std::sync::atomic::AtomicU64,
+    /// Random tag of this executor instance, part of every generated
+    /// session ID. Session IDs name the multiprocess nodes' iceoryx2
+    /// channels (`{session}_{node}_input`, also built by the Python worker
+    /// from `--session-id`), which are system-wide: a bare counter would make
+    /// every process's first session `session_0`, so two hosts (or a host and
+    /// a previous one's leftover workers) would share channels.
+    instance_tag: String,
     /// Shared pipeline sessions keyed by logical room/session key.
     shared_sessions: Arc<RwLock<HashMap<String, Arc<SharedPipelineSession>>>>,
     /// Process-wide control bus for client-side pub/sub/intercept.
@@ -585,6 +592,7 @@ impl PipelineExecutor {
             registry,
             scheduler,
             session_counter: std::sync::atomic::AtomicU64::new(0),
+            instance_tag: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
             shared_sessions: Arc::new(RwLock::new(HashMap::new())),
             control_bus,
             default_pool: std::sync::Mutex::new(None),
@@ -762,12 +770,13 @@ impl PipelineExecutor {
         &self.registry
     }
 
-    /// Generate a unique session ID
+    /// Generate a session ID unique across processes:
+    /// `{prefix}_{instance tag}_{n}` (see `instance_tag`).
     pub fn generate_session_id(&self) -> String {
         let count = self
             .session_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        format!("{}_{}", self.config.session_id_prefix, count)
+        format!("{}_{}_{}", self.config.session_id_prefix, self.instance_tag, count)
     }
 
     /// Register a custom node factory
@@ -1130,6 +1139,10 @@ impl PipelineExecutor {
             return Err(e);
         }
         tracing::info!("cold_build_session: validate_manifest ok");
+        // Remember author-written node ids so observers can tell which nodes
+        // negotiation / managed-service preparation spliced in.
+        let authored_ids: std::collections::HashSet<String> =
+            manifest.nodes.iter().map(|n| n.id.clone()).collect();
         let manifest = self.negotiate_capabilities(manifest).await?;
         tracing::info!("cold_build_session: negotiate_capabilities ok");
         let manifest = self.managed_llama_servers.prepare(&manifest).await?;
@@ -1168,6 +1181,16 @@ impl PipelineExecutor {
             },
         )?;
 
+        let inserted: std::collections::HashSet<String> = manifest
+            .nodes
+            .iter()
+            .filter(|n| !authored_ids.contains(&n.id))
+            .map(|n| n.id.clone())
+            .collect();
+        if !inserted.is_empty() {
+            router.mark_inserted_nodes(&inserted);
+        }
+
         // Create and attach the per-session control bus. Must happen before
         // `start()` consumes the router's input_tx.
         let control = SessionControl::new(session_id.clone());
@@ -1193,7 +1216,8 @@ impl PipelineExecutor {
         ) {
             Ok(bridge) => bridge,
             Err(error) => {
-                self.control_bus.unregister(&session_id);
+                self.control_bus
+                    .unregister_with(&session_id, Some(error.to_string()));
                 return Err(error);
             }
         };
@@ -1225,9 +1249,11 @@ impl PipelineExecutor {
         // see SessionNotFound. The router itself drops at the end
         // of this scope.
         if let Err(e) = router.initialize_nodes().await {
-            self.control_bus.unregister(&session_id);
+            self.control_bus
+                .unregister_with(&session_id, Some(e.to_string()));
             return Err(e);
         }
+        control.set_phase(crate::transport::session_control::SessionPhase::Active);
 
         // Spawn router task. When the router exits, remove the session
         // entry from the bus so late attaches cleanly see SessionNotFound.
@@ -1245,7 +1271,10 @@ impl PipelineExecutor {
                     "Session router task exited with error"
                 );
             }
-            bus.unregister(&unregister_sid);
+            bus.unregister_with(
+                &unregister_sid,
+                result.as_ref().err().map(|e| e.to_string()),
+            );
             result
         });
 
@@ -1268,16 +1297,51 @@ impl PipelineExecutor {
         })
     }
 
-    /// Get scheduler metrics in Prometheus format
+    /// Get scheduler metrics in Prometheus format, aggregated over every
+    /// live session (each session router owns its own scheduler).
     pub async fn prometheus_metrics(&self) -> String {
-        self.scheduler.to_prometheus().await
+        let mut out = self.scheduler.to_prometheus().await;
+        for ctrl in self.live_controls() {
+            if let Some(tel) = ctrl.telemetry() {
+                out.push_str(&tel.scheduler().to_prometheus().await);
+            }
+        }
+        out
     }
 
-    /// Get scheduler statistics for all nodes
+    /// Get scheduler statistics for all nodes, aggregated over every live
+    /// session. Node ids that appear in several sessions are summed
+    /// (counts) / max-ed (latency percentiles); `circuit_breaker_open` is
+    /// true if it is open in any session.
     pub async fn get_node_stats(
         &self,
     ) -> std::collections::HashMap<String, crate::executor::streaming_scheduler::NodeStats> {
-        self.scheduler.get_all_node_stats().await
+        let mut merged = self.scheduler.get_all_node_stats().await;
+        for ctrl in self.live_controls() {
+            let Some(tel) = ctrl.telemetry() else { continue };
+            for (id, s) in tel.scheduler().get_all_node_stats().await {
+                merged
+                    .entry(id)
+                    .and_modify(|m| {
+                        m.execution_count += s.execution_count;
+                        m.error_count += s.error_count;
+                        m.circuit_breaker_open |= s.circuit_breaker_open;
+                        m.p50_us = m.p50_us.max(s.p50_us);
+                        m.p95_us = m.p95_us.max(s.p95_us);
+                        m.p99_us = m.p99_us.max(s.p99_us);
+                    })
+                    .or_insert(s);
+            }
+        }
+        merged
+    }
+
+    fn live_controls(&self) -> Vec<Arc<SessionControl>> {
+        self.control_bus
+            .list()
+            .into_iter()
+            .filter_map(|s| self.control_bus.get(&s.session_id))
+            .collect()
     }
 }
 
@@ -1359,6 +1423,15 @@ mod tests {
 
         assert_ne!(id1, id2);
         assert!(id1.starts_with("session_"));
+    }
+
+    /// Two executors (as in two processes) never hand out the same ID, so
+    /// their multiprocess nodes' iceoryx2 channels can't collide.
+    #[test]
+    fn test_session_ids_differ_between_executors() {
+        let a = PipelineExecutor::new().unwrap();
+        let b = PipelineExecutor::new().unwrap();
+        assert_ne!(a.generate_session_id(), b.generate_session_id());
     }
 
     #[test]

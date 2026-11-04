@@ -114,13 +114,14 @@ class ReplyDemux {
   }
 
   async _consume() {
+    let failure = new RpcError("reply subscription closed");
     try {
       while (!this._closed) {
         let data;
         try {
           data = await this._subscription.recv();
-        } catch (_) {
-          // Channel closed by transport. Drain pending callers.
+        } catch (error) {
+          failure = new RpcError(`reply subscription failed: ${error.message || error}`);
           break;
         }
         if (data == null) {
@@ -136,13 +137,17 @@ class ReplyDemux {
         this._dispatch(String(corrId), kind, payload);
       }
     } finally {
+      this._closed = true;
       // Reject any remaining unary calls so callers don't hang forever.
       for (const [, entry] of this._unary) {
         if (entry.timeoutHandle) clearTimeout(entry.timeoutHandle);
-        entry.reject(new RpcError('reply subscription closed'));
+        entry.reject(failure);
       }
       this._unary.clear();
-      for (const [, q] of this._streams) q.close();
+      for (const [, q] of this._streams) {
+        q.put({ kind: "error", payload: failure.message });
+        q.close();
+      }
       this._streams.clear();
     }
   }
@@ -203,6 +208,7 @@ class ReplyDemux {
   }
 
   registerUnary(corrId, timeoutMs) {
+    if (this._closed) return Promise.reject(new RpcError('reply subscription closed'));
     return new Promise((resolve, reject) => {
       const timeoutHandle =
         timeoutMs != null && Number.isFinite(timeoutMs) && timeoutMs > 0
@@ -221,6 +227,7 @@ class ReplyDemux {
   }
 
   registerStream(corrId) {
+    if (this._closed) throw new RpcError('reply subscription closed');
     const q = new _StreamQueue();
     this._streams.set(corrId, q);
     return q;
