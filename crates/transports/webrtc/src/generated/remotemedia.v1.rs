@@ -958,7 +958,7 @@ pub mod intercept_decision {
 pub struct Empty {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlFrame {
-    #[prost(oneof = "control_frame::Op", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "control_frame::Op", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub op: ::core::option::Option<control_frame::Op>,
 }
 /// Nested message and enum types in `ControlFrame`.
@@ -983,6 +983,9 @@ pub mod control_frame {
         SetNodeState(super::SetNodeState),
         #[prost(message, tag = "9")]
         ClearNodeState(super::ClearNodeState),
+        /// Change this session's telemetry level / snapshot interval.
+        #[prost(message, tag = "10")]
+        SetTelemetry(super::SetTelemetry),
     }
 }
 /// Identifies the session this attach is scoped to. MUST be the first frame.
@@ -1046,6 +1049,16 @@ pub struct ClearNodeState {
     #[prost(string, tag = "1")]
     pub node_id: ::prost::alloc::string::String,
 }
+/// Telemetry level for the attached session: "off" | "counters" | "auto" |
+/// "full". Empty = unchanged. `interval_ms` 0 = unchanged (else clamped to
+/// 250–5000).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetTelemetry {
+    #[prost(string, tag = "1")]
+    pub level: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub interval_ms: u32,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlEvent {
     #[prost(oneof = "control_event::Event", tags = "1, 2, 3, 4, 5")]
@@ -1080,6 +1093,10 @@ pub struct Attached {
     pub session_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub attach_id: ::prost::alloc::string::String,
+    /// Telemetry / descriptor schema version the server speaks (0 = server
+    /// predates live-pipeline-observer).
+    #[prost(uint32, tag = "3")]
+    pub observer_schema_version: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TapEvent {
@@ -1114,6 +1131,89 @@ pub struct SessionClosed {
     /// Free-form detail (e.g. the Error string for CloseReason::Error).
     #[prost(string, tag = "2")]
     pub detail: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionSummaryPb {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub pipeline_name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub created_at_ms: u64,
+    /// Transport kind ("grpc", "webrtc", "http", "ui", "ffi"); empty if unknown.
+    #[prost(string, tag = "4")]
+    pub transport: ::prost::alloc::string::String,
+    /// "initializing" | "warm" | "active" | "closing".
+    #[prost(string, tag = "5")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "6")]
+    pub node_count: u32,
+    /// Transport-specific origin (peer id, remote address); empty if unknown.
+    #[prost(string, tag = "7")]
+    pub origin: ::prost::alloc::string::String,
+    /// Whether hot-path telemetry counters exist for this session.
+    #[prost(bool, tag = "8")]
+    pub has_telemetry: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListSessionsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListSessionsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub sessions: ::prost::alloc::vec::Vec<SessionSummaryPb>,
+    #[prost(uint32, tag = "2")]
+    pub observer_schema_version: u32,
+    #[prost(string, tag = "3")]
+    pub server_version: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DescribeSessionRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DescribeSessionResponse {
+    /// `SessionDescriptor` serialized as JSON (the Rust serde type is the
+    /// schema; see docs/OBSERVABILITY.md).
+    #[prost(string, tag = "1")]
+    pub descriptor_json: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub schema_version: u32,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchSessionsRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionClosedInfo {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub ts_ms: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionLifecycle {
+    #[prost(oneof = "session_lifecycle::Event", tags = "1, 2, 3, 4, 5")]
+    pub event: ::core::option::Option<session_lifecycle::Event>,
+}
+/// Nested message and enum types in `SessionLifecycle`.
+pub mod session_lifecycle {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        /// First message on every WatchSessions stream.
+        #[prost(message, tag = "1")]
+        Initial(super::ListSessionsResponse),
+        #[prost(message, tag = "2")]
+        Created(super::SessionSummaryPb),
+        #[prost(message, tag = "3")]
+        Updated(super::SessionSummaryPb),
+        #[prost(message, tag = "4")]
+        Closed(super::SessionClosedInfo),
+        /// The watcher fell behind; clients should treat the next `initial`
+        /// as authoritative (the server re-sends one immediately).
+        #[prost(message, tag = "5")]
+        Resync(super::Empty),
+    }
 }
 /// Which side of a node the client is talking to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -1370,6 +1470,89 @@ pub mod pipeline_control_client {
                 .insert(GrpcMethod::new("remotemedia.v1.PipelineControl", "Attach"));
             self.inner.streaming(req, path, codec).await
         }
+        /// ── Discovery (openspec: add-live-pipeline-observer) ─────────────────
+        /// List every session registered on this process's control bus.
+        pub async fn list_sessions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListSessionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListSessionsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.PipelineControl/ListSessions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("remotemedia.v1.PipelineControl", "ListSessions"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Running topology of one session (nodes, ports, edges). NOT_FOUND for
+        /// unknown ids.
+        pub async fn describe_session(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DescribeSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DescribeSessionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.PipelineControl/DescribeSession",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("remotemedia.v1.PipelineControl", "DescribeSession"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Initial session list followed by created / updated / closed events.
+        pub async fn watch_sessions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchSessionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::SessionLifecycle>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.PipelineControl/WatchSessions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("remotemedia.v1.PipelineControl", "WatchSessions"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1398,6 +1581,38 @@ pub mod pipeline_control_server {
             &self,
             request: tonic::Request<tonic::Streaming<super::ControlFrame>>,
         ) -> std::result::Result<tonic::Response<Self::AttachStream>, tonic::Status>;
+        /// ── Discovery (openspec: add-live-pipeline-observer) ─────────────────
+        /// List every session registered on this process's control bus.
+        async fn list_sessions(
+            &self,
+            request: tonic::Request<super::ListSessionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListSessionsResponse>,
+            tonic::Status,
+        >;
+        /// Running topology of one session (nodes, ports, edges). NOT_FOUND for
+        /// unknown ids.
+        async fn describe_session(
+            &self,
+            request: tonic::Request<super::DescribeSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DescribeSessionResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the WatchSessions method.
+        type WatchSessionsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::SessionLifecycle, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Initial session list followed by created / updated / closed events.
+        async fn watch_sessions(
+            &self,
+            request: tonic::Request<super::WatchSessionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::WatchSessionsStream>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct PipelineControlServer<T> {
@@ -1519,6 +1734,144 @@ pub mod pipeline_control_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.PipelineControl/ListSessions" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListSessionsSvc<T: PipelineControl>(pub Arc<T>);
+                    impl<
+                        T: PipelineControl,
+                    > tonic::server::UnaryService<super::ListSessionsRequest>
+                    for ListSessionsSvc<T> {
+                        type Response = super::ListSessionsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListSessionsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PipelineControl>::list_sessions(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListSessionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.PipelineControl/DescribeSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct DescribeSessionSvc<T: PipelineControl>(pub Arc<T>);
+                    impl<
+                        T: PipelineControl,
+                    > tonic::server::UnaryService<super::DescribeSessionRequest>
+                    for DescribeSessionSvc<T> {
+                        type Response = super::DescribeSessionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DescribeSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PipelineControl>::describe_session(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DescribeSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.PipelineControl/WatchSessions" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchSessionsSvc<T: PipelineControl>(pub Arc<T>);
+                    impl<
+                        T: PipelineControl,
+                    > tonic::server::ServerStreamingService<super::WatchSessionsRequest>
+                    for WatchSessionsSvc<T> {
+                        type Response = super::SessionLifecycle;
+                        type ResponseStream = T::WatchSessionsStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WatchSessionsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PipelineControl>::watch_sessions(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchSessionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

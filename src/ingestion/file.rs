@@ -107,8 +107,12 @@ pub fn url_to_path(url: &str) -> Result<PathBuf, Error> {
             // Unix absolute path or Windows path with drive letter
             #[cfg(windows)]
             {
-                // On Windows, file:///C:/path should become C:/path
-                let path = stripped.strip_prefix('/').unwrap_or(stripped);
+                // On Windows, file:///C:/path should become C:/path; a
+                // drive-less file:///path stays rooted (\path), not relative.
+                let rest = &stripped[1..];
+                let b = rest.as_bytes();
+                let has_drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+                let path = if has_drive { rest } else { stripped };
                 return Ok(PathBuf::from(path));
             }
             #[cfg(not(windows))]
@@ -832,6 +836,15 @@ mod tests {
         assert_eq!(
             url_to_path("file://relative/path.wav").unwrap(),
             PathBuf::from("relative/path.wav")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_url_to_path_handles_windows_drive_urls() {
+        assert_eq!(
+            url_to_path("file:///C:/media/file.wav").unwrap(),
+            PathBuf::from("C:/media/file.wav")
         );
     }
 

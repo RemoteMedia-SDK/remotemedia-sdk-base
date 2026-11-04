@@ -789,6 +789,8 @@ impl ServerPeer {
         // TrackRegistry so registered tracks publish media_clock on the
         // shared pipeline session bus at `<medium>:<stream_id>`.
         if let Some(ctrl) = self.executor.control_bus().get(shared_session.session_id()) {
+            // Discovery metadata (openspec: add-live-pipeline-observer).
+            ctrl.set_transport_info("webrtc", Some(self.peer_id.clone()));
             self.track_registry
                 .attach_session_control(Arc::clone(&ctrl))
                 .await;

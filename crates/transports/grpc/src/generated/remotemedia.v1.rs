@@ -12,6 +12,7 @@
 /// DataBuffer json_buf = {
 /// json: { json_payload: "{"operation": "add"}", ... }
 /// };
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DataBuffer {
     /// Optional metadata for extensibility
@@ -29,6 +30,7 @@ pub struct DataBuffer {
 /// Nested message and enum types in `DataBuffer`.
 pub mod data_buffer {
     /// Data type discriminator (exactly one must be set)
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum DataType {
         #[prost(message, tag = "1")]
@@ -60,6 +62,7 @@ pub mod data_buffer {
 /// For stereo: \[L0, R0, L1, R1, L2, R2, ...\]
 ///
 /// This type is unchanged from Feature 003 to maintain backward compatibility.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AudioBuffer {
     /// Raw audio samples (interleaved, little-endian)
@@ -94,6 +97,7 @@ pub struct AudioBuffer {
 /// Validation:
 /// Raw: pixel_data.len() == width * height * format.bytes_per_pixel()
 /// Encoded: pixel_data.len() is variable (codec-dependent)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VideoFrame {
     /// Raw pixel data or encoded bitstream
@@ -139,6 +143,7 @@ pub struct VideoFrame {
 /// shape: \[512\],
 /// dtype: TENSOR_DTYPE_F32
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TensorBuffer {
     /// Raw tensor data (row-major layout by default)
@@ -173,6 +178,7 @@ pub struct TensorBuffer {
 /// c_contiguous: true,
 /// f_contiguous: false
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NumpyBuffer {
     /// Raw array data (bytes)
@@ -207,6 +213,7 @@ pub struct NumpyBuffer {
 /// json_payload: "{"operation": "add", "operands": \[10, 20\]}",
 /// schema_type: "CalculatorRequest"
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct JsonData {
     /// JSON payload as string (required, must be valid JSON)
@@ -228,6 +235,7 @@ pub struct JsonData {
 /// encoding: "utf-8",
 /// language: "en"
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TextBuffer {
     /// Text data as UTF-8 encoded bytes
@@ -261,6 +269,7 @@ pub struct TextBuffer {
 /// data: <PNG file bytes>,
 /// mime_type: "image/png"
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BinaryBuffer {
     /// Raw binary data
@@ -297,6 +306,7 @@ pub struct BinaryBuffer {
 /// offset: 1048576,  // 1 MB offset
 /// length: 65536     // 64 KB chunk
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileBuffer {
     /// File path (required, UTF-8)
@@ -349,6 +359,7 @@ pub struct FileBuffer {
 /// segment_id: "seg_abc123",
 /// timestamp_ms: 1500
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ControlMessage {
     /// Optional target segment ID for cancellation
@@ -368,6 +379,7 @@ pub struct ControlMessage {
 /// Nested message and enum types in `ControlMessage`.
 pub mod control_message {
     /// Control message type (exactly one must be set)
+    #[allow(clippy::all)]
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum MessageType {
         #[prost(message, tag = "1")]
@@ -379,6 +391,7 @@ pub mod control_message {
     }
 }
 /// Cancel a speculative segment (retroactive cancellation)
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelSpeculation {
     /// Start timestamp of segment to cancel (sample index or microseconds)
@@ -389,6 +402,7 @@ pub struct CancelSpeculation {
     pub to_timestamp: u64,
 }
 /// Hint to increase batch size for throughput
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BatchHint {
     /// Suggested batch size for downstream nodes
@@ -396,6 +410,7 @@ pub struct BatchHint {
     pub suggested_batch_size: u32,
 }
 /// Soft deadline approaching (not a hard timeout)
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeadlineWarning {
     /// Deadline in microseconds from now
@@ -405,6 +420,7 @@ pub struct DeadlineWarning {
 /// Performance metrics for pipeline execution
 ///
 /// UPDATED: Added serialization_time_ms and data_type_breakdown
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecutionMetrics {
     /// Wall-clock time from request receipt to response ready (milliseconds)
@@ -444,6 +460,7 @@ pub struct ExecutionMetrics {
     >,
 }
 /// Performance metrics for a single node execution
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NodeMetrics {
     /// Time spent executing this node's process() method (milliseconds)
@@ -464,6 +481,7 @@ pub struct NodeMetrics {
 /// Structured error information for debugging and diagnostics
 ///
 /// UPDATED: Added ERROR_TYPE_TYPE_VALIDATION for generic type errors
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ErrorResponse {
     /// Error category for programmatic handling
@@ -486,6 +504,7 @@ pub struct ErrorResponse {
 /// Service version and protocol compatibility information
 ///
 /// Returned by GetVersion() RPC to enable client compatibility checks.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VersionInfo {
     /// Current protocol version (e.g., "v1")
@@ -511,6 +530,7 @@ pub struct VersionInfo {
 ///
 /// Clients can request custom limits within service-defined maximums.
 /// Service applies defaults if not specified.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResourceLimits {
     /// Maximum memory allocation (bytes)
@@ -528,6 +548,7 @@ pub struct ResourceLimits {
     pub max_audio_samples: u64,
 }
 /// Execution details for a single node
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NodeResult {
     /// Node ID from manifest
@@ -545,6 +566,7 @@ pub struct NodeResult {
     pub output_metadata: ::prost::alloc::string::String,
 }
 /// Audio sample encoding format
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum AudioFormat {
@@ -584,6 +606,7 @@ impl AudioFormat {
     }
 }
 /// Pixel format enumeration
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum PixelFormat {
@@ -639,6 +662,7 @@ impl PixelFormat {
     }
 }
 /// Video codec enumeration (Spec 012: Video Codec Support)
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum VideoCodec {
@@ -677,6 +701,7 @@ impl VideoCodec {
     }
 }
 /// Tensor data type enumeration
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TensorDtype {
@@ -736,6 +761,7 @@ impl TensorDtype {
 /// input_types: \[DATA_TYPE_HINT_AUDIO\],
 /// output_types: \[DATA_TYPE_HINT_JSON\]
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum DataTypeHint {
@@ -789,6 +815,7 @@ impl DataTypeHint {
 /// Error category enumeration
 ///
 /// UPDATED: Added ERROR_TYPE_TYPE_VALIDATION
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ErrorType {
@@ -849,6 +876,7 @@ impl ErrorType {
     }
 }
 /// Overall pipeline execution status
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ExecutionStatus {
@@ -886,6 +914,7 @@ impl ExecutionStatus {
     }
 }
 /// Execution status for a single node
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum NodeStatus {
@@ -924,6 +953,7 @@ impl NodeStatus {
 /// Request to execute a pipeline
 ///
 /// UPDATED: Uses generic data_inputs map
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecuteRequest {
     /// Pipeline manifest
@@ -977,6 +1007,7 @@ pub struct ExecuteRequest {
 }
 /// A native plugin blob shipped inline with an ExecuteRequest so the server
 /// can load it without a prior deploy.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EmbeddedPluginBlob {
     /// sha256 hex digest of `content` (matches the bundle lock artifact_digest).
@@ -988,6 +1019,7 @@ pub struct EmbeddedPluginBlob {
 }
 /// A single frozen Python wheel shipped inline with a request so the
 /// server can materialize it into a venv without a prior deploy.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EmbeddedWheel {
     /// Distribution name (PEP 503 normalized, e.g. "remotemedia-client").
@@ -1004,6 +1036,7 @@ pub struct EmbeddedWheel {
     pub content: ::prost::alloc::vec::Vec<u8>,
 }
 /// Locked interpreter target the wheels were frozen against.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EmbeddedInterpreter {
     /// Implementation tag, e.g. "cp" (CPython) or "pp" (PyPy).
@@ -1022,6 +1055,7 @@ pub struct EmbeddedInterpreter {
 /// Self-contained Python environment (frozen wheelhouse) shipped inline
 /// with a request so the server can build a venv without a prior deploy
 /// or a resolvable filesystem path. Parallel to EmbeddedPluginBlob.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EmbeddedPythonEnv {
     #[prost(message, optional, tag = "1")]
@@ -1033,6 +1067,7 @@ pub struct EmbeddedPythonEnv {
     pub wheels: ::prost::alloc::vec::Vec<EmbeddedWheel>,
 }
 /// Response from pipeline execution (unchanged from Feature 003)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecuteResponse {
     /// Either result or error (mutually exclusive)
@@ -1042,6 +1077,7 @@ pub struct ExecuteResponse {
 /// Nested message and enum types in `ExecuteResponse`.
 pub mod execute_response {
     /// Either result or error (mutually exclusive)
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Outcome {
         /// Execution result (if successful)
@@ -1055,6 +1091,7 @@ pub mod execute_response {
 /// Pipeline manifest structure (v1)
 ///
 /// UPDATED: NodeManifest adds input_types and output_types for type validation
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PipelineManifest {
     /// Schema version (e.g., "v1")
@@ -1084,6 +1121,7 @@ pub struct PipelineManifest {
     pub manifest_json: ::prost::alloc::vec::Vec<u8>,
 }
 /// Pipeline metadata (unchanged from Feature 003)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ManifestMetadata {
     /// Pipeline name (required)
@@ -1101,6 +1139,7 @@ pub struct ManifestMetadata {
 /// Node manifest entry
 ///
 /// UPDATED: Added input_types and output_types for type validation
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NodeManifest {
     /// Unique node ID within pipeline
@@ -1163,6 +1202,7 @@ pub struct NodeManifest {
     pub output_types: ::prost::alloc::vec::Vec<i32>,
 }
 /// Connection between nodes (unchanged from Feature 003)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Connection {
     /// Source node ID (produces output)
@@ -1173,6 +1213,7 @@ pub struct Connection {
     pub to: ::prost::alloc::string::String,
 }
 /// Hardware/resource requirements for node execution
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CapabilityRequirements {
     /// GPU requirements
@@ -1186,6 +1227,7 @@ pub struct CapabilityRequirements {
     pub memory_gb: f64,
 }
 /// GPU hardware requirements
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GpuRequirement {
     /// GPU type: "cuda", "rocm", "metal"
@@ -1199,6 +1241,7 @@ pub struct GpuRequirement {
     pub required: bool,
 }
 /// CPU requirements
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CpuRequirement {
     /// Minimum number of cores
@@ -1212,6 +1255,7 @@ pub struct CpuRequirement {
 /// Result of successful pipeline execution
 ///
 /// UPDATED: Uses generic data_outputs map
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecutionResult {
     /// UPDATED: Generic data outputs (keyed by node ID)
@@ -1246,6 +1290,7 @@ pub struct ExecutionResult {
     pub status: i32,
 }
 /// Request for version information
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VersionRequest {
     /// Client version for compatibility check (e.g., "v1", "v1.2.0")
@@ -1253,6 +1298,7 @@ pub struct VersionRequest {
     pub client_version: ::prost::alloc::string::String,
 }
 /// Response with version and compatibility information
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VersionResponse {
     /// Service version details
@@ -1267,6 +1313,7 @@ pub struct VersionResponse {
     pub compatibility_message: ::prost::alloc::string::String,
 }
 /// Runtime hint for Python node execution
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum RuntimeHint {
@@ -1727,6 +1774,7 @@ pub mod pipeline_execution_service_server {
 /// Client streaming request
 ///
 /// UPDATED: Generic data streaming
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamRequest {
     /// Request type (only one field set per message)
@@ -1736,6 +1784,7 @@ pub struct StreamRequest {
 /// Nested message and enum types in `StreamRequest`.
 pub mod stream_request {
     /// Request type (only one field set per message)
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Request {
         /// First message: pipeline initialization
@@ -1751,6 +1800,7 @@ pub mod stream_request {
     }
 }
 /// Initialize streaming pipeline (first message)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamInit {
     /// Pipeline manifest
@@ -1826,6 +1876,7 @@ pub struct StreamInit {
 /// * Exactly one of buffer OR named_buffers must be set (not both, not neither)
 /// * Sequence numbers must be strictly monotonic increasing
 /// * Timestamps should be non-decreasing (warnings for inversions)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DataChunk {
     /// Target node ID (must match manifest node)
@@ -1855,6 +1906,7 @@ pub struct DataChunk {
     pub timestamp_ms: u64,
 }
 /// Stream control commands (unchanged from Feature 003)
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StreamControl {
     /// Control command type
@@ -1864,6 +1916,7 @@ pub struct StreamControl {
 /// Nested message and enum types in `StreamControl`.
 pub mod stream_control {
     /// Control command enumeration
+    #[allow(clippy::all)]
     #[derive(
         Clone,
         Copy,
@@ -1909,6 +1962,7 @@ pub mod stream_control {
 /// Server streaming response
 ///
 /// UPDATED: ChunkResult now uses generic data outputs
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamResponse {
     /// Response type (only one field set per message)
@@ -1918,6 +1972,7 @@ pub struct StreamResponse {
 /// Nested message and enum types in `StreamResponse`.
 pub mod stream_response {
     /// Response type (only one field set per message)
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Response {
         /// First response: pipeline ready to receive chunks
@@ -1938,6 +1993,7 @@ pub mod stream_response {
     }
 }
 /// Pipeline initialized and ready to receive chunks
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StreamReady {
     /// Unique session ID for this stream
@@ -1956,6 +2012,7 @@ pub struct StreamReady {
 /// Result from processing a single chunk
 ///
 /// UPDATED: Uses generic data_outputs map (replaces audio_outputs + string data_outputs)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChunkResult {
     /// Sequence number (matches input DataChunk.sequence)
@@ -1995,6 +2052,7 @@ pub struct ChunkResult {
 /// real-time visibility into stream health.
 ///
 /// UPDATED: Uses generic item counting and type breakdown
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamMetrics {
     /// Session ID
@@ -2051,6 +2109,7 @@ pub struct StreamMetrics {
     pub cache_hit_rate: f64,
 }
 /// Stream closed gracefully (unchanged from Feature 003)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamClosed {
     /// Session ID
@@ -2064,6 +2123,7 @@ pub struct StreamClosed {
     pub reason: ::prost::alloc::string::String,
 }
 /// Extended error response for streaming (unchanged from Feature 003)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StreamErrorResponse {
     /// Base error information
@@ -2080,6 +2140,7 @@ pub struct StreamErrorResponse {
     pub session_id: ::prost::alloc::string::String,
 }
 /// Streaming-specific error types (unchanged from Feature 003)
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StreamErrorType {
@@ -2484,6 +2545,7 @@ pub mod streaming_pipeline_service_server {
     }
 }
 /// A point within the session's pipeline. Mirrors `ControlAddress` in Rust.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ControlAddress {
     #[prost(string, tag = "1")]
@@ -2495,6 +2557,7 @@ pub struct ControlAddress {
     pub direction: i32,
 }
 /// Decision the client returns for an `InterceptRequest`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InterceptDecision {
     #[prost(oneof = "intercept_decision::Decision", tags = "1, 2, 3")]
@@ -2502,6 +2565,7 @@ pub struct InterceptDecision {
 }
 /// Nested message and enum types in `InterceptDecision`.
 pub mod intercept_decision {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Decision {
         /// Forward the frame unchanged.
@@ -2516,15 +2580,18 @@ pub mod intercept_decision {
     }
 }
 /// Empty placeholder (protobuf oneof can't have bare tag variants).
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Empty {}
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlFrame {
-    #[prost(oneof = "control_frame::Op", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "control_frame::Op", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub op: ::core::option::Option<control_frame::Op>,
 }
 /// Nested message and enum types in `ControlFrame`.
 pub mod control_frame {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Op {
         #[prost(message, tag = "1")]
@@ -2545,9 +2612,13 @@ pub mod control_frame {
         SetNodeState(super::SetNodeState),
         #[prost(message, tag = "9")]
         ClearNodeState(super::ClearNodeState),
+        /// Change this session's telemetry level / snapshot interval.
+        #[prost(message, tag = "10")]
+        SetTelemetry(super::SetTelemetry),
     }
 }
 /// Identifies the session this attach is scoped to. MUST be the first frame.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Hello {
     #[prost(string, tag = "1")]
@@ -2557,16 +2628,19 @@ pub struct Hello {
     #[prost(string, tag = "2")]
     pub attach_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Subscribe {
     #[prost(message, optional, tag = "1")]
     pub addr: ::core::option::Option<ControlAddress>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Unsubscribe {
     #[prost(message, optional, tag = "1")]
     pub addr: ::core::option::Option<ControlAddress>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Publish {
     #[prost(message, optional, tag = "1")]
@@ -2574,11 +2648,13 @@ pub struct Publish {
     #[prost(message, optional, tag = "2")]
     pub data: ::core::option::Option<DataBuffer>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveIntercept {
     #[prost(message, optional, tag = "1")]
     pub addr: ::core::option::Option<ControlAddress>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Intercept {
     #[prost(message, optional, tag = "1")]
@@ -2588,6 +2664,7 @@ pub struct Intercept {
     #[prost(uint32, tag = "2")]
     pub deadline_ms: u32,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InterceptReply {
     /// Matches the `correlation_id` on the inbound `InterceptRequest` event.
@@ -2596,6 +2673,7 @@ pub struct InterceptReply {
     #[prost(message, optional, tag = "2")]
     pub decision: ::core::option::Option<InterceptDecision>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SetNodeState {
     #[prost(string, tag = "1")]
@@ -2603,11 +2681,24 @@ pub struct SetNodeState {
     #[prost(enumeration = "NodeState", tag = "2")]
     pub state: i32,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClearNodeState {
     #[prost(string, tag = "1")]
     pub node_id: ::prost::alloc::string::String,
 }
+/// Telemetry level for the attached session: "off" | "counters" | "auto" |
+/// "full". Empty = unchanged. `interval_ms` 0 = unchanged (else clamped to
+/// 250–5000).
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetTelemetry {
+    #[prost(string, tag = "1")]
+    pub level: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub interval_ms: u32,
+}
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlEvent {
     #[prost(oneof = "control_event::Event", tags = "1, 2, 3, 4, 5")]
@@ -2615,6 +2706,7 @@ pub struct ControlEvent {
 }
 /// Nested message and enum types in `ControlEvent`.
 pub mod control_event {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Event {
         /// Attach was accepted. Sent exactly once, in response to Hello.
@@ -2636,13 +2728,19 @@ pub mod control_event {
         SessionClosed(super::SessionClosed),
     }
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Attached {
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub attach_id: ::prost::alloc::string::String,
+    /// Telemetry / descriptor schema version the server speaks (0 = server
+    /// predates live-pipeline-observer).
+    #[prost(uint32, tag = "3")]
+    pub observer_schema_version: u32,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TapEvent {
     #[prost(message, optional, tag = "1")]
@@ -2650,6 +2748,7 @@ pub struct TapEvent {
     #[prost(message, optional, tag = "2")]
     pub data: ::core::option::Option<DataBuffer>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InterceptRequest {
     #[prost(message, optional, tag = "1")]
@@ -2659,6 +2758,7 @@ pub struct InterceptRequest {
     #[prost(message, optional, tag = "3")]
     pub data: ::core::option::Option<DataBuffer>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ErrorEvent {
     #[prost(enumeration = "ControlErrorCode", tag = "1")]
@@ -2669,6 +2769,7 @@ pub struct ErrorEvent {
     #[prost(message, optional, tag = "3")]
     pub addr: ::core::option::Option<ControlAddress>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionClosed {
     #[prost(enumeration = "CloseReasonCode", tag = "1")]
@@ -2677,7 +2778,100 @@ pub struct SessionClosed {
     #[prost(string, tag = "2")]
     pub detail: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionSummaryPb {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub pipeline_name: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub created_at_ms: u64,
+    /// Transport kind ("grpc", "webrtc", "http", "ui", "ffi"); empty if unknown.
+    #[prost(string, tag = "4")]
+    pub transport: ::prost::alloc::string::String,
+    /// "initializing" | "warm" | "active" | "closing".
+    #[prost(string, tag = "5")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "6")]
+    pub node_count: u32,
+    /// Transport-specific origin (peer id, remote address); empty if unknown.
+    #[prost(string, tag = "7")]
+    pub origin: ::prost::alloc::string::String,
+    /// Whether hot-path telemetry counters exist for this session.
+    #[prost(bool, tag = "8")]
+    pub has_telemetry: bool,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListSessionsRequest {}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListSessionsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub sessions: ::prost::alloc::vec::Vec<SessionSummaryPb>,
+    #[prost(uint32, tag = "2")]
+    pub observer_schema_version: u32,
+    #[prost(string, tag = "3")]
+    pub server_version: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DescribeSessionRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DescribeSessionResponse {
+    /// `SessionDescriptor` serialized as JSON (the Rust serde type is the
+    /// schema; see docs/OBSERVABILITY.md).
+    #[prost(string, tag = "1")]
+    pub descriptor_json: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub schema_version: u32,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchSessionsRequest {}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionClosedInfo {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub ts_ms: u64,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionLifecycle {
+    #[prost(oneof = "session_lifecycle::Event", tags = "1, 2, 3, 4, 5")]
+    pub event: ::core::option::Option<session_lifecycle::Event>,
+}
+/// Nested message and enum types in `SessionLifecycle`.
+pub mod session_lifecycle {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        /// First message on every WatchSessions stream.
+        #[prost(message, tag = "1")]
+        Initial(super::ListSessionsResponse),
+        #[prost(message, tag = "2")]
+        Created(super::SessionSummaryPb),
+        #[prost(message, tag = "3")]
+        Updated(super::SessionSummaryPb),
+        #[prost(message, tag = "4")]
+        Closed(super::SessionClosedInfo),
+        /// The watcher fell behind; clients should treat the next `initial`
+        /// as authoritative (the server re-sends one immediately).
+        #[prost(message, tag = "5")]
+        Resync(super::Empty),
+    }
+}
 /// Which side of a node the client is talking to.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ControlDirection {
@@ -2710,6 +2904,7 @@ impl ControlDirection {
     }
 }
 /// Runtime execution state for a single node. Mirrors Rust `NodeState`.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum NodeState {
@@ -2743,6 +2938,7 @@ impl NodeState {
     }
 }
 /// Structured error codes. Granular for client-side pattern-matching.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ControlErrorCode {
@@ -2785,6 +2981,7 @@ impl ControlErrorCode {
         }
     }
 }
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum CloseReasonCode {
@@ -2932,6 +3129,89 @@ pub mod pipeline_control_client {
                 .insert(GrpcMethod::new("remotemedia.v1.PipelineControl", "Attach"));
             self.inner.streaming(req, path, codec).await
         }
+        /// ── Discovery (openspec: add-live-pipeline-observer) ─────────────────
+        /// List every session registered on this process's control bus.
+        pub async fn list_sessions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListSessionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListSessionsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.PipelineControl/ListSessions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("remotemedia.v1.PipelineControl", "ListSessions"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Running topology of one session (nodes, ports, edges). NOT_FOUND for
+        /// unknown ids.
+        pub async fn describe_session(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DescribeSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DescribeSessionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.PipelineControl/DescribeSession",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("remotemedia.v1.PipelineControl", "DescribeSession"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Initial session list followed by created / updated / closed events.
+        pub async fn watch_sessions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchSessionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::SessionLifecycle>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.PipelineControl/WatchSessions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("remotemedia.v1.PipelineControl", "WatchSessions"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -2960,6 +3240,38 @@ pub mod pipeline_control_server {
             &self,
             request: tonic::Request<tonic::Streaming<super::ControlFrame>>,
         ) -> std::result::Result<tonic::Response<Self::AttachStream>, tonic::Status>;
+        /// ── Discovery (openspec: add-live-pipeline-observer) ─────────────────
+        /// List every session registered on this process's control bus.
+        async fn list_sessions(
+            &self,
+            request: tonic::Request<super::ListSessionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListSessionsResponse>,
+            tonic::Status,
+        >;
+        /// Running topology of one session (nodes, ports, edges). NOT_FOUND for
+        /// unknown ids.
+        async fn describe_session(
+            &self,
+            request: tonic::Request<super::DescribeSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::DescribeSessionResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the WatchSessions method.
+        type WatchSessionsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::SessionLifecycle, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Initial session list followed by created / updated / closed events.
+        async fn watch_sessions(
+            &self,
+            request: tonic::Request<super::WatchSessionsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::WatchSessionsStream>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct PipelineControlServer<T> {
@@ -3085,6 +3397,144 @@ pub mod pipeline_control_server {
                     };
                     Box::pin(fut)
                 }
+                "/remotemedia.v1.PipelineControl/ListSessions" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListSessionsSvc<T: PipelineControl>(pub Arc<T>);
+                    impl<
+                        T: PipelineControl,
+                    > tonic::server::UnaryService<super::ListSessionsRequest>
+                    for ListSessionsSvc<T> {
+                        type Response = super::ListSessionsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListSessionsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PipelineControl>::list_sessions(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListSessionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.PipelineControl/DescribeSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct DescribeSessionSvc<T: PipelineControl>(pub Arc<T>);
+                    impl<
+                        T: PipelineControl,
+                    > tonic::server::UnaryService<super::DescribeSessionRequest>
+                    for DescribeSessionSvc<T> {
+                        type Response = super::DescribeSessionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DescribeSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PipelineControl>::describe_session(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DescribeSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.PipelineControl/WatchSessions" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchSessionsSvc<T: PipelineControl>(pub Arc<T>);
+                    impl<
+                        T: PipelineControl,
+                    > tonic::server::ServerStreamingService<super::WatchSessionsRequest>
+                    for WatchSessionsSvc<T> {
+                        type Response = super::SessionLifecycle;
+                        type ResponseStream = T::WatchSessionsStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WatchSessionsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PipelineControl>::watch_sessions(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchSessionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 _ => {
                     Box::pin(async move {
                         let mut response = http::Response::new(
@@ -3125,16 +3575,19 @@ pub mod pipeline_control_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeploymentCapabilitiesRequest {
     #[prost(string, tag = "1")]
     pub protocol_version: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListDeploymentsRequest {
     #[prost(string, tag = "1")]
     pub protocol_version: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeploymentJsonResponse {
     #[prost(string, tag = "1")]
@@ -3142,6 +3595,7 @@ pub struct DeploymentJsonResponse {
     #[prost(bytes = "vec", tag = "2")]
     pub canonical_json: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BundlePreflightRequest {
     #[prost(string, tag = "1")]
@@ -3149,6 +3603,7 @@ pub struct BundlePreflightRequest {
     #[prost(bytes = "vec", tag = "2")]
     pub candidates_json: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BlobIdentity {
     #[prost(string, tag = "1")]
@@ -3156,6 +3611,7 @@ pub struct BlobIdentity {
     #[prost(uint64, tag = "2")]
     pub size: u64,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MissingBlobsRequest {
     #[prost(string, tag = "1")]
@@ -3163,6 +3619,7 @@ pub struct MissingBlobsRequest {
     #[prost(message, repeated, tag = "2")]
     pub blobs: ::prost::alloc::vec::Vec<BlobIdentity>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MissingBlobsResponse {
     #[prost(string, tag = "1")]
@@ -3170,6 +3627,7 @@ pub struct MissingBlobsResponse {
     #[prost(message, repeated, tag = "2")]
     pub missing: ::prost::alloc::vec::Vec<BlobIdentity>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UploadBlobChunk {
     #[prost(string, tag = "1")]
@@ -3181,6 +3639,7 @@ pub struct UploadBlobChunk {
     #[prost(bytes = "vec", tag = "4")]
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UploadBlobResponse {
     #[prost(string, tag = "1")]
@@ -3190,6 +3649,7 @@ pub struct UploadBlobResponse {
     #[prost(uint64, tag = "3")]
     pub committed_size: u64,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InstallBundleRequest {
     #[prost(string, tag = "1")]
@@ -3201,6 +3661,7 @@ pub struct InstallBundleRequest {
     #[prost(uint64, tag = "4")]
     pub total_bytes: u64,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InstallStatusRequest {
     #[prost(string, tag = "1")]
@@ -3208,6 +3669,7 @@ pub struct InstallStatusRequest {
     #[prost(string, tag = "2")]
     pub operation_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelInstallRequest {
     #[prost(string, tag = "1")]
@@ -3215,6 +3677,7 @@ pub struct CancelInstallRequest {
     #[prost(string, tag = "2")]
     pub operation_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ActivateBundleRequest {
     #[prost(string, tag = "1")]
@@ -3224,6 +3687,7 @@ pub struct ActivateBundleRequest {
     #[prost(string, tag = "3")]
     pub bundle_digest: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RollbackBundleRequest {
     #[prost(string, tag = "1")]
@@ -3231,6 +3695,7 @@ pub struct RollbackBundleRequest {
     #[prost(string, tag = "2")]
     pub deployment_name: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RollbackBundleResponse {
     #[prost(string, tag = "1")]
@@ -3238,6 +3703,7 @@ pub struct RollbackBundleResponse {
     #[prost(string, tag = "2")]
     pub active_bundle_digest: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SmokeTestDeploymentRequest {
     #[prost(string, tag = "1")]
@@ -3247,6 +3713,7 @@ pub struct SmokeTestDeploymentRequest {
     #[prost(string, tag = "3")]
     pub input_text: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SmokeTestDeploymentResponse {
     #[prost(string, tag = "1")]
@@ -3256,6 +3723,7 @@ pub struct SmokeTestDeploymentResponse {
     #[prost(string, tag = "3")]
     pub output_text: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EmptyDeploymentResponse {
     #[prost(string, tag = "1")]
