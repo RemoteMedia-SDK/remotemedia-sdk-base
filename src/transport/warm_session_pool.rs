@@ -289,6 +289,7 @@ impl WarmSessionPool {
                 // to every freshly-built session.
                 if let Some(control) = self.executor.control_bus().get(&handle.session_id) {
                     control.set_system_retained_cap(self.config.system_retained_cap);
+                    control.set_phase(crate::transport::session_control::SessionPhase::Warm);
                 }
                 // C1 fix: a successful prewarm clears any prior give-up
                 // marker — operator manual override.
@@ -384,6 +385,9 @@ impl WarmSessionPool {
 
             // Phase 2: act on the snapshot (lock dropped).
             if let Some(handle) = warm {
+                if let Some(control) = self.executor.control_bus().get(&handle.session_id) {
+                    control.set_phase(crate::transport::session_control::SessionPhase::Active);
+                }
                 if let Some(pre_notify) = scheduled_refill {
                     if let Some(this) = self.arc_self() {
                         Self::spawn_refill_task(this, manifest.clone(), hash, Some(pre_notify));
@@ -665,6 +669,9 @@ impl WarmSessionPool {
                         // retained cap to the freshly-built session.
                         if let Some(control) = this.executor.control_bus().get(&handle.session_id) {
                             control.set_system_retained_cap(this.config.system_retained_cap);
+                            control.set_phase(
+                                crate::transport::session_control::SessionPhase::Warm,
+                            );
                         }
                         let should_continue = {
                             let mut state = this.state.lock().await;

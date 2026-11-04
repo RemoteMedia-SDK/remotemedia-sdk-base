@@ -216,6 +216,11 @@ impl PerfAggregator {
         self.enabled.store(on, Ordering::Relaxed);
     }
 
+    /// Snapshot window length (ms) this aggregator was configured with.
+    pub fn window_ms(&self) -> u32 {
+        self.window_ms
+    }
+
     /// Get or create a bucket for `node_id`. Hot path: shard lookup
     /// against an `Arc<str>` key via `Borrow<str>` — no alloc on hit.
     /// Cold path (first time we see this `node_id`): single

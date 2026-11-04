@@ -247,6 +247,8 @@ async fn handle_inbound(
                     event: Some(PbEvent::Attached(Attached {
                         session_id: hello.session_id.clone(),
                         attach_id: hello.attach_id,
+                        observer_schema_version:
+                            remotemedia_core::telemetry::SCHEMA_VERSION as u32,
                     })),
                 })
                 .await;
@@ -462,6 +464,31 @@ async fn dispatch_frame(
 
         Some(PbOp::ClearNodeState(c)) => {
             ctrl.clear_node_state(&c.node_id);
+            Ok(())
+        }
+
+        Some(PbOp::SetTelemetry(set)) => {
+            let Some(tel) = ctrl.telemetry() else {
+                return Err(error_inner(
+                    ControlErrorCode::Internal,
+                    "session has no telemetry".to_string(),
+                    None,
+                ));
+            };
+            if !set.level.is_empty() {
+                let Some(level) = remotemedia_core::telemetry::TelemetryLevel::parse(&set.level)
+                else {
+                    return Err(error_inner(
+                        ControlErrorCode::Protocol,
+                        format!("unknown telemetry level '{}'", set.level),
+                        None,
+                    ));
+                };
+                tel.set_level(level);
+            }
+            if set.interval_ms > 0 {
+                tel.set_interval_ms(set.interval_ms);
+            }
             Ok(())
         }
 

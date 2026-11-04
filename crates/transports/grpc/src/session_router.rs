@@ -27,7 +27,11 @@ use remotemedia_core::data::RuntimeData;
 use remotemedia_core::executor::PipelineGraph;
 use remotemedia_core::metrics::RtProbeSet;
 use remotemedia_core::nodes::{StreamingNode, StreamingNodeRegistry};
-use remotemedia_core::transport::session_control::SessionControl;
+use remotemedia_core::telemetry::{
+    approx_payload_bytes, NoQueue, QueueCapacity, SessionDescriptor, SessionTelemetry,
+};
+use remotemedia_core::transport::perf_aggregator::PerfAggregator;
+use remotemedia_core::transport::session_control::{NodeState, SessionControl};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -177,6 +181,12 @@ pub struct SessionRouter {
     /// spawned node task so they can record samples without
     /// needing a handle back to the router.
     probes: Arc<RtProbeSet>,
+
+    /// Running topology + live counters (openspec: add-live-pipeline-observer).
+    descriptor: SessionDescriptor,
+    telemetry: Arc<SessionTelemetry>,
+    /// `from` node → `(telemetry edge idx, to node)` in connection order.
+    successors: HashMap<String, Vec<(usize, String)>>,
 }
 
 impl SessionRouter {
@@ -197,16 +207,49 @@ impl SessionRouter {
         client_tx: mpsc::Sender<Result<StreamResponse, Status>>,
     ) -> Result<(Self, mpsc::Sender<()>), Status> {
         // Build and validate the pipeline graph (spec 021)
-        let graph = {
+        let (graph, descriptor, successors) = {
             let session_guard = session.lock().await;
-            PipelineGraph::from_manifest(&session_guard.manifest).map_err(|e| {
+            let graph = PipelineGraph::from_manifest(&session_guard.manifest).map_err(|e| {
                 error!(
                     "Session {}: Pipeline graph validation failed: {}",
                     session_id, e
                 );
                 Status::invalid_argument(format!("Invalid pipeline graph: {}", e))
-            })?
+            })?;
+            // This router has a single bounded input per node (no separate
+            // filter / fan-out stages).
+            let descriptor = SessionDescriptor::build(
+                &session_id,
+                &session_guard.manifest,
+                &graph,
+                &registry,
+                QueueCapacity {
+                    input: grpc_node_input_capacity() as u32,
+                    filter: 0,
+                    fanout: 0,
+                },
+            );
+            let mut successors: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+            for (idx, c) in session_guard.manifest.connections.iter().enumerate() {
+                successors
+                    .entry(c.from.clone())
+                    .or_default()
+                    .push((idx, c.to.clone()));
+            }
+            (graph, descriptor, successors)
         };
+        let telemetry = Arc::new(SessionTelemetry::new(
+            &descriptor,
+            Arc::new(remotemedia_core::executor::StreamingScheduler::new(
+                remotemedia_core::executor::SchedulerConfig::default(),
+            )),
+            Arc::new(PerfAggregator::with_sample_stride(
+                session_id.clone(),
+                PerfAggregator::enabled_from_env(),
+                PerfAggregator::window_ms_from_env(),
+                PerfAggregator::sample_stride_from_env(),
+            )),
+        ));
 
         info!(
             "Session {}: Built pipeline graph - {} nodes, order: {:?}, sources: {:?}, sinks: {:?}",
@@ -246,6 +289,9 @@ impl SessionRouter {
             #[cfg(feature = "multiprocess")]
             multiprocess_executor: None,
             probes: Arc::new(RtProbeSet::new()),
+            descriptor,
+            telemetry,
+            successors,
         };
 
         Ok((router, shutdown_tx_clone))
@@ -261,7 +307,14 @@ impl SessionRouter {
 
     /// Attach the control bus before node initialization and router start.
     pub fn attach_control(&mut self, control: Arc<SessionControl>) {
+        control.set_descriptor(Arc::new(self.descriptor.clone()));
+        control.set_telemetry(self.telemetry.clone());
         self.control = Some(control);
+    }
+
+    /// The session's live telemetry handle.
+    pub fn telemetry(&self) -> Arc<SessionTelemetry> {
+        self.telemetry.clone()
     }
 
     /// Snapshot every RT latency probe in declaration order:
@@ -469,6 +522,26 @@ impl SessionRouter {
             total_nodes
         );
 
+        // Pacing is a property of node instances; refine the descriptor.
+        {
+            let session = self.session.lock().await;
+            let pacing: HashMap<String, String> = session
+                .node_cache
+                .iter()
+                .map(|(id, n)| {
+                    (
+                        id.clone(),
+                        remotemedia_core::telemetry::descriptor::pacing_label(n.pacing_nature()),
+                    )
+                })
+                .collect();
+            drop(session);
+            self.descriptor.set_pacing(&pacing);
+            if let Some(ctrl) = &self.control {
+                ctrl.set_descriptor(Arc::new(self.descriptor.clone()));
+            }
+        }
+
         // Send completion message to client
         self.send_status_update(
             "_system",
@@ -533,6 +606,13 @@ impl SessionRouter {
     async fn run(&mut self) -> Result<(), Status> {
         info!("📡 Session router running - waiting for chunks from client...");
 
+        let publisher_shutdown = Arc::new(tokio::sync::Notify::new());
+        let publisher = remotemedia_core::telemetry::publisher::spawn_publisher(
+            self.telemetry.clone(),
+            self.control.clone(),
+            publisher_shutdown.clone(),
+        );
+
         // Process incoming packets from client ingress OR from node loopback,
         // plus the shutdown signal. Keeping client and loopback as separate
         // bounded channels lets us apply real backpressure to the client
@@ -590,6 +670,10 @@ impl SessionRouter {
         // Shutdown all node tasks
         self.shutdown_nodes().await;
 
+        // Final telemetry snapshot once every node task has stopped.
+        publisher_shutdown.notify_one();
+        let _ = publisher.await;
+
         Ok(())
     }
 
@@ -598,6 +682,11 @@ impl SessionRouter {
         // Node outputs pass through SessionControl before normal graph fan-out.
         // This publishes requested taps (including tool/blip/system events)
         // and applies any installed intercept without touching client ingress.
+        if packet.to_node.is_none() {
+            if let Some(i) = self.telemetry.node_index(&packet.from_node) {
+                self.telemetry.node(i).count_output();
+            }
+        }
         let packet = if packet.to_node.is_none() {
             if let Some(control) = &self.control {
                 let DataPacket {
@@ -626,22 +715,29 @@ impl SessionRouter {
             packet
         };
 
-        // If to_node is specified, route directly to that node (for client input)
-        let downstream_nodes = if let Some(ref to_node) = packet.to_node {
-            vec![to_node.clone()]
-        } else {
-            // Find downstream nodes for this packet based on manifest connections
-            let nodes = self.get_downstream_nodes(&packet.from_node).await?;
-            if nodes.is_empty() {
-                // Terminal node - send to client
-                self.send_to_client(packet).await?;
-                return Ok(());
-            }
-            nodes
-        };
+        // If to_node is specified, route directly to that node (for client
+        // input); the telemetry edge is the target's ingress edge, if any.
+        let downstream_nodes: Vec<(Option<usize>, String)> =
+            if let Some(ref to_node) = packet.to_node {
+                vec![(self.descriptor.ingress_edge(to_node), to_node.clone())]
+            } else {
+                // Downstream nodes from manifest connections (with edge ids).
+                let nodes = self
+                    .successors
+                    .get(&packet.from_node)
+                    .cloned()
+                    .unwrap_or_default();
+                if nodes.is_empty() {
+                    // Terminal node - send to client
+                    self.send_to_client(packet).await?;
+                    return Ok(());
+                }
+                nodes.into_iter().map(|(i, n)| (Some(i), n)).collect()
+            };
+        let bytes = approx_payload_bytes(&packet.data);
 
         // Route to downstream nodes
-        for next_node_id in downstream_nodes {
+        for (edge_idx, next_node_id) in downstream_nodes {
             // info!("🔀 Routing from '{}' → '{}'", packet.from_node, next_node_id);
 
             // Get or create the node task
@@ -654,12 +750,34 @@ impl SessionRouter {
             // Multiprocess nodes will internally use the IPC thread via process_streaming_async()
             if let Some(node_input) = self.node_inputs.get(&next_node_id) {
                 let packet_clone = packet.clone();
+                let edge = edge_idx.and_then(|i| self.telemetry.edge(i));
                 // Bounded per-node input: `.await` stalls the router task
                 // when a node is saturated. Loopback capacity is sized
                 // (32× node-input) so the node task can drain onto the
                 // loopback even when its input is full — preventing the
                 // mutual-await deadlock a naive bounding would create.
-                if let Err(e) = node_input.send(packet_clone).await {
+                // try_send first so a full input is observable as a stall.
+                let sent = match node_input.try_send(packet_clone) {
+                    Ok(()) => Ok(()),
+                    Err(mpsc::error::TrySendError::Full(p)) => {
+                        let t0 = std::time::Instant::now();
+                        if let Some(e) = edge {
+                            e.begin_stall();
+                        }
+                        let r = node_input.send(p).await.map_err(|e| e.to_string());
+                        if let Some(e) = edge {
+                            e.end_stall(t0.elapsed().as_micros() as u64);
+                        }
+                        r
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => Err("channel closed".to_string()),
+                };
+                match (&sent, edge) {
+                    (Ok(()), Some(e)) => e.record_frame(bytes),
+                    (Err(_), Some(e)) => e.record_drop(),
+                    _ => {}
+                }
+                if let Err(e) = sent {
                     error!("Failed to send packet to node '{}': {}", next_node_id, e);
                 }
             } else {
@@ -697,7 +815,18 @@ impl SessionRouter {
         // DEFAULT_GRPC_NODE_INPUT_CAPACITY for deadlock-safety sizing
         // (loopback must be ≥ node_input × max_fanout).
         let (input_tx, mut input_rx) = mpsc::channel::<DataPacket>(grpc_node_input_capacity());
+        let tel = self.telemetry.clone();
+        let node_idx = tel.node_index(&node_id);
+        if let Some(i) = node_idx {
+            tel.install_queues(
+                i,
+                Box::new(input_tx.downgrade()),
+                Box::new(NoQueue),
+                Box::new(NoQueue),
+            );
+        }
         self.node_inputs.insert(node_id.clone(), input_tx);
+        let node_control = self.control.clone();
 
         // Clone what we need for the task
         let node_id_clone = node_id.clone();
@@ -825,11 +954,45 @@ impl SessionRouter {
                 }
             }
 
+            if let Some(i) = node_idx {
+                tel.set_alive(i, true);
+            }
+            let perf = tel.perf().clone();
             while let Some(packet) = input_rx.recv().await {
                 debug!(
                     "📦 Node '{}' processing packet (seq: {})",
                     node_id_clone, packet.sequence
                 );
+
+                // Node-state gate (Bypass / Disabled) + input counters.
+                if let Some(i) = node_idx {
+                    let cell = tel.node(i);
+                    match cell.node_state() {
+                        NodeState::Enabled => {}
+                        NodeState::Bypass => {
+                            cell.count_bypassed();
+                            let passthrough = DataPacket {
+                                data: packet.data,
+                                from_node: node_id_clone.clone(),
+                                to_node: None,
+                                session_id: session_id.clone(),
+                                sequence: packet.sequence,
+                                sub_sequence: 0,
+                            };
+                            if router_tx.send(passthrough).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        NodeState::Disabled => {
+                            cell.count_discarded();
+                            continue;
+                        }
+                    }
+                    cell.count_input();
+                    cell.begin_dispatch(tel.now_us());
+                }
+                perf.record_input(&node_id_clone);
 
                 if is_streaming {
                     // Streaming node — inline dispatch.
@@ -855,6 +1018,7 @@ impl SessionRouter {
                     let session_id_for_cb = session_id.clone();
                     let router_tx_for_cb = router_tx.clone();
                     let mut output_count = 0_u64;
+                    let perf_cb = perf.clone();
 
                     let node_dispatch_start = std::time::Instant::now();
                     let result = node
@@ -863,6 +1027,11 @@ impl SessionRouter {
                             &runtime_ctx,
                             Box::new(move |output| {
                                 output_count += 1;
+                                perf_cb.record_output(
+                                    &node_id_for_cb,
+                                    node_dispatch_start.elapsed().as_micros() as u64,
+                                    output_count == 1,
+                                );
                                 let output_packet = DataPacket {
                                     data: output,
                                     from_node: node_id_for_cb.clone(),
@@ -898,12 +1067,17 @@ impl SessionRouter {
                         )
                         .await;
                     probes.node_out.record_since(node_dispatch_start);
+                    if let Some(i) = node_idx {
+                        tel.node(i)
+                            .end_dispatch(node_dispatch_start.elapsed().as_micros() as u64);
+                    }
 
                     match result {
                         Ok(count) => {
                             debug!("✅ Node '{}' produced {} outputs", node_id_clone, count);
                         }
                         Err(e) => {
+                            record_node_error(&tel, node_idx, node_control.as_deref(), &node_id_clone, &e.to_string());
                             error!("Streaming node '{}' failed: {}", node_id_clone, e);
                         }
                     }
@@ -913,8 +1087,13 @@ impl SessionRouter {
                     let node_dispatch_start = std::time::Instant::now();
                     let process_result = node.process_async(packet.data, &runtime_ctx).await;
                     probes.node_out.record_since(node_dispatch_start);
+                    let elapsed_us = node_dispatch_start.elapsed().as_micros() as u64;
+                    if let Some(i) = node_idx {
+                        tel.node(i).end_dispatch(elapsed_us);
+                    }
                     match process_result {
                         Ok(output) => {
+                            perf.record_output(&node_id_clone, elapsed_us, true);
                             let output_packet = DataPacket {
                                 data: output,
                                 from_node: node_id_clone.clone(),
@@ -931,12 +1110,16 @@ impl SessionRouter {
                             }
                         }
                         Err(e) => {
+                            record_node_error(&tel, node_idx, node_control.as_deref(), &node_id_clone, &e.to_string());
                             error!("Node '{}' failed: {}", node_id_clone, e);
                         }
                     }
                 }
             }
 
+            if let Some(i) = node_idx {
+                tel.set_alive(i, false);
+            }
             info!("⚡ Node '{}' task completed", node_id_clone);
         });
 
@@ -1058,21 +1241,6 @@ impl SessionRouter {
         Ok(arc_node)
     }
 
-    /// Get downstream nodes for a given node
-    async fn get_downstream_nodes(&self, from_node_id: &str) -> Result<Vec<String>, Status> {
-        let session = self.session.lock().await;
-
-        let downstream: Vec<String> = session
-            .manifest
-            .connections
-            .iter()
-            .filter(|c| c.from == from_node_id)
-            .map(|c| c.to.clone())
-            .collect();
-
-        Ok(downstream)
-    }
-
     /// Get node type from node ID
     async fn get_node_type(&self, node_id: &str) -> String {
         let session = self.session.lock().await;
@@ -1092,6 +1260,11 @@ impl SessionRouter {
             packet.from_node, packet.sequence, packet.sub_sequence
         );
 
+        let egress = self
+            .descriptor
+            .egress_edge(&packet.from_node)
+            .and_then(|i| self.telemetry.edge(i));
+        let bytes = approx_payload_bytes(&packet.data);
         let output_buffer = runtime_data_to_data_buffer(&packet.data);
 
         let mut data_outputs = HashMap::new();
@@ -1108,10 +1281,27 @@ impl SessionRouter {
             response: Some(StreamResponseType::Result(chunk_result)),
         };
 
-        self.client_tx
-            .send(Ok(response))
-            .await
-            .map_err(|_| Status::internal("Failed to send to client"))?;
+        let sent = match self.client_tx.try_send(Ok(response)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(r)) => {
+                let t0 = std::time::Instant::now();
+                if let Some(e) = egress {
+                    e.begin_stall();
+                }
+                let res = self.client_tx.send(r).await.map_err(|_| ());
+                if let Some(e) = egress {
+                    e.end_stall(t0.elapsed().as_micros() as u64);
+                }
+                res
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+        };
+        match (&sent, egress) {
+            (Ok(()), Some(e)) => e.record_frame(bytes),
+            (Err(()), Some(e)) => e.record_drop(),
+            _ => {}
+        }
+        sent.map_err(|_| Status::internal("Failed to send to client"))?;
 
         Ok(())
     }
@@ -1156,5 +1346,24 @@ impl SessionRouter {
             .send(packet)
             .await
             .map_err(|e| format!("Failed to feed chunk: {}", e))
+    }
+}
+
+
+/// Count a dispatch error and publish a rate-limited `node_error` event.
+fn record_node_error(
+    tel: &SessionTelemetry,
+    idx: Option<usize>,
+    control: Option<&SessionControl>,
+    node_id: &str,
+    message: &str,
+) {
+    let Some(i) = idx else { return };
+    if let Some(ev) = tel.record_error(i, message) {
+        if let Some(ctrl) = control {
+            remotemedia_core::telemetry::publisher::publish_node_error(
+                ctrl, node_id, &ev.message, ev.count,
+            );
+        }
     }
 }

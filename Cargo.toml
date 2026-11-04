@@ -247,6 +247,12 @@ remotemedia-python-nodes = { path = "crates/python-nodes" }
 axum = "0.7"
 tokio-stream = "0.1"
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+criterion = { version = "0.5", default-features = false }
+
+# Live-pipeline-observer hot-path cost (openspec: add-live-pipeline-observer).
+[[bench]]
+name = "telemetry_hot_path"
+harness = false
 
 [features]
 default = []

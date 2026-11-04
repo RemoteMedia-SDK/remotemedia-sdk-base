@@ -43,6 +43,15 @@ service PipelineControl {
   // the client sends MUST be a `Hello`. The server streams `ControlEvent`s
   // back until the session terminates or the client closes the stream.
   rpc Attach(stream ControlFrame) returns (stream ControlEvent);
+
+  // ── Discovery (openspec: add-live-pipeline-observer) ─────────────────
+  // List every session registered on this process's control bus.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  // Running topology of one session (nodes, ports, edges). NOT_FOUND for
+  // unknown ids.
+  rpc DescribeSession(DescribeSessionRequest) returns (DescribeSessionResponse);
+  // Initial session list followed by created / updated / closed events.
+  rpc WatchSessions(WatchSessionsRequest) returns (stream SessionLifecycle);
 }
 
 // ============================================================================
@@ -110,6 +119,8 @@ message ControlFrame {
     InterceptReply   intercept_reply  = 7;
     SetNodeState     set_node_state   = 8;
     ClearNodeState   clear_node_state = 9;
+    // Change this session's telemetry level / snapshot interval.
+    SetTelemetry     set_telemetry    = 10;
   }
 }
 
@@ -146,6 +157,14 @@ message SetNodeState {
 
 message ClearNodeState { string node_id = 1; }
 
+// Telemetry level for the attached session: "off" | "counters" | "auto" |
+// "full". Empty = unchanged. `interval_ms` 0 = unchanged (else clamped to
+// 250–5000).
+message SetTelemetry {
+  string level = 1;
+  uint32 interval_ms = 2;
+}
+
 // ============================================================================
 // Server -> Client events
 // ============================================================================
@@ -170,6 +189,9 @@ message ControlEvent {
 message Attached {
   string session_id = 1;
   string attach_id = 2;
+  // Telemetry / descriptor schema version the server speaks (0 = server
+  // predates live-pipeline-observer).
+  uint32 observer_schema_version = 3;
 }
 
 message TapEvent {
@@ -211,4 +233,61 @@ message SessionClosed {
   CloseReasonCode reason = 1;
   // Free-form detail (e.g. the Error string for CloseReason::Error).
   string detail = 2;
+}
+
+// ============================================================================
+// Discovery (openspec: add-live-pipeline-observer)
+// ============================================================================
+
+message SessionSummaryPb {
+  string session_id = 1;
+  string pipeline_name = 2;
+  uint64 created_at_ms = 3;
+  // Transport kind ("grpc", "webrtc", "http", "ui", "ffi"); empty if unknown.
+  string transport = 4;
+  // "initializing" | "warm" | "active" | "closing".
+  string phase = 5;
+  uint32 node_count = 6;
+  // Transport-specific origin (peer id, remote address); empty if unknown.
+  string origin = 7;
+  // Whether hot-path telemetry counters exist for this session.
+  bool has_telemetry = 8;
+}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated SessionSummaryPb sessions = 1;
+  uint32 observer_schema_version = 2;
+  string server_version = 3;
+}
+
+message DescribeSessionRequest { string session_id = 1; }
+
+message DescribeSessionResponse {
+  // `SessionDescriptor` serialized as JSON (the Rust serde type is the
+  // schema; see docs/OBSERVABILITY.md).
+  string descriptor_json = 1;
+  uint32 schema_version = 2;
+}
+
+message WatchSessionsRequest {}
+
+message SessionClosedInfo {
+  string session_id = 1;
+  string reason = 2;
+  uint64 ts_ms = 3;
+}
+
+message SessionLifecycle {
+  oneof event {
+    // First message on every WatchSessions stream.
+    ListSessionsResponse initial = 1;
+    SessionSummaryPb     created = 2;
+    SessionSummaryPb     updated = 3;
+    SessionClosedInfo    closed  = 4;
+    // The watcher fell behind; clients should treat the next `initial`
+    // as authoritative (the server re-sends one immediately).
+    Empty                resync  = 5;
+  }
 }
