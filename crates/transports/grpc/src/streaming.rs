@@ -36,16 +36,22 @@ use crate::metrics::ServiceMetrics;
 use crate::session_router::{DataPacket, SessionRouter};
 use crate::ServiceError;
 #[cfg(feature = "multiprocess")]
+use remotemedia_core::nodes::python_streaming::PythonStreamingNode;
+#[cfg(feature = "multiprocess")]
 use remotemedia_core::python::multiprocess::MultiprocessExecutor;
 use remotemedia_core::{
     data::RuntimeData,
     manifest::Manifest,
-    nodes::{python_streaming::PythonStreamingNode, StreamingNode, StreamingNodeRegistry},
+    nodes::{StreamingNode, StreamingNodeRegistry},
     transport::{
         session_control::{ControlAddress, SessionControl},
         PipelineExecutor,
     },
 };
+/// Python streaming nodes only exist with the `multiprocess` feature;
+/// without it the node cache's Python slot is always `None`.
+#[cfg(not(feature = "multiprocess"))]
+type PythonStreamingNode = std::convert::Infallible;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1041,6 +1047,58 @@ async fn route_to_downstream(
     .map_err(|e| ServiceError::Internal(e.to_string()));
 }
 
+/// Create and initialize a Python streaming node, returning the boxed
+/// streaming node plus the unwrapped instance kept in the node cache.
+#[cfg(feature = "multiprocess")]
+async fn create_python_streaming_node(
+    node_id: &str,
+    node_type: &str,
+    params: &serde_json::Value,
+    session_id: &str,
+) -> Result<(Box<dyn StreamingNode>, Arc<PythonStreamingNode>), ServiceError> {
+    use remotemedia_core::nodes::AsyncNodeWrapper;
+
+    info!(
+        "🐍 Creating Python streaming node: {} with session {}",
+        node_type, session_id
+    );
+
+    let py_node = PythonStreamingNode::with_session(
+        node_id.to_string(),
+        node_type,
+        params,
+        session_id.to_string(),
+    )
+    .map_err(|e| {
+        ServiceError::Internal(format!("Failed to create Python streaming node: {}", e))
+    })?;
+
+    // Initialize the node immediately to load the model into memory
+    py_node
+        .ensure_initialized()
+        .await
+        .map_err(|e| ServiceError::Internal(format!("Failed to initialize Python node: {}", e)))?;
+
+    let py_node_arc = Arc::new(py_node);
+    let wrapped: Box<dyn StreamingNode> = Box::new(AsyncNodeWrapper(Arc::clone(&py_node_arc)));
+    Ok((wrapped, py_node_arc))
+}
+
+/// Without the `multiprocess` feature there is no Python runtime to host
+/// the node, so creating one is a clear error rather than a build failure.
+#[cfg(not(feature = "multiprocess"))]
+async fn create_python_streaming_node(
+    _node_id: &str,
+    node_type: &str,
+    _params: &serde_json::Value,
+    _session_id: &str,
+) -> Result<(Box<dyn StreamingNode>, Arc<PythonStreamingNode>), ServiceError> {
+    Err(ServiceError::Internal(format!(
+        "Python node '{}' requires remotemedia-grpc to be built with the `multiprocess` feature",
+        node_type
+    )))
+}
+
 /// Handle DataChunk message with multi-output support (for streaming generators)
 async fn handle_data_chunk_multi(
     chunk: crate::generated::DataChunk,
@@ -1123,37 +1181,10 @@ async fn handle_data_chunk_multi(
             // Check if this is a Python node via the registry
             // Python nodes need special handling to preserve the unwrapped instance for caching
             let (new_node, py_streaming_node) = if streaming_registry.is_python_node(&node_type) {
-                use remotemedia_core::nodes::{
-                    python_streaming::PythonStreamingNode, AsyncNodeWrapper,
-                };
-
-                info!(
-                    "🐍 Creating Python streaming node: {} with session {}",
-                    node_type, session_id
-                );
-
-                let py_node = PythonStreamingNode::with_session(
-                    chunk.node_id.clone(),
-                    &node_type,
-                    &params,
-                    session_id.clone(),
-                )
-                .map_err(|e| {
-                    ServiceError::Internal(format!("Failed to create Python streaming node: {}", e))
-                })?;
-
-                // Initialize the node immediately to load the model into memory
-                // info!("🔧 Initializing Python streaming node '{}'...", chunk.node_id);
-                py_node.ensure_initialized().await.map_err(|e| {
-                    ServiceError::Internal(format!("Failed to initialize Python node: {}", e))
-                })?;
-                // info!("✅ Python streaming node '{}' initialized successfully", chunk.node_id);
-
-                let py_node_arc = Arc::new(py_node);
-                let wrapped: Box<dyn StreamingNode> =
-                    Box::new(AsyncNodeWrapper(Arc::clone(&py_node_arc)));
-
-                (wrapped, Some(py_node_arc))
+                let (wrapped, py_node) =
+                    create_python_streaming_node(&chunk.node_id, &node_type, &params, &session_id)
+                        .await?;
+                (wrapped, Some(py_node))
             } else {
                 // Regular Rust nodes - use registry normally
                 // info!("🦀 Creating Rust streaming node: {}", node_type);
