@@ -15,7 +15,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use remotemedia_core::capabilities::{
+//! use remotemedia_sdk_base::capabilities::{
 //!     MediaCapabilities, MediaConstraints, AudioConstraints, ConstraintValue,
 //! };
 //!

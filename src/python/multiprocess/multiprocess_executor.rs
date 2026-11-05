@@ -390,7 +390,7 @@ impl MultiprocessConfig {
     ///
     /// # Example
     /// ```
-    /// use remotemedia_core::python::multiprocess::multiprocess_executor::MultiprocessConfig;
+    /// use remotemedia_sdk_base::python::multiprocess::multiprocess_executor::MultiprocessConfig;
     /// use std::path::Path;
     ///
     /// // Use from_toml_str for inline configuration
@@ -415,7 +415,7 @@ impl MultiprocessConfig {
     ///
     /// # Example
     /// ```
-    /// use remotemedia_core::python::multiprocess::multiprocess_executor::MultiprocessConfig;
+    /// use remotemedia_sdk_base::python::multiprocess::multiprocess_executor::MultiprocessConfig;
     ///
     /// let config_str = r#"
     ///     max_processes_per_session = 20

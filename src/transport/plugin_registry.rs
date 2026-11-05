@@ -22,7 +22,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::transport::plugin_registry::TransportPluginRegistry;
+/// use remotemedia_sdk_base::transport::plugin_registry::TransportPluginRegistry;
 ///
 /// let registry = TransportPluginRegistry::new();
 /// assert!(registry.list().is_empty());
@@ -37,7 +37,7 @@ impl TransportPluginRegistry {
     /// # Example
     ///
     /// ```
-    /// use remotemedia_core::transport::plugin_registry::TransportPluginRegistry;
+    /// use remotemedia_sdk_base::transport::plugin_registry::TransportPluginRegistry;
     ///
     /// let registry = TransportPluginRegistry::new();
     /// ```
@@ -112,7 +112,7 @@ impl TransportPluginRegistry {
     /// # Example
     ///
     /// ```
-    /// use remotemedia_core::transport::plugin_registry::TransportPluginRegistry;
+    /// use remotemedia_sdk_base::transport::plugin_registry::TransportPluginRegistry;
     ///
     /// let registry = TransportPluginRegistry::new();
     /// // Initially empty
@@ -150,7 +150,7 @@ impl TransportPluginRegistry {
     /// # Example
     ///
     /// ```
-    /// use remotemedia_core::transport::plugin_registry::TransportPluginRegistry;
+    /// use remotemedia_sdk_base::transport::plugin_registry::TransportPluginRegistry;
     ///
     /// let registry = TransportPluginRegistry::new();
     ///
@@ -200,7 +200,7 @@ static GLOBAL_REGISTRY: OnceLock<TransportPluginRegistry> = OnceLock::new();
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::transport::plugin_registry::global_registry;
+/// use remotemedia_sdk_base::transport::plugin_registry::global_registry;
 ///
 /// let registry = global_registry();
 /// let plugins = registry.list();
@@ -227,7 +227,7 @@ pub fn global_registry() -> &'static TransportPluginRegistry {
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::transport::plugin_registry::init_global_registry;
+/// use remotemedia_sdk_base::transport::plugin_registry::init_global_registry;
 ///
 /// init_global_registry(|_registry| {
 ///     // Register plugins here
@@ -266,7 +266,7 @@ where
 /// Applications should register transport plugins explicitly:
 ///
 /// ```
-/// use remotemedia_core::transport::plugin_registry::global_registry;
+/// use remotemedia_sdk_base::transport::plugin_registry::global_registry;
 ///
 /// // Get the global registry singleton
 /// let registry = global_registry();

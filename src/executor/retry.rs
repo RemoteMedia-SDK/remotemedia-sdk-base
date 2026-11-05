@@ -127,7 +127,7 @@ pub enum CircuitState {
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::executor::retry::CircuitBreaker;
+/// use remotemedia_sdk_base::executor::retry::CircuitBreaker;
 /// use std::time::Duration;
 ///
 /// let mut cb = CircuitBreaker::with_timeout(3, Duration::from_secs(30));

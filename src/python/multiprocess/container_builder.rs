@@ -485,8 +485,8 @@ impl ContainerBuilder {
     ///
     /// # Example
     /// ```
-    /// use remotemedia_core::python::multiprocess::docker_support::DockerNodeConfig;
-    /// use remotemedia_core::python::multiprocess::container_builder::ContainerBuilder;
+    /// use remotemedia_sdk_base::python::multiprocess::docker_support::DockerNodeConfig;
+    /// use remotemedia_sdk_base::python::multiprocess::container_builder::ContainerBuilder;
     ///
     /// let config = DockerNodeConfig {
     ///     python_version: "3.10".to_string(),
