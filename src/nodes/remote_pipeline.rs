@@ -497,7 +497,7 @@ pub async fn load_manifest_from_source(source: &ManifestSource) -> Result<Manife
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::nodes::remote_pipeline::substitute_env_vars;
+/// use remotemedia_sdk_base::nodes::remote_pipeline::substitute_env_vars;
 ///
 /// // When value has no env vars, returns as-is
 /// let simple = substitute_env_vars("simple_token").unwrap();
@@ -669,7 +669,7 @@ impl RemotePipelineNode {
     /// # Example
     ///
     /// ```
-    /// use remotemedia_core::nodes::remote_pipeline::RemotePipelineNode;
+    /// use remotemedia_sdk_base::nodes::remote_pipeline::RemotePipelineNode;
     ///
     /// let params = serde_json::json!({
     ///     "transport": "grpc",
@@ -1311,8 +1311,8 @@ const MAX_RECURSION_DEPTH: usize = 10;
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::nodes::remote_pipeline::detect_circular_dependencies;
-/// use remotemedia_core::manifest::{Manifest, ManifestMetadata};
+/// use remotemedia_sdk_base::nodes::remote_pipeline::detect_circular_dependencies;
+/// use remotemedia_sdk_base::manifest::{Manifest, ManifestMetadata};
 /// use std::collections::HashSet;
 ///
 /// let manifest = Manifest {

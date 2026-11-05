@@ -140,8 +140,8 @@ impl Participant {
 /// # Examples
 ///
 /// ```
-/// use remotemedia_core::transport::TransportData;
-/// use remotemedia_core::data::RuntimeData;
+/// use remotemedia_sdk_base::transport::TransportData;
+/// use remotemedia_sdk_base::data::RuntimeData;
 ///
 /// // Simple usage
 /// let data = TransportData::new(RuntimeData::Text("hello".into()));
@@ -180,8 +180,8 @@ impl TransportData {
     /// # Examples
     ///
     /// ```
-    /// use remotemedia_core::transport::TransportData;
-    /// use remotemedia_core::data::RuntimeData;
+    /// use remotemedia_sdk_base::transport::TransportData;
+    /// use remotemedia_sdk_base::data::RuntimeData;
     ///
     /// let data = TransportData::new(RuntimeData::Text("hello".into()));
     /// assert!(data.sequence.is_none());
@@ -205,8 +205,8 @@ impl TransportData {
     /// # Examples
     ///
     /// ```
-    /// use remotemedia_core::transport::TransportData;
-    /// use remotemedia_core::data::RuntimeData;
+    /// use remotemedia_sdk_base::transport::TransportData;
+    /// use remotemedia_sdk_base::data::RuntimeData;
     ///
     /// let data = TransportData::new(RuntimeData::Text("hello".into()))
     ///     .with_sequence(1);
@@ -227,8 +227,8 @@ impl TransportData {
     /// # Examples
     ///
     /// ```
-    /// use remotemedia_core::transport::TransportData;
-    /// use remotemedia_core::data::RuntimeData;
+    /// use remotemedia_sdk_base::transport::TransportData;
+    /// use remotemedia_sdk_base::data::RuntimeData;
     ///
     /// let data = TransportData::new(RuntimeData::Text("hello".into()))
     ///     .with_metadata("client_id".into(), "user123".into())

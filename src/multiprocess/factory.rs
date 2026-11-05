@@ -6,8 +6,8 @@
 //! ```no_run
 //! use std::path::PathBuf;
 //! use std::sync::Arc;
-//! use remotemedia_core::multiprocess::factory::MultiprocessNativeFactory;
-//! use remotemedia_core::nodes::StreamingNodeRegistry;
+//! use remotemedia_sdk_base::multiprocess::factory::MultiprocessNativeFactory;
+//! use remotemedia_sdk_base::nodes::StreamingNodeRegistry;
 //!
 //! let mut registry = StreamingNodeRegistry::new();
 //! registry.register(Arc::new(MultiprocessNativeFactory {

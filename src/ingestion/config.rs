@@ -12,7 +12,7 @@ use super::status::MediaType;
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::ingestion::{IngestConfig, TrackSelection, AudioConfig, VideoConfig, ReconnectConfig};
+/// use remotemedia_sdk_base::ingestion::{IngestConfig, TrackSelection, AudioConfig, VideoConfig, ReconnectConfig};
 ///
 /// let config = IngestConfig {
 ///     url: "rtmp://localhost:1935/live/stream".to_string(),

@@ -1,7 +1,7 @@
 //! Routing-channel helpers for `RuntimeData::Text`.
 //!
 //! Re-exports the wire-shape helpers from `remotemedia-types` so
-//! existing `use remotemedia_core::data::{split_text_str, …}` call
+//! existing `use remotemedia_sdk_base::data::{split_text_str, …}` call
 //! sites keep compiling. See `remotemedia_types::text_channel`-
 //! adjacent items for the canonical definitions.
 //!

@@ -20,7 +20,7 @@
 //! their own routing logic:
 //!
 //! ```ignore
-//! use remotemedia_core::transport::SessionRouter;
+//! use remotemedia_sdk_base::transport::SessionRouter;
 //!
 //! let router = SessionRouter::new(
 //!     session_id,

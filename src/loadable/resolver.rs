@@ -47,9 +47,9 @@
 //!
 //! ```ignore
 //! use std::path::Path;
-//! use remotemedia_core::loadable::resolver::PluginResolver;
+//! use remotemedia_sdk_base::loadable::resolver::PluginResolver;
 //!
-//! let manifest = remotemedia_core::manifest::parse(manifest_json)?;
+//! let manifest = remotemedia_sdk_base::manifest::parse(manifest_json)?;
 //! let resolver = PluginResolver::new(Path::new("/path/to/project"));
 //! // Local-only — synchronous, no I/O network.
 //! let local_paths = resolver.resolve_all(&[/* local path specs */])?;

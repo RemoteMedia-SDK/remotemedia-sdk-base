@@ -23,8 +23,8 @@ pub use crate::nodes::remote_pipeline::RetryConfig;
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::transport::client::RetryConfig;
-/// use remotemedia_core::transport::client::retry::RetryExecutor;
+/// use remotemedia_sdk_base::transport::client::RetryConfig;
+/// use remotemedia_sdk_base::transport::client::retry::RetryExecutor;
 ///
 /// let config = RetryConfig {
 ///     max_retries: 3,
