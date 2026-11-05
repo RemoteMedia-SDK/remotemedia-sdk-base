@@ -141,7 +141,7 @@ impl MediaType {
     ///
     /// # Example
     /// ```
-    /// use remotemedia_core::ingestion::MediaType;
+    /// use remotemedia_sdk_base::ingestion::MediaType;
     ///
     /// let stream_id = MediaType::Audio.stream_id(0);
     /// assert_eq!(stream_id, "audio:0");

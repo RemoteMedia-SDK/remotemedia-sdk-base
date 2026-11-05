@@ -12,8 +12,8 @@
 //! # Example
 //!
 //! ```
-//! use remotemedia_core::transport::{PipelineExecutor, TransportData};
-//! use remotemedia_core::data::RuntimeData;
+//! use remotemedia_sdk_base::transport::{PipelineExecutor, TransportData};
+//! use remotemedia_sdk_base::data::RuntimeData;
 //!
 //! let executor = PipelineExecutor::new().unwrap();
 //! let input = TransportData::new(RuntimeData::Text("hello".into()));

@@ -7,8 +7,8 @@
 //! # Usage
 //!
 //! ```ignore
-//! use remotemedia_core::validation::{SchemaValidator, validate_manifest};
-//! use remotemedia_core::nodes::schema::NodeSchemaRegistry;
+//! use remotemedia_sdk_base::validation::{SchemaValidator, validate_manifest};
+//! use remotemedia_sdk_base::nodes::schema::NodeSchemaRegistry;
 //!
 //! // Create validator from schema registry (typically done at startup)
 //! let registry = NodeSchemaRegistry::default();

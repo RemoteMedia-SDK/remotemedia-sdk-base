@@ -43,7 +43,7 @@
 //! All security settings can be customized via `SecurityConfig`:
 //!
 //! ```
-//! use remotemedia_core::python::multiprocess::docker_support::SecurityConfig;
+//! use remotemedia_sdk_base::python::multiprocess::docker_support::SecurityConfig;
 //!
 //! let security = SecurityConfig::default();
 //! ```
@@ -74,7 +74,7 @@
 //! The module provides real-time resource usage monitoring via Docker's stats API:
 //!
 //! ```
-//! use remotemedia_core::python::multiprocess::docker_support::DockerSupport;
+//! use remotemedia_sdk_base::python::multiprocess::docker_support::DockerSupport;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let docker_support = DockerSupport::new().await?;
@@ -2583,7 +2583,7 @@ impl DockerSupport {
     /// # Example
     ///
     /// ```
-    /// use remotemedia_core::python::multiprocess::docker_support::{
+    /// use remotemedia_sdk_base::python::multiprocess::docker_support::{
     ///     DockerSupport, LogForwardingConfig
     /// };
     ///

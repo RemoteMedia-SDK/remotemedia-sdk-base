@@ -18,7 +18,7 @@
 //! # Usage
 //!
 //! ```
-//! use remotemedia_core::transport::client::TransportType;
+//! use remotemedia_sdk_base::transport::client::TransportType;
 //!
 //! // Transport types for client configuration
 //! let grpc = TransportType::Grpc;
@@ -257,7 +257,7 @@ pub struct TransportConfig {
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::transport::client::{TransportConfig, TransportType};
+/// use remotemedia_sdk_base::transport::client::{TransportConfig, TransportType};
 ///
 /// // Create transport configuration
 /// let config = TransportConfig {

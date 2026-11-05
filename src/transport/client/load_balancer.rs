@@ -12,7 +12,7 @@
 //! # Example
 //!
 //! ```
-//! use remotemedia_core::transport::client::LoadBalanceStrategy;
+//! use remotemedia_sdk_base::transport::client::LoadBalanceStrategy;
 //!
 //! // Load balancing strategies
 //! let strategy = LoadBalanceStrategy::RoundRobin;
