@@ -18,7 +18,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
   # Cargo.toml [patch]es plugin-sdk crates to ../remotemedia-plugin-sdk.
-  PLUGIN_SDK_REV: 066f508a1079f0b1986b3b296fb335381272fd51
+  PLUGIN_SDK_REV: 8dd9b5cf2df1196c1e8b12e8368f7a404aa6b69a
 
 jobs:
   check:
@@ -53,5 +53,11 @@ jobs:
         with:
           cache-key: test
           plugin-sdk-rev: ${{ env.PLUGIN_SDK_REV }}
+      # Selecting the crates together keeps their features unified, as in a real
+      # build. In particular webrtc turns on core's `bundled-uv`.
       - name: cargo test
-        run: cargo test -p remotemedia-sdk-base -p remotemedia-grpc -p remotemedia-webrtc --no-fail-fast
+        run: cargo test -p remotemedia-sdk-base -p remotemedia-grpc -p remotemedia-webrtc --lib --bins --tests --no-fail-fast
+      # Not core: its doctests use the downstream name `remotemedia_core`, which
+      # doesn't resolve inside the crate, so none of them compile.
+      - name: cargo test --doc
+        run: cargo test -p remotemedia-grpc -p remotemedia-webrtc --doc --no-fail-fast
