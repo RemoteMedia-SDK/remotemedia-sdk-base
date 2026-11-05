@@ -50,11 +50,9 @@ thiserror = { workspace = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv"] }
-remotemedia-core-multiprocess = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["multiprocess"], optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv"] }
-remotemedia-core-multiprocess = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["multiprocess"], optional = true }
 
 [dev-dependencies]
 remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk" }
@@ -101,7 +99,8 @@ avatar-live2d = ["avatar-core"]
 avatar-cc = ["avatar-core"]
 avatar = ["avatar-core"]
 full = ["codecs", "h264", "grpc-signaling", "ws-signaling"]
-multiprocess = ["dep:remotemedia-core-multiprocess"]
+# Python streaming nodes (PythonNodeFactory) via the multiprocess executor.
+multiprocess = ["remotemedia-core/multiprocess"]
 
 [[test]]
 name = "video_integration_test"
