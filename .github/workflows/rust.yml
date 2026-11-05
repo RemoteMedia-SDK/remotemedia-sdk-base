@@ -1,0 +1,57 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Debuginfo is what fills the runner's disk, and CI never reads it.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  # Cargo.toml [patch]es plugin-sdk crates to ../remotemedia-plugin-sdk.
+  PLUGIN_SDK_REV: 066f508a1079f0b1986b3b296fb335381272fd51
+
+jobs:
+  check:
+    name: Check (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            features: ''
+          # Python streaming nodes are compiled only with this feature.
+          - name: multiprocess
+            features: remotemedia-grpc/multiprocess,remotemedia-webrtc/multiprocess
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          cache-key: check-${{ matrix.name }}
+          plugin-sdk-rev: ${{ env.PLUGIN_SDK_REV }}
+      - name: cargo check
+        run: >-
+          cargo check -p remotemedia-grpc -p remotemedia-webrtc --all-targets
+          ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          cache-key: test
+          plugin-sdk-rev: ${{ env.PLUGIN_SDK_REV }}
+      - name: cargo test
+        run: cargo test -p remotemedia-sdk-base -p remotemedia-grpc -p remotemedia-webrtc --no-fail-fast
