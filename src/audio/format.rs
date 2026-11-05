@@ -103,12 +103,15 @@ pub fn f32_to_i32(samples: &[f32]) -> Vec<i32> {
 ///
 /// # Example
 /// ```
-/// use remotemedia_sdk_base::audio::format::transmute_u8_to_f32;
+/// use remotemedia_sdk_base::audio::format::{transmute_f32_to_u8, transmute_u8_to_f32};
 ///
-/// let bytes: Vec<u8> = vec![0, 0, 0, 0, 0, 0, 128, 63]; // [0.0, 1.0] in LE
-/// let f32_slice = transmute_u8_to_f32(&bytes);
+/// // Bytes borrowed from f32s are aligned for f32, which a `Vec<u8>` need not be.
+/// let samples = [0.0_f32, 1.0];
+/// let bytes = transmute_f32_to_u8(&samples);
 ///
-/// assert!(f32_slice.is_some());
+/// assert_eq!(transmute_u8_to_f32(bytes), Some(&samples[..]));
+/// assert_eq!(transmute_u8_to_f32(&bytes[..3]), None); // length not a multiple of 4
+/// assert_eq!(transmute_u8_to_f32(&bytes[1..5]), None); // misaligned
 /// ```
 pub fn transmute_u8_to_f32(bytes: &[u8]) -> Option<&[f32]> {
     // Check length alignment

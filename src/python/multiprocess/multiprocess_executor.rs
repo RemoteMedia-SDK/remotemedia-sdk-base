@@ -391,10 +391,14 @@ impl MultiprocessConfig {
     /// # Example
     /// ```
     /// use remotemedia_sdk_base::python::multiprocess::multiprocess_executor::MultiprocessConfig;
-    /// use std::path::Path;
     ///
-    /// // Use from_toml_str for inline configuration
-    /// let config = MultiprocessConfig::default();
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// let path = dir.path().join("runtime.toml");
+    /// std::fs::write(&path, "channel_capacity = 200").unwrap();
+    ///
+    /// let config = MultiprocessConfig::from_file(&path).unwrap();
+    /// assert_eq!(config.channel_capacity, 200);
+    /// assert_eq!(config.init_timeout_secs, 300); // not in the file, so the default applies
     /// ```
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path).map_err(|e| {
