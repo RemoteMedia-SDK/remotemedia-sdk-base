@@ -29,15 +29,17 @@ jobs:
       matrix:
         include:
           - name: default features
+            key: default
             features: ''
           # Python streaming nodes are compiled only with this feature.
           - name: multiprocess
+            key: multiprocess
             features: remotemedia-grpc/multiprocess,remotemedia-webrtc/multiprocess
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
-          cache-key: check-${{ matrix.name }}
+          cache-key: check-${{ matrix.key }}
           plugin-sdk-rev: ${{ env.PLUGIN_SDK_REV }}
       - name: cargo check
         run: >-
@@ -57,7 +59,5 @@ jobs:
       # build. In particular webrtc turns on core's `bundled-uv`.
       - name: cargo test
         run: cargo test -p remotemedia-sdk-base -p remotemedia-grpc -p remotemedia-webrtc --lib --bins --tests --no-fail-fast
-      # Not core: its doctests use the downstream name `remotemedia_core`, which
-      # doesn't resolve inside the crate, so none of them compile.
       - name: cargo test --doc
-        run: cargo test -p remotemedia-grpc -p remotemedia-webrtc --doc --no-fail-fast
+        run: cargo test -p remotemedia-sdk-base -p remotemedia-grpc -p remotemedia-webrtc --doc --no-fail-fast
