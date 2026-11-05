@@ -3,6 +3,7 @@
 ///
 /// Uses oneof discriminator for type-safe message variants.
 /// Exactly one variant must be set.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SignalingRequest {
     /// Request ID for matching responses (optional)
@@ -16,6 +17,7 @@ pub struct SignalingRequest {
 /// Nested message and enum types in `SignalingRequest`.
 pub mod signaling_request {
     /// Request type (exactly one must be set)
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Request {
         #[prost(message, tag = "10")]
@@ -36,6 +38,7 @@ pub mod signaling_request {
 ///
 /// Must be the first message sent on a new stream.
 /// Registers the peer and enables receiving notifications.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AnnounceRequest {
     /// Unique peer identifier
@@ -54,6 +57,7 @@ pub struct AnnounceRequest {
     >,
 }
 /// Send SDP offer to another peer
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OfferRequest {
     /// Target peer ID
@@ -67,6 +71,7 @@ pub struct OfferRequest {
     pub r#type: ::prost::alloc::string::String,
 }
 /// Send SDP answer to another peer
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AnswerRequest {
     /// Target peer ID (who sent the offer)
@@ -80,6 +85,7 @@ pub struct AnswerRequest {
     pub r#type: ::prost::alloc::string::String,
 }
 /// Exchange ICE candidate with another peer
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct IceCandidateRequest {
     /// Target peer ID
@@ -96,6 +102,7 @@ pub struct IceCandidateRequest {
     pub sdp_mline_index: u32,
 }
 /// Notify server of peer disconnection
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DisconnectRequest {
     /// Peer ID to disconnect from
@@ -105,16 +112,19 @@ pub struct DisconnectRequest {
 /// Request list of connected peers
 ///
 /// No fields - returns all connected peers
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListPeersRequest {}
 /// Get peers request (unary RPC)
 ///
 /// No fields - returns all connected peers
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetPeersRequest {}
 /// Health check request
 ///
 /// No fields
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckRequest {}
 /// Signaling response from server to client
@@ -123,6 +133,7 @@ pub struct HealthCheckRequest {}
 ///
 /// * Acknowledgment of client request (with request_id)
 /// * Notification of peer event (no request_id)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SignalingResponse {
     /// Request ID from SignalingRequest (empty for notifications)
@@ -135,6 +146,7 @@ pub struct SignalingResponse {
 /// Nested message and enum types in `SignalingResponse`.
 pub mod signaling_response {
     /// Response type (exactly one must be set)
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Response {
         #[prost(message, tag = "10")]
@@ -148,6 +160,7 @@ pub mod signaling_response {
     }
 }
 /// Acknowledgment of successful request
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AckResponse {
     /// Success message
@@ -161,6 +174,7 @@ pub struct AckResponse {
     pub data: ::prost::alloc::string::String,
 }
 /// List of connected peers
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PeerListResponse {
     /// Connected peers
@@ -174,6 +188,7 @@ pub struct PeerListResponse {
 ///
 /// Sent to clients without corresponding request.
 /// Used for peer events and message forwarding.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SignalingNotification {
     /// Notification type (exactly one must be set)
@@ -183,6 +198,7 @@ pub struct SignalingNotification {
 /// Nested message and enum types in `SignalingNotification`.
 pub mod signaling_notification {
     /// Notification type (exactly one must be set)
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Notification {
         #[prost(message, tag = "1")]
@@ -200,6 +216,7 @@ pub mod signaling_notification {
     }
 }
 /// Notification: New peer joined
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PeerJoinedNotification {
     /// Peer ID
@@ -216,6 +233,7 @@ pub struct PeerJoinedNotification {
     >,
 }
 /// Notification: Peer left
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PeerLeftNotification {
     /// Peer ID
@@ -223,6 +241,7 @@ pub struct PeerLeftNotification {
     pub peer_id: ::prost::alloc::string::String,
 }
 /// Notification: Offer received from peer
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OfferNotification {
     /// Peer ID who sent the offer
@@ -239,6 +258,7 @@ pub struct OfferNotification {
     pub r#type: ::prost::alloc::string::String,
 }
 /// Notification: Answer received from peer
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AnswerNotification {
     /// Peer ID who sent the answer
@@ -252,6 +272,7 @@ pub struct AnswerNotification {
     pub r#type: ::prost::alloc::string::String,
 }
 /// Notification: ICE candidate received from peer
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct IceCandidateNotification {
     /// Peer ID who sent the ICE candidate
@@ -268,6 +289,7 @@ pub struct IceCandidateNotification {
     pub sdp_mline_index: u32,
 }
 /// Notification: Peer disconnected
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PeerDisconnectedNotification {
     /// Peer ID
@@ -275,6 +297,7 @@ pub struct PeerDisconnectedNotification {
     pub peer_id: ::prost::alloc::string::String,
 }
 /// Error response
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ErrorResponse {
     /// Error code (gRPC status code)
@@ -288,6 +311,7 @@ pub struct ErrorResponse {
     pub details: ::prost::alloc::string::String,
 }
 /// Get peers response (unary RPC)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetPeersResponse {
     /// Connected peers
@@ -298,6 +322,7 @@ pub struct GetPeersResponse {
     pub count: u32,
 }
 /// Health check response
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckResponse {
     /// Service status ("healthy", "degraded", "unhealthy")
@@ -314,6 +339,7 @@ pub struct HealthCheckResponse {
     pub metrics: ::prost::alloc::string::String,
 }
 /// Peer information
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PeerInfo {
     /// Unique peer identifier
@@ -336,6 +362,7 @@ pub struct PeerInfo {
     pub connected_at: u64,
 }
 /// Peer capabilities
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PeerCapabilities {
     /// Audio support
@@ -352,16 +379,19 @@ pub struct PeerCapabilities {
     #[prost(string, tag = "4")]
     pub extensions: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ControlJsonFrame {
     #[prost(bytes = "vec", tag = "1")]
     pub json: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TextFrame {
     #[prost(string, tag = "1")]
     pub text: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BinaryFrame {
     #[prost(bytes = "vec", tag = "1")]
@@ -371,6 +401,7 @@ pub struct BinaryFrame {
     #[prost(string, optional, tag = "3")]
     pub data_type_hint: ::core::option::Option<::prost::alloc::string::String>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RuntimeDataFrame {
     /// Protobuf-encoded DataBuffer bytes.
@@ -381,6 +412,7 @@ pub struct RuntimeDataFrame {
     #[prost(string, optional, tag = "3")]
     pub data_type_hint: ::core::option::Option<::prost::alloc::string::String>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChunkFrame {
     #[prost(string, tag = "1")]
@@ -401,6 +433,7 @@ pub struct ChunkFrame {
     #[prost(bytes = "vec", tag = "8")]
     pub data: ::prost::alloc::vec::Vec<u8>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DataChannelEnvelope {
     #[prost(uint32, tag = "1")]
@@ -419,6 +452,7 @@ pub struct DataChannelEnvelope {
 }
 /// Nested message and enum types in `DataChannelEnvelope`.
 pub mod data_channel_envelope {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Payload {
         #[prost(message, tag = "10")]
@@ -434,6 +468,7 @@ pub mod data_channel_envelope {
     }
 }
 /// Peer state enumeration
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum PeerState {
@@ -473,6 +508,7 @@ impl PeerState {
         }
     }
 }
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum FrameKind {

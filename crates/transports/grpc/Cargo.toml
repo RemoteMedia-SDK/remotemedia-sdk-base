@@ -67,14 +67,18 @@ tempfile = "3.8"
 remotemedia-python-nodes = { path = "../../python-nodes" }
 
 [build-dependencies]
-tonic-build = { workspace = true }
-prost-build = { workspace = true }
-tonic-prost-build = { workspace = true }
-protobuf-src = { workspace = true }
+# Only for regenerating the committed bindings in src/generated/ (see build.rs).
+tonic-prost-build = { workspace = true, optional = true }
+protobuf-src = { workspace = true, optional = true }
 
 [features]
 # Default features: basic gRPC pipeline execution and streaming
 default = []
+
+# Regenerate (REMOTEMEDIA_REGEN_PROTOS=1) or check the committed protobuf
+# bindings in src/generated/ against proto/*.proto. Builds protoc from source
+# via protobuf-src. Not needed for normal builds; see build.rs.
+regen-protos = ["dep:tonic-prost-build", "dep:protobuf-src"]
 
 # Runtime loading and manifest resolution for native node plugins.
 loadable = ["remotemedia-core/loadable", "remotemedia-core/python-source-plugin"]
