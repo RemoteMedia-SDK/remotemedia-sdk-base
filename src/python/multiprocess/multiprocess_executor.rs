@@ -366,12 +366,12 @@ fn default_docker_fallback_policy() -> DockerFallbackPolicy {
 impl Default for MultiprocessConfig {
     fn default() -> Self {
         Self {
-            max_processes_per_session: Some(10),
-            channel_capacity: 100,
-            init_timeout_secs: 300, // 5 minutes for model loading
+            max_processes_per_session: default_max_processes(),
+            channel_capacity: default_channel_capacity(),
+            init_timeout_secs: default_init_timeout(),
             python_executable: default_python_executable(),
-            enable_backpressure: true,
-            docker_fallback_policy: DockerFallbackPolicy::AllowWithWarning,
+            enable_backpressure: default_backpressure(),
+            docker_fallback_policy: default_docker_fallback_policy(),
             python_path: Vec::new(),
             python_env: Default::default(),
         }
@@ -3139,6 +3139,31 @@ impl NodesNodeExecutor for MultiprocessExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing `runtime.toml` uses `Default`; a file that omits a field uses
+    /// the serde default. The two must agree.
+    #[test]
+    fn default_config_matches_empty_toml() {
+        let from_default = MultiprocessConfig::default();
+        let from_empty = MultiprocessConfig::from_toml_str("").unwrap();
+
+        assert_eq!(
+            from_default.max_processes_per_session,
+            from_empty.max_processes_per_session
+        );
+        assert_eq!(from_default.channel_capacity, from_empty.channel_capacity);
+        assert_eq!(from_default.init_timeout_secs, from_empty.init_timeout_secs);
+        assert_eq!(from_default.python_executable, from_empty.python_executable);
+        assert_eq!(
+            from_default.enable_backpressure,
+            from_empty.enable_backpressure
+        );
+        assert_eq!(
+            from_default.docker_fallback_policy,
+            from_empty.docker_fallback_policy
+        );
+        assert_eq!(from_default.python_path, from_empty.python_path);
+    }
 
     #[tokio::test]
     async fn test_multiprocess_executor_creation() {

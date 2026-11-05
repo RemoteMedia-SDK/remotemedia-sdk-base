@@ -212,17 +212,18 @@ pub fn global_registry() -> &'static TransportPluginRegistry {
 
 /// Initialize the global registry with custom plugins
 ///
-/// This function should be called once during application startup to register
-/// plugins. Subsequent calls will be ignored.
+/// Runs `init_fn` against the global registry, typically once during application
+/// startup to register plugins. Every call runs `init_fn` again, so registering
+/// the same plugin name twice returns an error from
+/// [`register`](TransportPluginRegistry::register).
 ///
 /// # Arguments
 ///
-/// * `init_fn` - Closure that receives a mutable reference to the registry for initialization
+/// * `init_fn` - Closure that receives a reference to the registry for initialization
 ///
 /// # Returns
 ///
-/// * `Ok(())` - Registry initialized successfully
-/// * `Err(Error)` - Registry already initialized
+/// Whatever `init_fn` returns.
 ///
 /// # Example
 ///
