@@ -1364,6 +1364,9 @@ impl PipelineExecutor {
             },
         )?;
         router.set_output_allocator(output_allocator.clone());
+        if let Some(report) = &buffer_preflight {
+            router.set_buffer_contracts(report);
+        }
         let node_materialization_copies =
             router.set_node_materialization_policy(self.config.node_materialization_policy);
 

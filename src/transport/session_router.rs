@@ -314,6 +314,12 @@ pub struct DataPacket {
 /// - Integrates StreamingScheduler for timeout, retry, and circuit breaker (spec 026)
 /// - Tracks per-stream drift metrics for health monitoring (spec 026)
 pub struct SessionRouter {
+    buffer_contracts: Option<
+        std::collections::BTreeMap<
+            String,
+            Option<remotemedia_traits::buffer_contract::BufferContract>,
+        >,
+    >,
     node_materialization: super::NodeMaterializationCopies,
     /// Storage selected for producer outputs in this session. Nodes allocate
     /// through their context; routing never converts existing private buffers.
@@ -574,6 +580,7 @@ impl SessionRouter {
         ));
 
         let router = Self {
+            buffer_contracts: None,
             node_materialization: super::NodeMaterializationCopies::new(
                 &session_id,
                 manifest.nodes.iter().map(|node| node.id.as_str()),
@@ -629,6 +636,33 @@ impl SessionRouter {
     /// existing input buffers or make legacy node allocations shareable.
     pub fn set_output_allocator(&mut self, allocator: Arc<dyn remotemedia_types::OutputAllocator>) {
         self.output_allocator = allocator;
+    }
+
+    pub(crate) fn set_buffer_contracts(
+        &mut self,
+        report: &super::buffer_preflight::BufferPreflightReport,
+    ) {
+        self.buffer_contracts = Some(report.nodes.clone());
+    }
+
+    fn validate_effective_buffer_contract(
+        &self,
+        node: &crate::manifest::NodeManifest,
+        params: &serde_json::Value,
+    ) -> Result<()> {
+        if let Some(contracts) = &self.buffer_contracts {
+            let expected = contracts.get(&node.id).ok_or_else(|| {
+                Error::ConfigError(format!("missing buffer preflight for node '{}'", node.id))
+            })?;
+            let actual = self
+                .registry
+                .get_factory(&node.node_type)
+                .and_then(|factory| factory.buffer_contract(params));
+            if &actual != expected {
+                return Err(Error::ConfigError(format!("buffer contract node '{}': effective runtime parameters changed the preflight declaration", node.id)));
+            }
+        }
+        Ok(())
     }
 
     /// Select explicit host-node materialization policy before starting execution.
@@ -707,6 +741,72 @@ impl SessionRouter {
         self.perf.clone()
     }
 
+    /// Shape the exact parameters factories receive, including resolved Python
+    /// environment metadata. Buffer preflight must be rechecked on this value.
+    fn effective_node_parameters(&self, node: &crate::manifest::NodeManifest) -> serde_json::Value {
+        let mut params = node.params.clone();
+        let Some(obj) = params.as_object_mut() else {
+            return params;
+        };
+        if let Some(deps) = &node.python_deps {
+            obj.insert("__python_deps__".into(), serde_json::json!(deps));
+        }
+        if let Some(env) = &self.manifest.python_env {
+            if !env.extra_deps.is_empty() {
+                obj.insert(
+                    "__python_extra_deps__".into(),
+                    serde_json::json!(env.extra_deps),
+                );
+            }
+            if let Some(version) = &env.python_version {
+                obj.insert("__python_version__".into(), serde_json::json!(version));
+            }
+            // A materialized frozen venv overrides dependency resolution.
+            if let Some(venv) = env.explicit_venv.as_ref().filter(|path| !path.is_empty()) {
+                obj.insert("__python_explicit_venv__".into(), serde_json::json!(venv));
+            }
+            // Preserve the frozen wheelhouse for offline ABI-compatible installs.
+            if !env.find_links.is_empty() {
+                obj.insert(
+                    "__python_find_links__".into(),
+                    serde_json::json!(env.find_links),
+                );
+            }
+        }
+        let scope = node
+            .python_env
+            .as_ref()
+            .and_then(|env| env.scope.as_ref())
+            .or_else(|| {
+                self.manifest
+                    .python_env
+                    .as_ref()
+                    .and_then(|env| env.scope.as_ref())
+            });
+        if let Some(scope) = scope {
+            obj.insert(
+                "__python_env_scope__".into(),
+                serde_json::to_value(scope).unwrap_or_else(|_| serde_json::Value::Null),
+            );
+            use crate::python::env_manager::EnvScope;
+            let context = match scope {
+                EnvScope::Global => None,
+                EnvScope::PerPipeline => Some(format!("session:{}", self.session_id)),
+                EnvScope::PerNode => Some(format!(
+                    "session:{};node:{};type:{}",
+                    self.session_id, node.id, node.node_type
+                )),
+            };
+            if let Some(context) = context {
+                obj.insert(
+                    "__python_env_scope_context__".into(),
+                    serde_json::json!(context),
+                );
+            }
+        }
+        params
+    }
+
     /// Initialize all nodes in the pipeline
     ///
     /// This pre-creates and caches all nodes before streaming starts,
@@ -723,104 +823,37 @@ impl SessionRouter {
         );
         self.emit_loading_event("initializing", Some(format!("Starting {} nodes", total)));
 
-        // Phase 1: synchronously create every node. Cheap (registry
-        // lookup + param shaping) and lets us fail fast on an
-        // unregistered node_type before spawning anything heavy. We
-        // also stamp manifest-level Python dep info onto each node's
-        // params here so the multiprocess executor can provision its
-        // venv on first call to initialize().
+        // Validate every effective declaration before creating the first node.
+        let prepared = self
+            .manifest
+            .nodes
+            .iter()
+            .map(|node_spec| {
+                let params = self.effective_node_parameters(node_spec);
+                self.validate_effective_buffer_contract(node_spec, &params)?;
+                Ok((node_spec, params))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut created: Vec<(String, String, Box<dyn StreamingNode>)> = Vec::with_capacity(total);
-        for node_spec in &self.manifest.nodes {
-            let mut params = node_spec.params.clone();
-            if let Some(ref py_deps) = node_spec.python_deps {
-                if let Some(obj) = params.as_object_mut() {
-                    obj.insert("__python_deps__".to_string(), serde_json::json!(py_deps));
-                }
-            }
-            if let Some(ref py_env) = self.manifest.python_env {
-                if !py_env.extra_deps.is_empty() {
-                    if let Some(obj) = params.as_object_mut() {
-                        obj.insert(
-                            "__python_extra_deps__".to_string(),
-                            serde_json::json!(py_env.extra_deps),
-                        );
-                    }
-                }
-                if let Some(ref python_version) = py_env.python_version {
-                    if let Some(obj) = params.as_object_mut() {
-                        obj.insert(
-                            "__python_version__".to_string(),
-                            serde_json::json!(python_version),
-                        );
-                    }
-                }
-                // A server-materialized embedded (frozen) venv wins over any
-                // dep resolution: point the node straight at it.
-                if let Some(ref explicit_venv) = py_env.explicit_venv {
-                    if !explicit_venv.is_empty() {
-                        if let Some(obj) = params.as_object_mut() {
-                            obj.insert(
-                                "__python_explicit_venv__".to_string(),
-                                serde_json::json!(explicit_venv),
-                            );
-                        }
-                    }
-                }
-                // Thread the embedded wheelhouse (find-links) to the executor so the
-                // managed venv resolves the server-frozen `iceoryx2` (and other
-                // pinned deps) offline, instead of fetching a possibly ABI-
-                // incompatible version from PyPI.
-                if !py_env.find_links.is_empty() {
-                    if let Some(obj) = params.as_object_mut() {
-                        obj.insert(
-                            "__python_find_links__".to_string(),
-                            serde_json::json!(py_env.find_links),
-                        );
-                    }
-                }
-            }
-            let effective_scope = node_spec
-                .python_env
-                .as_ref()
-                .and_then(|env| env.scope.as_ref())
-                .or_else(|| {
-                    self.manifest
-                        .python_env
-                        .as_ref()
-                        .and_then(|env| env.scope.as_ref())
-                });
-            if let Some(scope) = effective_scope {
-                if let Some(obj) = params.as_object_mut() {
-                    obj.insert(
-                        "__python_env_scope__".to_string(),
-                        serde_json::to_value(scope).unwrap_or_else(|_| serde_json::Value::Null),
-                    );
-                    match scope {
-                        crate::python::env_manager::EnvScope::Global => {}
-                        crate::python::env_manager::EnvScope::PerPipeline => {
-                            obj.insert(
-                                "__python_env_scope_context__".to_string(),
-                                serde_json::json!(format!("session:{}", self.session_id)),
-                            );
-                        }
-                        crate::python::env_manager::EnvScope::PerNode => {
-                            obj.insert(
-                                "__python_env_scope_context__".to_string(),
-                                serde_json::json!(format!(
-                                    "session:{};node:{};type:{}",
-                                    self.session_id, node_spec.id, node_spec.node_type
-                                )),
-                            );
-                        }
-                    }
-                }
-            }
-            let node = self.registry.create_node(
+        for (node_spec, params) in prepared {
+            let mut node = self.registry.create_node(
                 &node_spec.node_type,
                 node_spec.id.clone(),
                 &params,
                 Some(self.session_id.clone()),
             )?;
+            if let Some(contract) = self
+                .buffer_contracts
+                .as_ref()
+                .and_then(|contracts| contracts.get(&node_spec.id))
+                .and_then(Option::as_ref)
+            {
+                node = Box::new(super::buffer_validation::BufferCheckedNode::new(
+                    node_spec.id.clone(),
+                    contract.clone(),
+                    node,
+                ));
+            }
             created.push((node_spec.id.clone(), node_spec.node_type.clone(), node));
         }
 

@@ -84,6 +84,7 @@ pub fn inspect_buffer_sharing(
             .and_then(|f| f.buffer_contract(&node.params));
         if let Some(contract) = &contract {
             inspect_node(&mut report, node, contract);
+            inspect_snapshot_bindings(&mut report, node, registry);
         } else {
             report.issue(&node.id, format!("{} has no buffer contract; declare allocation, layout, protocol and retention support", node.node_type));
             report.declared_node_retention = None;
@@ -103,6 +104,27 @@ pub fn inspect_buffer_sharing(
         }
     }
     report
+}
+
+fn inspect_snapshot_bindings(
+    report: &mut BufferPreflightReport,
+    node: &NodeManifest,
+    registry: &StreamingNodeRegistry,
+) {
+    let Some(factory) = registry.get_factory(&node.node_type) else {
+        return;
+    };
+    let has_snapshot = factory
+        .input_port_kinds()
+        .values()
+        .chain(factory.output_port_kinds().values())
+        .any(|kind| *kind == remotemedia_traits::ports::PortKind::Snapshot);
+    if has_snapshot {
+        report.issue(
+            &node.id,
+            "snapshot contract enforcement requires a fallible publication/read adapter",
+        );
+    }
 }
 
 fn inspect_edges(report: &mut BufferPreflightReport, manifest: &Manifest) {
@@ -160,11 +182,8 @@ fn inspect_node(
 
 fn inspect_ports(report: &mut BufferPreflightReport, node_id: &str, contract: &BufferContract) {
     for (name, port) in contract.inputs.iter().chain(contract.outputs.iter()) {
-        if !port.layouts.is_empty() && (port.domains.is_empty() || port.max_payload_bytes == 0) {
-            report.issue(
-                format!("{}:{name}", node_id),
-                "bulk port needs a memory domain and a nonzero payload bound",
-            );
+        if let Err(reason) = port.validate_definition() {
+            report.issue(format!("{}:{name}", node_id), reason);
         }
         if port
             .domains
