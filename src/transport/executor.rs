@@ -1364,6 +1364,10 @@ impl PipelineExecutor {
             },
         )?;
         router.set_output_allocator(output_allocator.clone());
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        if let Some(pool) = &mapped_pool {
+            router.set_mapped_buffer_pool(pool.clone());
+        }
         if let Some(report) = &buffer_preflight {
             router.set_buffer_contracts(report);
         }

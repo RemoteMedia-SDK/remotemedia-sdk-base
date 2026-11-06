@@ -18,12 +18,36 @@ use std::{
 type Callback = Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>;
 
 struct Checks {
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    mapped_pool: Option<crate::multiprocess::native_worker::SharedPool>,
     node_id: String,
     contract: BufferContract,
     forwarding: remotemedia_types::ForwardingScope,
     allocator: Option<Arc<remotemedia_types::BoundOutputAllocator>>,
 }
 impl Checks {
+    fn validate_domain(
+        &self,
+        contract: &BufferPortContract,
+        data: &RuntimeData,
+    ) -> Result<(), String> {
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        if contract
+            .domains
+            .contains(&remotemedia_traits::buffer_contract::BufferDomain::SessionMapped)
+            && self
+                .mapped_pool
+                .as_ref()
+                .is_some_and(|pool| pool.owns_payload(data))
+        {
+            return contract.validate_payload_in_domain(
+                data,
+                &remotemedia_traits::buffer_contract::BufferDomain::SessionMapped,
+            );
+        }
+        contract.validate_payload(data)
+    }
+
     fn check(&self, data: &RuntimeData, port: &str, output: bool) -> Result<(), Error> {
         let ports: &BTreeMap<String, BufferPortContract> = if output {
             &self.contract.outputs
@@ -31,7 +55,7 @@ impl Checks {
             &self.contract.inputs
         };
         let validation = match ports.get(port) {
-            Some(contract) => contract.validate_payload(data),
+            Some(contract) => self.validate_domain(contract, data),
             None if matches!(
                 data,
                 RuntimeData::Text(_)
@@ -150,12 +174,27 @@ impl BufferCheckedNode {
         Self {
             inner,
             checks: Arc::new(Checks {
+                #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+                mapped_pool: None,
                 node_id,
                 contract,
                 allocator,
                 forwarding: Default::default(),
             }),
         }
+    }
+
+    /// Bind the concrete session pool used to validate mapped-only ports.
+    /// Private/foreign buffers fail; this never stages or imports storage.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub fn with_mapped_pool(
+        mut self,
+        pool: crate::multiprocess::native_worker::SharedPool,
+    ) -> Self {
+        Arc::get_mut(&mut self.checks)
+            .expect("unshared node construction")
+            .mapped_pool = Some(pool);
+        self
     }
 
     fn output(&self, data: RuntimeData) -> Result<RuntimeData, Error> {

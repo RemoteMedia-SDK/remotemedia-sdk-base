@@ -314,6 +314,8 @@ pub struct DataPacket {
 /// - Integrates StreamingScheduler for timeout, retry, and circuit breaker (spec 026)
 /// - Tracks per-stream drift metrics for health monitoring (spec 026)
 pub struct SessionRouter {
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    mapped_buffer_pool: Option<crate::multiprocess::native_worker::SharedPool>,
     bound_output_allocators: HashMap<String, Arc<remotemedia_types::BoundOutputAllocator>>,
     buffer_contracts: Option<
         std::collections::BTreeMap<
@@ -581,6 +583,8 @@ impl SessionRouter {
         ));
 
         let router = Self {
+            #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+            mapped_buffer_pool: None,
             bound_output_allocators: HashMap::new(),
             buffer_contracts: None,
             node_materialization: super::NodeMaterializationCopies::new(
@@ -638,6 +642,13 @@ impl SessionRouter {
     /// existing input buffers or make legacy node allocations shareable.
     pub fn set_output_allocator(&mut self, allocator: Arc<dyn remotemedia_types::OutputAllocator>) {
         self.output_allocator = allocator;
+    }
+
+    /// Bind exact mapped-domain identity before initialization. Selecting this
+    /// validator does not change the output allocator or adapt incoming buffers.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub fn set_mapped_buffer_pool(&mut self, pool: crate::multiprocess::native_worker::SharedPool) {
+        self.mapped_buffer_pool = Some(pool);
     }
 
     pub(crate) fn set_buffer_contracts(
@@ -858,12 +869,18 @@ impl SessionRouter {
                 ));
                 self.bound_output_allocators
                     .insert(node_spec.id.clone(), allocator.clone());
-                node = Box::new(super::buffer_validation::BufferCheckedNode::new(
+                let checked = super::buffer_validation::BufferCheckedNode::new(
                     node_spec.id.clone(),
                     contract.clone(),
                     node,
                     Some(allocator),
-                ));
+                );
+                #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+                let checked = match &self.mapped_buffer_pool {
+                    Some(pool) => checked.with_mapped_pool(pool.clone()),
+                    None => checked,
+                };
+                node = Box::new(checked);
             }
             created.push((node_spec.id.clone(), node_spec.node_type.clone(), node));
         }
