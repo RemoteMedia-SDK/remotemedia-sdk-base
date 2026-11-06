@@ -560,7 +560,7 @@ pub struct SessionControl {
     intercepts: DashMap<InterceptKey, Arc<InterceptSlot>>,
     /// Handle to the router's input channel so `publish` can inject packets.
     /// Set by `attach_input_sender` after the router is constructed.
-    input_tx: RwLock<Option<mpsc::Sender<DataPacket>>>,
+    input_tx: RwLock<Option<super::SessionPacketSender>>,
     rpc_inputs: DashMap<String, mpsc::Sender<RpcInvocation>>,
     /// Monotonic sequence for injected packets (kept separate from the
     /// transport's own sequence to make out-of-band traffic identifiable).
@@ -962,12 +962,12 @@ impl SessionControl {
 
     /// Wire the router's input channel so `publish` can reach nodes.
     /// Called once from `SessionRouter::attach_control`.
-    pub async fn attach_input_sender(&self, tx: mpsc::Sender<DataPacket>) {
-        *self.input_tx.write().await = Some(tx);
+    pub async fn attach_input_sender(&self, tx: impl Into<super::SessionPacketSender>) {
+        *self.input_tx.write().await = Some(tx.into());
     }
 
     /// Clone the router input sender for transport-level participant joins.
-    pub async fn input_sender(&self) -> Option<mpsc::Sender<DataPacket>> {
+    pub async fn input_sender(&self) -> Option<super::SessionPacketSender> {
         self.input_tx.read().await.clone()
     }
 
@@ -1159,10 +1159,7 @@ impl SessionControl {
             crate::Error::Execution("session control not yet attached to router".into())
         })?;
 
-        let payload = match &addr.port {
-            None => data,
-            Some(port) => wrap_aux_port(port, data),
-        };
+        let payload = tx.control_payload(addr.port.as_deref(), data)?;
 
         let packet = DataPacket {
             data: payload,
@@ -1175,8 +1172,8 @@ impl SessionControl {
             sub_sequence: 0,
             metadata: std::collections::HashMap::new(),
         };
-        tx.send(packet).await.map_err(|_| {
-            crate::Error::Execution(format!("session {} router input closed", self.session_id))
+        tx.send(packet).await.map_err(|error| {
+            crate::Error::Execution(format!("session {} ingress: {error}", self.session_id))
         })
     }
 

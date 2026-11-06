@@ -34,6 +34,8 @@ pub mod client;
 pub mod control_transport;
 pub mod data;
 pub mod embedded_python_env;
+mod ingress;
+pub use ingress::{IngressSendError, SessionPacketPermit, SessionPacketSender};
 mod managed_ardy;
 #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
 mod mapped_placement;

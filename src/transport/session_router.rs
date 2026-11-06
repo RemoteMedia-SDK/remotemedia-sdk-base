@@ -362,7 +362,7 @@ pub struct SessionRouter {
     input_rx: std::sync::Mutex<Option<mpsc::Receiver<DataPacket>>>,
 
     /// Channel to send inputs to router (held by external code, dropped in run()).
-    input_tx: Option<mpsc::Sender<DataPacket>>,
+    input_tx: Option<super::SessionPacketSender>,
 
     /// Shutdown signal receiver. See [`Self::input_rx`] for why the
     /// receiver is wrapped in a `std::sync::Mutex`.
@@ -603,7 +603,7 @@ impl SessionRouter {
             snapshot_bindings: None,
             output_router,
             input_rx: std::sync::Mutex::new(Some(input_rx)),
-            input_tx: Some(input_tx),
+            input_tx: Some(input_tx.into()),
             shutdown_rx: std::sync::Mutex::new(Some(shutdown_rx)),
             _shutdown_tx: shutdown_tx,
             resolution_ctx: None,
@@ -718,12 +718,18 @@ impl SessionRouter {
         self.telemetry.clone()
     }
 
-    /// Get the input sender for feeding data to the router.
-    ///
-    /// The returned sender is bounded; callers should `.send(...).await`
-    /// and treat the back-pressure as real (drop-on-deadline is a policy
-    /// decision for the transport ingress, not the router).
-    pub fn get_input_sender(&self) -> mpsc::Sender<DataPacket> {
+    /// Bind a live ingress budget before any packet is submitted. Sender clones
+    /// obtained earlier share the binding. Rebinding or binding after use fails.
+    pub fn set_ingress_budget(&self, budget: remotemedia_types::BufferBudget) -> Result<()> {
+        self.input_tx
+            .as_ref()
+            .ok_or_else(|| Error::ConfigError("ingress budget cannot be bound after router start".into()))?
+            .bind_budget(budget)
+    }
+
+    /// Get a clone of the budget-aware, bounded input sender. Channel fullness
+    /// backpressures; configured owner/byte exhaustion fails before enqueueing.
+    pub fn get_input_sender(&self) -> super::SessionPacketSender {
         self.input_tx
             .clone()
             .expect("input_tx not yet consumed by run()")

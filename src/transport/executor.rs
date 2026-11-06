@@ -47,6 +47,10 @@ pub struct ExecutorConfig {
     /// Optional static buffer-contract gate before node creation. This checks
     /// declarations only, not dynamic payloads or whole-pipeline copy freedom.
     pub buffer_preflight: Option<super::buffer_preflight::BufferPreflightConfig>,
+    /// Live ingress owners/backing bytes, shared by direct ingress allocation and
+    /// all input senders. None uses the preflight node budget when configured;
+    /// without preflight it preserves legacy channel-count-only admission.
+    pub ingress_retention: Option<remotemedia_traits::buffer_contract::BufferRetention>,
     /// Policy for explicit materializations in host Rust node contexts. Separate
     /// from mapped worker ingress; this alone is not graph-wide certification.
     pub node_materialization_policy: remotemedia_types::CopyPolicy,
@@ -97,6 +101,7 @@ impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
             buffer_preflight: None,
+            ingress_retention: None,
             node_materialization_policy: remotemedia_types::CopyPolicy::AllowCopies,
             scheduler_config: SchedulerConfig::default(),
             drift_thresholds: DriftThresholds::default(),
@@ -140,7 +145,7 @@ pub struct SessionHandle {
     /// Channel for sending input data to the session (None after input complete).
     ///
     /// Bounded — see `DEFAULT_ROUTER_INPUT_CAPACITY` in `session_router`.
-    input_tx: Option<mpsc::Sender<DataPacket>>,
+    input_tx: Option<super::SessionPacketSender>,
     /// Per-kind receivers for sink output. See [`ClientOutputRouter`] for
     /// why kinds are split. Wrapped in `Option` so `take_output_receivers`
     /// can consume them — needed when a transport (e.g. WebRTC peer) wants
@@ -181,6 +186,8 @@ impl SessionHandle {
 
     /// Allocate ingress media directly in the storage used by this session's
     /// producers. Loans and published outputs retain storage after session close.
+    /// Configured ingress credit covers these loans before submission and follows
+    /// admitted views after dequeue. Node-generated outputs use separate budgets.
     /// Allocation may block; this is not an audio-callback API.
     pub fn output_allocator(&self) -> Arc<dyn remotemedia_types::OutputAllocator> {
         self.output_allocator.clone()
@@ -435,11 +442,16 @@ impl SessionHandle {
 /// See [`SessionHandle::input_sender`] for why this exists.
 #[derive(Clone)]
 pub struct SessionInputSender {
-    tx: mpsc::Sender<DataPacket>,
+    tx: super::SessionPacketSender,
     session_id: String,
 }
 
 impl SessionInputSender {
+    /// Live ingress credit shared by all senders and direct session allocation.
+    pub fn buffer_budget(&self) -> Option<remotemedia_types::BufferBudget> {
+        self.tx.buffer_budget()
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -465,7 +477,7 @@ impl SessionInputSender {
 
     pub(crate) fn from_data_packet_sender(
         session_id: impl Into<String>,
-        tx: mpsc::Sender<DataPacket>,
+        tx: super::SessionPacketSender,
     ) -> Self {
         Self {
             tx,
@@ -1372,6 +1384,10 @@ impl PipelineExecutor {
             },
         )?;
         router.set_output_allocator(output_allocator.clone());
+        // Node outputs keep their own budgets; only external production uses
+        // the shared ingress allocator returned to the session handle.
+        let output_allocator =
+            super::ingress::bind_allocator(&router, output_allocator, &self.config)?;
         #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
         if let Some(pool) = &mapped_pool {
             router.set_mapped_buffer_pool(pool.clone());
