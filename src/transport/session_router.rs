@@ -864,9 +864,16 @@ impl SessionRouter {
                 .and_then(|contracts| contracts.get(&node_spec.id))
                 .and_then(Option::as_ref)
             {
-                let allocator = Arc::new(remotemedia_types::BoundOutputAllocator::new(
+                let allocator = remotemedia_types::BoundOutputAllocator::new(
                     self.output_allocator.clone(),
-                ));
+                );
+                let allocator = match contract.retention {
+                    Some(limit) => allocator.with_budget(remotemedia_types::BufferBudget::new(
+                        limit.owners, limit.bytes,
+                    )),
+                    None => allocator,
+                };
+                let allocator = Arc::new(allocator);
                 self.bound_output_allocators
                     .insert(node_spec.id.clone(), allocator.clone());
                 let checked = super::buffer_validation::BufferCheckedNode::new(
