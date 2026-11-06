@@ -22,6 +22,10 @@
 //! hook failures propagate; they never retry through the copying codec.
 //!
 //! Rebuilt protocol-0 plugins use the legacy MessagePack RuntimeData hooks.
+//! Context-bearing calls require an explicit allow-copies policy and attribute
+//! host encoding/decoding to its ledger; strict and missing policies reject before
+//! invoking legacy hooks, including metadata-only calls. Plugin-internal copies
+//! cannot be accounted through protocol 0. Context-free APIs use the legacy ledger.
 //! RPC remains on its separate MessagePack request/reply channel. Native Rust
 //! enum layouts and allocator implementations never cross the dynamic ABI.
 //!
@@ -54,7 +58,10 @@ use loadable_node_abi::{
     RpcReplySinkBox, RpcReplySink_TO,
 };
 use remotemedia_traits::rpc::{RpcEvent, RpcMethod, RpcMode, RpcReply, RpcRequest, RpcResponder};
+use remotemedia_types::CopyContext;
 use serde_json::Value;
+
+mod legacy;
 
 use crate::data::RuntimeData;
 use crate::nodes::{
@@ -388,7 +395,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
             )
             .await
         } else {
-            self.process(data).await
+            self.legacy_process(data, &self.legacy_copies(ctx)?).await
         }
     }
 
@@ -418,7 +425,13 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
             self.shared_tick(tick, self.context_from(ctx)?, callback)
                 .await
         } else {
-            self.tick(tick, context_session(ctx), callback).await
+            self.legacy_tick(
+                tick,
+                context_session(ctx),
+                &self.legacy_copies(ctx)?,
+                callback,
+            )
+            .await
         }
     }
 
@@ -436,7 +449,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
                     Error::from_plugin(error.into_string(), &self.node_id, &self.node_type)
                 })
         } else {
-            self.process_control_message(message, context_session(ctx))
+            self.legacy_control(message, context_session(ctx), &self.legacy_copies(ctx)?)
                 .await
         }
     }
@@ -451,6 +464,9 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         ctx: &dyn NodeRuntimeContextRead,
         replies: &mut RpcResponder,
     ) -> Result<(), Error> {
+        if !self.uses_shared()? {
+            self.legacy_copies(ctx)?;
+        }
         let bytes = rmp_serde::to_vec_named(&request)
             .map_err(|e| Error::Execution(format!("RPC encode: {e}")))?;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -536,20 +552,8 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
                 .shared_tick(tick, self.execution_context(session_id, None), callback)
                 .await;
         }
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let sink = OutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
-        let future = self.inner.tick(
-            loadable_node_abi::FfiTick {
-                clock_id: tick.clock_id.into(),
-                pts_us: tick.pts_us,
-                frame_idx: tick.frame_idx,
-                deadline_us: tick.deadline_us,
-            },
-            session_id.unwrap_or_default().into(),
-            sink,
-        );
-
-        self.drain_outputs(future, rx, callback).await.map(|_| ())
+        self.legacy_tick(tick, session_id, CopyContext::legacy(), callback)
+            .await
     }
 
     async fn process_control_message(
@@ -570,20 +574,8 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
                     Error::from_plugin(error.into_string(), &self.node_id, &self.node_type)
                 });
         }
-        let bytes = rmp_serde::to_vec_named(&message)
-            .map_err(|e| Error::Execution(format!("rmp encode control: {e}")))?;
-        match self
-            .inner
-            .process_control_message(bytes.into(), session_id.unwrap_or_default().into())
+        self.legacy_control(message, session_id, CopyContext::legacy())
             .await
-        {
-            RResult::ROk(handled) => Ok(handled),
-            RResult::RErr(e) => Err(Error::from_plugin(
-                e.into_string(),
-                &self.node_id,
-                &self.node_type,
-            )),
-        }
     }
 
     /// Forward initialization across the FFI boundary so lazy-load
@@ -627,36 +619,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
                 )
                 .await;
         }
-        // Encode any RuntimeData variant via MessagePack. No
-        // per-variant mapping needed — the public type derives
-        // Serialize and so does every sub-type (AudioSamples,
-        // ImageFormat, ControlMessageType, serde_json::Value, …).
-        // Use named (map) encoding to remain compatible with
-        // `#[serde(skip_serializing_if = "Option::is_none")]` fields
-        // on `RuntimeData` variants. The compact (positional) encoder
-        // would shift fields when partial optionals are skipped.
-        let req_bytes = rmp_serde::to_vec_named(&data).map_err(|e| {
-            Error::Execution(format!(
-                "rmp encode for plugin '{}' (id={}): {e}",
-                self.node_type, self.node_id
-            ))
-        })?;
-
-        match self.inner.process(RVec::from(req_bytes)).await {
-            RResult::ROk(out) => {
-                rmp_serde::from_slice::<RuntimeData>(out.as_slice()).map_err(|e| {
-                    Error::Execution(format!(
-                        "rmp decode from plugin '{}' (id={}): {e}",
-                        self.node_type, self.node_id
-                    ))
-                })
-            }
-            RResult::RErr(e) => Err(Error::from_plugin(
-                e.into_string(),
-                &self.node_id,
-                &self.node_type,
-            )),
-        }
+        self.legacy_process(data, CopyContext::legacy()).await
     }
 
     /// Streaming entry point — forwards through the per-frame FFI
@@ -692,36 +655,8 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
                 .shared_stream(data, self.execution_context(session_id, None), callback)
                 .await;
         }
-        let req_bytes = rmp_serde::to_vec_named(&data).map_err(|e| {
-            Error::Execution(format!(
-                "rmp encode for plugin '{}' (id={}): {e}",
-                self.node_type, self.node_id
-            ))
-        })?;
-
-        // Capacity 32 is a comfortable margin for any real plugin —
-        // the drain loop below runs on the host runtime and pulls
-        // frames as fast as the user callback consumes them. If the
-        // callback is slow the sink's `push` parks via blocking_send
-        // (multi-threaded plugin runtime → safe), propagating real
-        // backpressure to the plugin's generator.
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<NativeFrame>(32);
-        let sink: OutputSinkBox =
-            OutputSink_TO::from_value(ChannelSink { tx: frame_tx }, TD_Opaque);
-
-        // Build the FFI future before we await anything else so the
-        // plugin starts generating in parallel with our drain loop.
-        // The future captures `sink` by value (FfiFuture is `'static`),
-        // so there's no borrow on `self`.
-        let ffi_fut = self.inner.process_streaming_with_context(
-            RVec::from(req_bytes),
-            FfiCallContext {
-                session_id: session_id.map(RString::from).into(),
-                node_id: self.node_id.clone().into(),
-            },
-            sink,
-        );
-        self.drain_outputs(ffi_fut, frame_rx, callback).await
+        self.legacy_stream(data, session_id, CopyContext::legacy(), callback)
+            .await
     }
 
     /// Ctx-aware streaming entry point — same per-frame FFI path,
@@ -741,12 +676,13 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
                 .shared_stream(data, self.context_from(ctx)?, callback)
                 .await;
         }
-        let session_id = if ctx.session_id().is_empty() {
-            None
-        } else {
-            Some(ctx.session_id().to_string())
-        };
-        self.process_streaming(data, session_id, callback).await
+        self.legacy_stream(
+            data,
+            context_session(ctx),
+            &self.legacy_copies(ctx)?,
+            callback,
+        )
+        .await
     }
 }
 
@@ -835,7 +771,7 @@ impl LoadableNodeAdapter {
         let future = self
             .inner
             .process_streaming_shared(encode_shared(data)?, context, sink);
-        self.drain_outputs(future, rx, callback).await
+        self.drain_outputs(future, rx, None, callback).await
     }
 
     async fn shared_tick(
@@ -852,15 +788,21 @@ impl LoadableNodeAdapter {
             frame_idx: tick.frame_idx,
             deadline_us: tick.deadline_us,
         };
-        self.drain_outputs(self.inner.tick_shared(tick, context, sink), rx, callback)
-            .await
-            .map(|_| ())
+        self.drain_outputs(
+            self.inner.tick_shared(tick, context, sink),
+            rx,
+            None,
+            callback,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn drain_outputs<F>(
         &self,
         ffi_fut: async_ffi::FfiFuture<RResult<usize, RString>>,
         mut frame_rx: tokio::sync::mpsc::Receiver<NativeFrame>,
+        legacy_copies: Option<&CopyContext>,
         mut callback: F,
     ) -> Result<usize, Error>
     where
@@ -879,8 +821,8 @@ impl LoadableNodeAdapter {
                             let out_data = match frame {
                                 NativeFrame::Shared(message) => runtime_buffer::decode(message)
                                     .map_err(|error| Error::Execution(error.into_string()))?,
-                                NativeFrame::Legacy(bytes) => rmp_serde::from_slice(bytes.as_slice())
-                                    .map_err(|error| Error::Execution(format!("rmp decode from plugin: {error}")))?,
+                                NativeFrame::Legacy(bytes) => self.legacy_decode(bytes.as_slice(), legacy_copies.ok_or_else(||
+                                    Error::Execution("unexpected legacy frame on shared plugin path".into()))?)?,
                             };
                             callback(out_data)?;
                             count += 1;
