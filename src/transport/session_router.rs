@@ -659,7 +659,9 @@ impl SessionRouter {
             let actual = self
                 .registry
                 .get_factory(&node.node_type)
-                .and_then(|factory| factory.buffer_contract(params));
+                .map(|factory| factory.try_buffer_contract(params))
+                .transpose()?
+                .flatten();
             if &actual != expected {
                 return Err(Error::ConfigError(format!("buffer contract node '{}': effective runtime parameters changed the preflight declaration", node.id)));
             }

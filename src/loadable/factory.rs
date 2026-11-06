@@ -16,7 +16,7 @@
 //!
 //! # Media ownership and compatibility
 //!
-//! ABI 0.7 plugins advertising buffer protocol 2 exchange payload-free JSON
+//! ABI 0.8 plugins advertising buffer protocol 2 exchange payload-free JSON
 //! metadata and retained immutable owners. Per-call execution contexts supply
 //! the host output allocator for direct production into shared storage. Shared
 //! hook failures propagate; they never retry through the copying codec.
@@ -271,6 +271,51 @@ struct LoadableFactoryAdapter {
 }
 
 impl StreamingNodeFactory for LoadableFactoryAdapter {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        let params =
+            serde_json::to_string(params).map_err(|error| Error::ConfigError(error.to_string()))?;
+        let encoded = self
+            .inner
+            .buffer_contract(params.into())
+            .into_result()
+            .map_err(|error| {
+                Error::ConfigError(format!("native factory '{}': {error}", self.node_type))
+            })?;
+        let Some(encoded) = encoded.into_option() else {
+            return Ok(None);
+        };
+        if encoded.len() > loadable_node_abi::MAX_BUFFER_CONTRACT_BYTES {
+            return Err(Error::ConfigError(format!(
+                "native factory '{}': buffer contract exceeds 1 MiB",
+                self.node_type
+            )));
+        }
+        let contract: remotemedia_traits::buffer_contract::BufferContract =
+            serde_json::from_str(&encoded).map_err(|error| {
+                Error::ConfigError(format!(
+                    "native factory '{}': invalid buffer contract: {error}",
+                    self.node_type
+                ))
+            })?;
+        if !self.supports_buffer_protocol(&contract.protocol) {
+            return Err(Error::ConfigError(format!(
+                "native factory '{}' binding does not support {:?}",
+                self.node_type, contract.protocol
+            )));
+        }
+        Ok(Some(contract))
+    }
+
+    fn supports_buffer_protocol(
+        &self,
+        protocol: &remotemedia_traits::buffer_contract::BufferProtocol,
+    ) -> bool {
+        matches!(protocol, remotemedia_traits::buffer_contract::BufferProtocol::NativeAbi { abi, buffers }
+            if abi == loadable_node_abi::ABI_VERSION && *buffers == BUFFER_ABI_VERSION)
+    }
     fn input_port_kinds(
         &self,
     ) -> std::collections::HashMap<String, remotemedia_traits::ports::PortKind> {
@@ -295,6 +340,7 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
+        let contract = self.try_buffer_contract(params)?;
         let params_json = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
         let ffi_node = match self.inner.create(RString::from(params_json)) {
             RResult::ROk(n) => n,
@@ -306,6 +352,10 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
                 )));
             }
         };
+
+        if contract.is_some() && ffi_node.shared_buffer_protocol() != BUFFER_ABI_VERSION {
+            return Err(Error::ConfigError(format!("native factory '{}': created node buffer protocol {} disagrees with declared protocol {}", self.node_type, ffi_node.shared_buffer_protocol(), BUFFER_ABI_VERSION)));
+        }
 
         let pacing: Value = serde_json::from_str(ffi_node.pacing().as_str())
             .map_err(|e| Error::Execution(format!("invalid plugin pacing: {e}")))?;

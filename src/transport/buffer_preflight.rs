@@ -79,9 +79,7 @@ pub fn inspect_buffer_sharing(
             report.declared_node_retention = None;
             continue;
         }
-        let contract = registry
-            .get_factory(&node.node_type)
-            .and_then(|f| f.buffer_contract(&node.params));
+        let contract = inspect_factory(&mut report, node, registry);
         if let Some(contract) = &contract {
             inspect_node(&mut report, node, contract);
             inspect_snapshot_bindings(&mut report, node, registry);
@@ -104,6 +102,28 @@ pub fn inspect_buffer_sharing(
         }
     }
     report
+}
+
+fn inspect_factory(
+    report: &mut BufferPreflightReport,
+    node: &NodeManifest,
+    registry: &StreamingNodeRegistry,
+) -> Option<BufferContract> {
+    let factory = registry.get_factory(&node.node_type)?;
+    let contract = match factory.try_buffer_contract(&node.params) {
+        Ok(contract) => contract?,
+        Err(error) => {
+            report.issue(&node.id, format!("buffer declaration failed: {error}"));
+            return None;
+        }
+    };
+    match &contract.protocol {
+        BufferProtocol::RustOwners | BufferProtocol::NativeAbi { .. }
+            if factory.supports_buffer_protocol(&contract.protocol) => {},
+        BufferProtocol::Serialized => report.issue(&node.id, "serialized protocol requires payload materialization"),
+        protocol => report.issue(&node.id, format!("transport contract {protocol:?} has no verified factory binding in this preflight version")),
+    }
+    Some(contract)
 }
 
 fn inspect_snapshot_bindings(
@@ -169,11 +189,6 @@ fn inspect_node(
     }
     if let Some(reason) = local_placement_issue(node) {
         report.issue(&node.id, reason);
-    }
-    match &contract.protocol {
-        BufferProtocol::RustOwners => {},
-        BufferProtocol::Serialized => report.issue(&node.id, "serialized protocol requires payload materialization"),
-        protocol => report.issue(&node.id, format!("transport contract {protocol:?} has no verified factory binding in this preflight version")),
     }
     inspect_ports(report, &node.id, contract);
     inspect_forwarding(report, &node.id, contract);
