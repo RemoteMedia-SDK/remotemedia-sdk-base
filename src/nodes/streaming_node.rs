@@ -159,6 +159,23 @@ impl StreamingNodeRegistry {
         self.session_workers.get(node_type)
     }
 
+    /// Replace a session template's executable factory while retaining its
+    /// registration provenance for preflight. Ordinary register clears it.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub(crate) fn bind_session_worker(
+        &mut self,
+        node_type: &str,
+        factory: Arc<dyn StreamingNodeFactory>,
+    ) -> Result<(), Error> {
+        if !self.session_workers.contains_key(node_type) || factory.node_type() != node_type {
+            return Err(crate::Error::ConfigError(
+                "session worker binding changed its registered node type".into(),
+            ));
+        }
+        self.factories.insert(node_type.to_owned(), factory);
+        Ok(())
+    }
+
     /// Merge the factories from `other` into `self`, consuming `other`.
     ///
     /// Factories from `other` override any existing entries in `self` with

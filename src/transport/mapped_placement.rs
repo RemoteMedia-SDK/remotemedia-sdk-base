@@ -44,13 +44,37 @@ pub(super) fn bind_session_workers(
     };
     let pool = SharedPool::new(SessionId(*uuid::Uuid::new_v4().as_bytes()), config.clone())
         .map_err(|error| Error::ConfigError(format!("session mapped pool: {error}")))?;
+    bind_registered_factories(manifest, registry, &pool, &copies)?;
+    Ok((Some(pool), copies))
+}
+
+fn bind_registered_factories(
+    manifest: &Manifest,
+    registry: &mut StreamingNodeRegistry,
+    pool: &SharedPool,
+    copies: &WorkerInputCopies,
+) -> Result<()> {
+    let mut bound_types = std::collections::HashSet::new();
     for node in &manifest.nodes {
-        if let Some(factory) = registry.session_worker(&node.node_type) {
-            let bound = factory.bind_session(pool.clone(), copies.clone());
-            registry.register(bound);
+        if let Some(factory) = registry.session_worker(&node.node_type).cloned() {
+            if bound_types.insert(node.node_type.clone()) {
+                let bound = factory.bind_session(pool.clone(), copies.clone());
+                registry.bind_session_worker(&node.node_type, bound)?;
+            }
+            let bound = registry
+                .get_factory(&node.node_type)
+                .expect("bound session factory");
+            if bound.try_buffer_contract(&node.params)?
+                != factory.try_buffer_contract(&node.params)?
+            {
+                return Err(Error::ConfigError(format!(
+                    "mapped worker '{}': session binding changed its buffer declaration",
+                    node.id
+                )));
+            }
         }
     }
-    Ok((Some(pool), copies))
+    Ok(())
 }
 
 fn incompatible_placement(node: &NodeManifest) -> Option<&'static str> {

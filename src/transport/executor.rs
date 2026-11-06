@@ -660,10 +660,18 @@ impl PipelineExecutor {
             .buffer_preflight
             .as_ref()
             .map(|config| {
-                let report = super::buffer_preflight::inspect_buffer_sharing(
+                #[cfg(not(all(feature = "native-worker", any(windows, target_os = "linux"))))]
+                let resources = super::buffer_preflight::BufferPreflightResources::default();
+                #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+                let resources = super::buffer_preflight::BufferPreflightResources {
+                    session_mapped: self.config.mapped_pool.is_some(),
+                    mapped_input_policy: self.config.mapped_input_policy,
+                };
+                let report = super::buffer_preflight::inspect_buffer_sharing_with_resources(
                     manifest,
                     registry,
                     config.node_retention_budget,
+                    &resources,
                 );
                 report.enforce(config.policy)?;
                 Ok(report)

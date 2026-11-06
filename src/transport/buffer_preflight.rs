@@ -11,6 +11,9 @@ use remotemedia_types::CopyPolicy;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+mod resources;
+pub use resources::BufferPreflightResources;
+
 #[derive(Debug, Clone)]
 pub struct BufferPreflightConfig {
     /// Strict rejects static incompatibilities before creating nodes. This does
@@ -62,6 +65,23 @@ pub fn inspect_buffer_sharing(
     registry: &StreamingNodeRegistry,
     budget: BufferRetention,
 ) -> BufferPreflightReport {
+    inspect_buffer_sharing_with_resources(
+        manifest,
+        registry,
+        budget,
+        &BufferPreflightResources::default(),
+    )
+}
+
+/// Inspect the planned session resources without allocating storage or starting
+/// nodes. The executor supplies its actual configuration and binds/rechecks the
+/// factories before initialization; this report alone is not runtime proof.
+pub fn inspect_buffer_sharing_with_resources(
+    manifest: &Manifest,
+    registry: &StreamingNodeRegistry,
+    budget: BufferRetention,
+    resources: &BufferPreflightResources,
+) -> BufferPreflightReport {
     let mut report = BufferPreflightReport {
         nodes: BTreeMap::new(),
         issues: Vec::new(),
@@ -79,9 +99,9 @@ pub fn inspect_buffer_sharing(
             report.declared_node_retention = None;
             continue;
         }
-        let contract = inspect_factory(&mut report, node, registry);
+        let contract = inspect_factory(&mut report, node, registry, resources);
         if let Some(contract) = &contract {
-            inspect_node(&mut report, node, contract);
+            inspect_node(&mut report, node, contract, resources);
             inspect_snapshot_bindings(&mut report, node, registry);
         } else {
             report.issue(&node.id, format!("{} has no buffer contract; declare allocation, layout, protocol and retention support", node.node_type));
@@ -108,6 +128,7 @@ fn inspect_factory(
     report: &mut BufferPreflightReport,
     node: &NodeManifest,
     registry: &StreamingNodeRegistry,
+    resources: &BufferPreflightResources,
 ) -> Option<BufferContract> {
     let factory = registry.get_factory(&node.node_type)?;
     let contract = match factory.try_buffer_contract(&node.params) {
@@ -120,6 +141,12 @@ fn inspect_factory(
     match &contract.protocol {
         BufferProtocol::RustOwners | BufferProtocol::NativeAbi { .. }
             if factory.supports_buffer_protocol(&contract.protocol) => {},
+        BufferProtocol::MappedNative { .. } | BufferProtocol::MappedPython { .. }
+            if factory.supports_buffer_protocol(&contract.protocol) => {
+                if let Some(reason) = resources.mapped_worker_issue(node, registry) {
+                    report.issue(&node.id, reason);
+                }
+            },
         BufferProtocol::Serialized => report.issue(&node.id, "serialized protocol requires payload materialization"),
         protocol => report.issue(&node.id, format!("transport contract {protocol:?} has no verified factory binding in this preflight version")),
     }
@@ -180,6 +207,7 @@ fn inspect_node(
     report: &mut BufferPreflightReport,
     node: &NodeManifest,
     contract: &BufferContract,
+    resources: &BufferPreflightResources,
 ) {
     if contract.version != BUFFER_CONTRACT_VERSION {
         report.issue(
@@ -190,21 +218,26 @@ fn inspect_node(
     if let Some(reason) = local_placement_issue(node) {
         report.issue(&node.id, reason);
     }
-    inspect_ports(report, &node.id, contract);
+    inspect_ports(report, &node.id, contract, resources);
     inspect_forwarding(report, &node.id, contract);
     record_retention(report, &node.id, contract);
 }
 
-fn inspect_ports(report: &mut BufferPreflightReport, node_id: &str, contract: &BufferContract) {
+fn inspect_ports(
+    report: &mut BufferPreflightReport,
+    node_id: &str,
+    contract: &BufferContract,
+    resources: &BufferPreflightResources,
+) {
     for (name, port) in contract.inputs.iter().chain(contract.outputs.iter()) {
         if let Err(reason) = port.validate_definition() {
             report.issue(format!("{}:{name}", node_id), reason);
         }
-        if port
-            .domains
-            .iter()
-            .any(|d| !matches!(d, BufferDomain::Host))
-        {
+        if port.domains.iter().any(|d| match d {
+            BufferDomain::Host => false,
+            BufferDomain::SessionMapped => !resources.mapped_available(),
+            BufferDomain::Device(_) => true,
+        }) {
             report.issue(
                 format!("{}:{name}", node_id),
                 "mapped/device domain requires allocator/transport binding verification",
