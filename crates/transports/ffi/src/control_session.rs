@@ -25,7 +25,7 @@ use remotemedia_core::transport::session_control::{
     ControlAddress, Direction, InterceptDecision, NodeState,
 };
 
-use crate::marshal::runtime_data_to_python;
+use crate::marshal::runtime_data_into_python;
 
 // ─── Custom exceptions ───────────────────────────────────────────────────────
 
@@ -374,7 +374,7 @@ impl PyInterceptSession {
             };
             match result {
                 Some(req) => Python::attach(|py| {
-                    let py_data = crate::marshal::runtime_data_to_python(py, &req.data)?;
+                    let py_data = crate::marshal::runtime_data_into_python(py, req.data)?;
                     let cid_py = req.correlation_id.into_pyobject(py)?;
                     let tuple =
                         pyo3::types::PyTuple::new(py, [cid_py.into_any(), py_data.into_bound(py)])?;
@@ -463,7 +463,7 @@ impl PySubscription {
                     // Return the marshalled Python object. The Python adapter
                     // wraps non-dict primitives in a canonical dict envelope
                     // before passing to Data._from_runtime_dict.
-                    Ok(runtime_data_to_python(py, &rd)?)
+                    Ok(runtime_data_into_python(py, rd)?)
                 }),
                 Err(RecvError::Lagged(count)) if rpc => Err(PyRuntimeError::new_err(format!(
                     "RPC reply subscription lagged by {count} frames; pending calls cannot complete reliably"

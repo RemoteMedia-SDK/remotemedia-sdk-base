@@ -190,6 +190,11 @@ impl SharedPipelineSession {
         self.input_sender.clone()
     }
 
+    /// Allocate directly against this shared session's ingress storage and budget.
+    pub async fn output_allocator(&self) -> Arc<dyn remotemedia_types::OutputAllocator> {
+        self.session_handle.lock().await.output_allocator()
+    }
+
     pub fn participant_handle(&self, participant: Participant) -> ParticipantSessionHandle {
         ParticipantSessionHandle::new(self.input_sender(), participant)
     }

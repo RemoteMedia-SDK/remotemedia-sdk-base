@@ -5,9 +5,9 @@ build-backend = "maturin"
 [project]
 name = "remotemedia-ffi"
 version = "0.4.4"
-description = "Python FFI transport for RemoteMedia pipelines - provides direct Python imports with zero-copy IPC via iceoryx2 shared memory"
+description = "Python FFI transport for RemoteMedia pipelines with owning read-only buffer views"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
     { name = "RemoteMedia SDK Contributors" }
@@ -35,7 +35,6 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -69,7 +68,7 @@ dev = [
 [tool.maturin]
 # Build extension module with proper linking
 features = ["extension-module"]
-# Use abi3 for broad compatibility (Python 3.10+)
+# Use abi3 for broad compatibility (Python 3.11+)
 # Install as remotemedia.runtime - the Rust execution runtime
 module-name = "remotemedia.runtime"
 # Include Python namespace package

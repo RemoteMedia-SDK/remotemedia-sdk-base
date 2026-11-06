@@ -274,11 +274,12 @@ pub fn numpy_to_runtime_data(py: Python<'_>, arr: Bound<'_, PyAny>) -> PyResult<
     // We keep this function for API compatibility and documentation
     Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
         "numpy_to_runtime_data is deprecated. Pass numpy arrays directly to execute_pipeline_with_input - \
-         they will be automatically wrapped in RuntimeData::Numpy for zero-copy passthrough."
+         private arrays use explicit copying; published owning views can pass without copying."
     ))
 }
 
-/// Convert AudioBuffer to numpy array with zero-copy (Phase 4: T049-T053)
+/// Legacy copying AudioBuffer-to-NumPy conversion. Owning RuntimeData views
+/// are exported by marshal::buffers instead.
 ///
 /// This function provides efficient transfer from Rust to Python by:
 /// 1. Getting a slice from the AudioBuffer (zero-copy via Arc)
@@ -298,7 +299,7 @@ pub fn audio_buffer_to_numpy_ffi<'py>(
     let slice = buffer.as_slice();
 
     // Create numpy array from slice
-    // PyArray::from_slice creates a numpy array that borrows from the Rust data
+    // PyArray::from_slice copies into a NumPy-owned allocation.
     let array = PyArray::from_slice(py, slice);
 
     // For multi-channel audio, reshape to (frames, channels)
@@ -648,7 +649,7 @@ result = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.float32)
     }
 
     #[test]
-    fn test_zero_copy_roundtrip() {
+    fn test_audio_buffer_value_roundtrip() {
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");

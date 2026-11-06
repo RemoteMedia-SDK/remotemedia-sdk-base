@@ -180,7 +180,7 @@ impl InstanceExecutor {
         // T006, T016: Python::attach() method calling pattern for process()
         Python::attach(|py| {
             // Convert RuntimeData to Python object (requires T007)
-            let py_input = super::marshal::runtime_data_to_python(py, &input)?;
+            let py_input = super::marshal::runtime_data_into_python(py, input)?;
 
             // Call process method
             let result = self

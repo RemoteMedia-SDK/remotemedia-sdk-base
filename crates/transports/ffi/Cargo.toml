@@ -40,6 +40,8 @@ remotemedia-grpc = { path = "../grpc", optional = true }
 pyo3 = { version = "0.28", features = ["abi3-py311", "auto-initialize"], default-features = false, optional = true }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"], optional = true }
 numpy = { version = "0.28", optional = true }
+remotemedia-python-buffers = { path = "../../../../remotemedia-plugin-sdk/crates/python-buffers", optional = true }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3" }
 
 # Node.js FFI (optional - enabled with napi feature)
 napi = { version = "2", features = ["napi6", "async", "tokio_rt"], optional = true }
@@ -85,7 +87,7 @@ napi-build = { version = "2", optional = true }
 [features]
 default = ["python", "native-numpy", "bundled-uv-embedded", "python-telephony"]
 # Python bindings (PyO3)
-python = ["dep:pyo3", "dep:pyo3-async-runtimes", "dep:numpy", "remotemedia-core/loadable"]
+python = ["dep:pyo3", "dep:pyo3-async-runtimes", "dep:numpy", "dep:remotemedia-python-buffers", "remotemedia-core/loadable"]
 extension-module = ["pyo3/extension-module", "python"]
 native-numpy = ["python"]
 # Embed a `uv` binary into the Python wheel so `PYTHON_ENV_MODE=managed`

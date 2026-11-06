@@ -402,7 +402,7 @@ impl InlinePythonStreamingNode {
         // Call instance.process(data) under GIL.
         let result = Python::attach(|py| -> Result<Py<PyAny>, Error> {
             let py_data =
-                super::marshal::runtime_data_to_python(py, &data).map_err(py_err_to_exec)?;
+                super::marshal::runtime_data_into_python(py, data).map_err(py_err_to_exec)?;
             let bound = instance.bind(py);
             let py_result = bound
                 .call_method1("process", (py_data,))

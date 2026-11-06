@@ -32,7 +32,8 @@ use remotemedia_core::transport::{
     SharedPipelineOutputReceivers, TransportData,
 };
 
-use crate::marshal::{python_to_runtime_data, runtime_data_to_python};
+use crate::marshal::{python_to_runtime_data_with_context, runtime_data_into_python};
+use remotemedia_types::{CopyContext, CopyPolicy, OutputAllocator};
 
 type InputSlot = Arc<Mutex<Option<InputSender>>>;
 type RxSlot = Arc<Mutex<Option<mpsc::Receiver<RuntimeData>>>>;
@@ -75,6 +76,9 @@ pub struct PyStreamingSession {
     /// task spawned at session creation holds `Arc` clones internally, but
     /// holding the executor here is a defensive cheap guarantee.
     _executor: Arc<PipelineExecutor>,
+    output_allocator: Arc<dyn OutputAllocator>,
+    input_copies: CopyContext,
+    strict_input_copies: CopyContext,
 }
 
 #[pymethods]
@@ -85,18 +89,41 @@ impl PyStreamingSession {
         self.session_id.clone()
     }
 
+    /// Allocate directly in this session's ingress storage. Release writable
+    /// views before publishing the loan; published views may outlive the session.
+    fn output_allocator(&self) -> _remotemedia_buffers::OutputAllocator {
+        _remotemedia_buffers::OutputAllocator::new(self.output_allocator.clone())
+    }
+
+    /// Logical copies performed while converting send_input payloads. This is
+    /// separate from the pipeline's node, codec and network copy accounting.
+    fn input_copy_report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = serde_json::json!({
+            "allow_copies": self.input_copies.report(),
+            "require_zero_copy": self.strict_input_copies.report(),
+        });
+        Ok(crate::marshal::json_to_python(py, &value)?.unbind())
+    }
+
     /// Push one input frame. `data` accepts the same shapes
     /// `execute_pipeline_with_input` does: numpy arrays, `{"type":"audio", ...}`
     /// dicts, strings, bytes, or anything `python_to_runtime_data` recognises.
     ///
     /// Returns a coroutine resolving to `None`. Raises `RuntimeError` if the
     /// input channel is closed.
+    #[pyo3(signature = (data, *, require_zero_copy=false))]
     fn send_input<'py>(
         &self,
         py: Python<'py>,
         data: Bound<'py, PyAny>,
+        require_zero_copy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let rd = python_to_runtime_data(py, &data)?;
+        let context = if require_zero_copy {
+            &self.strict_input_copies
+        } else {
+            &self.input_copies
+        };
+        let rd = python_to_runtime_data_with_context(py, &data, context)?;
         let input_sender = Arc::clone(&self.input_sender);
         future_into_py(py, async move {
             let guard = input_sender.lock().await;
@@ -198,7 +225,7 @@ impl PyStreamingSession {
                         *a_guard = a_taken;
                         *v_guard = v_taken;
                         *d_guard = d_taken;
-                        return Python::attach(|py| pack_kind(py, kind, &rd));
+                        return Python::attach(|py| pack_kind(py, kind, rd));
                     }
                     Outcome::Closed("audio") => {
                         *a_guard = None;
@@ -292,7 +319,7 @@ fn recv_kind_async(py: Python<'_>, rx_arc: RxSlot) -> PyResult<Bound<'_, PyAny>>
         }
         drop(guard);
         Python::attach(|py| match result {
-            Some(rd) => Ok(runtime_data_to_python(py, &rd)?),
+            Some(rd) => Ok(runtime_data_into_python(py, rd)?),
             None => Ok(py.None()),
         })
     })
@@ -309,7 +336,7 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot) -> PyResult<Py<PyAny>> {
         None => return Ok(py.None()),
     };
     match outcome {
-        Ok(rd) => Ok(runtime_data_to_python(py, &rd)?),
+        Ok(rd) => Ok(runtime_data_into_python(py, rd)?),
         Err(TryRecvError::Empty) => Ok(py.None()),
         Err(TryRecvError::Disconnected) => {
             *guard = None;
@@ -318,8 +345,8 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot) -> PyResult<Py<PyAny>> {
     }
 }
 
-fn pack_kind(py: Python<'_>, kind: &str, rd: &RuntimeData) -> PyResult<Py<PyAny>> {
-    let data_py = runtime_data_to_python(py, rd)?;
+fn pack_kind(py: Python<'_>, kind: &str, rd: RuntimeData) -> PyResult<Py<PyAny>> {
+    let data_py = runtime_data_into_python(py, rd)?;
     let kind_py = kind.into_py_any(py)?;
     let tuple = pyo3::types::PyTuple::new(py, &[kind_py, data_py])?;
     Ok(tuple.into_any().unbind())
@@ -446,6 +473,9 @@ pub(crate) async fn build_session(
         .ok_or_else(|| PyRuntimeError::new_err("session output receivers already taken"))?;
 
     Ok(PyStreamingSession {
+        output_allocator: handle.output_allocator(),
+        input_copies: CopyContext::new(CopyPolicy::AllowCopies, "python-ffi-input"),
+        strict_input_copies: CopyContext::new(CopyPolicy::RequireZeroCopy, "python-ffi-input"),
         session_id,
         input_sender: Arc::new(Mutex::new(Some(InputSender::Raw(input_sender)))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.audio_rx))),
@@ -490,6 +520,9 @@ pub(crate) async fn build_shared_session(
     let receivers = bridge_shared_outputs(shared.subscribe_outputs());
 
     Ok(PyStreamingSession {
+        output_allocator: shared.output_allocator().await,
+        input_copies: CopyContext::new(CopyPolicy::AllowCopies, "python-ffi-input"),
+        strict_input_copies: CopyContext::new(CopyPolicy::RequireZeroCopy, "python-ffi-input"),
         session_id: shared.session_id().to_string(),
         input_sender: Arc::new(Mutex::new(Some(InputSender::Participant(participant)))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.0))),

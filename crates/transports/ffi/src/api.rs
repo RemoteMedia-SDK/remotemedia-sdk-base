@@ -6,7 +6,7 @@
 //! Uses PipelineExecutor from core for transport-agnostic execution.
 //! (Migrated from PipelineRunner per spec 026)
 
-use super::marshal::{python_to_runtime_data, runtime_data_to_python};
+use super::marshal::{python_to_runtime_data, runtime_data_into_python};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 use remotemedia_core::{
@@ -110,7 +110,7 @@ pub fn execute_pipeline(
         Python::attach(|py| {
             // Use runtime_data_to_python for direct conversion (zero-copy for numpy!)
             // This avoids JSON serialization and converts RuntimeData::Numpy directly to numpy arrays
-            let outputs_py = runtime_data_to_python(py, &output.data)?;
+            let outputs_py = runtime_data_into_python(py, output.data)?;
 
             // Include metrics if requested - now includes scheduler metrics from PipelineExecutor
             if enable_metrics.unwrap_or(false) {
@@ -192,7 +192,7 @@ pub fn execute_pipeline_with_input<'py>(
         Python::attach(|py| {
             // Use runtime_data_to_python for direct conversion (zero-copy for numpy!)
             // This avoids JSON serialization and converts RuntimeData::Numpy directly to numpy arrays
-            let outputs_py = runtime_data_to_python(py, &output.data)?;
+            let outputs_py = runtime_data_into_python(py, output.data)?;
 
             // Include metrics if requested - now includes scheduler metrics from PipelineExecutor
             if enable_metrics.unwrap_or(false) {
@@ -227,7 +227,7 @@ pub fn execute_pipeline_with_instances<'py>(
     enable_metrics: Option<bool>,
 ) -> PyResult<Bound<'py, PyAny>> {
     use super::instance_handler::InstanceExecutor;
-    use super::marshal::{python_to_runtime_data, runtime_data_to_python};
+    use super::marshal::{python_to_runtime_data, runtime_data_into_python};
 
     // Convert to Py<PyAny> before async block (Bound is not Send)
     let node_refs: Vec<Py<PyAny>> = node_instances
@@ -286,7 +286,7 @@ pub fn execute_pipeline_with_instances<'py>(
 
         // Convert final output to Python
         Python::attach(|py| {
-            let py_output = runtime_data_to_python(py, &current_data)?;
+            let py_output = runtime_data_into_python(py, current_data)?;
 
             if enable_metrics.unwrap_or(false) {
                 let dict = pyo3::types::PyDict::new(py);

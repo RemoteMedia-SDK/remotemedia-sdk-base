@@ -8,14 +8,14 @@ This crate provides bindings to the `remotemedia-runtime-core` for multiple lang
 
 ### Python FFI
 - **Fast execution**: Native Rust performance for media processing
-- **Zero-copy**: Direct numpy array integration for audio/video data
+- **Owning buffers**: Read-only Python views retain published runtime allocations
 - **Async support**: Full Python asyncio integration via PyO3
 - **Independent deployment**: Can be updated without touching runtime-core
 
 ### Node.js FFI (N-API)
 - **Native performance**: Rust-powered media processing in Node.js
 - **Async/Promise support**: Full async/await integration
-- **Buffer handling**: Zero-copy Buffer operations
+- **Buffer handling**: Buffer APIs; Node.js copy accounting and ownership migration remain in progress
 - **WebRTC support**: Built-in WebRTC transport layer
 
 ### WebRTC Transport (both languages)
@@ -70,7 +70,7 @@ The `dev-install.sh` script:
 pip install python-client/
 
 # Install Rust runtime from wheel
-pip install remotemedia_ffi-0.4.0-cp310-abi3-macosx_11_0_arm64.whl
+pip install /path/to/the/matching/remotemedia_ffi-cp311-abi3-platform.whl
 ```
 
 Or build the wheel yourself:
@@ -147,19 +147,52 @@ if isinstance(result, np.ndarray):
     print(f"Received numpy array: {result.shape}")
 ```
 
-**How it works (zero-copy architecture):**
+## Owning Python buffers (Python 3.11+)
 
-1. **Python → Rust FFI**: `python_to_runtime_data` detects numpy arrays and wraps them in `RuntimeData::Numpy` (zero-copy via buffer protocol)
-2. **Rust Pipeline**: `RuntimeData::Numpy` flows through pipeline without conversion
-3. **IPC Boundary**: `to_ipc_runtime_data` serializes **once** to iceoryx2 shared memory format
-4. **Multiprocess Node**: Python receives data via zero-copy iceoryx2
-5. **Return Path**: `from_ipc_runtime_data` deserializes back to `RuntimeData::Numpy`
-6. **Rust → Python FFI**: `runtime_data_to_python` converts back to numpy array
+The native Python binding uses PyO3 0.28 and the Python 3.11 stable buffer ABI.
+The network-only Python client keeps its separate interpreter requirements.
+Runtime audio, binary, video, image, tensor and NumPy output retains immutable
+Rust owners. Binary and audio samples are read-only memoryviews; NumPy output is
+a read-only ndarray. Existing code that needs writable private storage must
+explicitly copy or produce into an output loan.
 
-**Performance for streaming audio:**
-- **Before**: Serialize on every FFI call (50+ times/sec for 20ms frames) = ~50ms total overhead
-- **After**: Serialize **once** at IPC boundary = ~1ms total overhead
-- **Speedup**: ~50x reduction in serialization overhead for streaming pipelines!
+```python
+allocator = session.output_allocator()
+loan = allocator.allocate_audio(960)
+samples = np.frombuffer(loan, dtype=np.float32)
+samples.fill(0.0)  # A producer can write its actual output here.
+del samples       # Every writable export must release before publish().
+await session.send_input({
+    "type": "audio", "samples": np.asarray(loan.publish()),
+    "sample_rate": 48000, "channels": 1,
+}, require_zero_copy=True)
+```
+
+Both ordinary and shared sessions expose their existing ingress allocator and
+budget. Loans and retained published views keep their storage after session
+close. Publishing a loan with outstanding writable exports raises BufferError.
+`send_input(require_zero_copy=True)` rejects private mutable inputs and packing
+at the Python ingress boundary; it does not certify every node, codec, IPC or
+network edge. `session.input_copy_report()` reports the two input-policy ledgers.
+
+Owned exported views and immutable Python bytes can enter without payload copies.
+Private NumPy arrays are explicitly packed once in compatibility mode, with the
+resulting C-order strides recorded correctly. Object and non-native-endian
+arrays require explicit conversion. Contiguous C/F arrays backed by an exported
+byte owner can return without copying. A view with a different backing element
+kind or a non-contiguous slice needs an explicit copy or rejects in strict mode.
+
+Video/image/tensor dictionaries carry their full metadata and owning byte views.
+Video `format` and image `format` use the RuntimeData enum strings; tensor dtype
+codes use the runtime convention (0=f32, 1=i32), not protobuf/Python IPC codes.
+Strict JSON metadata rejects embedded ndarray/buffer objects instead of hiding
+a payload conversion. Metadata, third-party operations and legacy NumPy helper
+copies are separate from the input bulk-copy report.
+
+The SDK FFI default build retains its desktop core features. For non-codec
+binding checks use `--no-default-features --features python`; its benchmark
+library dependency no longer silently re-enables core defaults. Optional codec
+features still need their normal FFmpeg/toolchain setup.
 
 ## API Reference
 
@@ -290,7 +323,7 @@ Compared to pure Python execution:
 - **Audio processing**: 2-16x faster (depending on operation)
 - **VAD (Voice Activity Detection)**: 8-12x faster
 - **Resampling**: 4-6x faster
-- **Zero-copy**: No data copying between Python and Rust
+- **Shared payload handoffs**: Published owning views avoid copies at supported boundaries; private storage may require counted materialization
 
 ## Migration from v0.3
 
