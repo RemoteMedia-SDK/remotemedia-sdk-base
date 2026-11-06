@@ -1,4 +1,4 @@
-//! Zero-copy IPC data transfer via iceoryx2 shared memory.
+//! Portable compatibility encoding for IPC data transfer.
 //!
 //! Uses the native [`RuntimeData`] enum from `remotemedia-types`
 //! directly — both host and plugin processes link the same crate
@@ -23,10 +23,12 @@
 //! Rust enums have no stable memory layout. `RuntimeData` contains
 //! `Vec`, `String`, `Arc`, `Option` — all heap-allocated with
 //! pointers meaningless across process boundaries. iceoryx2's
-//! zero-copy works at the byte-slice level; the data still needs
-//! to be serialized to a contiguous buffer.
+//! zero-copy works at the byte-slice level. This codec serializes the payload
+//! into a contiguous buffer; it does not provide zero-copy payload transfer.
+//! Sharing mapped allocations requires a separate descriptor/lease protocol.
 
 pub use remotemedia_types::{AudioSamples, RuntimeData};
+use remotemedia_types::{CopyContext, CopyReason};
 
 /// Maximum payload size for IPC transfers (1 MB).
 /// Matches the global iceoryx2 config: publish_subscribe.max_slice_len = 1048576.
@@ -45,10 +47,42 @@ const LEGACY_AUDIO_RMP_PREFIX: &[u8] = b"RM_AUD_RMP1\0";
 ///
 /// # Errors
 ///
-/// Returns `Err` if serialization fails or the payload exceeds
-/// [`MAX_SLICE_LEN`].
+/// Returns `Err` if serialization fails. The transport enforces its message-size
+/// limit. Logical bulk serialization is recorded in the unattributed legacy ledger.
 pub fn to_bytes(data: &RuntimeData) -> Result<Vec<u8>, String> {
-    rmp_serde::to_vec_named(data).map_err(|e| format!("msgpack serialize: {e}"))
+    to_bytes_with_copy_context(data, CopyContext::legacy())
+}
+
+/// Encode through an explicit boundary policy. Strict mode rejects nonempty bulk
+/// payloads before encoding. Metadata-only messages remain portable under either
+/// policy. Counts are visible source payload bytes, not wire length or all copies
+/// inside MessagePack/Vec growth; decoding and transport staging are separate.
+pub fn to_bytes_with_copy_context(
+    data: &RuntimeData,
+    copies: &CopyContext,
+) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    write_with_copy_context(&mut output, data, copies)?;
+    Ok(output)
+}
+
+/// Write portable MessagePack with the same policy/accounting as to_bytes.
+/// On writer/codec failure, output may be partial and must not be published.
+/// Failed requested bytes are recorded without claiming completed serialization.
+pub fn write_with_copy_context(
+    writer: impl std::io::Write,
+    data: &RuntimeData,
+    copies: &CopyContext,
+) -> Result<(), String> {
+    use serde::Serialize;
+    copies
+        .materialize_result(
+            CopyReason::PortableSerialization,
+            data.bulk_payload_bytes() as u64,
+            || data.serialize(&mut rmp_serde::Serializer::new(writer).with_struct_map()),
+        )
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("msgpack serialize: {e}"))
 }
 
 /// Deserialize a [`RuntimeData`] from iceoryx2 shared memory bytes.
@@ -61,10 +95,23 @@ pub fn to_bytes(data: &RuntimeData) -> Result<Vec<u8>, String> {
 /// Returns `Err` if deserialization fails (e.g., corrupted payload,
 /// version mismatch, or truncated data).
 pub fn from_bytes(bytes: &[u8]) -> Result<RuntimeData, String> {
+    from_bytes_with_copy_context(bytes, CopyContext::legacy())
+}
+
+/// Decode under an explicit bulk materialization policy. Strict mode rejects
+/// before decoding the first nonzero-size payload element or allocating its
+/// destination buffer. Metadata and empty payloads remain portable. Counts cover
+/// element storage, not metadata or codec internals; failures may be partial.
+pub fn from_bytes_with_copy_context(
+    bytes: &[u8],
+    copies: &CopyContext,
+) -> Result<RuntimeData, String> {
     // Strip the legacy audio prefix if present so old in-flight messages
     // from the short-lived hybrid encoding are still readable.
     let payload = bytes.strip_prefix(LEGACY_AUDIO_RMP_PREFIX).unwrap_or(bytes);
-    rmp_serde::from_slice(payload).map_err(|e| format!("msgpack deserialize: {e}"))
+    copies
+        .deserialize(&mut rmp_serde::Deserializer::from_read_ref(payload))
+        .map_err(|e| format!("msgpack deserialize: {e}"))
 }
 
 /// Re-export text-channel helpers that were previously defined in
@@ -464,7 +511,7 @@ pub fn from_python_wire(bytes: &[u8]) -> Result<RuntimeData, String> {
             pos += 8;
             let is_keyframe = payload[pos] != 0;
             pos += 1;
-            let pixel_data = payload[pos..].to_vec();
+            let pixel_data = payload[pos..].to_vec().into();
             Ok(RuntimeData::Video {
                 pixel_data,
                 width,
@@ -534,7 +581,7 @@ pub fn from_python_wire(bytes: &[u8]) -> Result<RuntimeData, String> {
                 None
             };
             pos += meta_len;
-            let data = payload[pos..].to_vec();
+            let data = payload[pos..].to_vec().into();
             Ok(RuntimeData::Tensor {
                 data,
                 shape,
@@ -659,7 +706,7 @@ pub fn from_python_wire(bytes: &[u8]) -> Result<RuntimeData, String> {
             pos += 1;
             let f_contiguous = pos < payload.len() && payload[pos] != 0;
             pos += 1;
-            let data = payload[pos..].to_vec();
+            let data = payload[pos..].to_vec().into();
             Ok(RuntimeData::Numpy {
                 data,
                 shape,
@@ -752,7 +799,7 @@ mod tests {
     #[test]
     fn video_roundtrips() {
         roundtrip(RuntimeData::Video {
-            pixel_data: vec![1, 2, 3, 4, 5],
+            pixel_data: vec![1, 2, 3, 4, 5].into(),
             width: 1280,
             height: 720,
             format: remotemedia_types::PixelFormat::Yuv420p,
@@ -768,7 +815,7 @@ mod tests {
     #[test]
     fn video_encoded_roundtrips() {
         roundtrip(RuntimeData::Video {
-            pixel_data: vec![0xff, 0xfe, 0xfd],
+            pixel_data: vec![0xff, 0xfe, 0xfd].into(),
             width: 1920,
             height: 1080,
             format: remotemedia_types::PixelFormat::Encoded,
@@ -784,7 +831,7 @@ mod tests {
     #[test]
     fn image_jpeg_roundtrips() {
         roundtrip(RuntimeData::Image {
-            data: vec![0xff, 0xd8, 0xff, 0xe0],
+            data: vec![0xff, 0xd8, 0xff, 0xe0].into(),
             format: remotemedia_types::ImageFormat::Jpeg,
             width: 640,
             height: 480,
@@ -797,7 +844,7 @@ mod tests {
     #[test]
     fn image_raw_roundtrips() {
         roundtrip(RuntimeData::Image {
-            data: vec![0; 64],
+            data: vec![0; 64].into(),
             format: remotemedia_types::ImageFormat::Raw {
                 pixel_format: remotemedia_types::PixelFormat::Rgba32,
             },
@@ -816,7 +863,7 @@ mod tests {
 
     #[test]
     fn binary_roundtrips() {
-        roundtrip(RuntimeData::Binary(vec![0, 1, 2, 3, 255]));
+        roundtrip(RuntimeData::Binary(vec![0, 1, 2, 3, 255].into()));
     }
 
     #[test]
@@ -831,7 +878,7 @@ mod tests {
     #[test]
     fn tensor_roundtrips() {
         roundtrip(RuntimeData::Tensor {
-            data: vec![0u8; 16],
+            data: vec![0u8; 16].into(),
             shape: vec![2, 2, 2, 2],
             dtype: 0,
             metadata: None,
@@ -841,7 +888,7 @@ mod tests {
     #[test]
     fn tensor_with_metadata_roundtrips() {
         roundtrip(RuntimeData::Tensor {
-            data: vec![1u8; 8],
+            data: vec![1u8; 8].into(),
             shape: vec![2, 4],
             dtype: 1,
             metadata: Some(serde_json::json!({"layer": "embedding"})),
@@ -851,7 +898,7 @@ mod tests {
     #[test]
     fn numpy_roundtrips() {
         roundtrip(RuntimeData::Numpy {
-            data: vec![0u8; 32],
+            data: vec![0u8; 32].into(),
             shape: vec![4, 2],
             dtype: "float32".into(),
             strides: vec![8, 4],

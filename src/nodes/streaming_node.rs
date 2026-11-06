@@ -116,6 +116,9 @@ impl remotemedia_traits::runtime_context::InitializeContextRead for InitializeCo
 #[derive(Clone)]
 pub struct StreamingNodeRegistry {
     factories: HashMap<String, Arc<dyn StreamingNodeFactory>>,
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    session_workers:
+        HashMap<String, Arc<dyn crate::multiprocess::native_worker::SessionWorkerFactory>>,
 }
 
 impl StreamingNodeRegistry {
@@ -123,24 +126,37 @@ impl StreamingNodeRegistry {
     pub fn new() -> Self {
         Self {
             factories: HashMap::new(),
+            #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+            session_workers: HashMap::new(),
         }
     }
 
     /// Register a streaming node factory
     pub fn register(&mut self, factory: Arc<dyn StreamingNodeFactory>) {
         let node_type = factory.node_type().to_string();
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        self.session_workers.remove(&node_type);
         self.factories.insert(node_type, factory);
     }
 
-    /// Drain the factories from another registry, transferring ownership.
-    ///
-    /// This is the internal primitive for `merge_from()` — it exists so
-    /// factories move rather than clone (avoiding Arc::clone on every node).
-    #[doc(hidden)]
-    pub(crate) fn drain_factories(
+    /// Register a trusted mapped worker template. PipelineExecutor binds only the
+    /// templates used by a manifest, using that session's own shared pool.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub fn register_session_worker(
         &mut self,
-    ) -> std::collections::hash_map::Drain<'_, String, Arc<dyn StreamingNodeFactory>> {
-        self.factories.drain()
+        factory: Arc<dyn crate::multiprocess::native_worker::SessionWorkerFactory>,
+    ) {
+        let node_type = factory.node_type().to_string();
+        self.register(factory.clone());
+        self.session_workers.insert(node_type, factory);
+    }
+
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub(crate) fn session_worker(
+        &self,
+        node_type: &str,
+    ) -> Option<&Arc<dyn crate::multiprocess::native_worker::SessionWorkerFactory>> {
+        self.session_workers.get(node_type)
     }
 
     /// Merge the factories from `other` into `self`, consuming `other`.
@@ -148,9 +164,11 @@ impl StreamingNodeRegistry {
     /// Factories from `other` override any existing entries in `self` with
     /// the same node type.
     pub(crate) fn merge_from(&mut self, other: &mut StreamingNodeRegistry) {
-        for (k, v) in other.drain_factories() {
-            self.factories.insert(k, v);
+        for (_, factory) in other.factories.drain() {
+            self.register(factory);
         }
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        self.session_workers.extend(other.session_workers.drain());
     }
 
     /// Create a streaming node by type
@@ -328,6 +346,7 @@ mod runtime_context_default_tests {
 
     fn ctx_for(node_id: &str, session_id: &str) -> NodeRuntimeContext {
         NodeRuntimeContext {
+            materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from(session_id),
             node_id: Arc::from(node_id),
             control: SessionControl::new(session_id),
@@ -335,6 +354,7 @@ mod runtime_context_default_tests {
             input_snapshots: Arc::new(HashMap::new()),
             session_state: Arc::new(()),
             cancel_gate: Arc::new(crate::transport::CancelGate::new()),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
         }
     }
 

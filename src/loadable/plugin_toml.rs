@@ -132,6 +132,22 @@ pub struct PluginPythonMeta {
     /// subdir (e.g. `"src/"`).
     #[serde(default = "default_module_root")]
     pub module_root: String,
+
+    /// Explicit mapped runner contract. Requires host-authorized mapped runtime;
+    /// it must never fall back to the legacy serialized runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped: Option<PluginPythonMapped>,
+}
+
+/// Versioned mapped Python capabilities declared by a source plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginPythonMapped {
+    pub runner_protocol: u16,
+    #[serde(default)]
+    pub snapshot_inputs: Vec<String>,
+    #[serde(default)]
+    pub snapshot_outputs: Vec<String>,
 }
 
 fn default_module_root() -> String {
@@ -157,6 +173,36 @@ pub struct PluginRustMeta {
     /// `release-manifest.json` instead); reserved for v2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_pattern: Option<String>,
+    /// Explicit subprocess contract; never falls back to loading a cdylib.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped: Option<PluginNativeMapped>,
+}
+
+/// Platform-specific native mapped executables supplied by a local package.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginNativeMapped {
+    pub wire_protocol: u16,
+    pub workers: Vec<PluginNativeWorker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginNativeWorker {
+    pub node_type: String,
+    pub executables: BTreeMap<String, PluginNativeExecutable>,
+    #[serde(default)]
+    pub snapshot_inputs: Vec<String>,
+    #[serde(default)]
+    pub snapshot_outputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginNativeExecutable {
+    /// Relative path inside the resolved package root.
+    pub file: String,
+    pub sha256: String,
 }
 
 /// Errors when parsing or validating a `plugin.toml`.
@@ -175,9 +221,8 @@ pub enum PluginTomlError {
     EmptyPythonNodeTypes,
 
     #[error(
-        "plugin.toml has `language = \"rust\"` — Rust plugins ship as \
-         cdylibs distributed via GitHub releases. Use the release-manifest.json \
-         path instead (see resolver Phase 1B docs)."
+        "a local Rust package directory requires [rust.mapped]; for an in-process \
+         cdylib use its explicit file path or a GitHub release-manifest.json"
     )]
     RustPluginWrongPath,
 }

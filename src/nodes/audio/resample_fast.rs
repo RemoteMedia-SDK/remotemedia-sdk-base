@@ -1,11 +1,14 @@
 use crate::audio::buffer::{AudioBuffer, AudioData};
 use crate::error::{Error, Result};
 use crate::nodes::audio::fast::FastAudioNode;
+use audioadapter_buffers::direct::InterleavedSlice;
+use remotemedia_types::{AudioSamples, HeapOutputAllocator, OutputAllocator, SharedBuffer};
 use rubato::{
-    Resampler as RubatoResampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType,
+    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
 };
-use tracing::info;
+mod input;
+use input::PendingInput;
 
 /// Quality settings for audio resampling
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,21 +36,17 @@ impl ResampleQuality {
     }
 }
 
-/// Fast path resampling node - no JSON overhead
+/// Stateful sinc resampler with retained input and caller-selected output storage.
+/// Rubato keeps its own filter history; framework input/output staging is avoided.
 pub struct FastResampleNode {
-    resampler: SincFixedOut<f32>,
+    resampler: Async<f32>,
     target_rate: u32,
     source_rate: u32,
     received_frames: u64,
     emitted_frames: u64,
     delay_remaining: usize,
-    #[allow(dead_code)] // Used for initialization, runtime channels derived from input data
     channels: usize,
-    // Ring buffer to accumulate input samples across calls (per channel)
-    // Using Vec for simplicity - drain from front as we consume
-    input_buffer: Vec<Vec<f32>>,
-    // Pre-allocated buffer for chunk extraction
-    chunk_buffer: Vec<Vec<f32>>,
+    pending: PendingInput,
 }
 
 impl FastResampleNode {
@@ -62,32 +61,22 @@ impl FastResampleNode {
                 "resampler rates and channels must be positive".into(),
             ));
         }
-        let chunk_size = quality.chunk_size();
-        let sinc_len = quality.sinc_len();
-        let resample_ratio = target_rate as f64 / source_rate as f64;
-
-        info!(
-            "Creating FastResampleNode: {} Hz -> {} Hz, ratio: {:.3}, quality: {:?}, channels: {}, chunk_size: {}, sinc_len: {}",
-            source_rate, target_rate, resample_ratio, quality, channels, chunk_size, sinc_len
-        );
-
         let parameters = SincInterpolationParameters {
-            sinc_len,
+            sinc_len: quality.sinc_len(),
             f_cutoff: 0.95,
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 256,
             window: WindowFunction::BlackmanHarris2,
         };
-
-        let resampler = SincFixedOut::new(
-            resample_ratio,
-            2.0, // max_resample_ratio_relative - allows 2x adjustment range
-            parameters,
-            chunk_size,
+        let resampler = Async::new_sinc(
+            target_rate as f64 / source_rate as f64,
+            2.0,
+            &parameters,
+            quality.chunk_size(),
             channels,
+            FixedAsync::Output,
         )
-        .map_err(|e| Error::Execution(format!("Failed to create resampler: {}", e)))?;
-
+        .map_err(|e| Error::Execution(format!("Failed to create resampler: {e}")))?;
         let delay_remaining = resampler.output_delay();
         Ok(Self {
             resampler,
@@ -97,179 +86,197 @@ impl FastResampleNode {
             emitted_frames: 0,
             delay_remaining,
             channels,
-            input_buffer: vec![Vec::with_capacity(chunk_size * 4); channels],
-            chunk_buffer: vec![Vec::with_capacity(chunk_size * 2); channels],
+            pending: PendingInput::new(channels),
         })
     }
-    /// Difference between the next input and output positions, for timestamp propagation.
+
     pub(crate) fn buffered_duration_us(&self) -> u64 {
-        (self.received_frames * 1_000_000 / self.source_rate as u64)
-            .saturating_sub(self.emitted_frames * 1_000_000 / self.target_rate as u64)
+        let input = self.received_frames as u128 * 1_000_000 / self.source_rate as u128;
+        let output = self.emitted_frames as u128 * 1_000_000 / self.target_rate as u128;
+        input.saturating_sub(output).min(u64::MAX as u128) as u64
     }
 
-    /// Finish an utterance without exposing filter padding as audible duration.
-    pub(crate) fn flush_audio(&mut self) -> Result<AudioData> {
-        let remaining = (self.received_frames * self.target_rate as u64 / self.source_rate as u64)
-            .saturating_sub(self.emitted_frames) as usize
-            * self.channels;
-        let mut samples = Vec::new();
-        while samples.len() < remaining {
-            let padding = self.resampler.input_frames_next();
-            let output = self.process_audio(AudioData::new(
-                AudioBuffer::new_f32(vec![0.0; padding * self.channels]),
-                self.source_rate,
-                self.channels,
-            ))?;
-            samples.extend_from_slice(output.buffer.as_f32().unwrap());
+    pub(crate) fn can_reconfigure(&self) -> bool {
+        self.received_frames == 0 || self.source_rate == self.target_rate
+    }
+
+    /// Borrow retained input chunks and compute interleaved output in the selected
+    /// provider. Allocation failure happens before accepting this input or advancing
+    /// filter state. The published view trims delay/padding without moving samples.
+    pub fn process_shared(
+        &mut self,
+        samples: AudioSamples,
+        sample_rate: u32,
+        channels: usize,
+        allocator: &dyn OutputAllocator,
+    ) -> Result<SharedBuffer<f32>> {
+        if channels != self.channels
+            || sample_rate != self.source_rate
+            || samples.len() % self.channels != 0
+        {
+            return Err(Error::Execution("resampler input format changed".into()));
         }
-        samples.truncate(remaining);
+        let frames = samples.len() / channels;
+        let received = self
+            .received_frames
+            .checked_add(frames as u64)
+            .ok_or_else(size_error)?;
+        if self.source_rate == self.target_rate {
+            self.received_frames = received;
+            self.emitted_frames = received;
+            return Ok(samples.into_shared());
+        }
+        let available = self
+            .pending
+            .frames()
+            .checked_add(frames)
+            .ok_or_else(size_error)?;
+        let capacity = if available < self.resampler.input_frames_next() {
+            0
+        } else {
+            // Same bound as Rubato's process_all_needed_output_len, with checked
+            // integer arithmetic. Fixed-output processing may leave unused capacity.
+            let expected =
+                (available as u128 * self.target_rate as u128).div_ceil(self.source_rate as u128);
+            usize::try_from(expected)
+                .ok()
+                .and_then(|n| n.checked_add(self.resampler.output_delay()))
+                .and_then(|n| n.checked_add(self.resampler.output_frames_max()))
+                .ok_or_else(size_error)?
+        };
+        let mut output = allocator
+            .allocate_audio(capacity.checked_mul(channels).ok_or_else(size_error)?)
+            .map_err(|e| Error::Execution(format!("resampler output allocation: {e}")))?;
+        self.pending.push(samples);
+        self.received_frames = received;
+        let written = self.render(output.as_mut_slice(), false, usize::MAX)?;
+        self.publish(output.freeze(), written, None)
+    }
+
+    /// Drain only the real utterance duration; padding remains internal to Rubato.
+    pub(crate) fn flush_shared(
+        &mut self,
+        allocator: &dyn OutputAllocator,
+    ) -> Result<SharedBuffer<f32>> {
+        let expected =
+            self.received_frames as u128 * self.target_rate as u128 / self.source_rate as u128;
+        let remaining = usize::try_from(expected.saturating_sub(self.emitted_frames as u128))
+            .map_err(|_| size_error())?;
+        if remaining == 0 {
+            self.reset();
+            return Ok(Vec::new().into());
+        }
+        let block = self.resampler.output_frames_next();
+        let raw = remaining
+            .checked_add(self.delay_remaining)
+            .ok_or_else(size_error)?;
+        let capacity = raw
+            .div_ceil(block)
+            .checked_mul(block)
+            .and_then(|n| n.checked_mul(self.channels))
+            .ok_or_else(size_error)?;
+        let mut output = allocator
+            .allocate_audio(capacity)
+            .map_err(|e| Error::Execution(format!("resampler output allocation: {e}")))?;
+        let written = self.render(output.as_mut_slice(), true, raw)?;
+        let result = self.publish(output.freeze(), written, Some(remaining))?;
         self.reset();
-        Ok(AudioData::new(
-            AudioBuffer::new_f32(samples),
-            self.target_rate,
-            self.channels,
-        ))
+        Ok(result)
+    }
+
+    fn render(&mut self, output: &mut [f32], flush: bool, limit: usize) -> Result<usize> {
+        let capacity = output.len() / self.channels;
+        let mut target = InterleavedSlice::new_mut(output, self.channels, capacity)
+            .map_err(|e| Error::Execution(format!("resampler output layout: {e}")))?;
+        let mut written = 0;
+        while written < limit {
+            let needed = self.resampler.input_frames_next();
+            if !flush && self.pending.frames() < needed {
+                break;
+            }
+            let next = self.resampler.output_frames_next();
+            if next > capacity.saturating_sub(written) {
+                return Err(Error::Execution(
+                    "resampler output capacity bound exceeded".into(),
+                ));
+            }
+            let consumed = needed.min(self.pending.frames());
+            let indexing = Indexing {
+                input_offset: 0,
+                output_offset: written,
+                partial_len: flush.then_some(consumed),
+                active_channels_mask: None,
+            };
+            let (_, produced) = self
+                .resampler
+                .process_into_buffer(&self.pending, &mut target, Some(&indexing))
+                .map_err(|e| Error::Execution(format!("Resampling failed: {e}")))?;
+            self.pending.consume(consumed);
+            written += produced;
+        }
+        Ok(written)
+    }
+
+    fn publish(
+        &mut self,
+        output: SharedBuffer<f32>,
+        written: usize,
+        keep: Option<usize>,
+    ) -> Result<SharedBuffer<f32>> {
+        let skip = self.delay_remaining.min(written);
+        let count = keep.unwrap_or(written - skip);
+        if count > written - skip {
+            return Err(size_error());
+        }
+        self.delay_remaining -= skip;
+        self.emitted_frames = self
+            .emitted_frames
+            .checked_add(count as u64)
+            .ok_or_else(size_error)?;
+        output
+            .slice(skip * self.channels..(skip + count) * self.channels)
+            .map_err(|e| Error::Execution(e.to_string()))
     }
 
     pub(crate) fn reset(&mut self) {
         self.resampler.reset();
-        self.input_buffer.iter_mut().for_each(Vec::clear);
+        self.pending.clear();
         self.received_frames = 0;
         self.emitted_frames = 0;
         self.delay_remaining = self.resampler.output_delay();
     }
 }
+fn size_error() -> Error {
+    Error::Execution("resampler frame count overflow".into())
+}
 
+// Preserve the legacy owned fast-node API. Its explicit contiguous Vec recovery
+// may materialize a trimmed output view; context-aware pipeline calls use loans.
+struct OwnedF32(AudioBuffer);
+impl AsRef<[f32]> for OwnedF32 {
+    fn as_ref(&self) -> &[f32] {
+        self.0.as_f32().expect("validated F32 buffer")
+    }
+}
 impl FastAudioNode for FastResampleNode {
     fn node_type(&self) -> &str {
         "FastResampleNode"
     }
-
     fn process_audio(&mut self, input: AudioData) -> Result<AudioData> {
-        // Get F32 buffer
-        let samples = input
-            .buffer
-            .as_f32()
-            .ok_or_else(|| Error::Execution("Resample requires F32 format".into()))?;
-
-        let channels = input.channels;
-        if channels != self.channels
-            || input.sample_rate != self.source_rate
-            || samples.len() % channels != 0
-        {
-            return Err(Error::Execution("resampler input format changed".into()));
+        if input.buffer.as_f32().is_none() {
+            return Err(Error::Execution("Resample requires F32 format".into()));
         }
-        let input_frames = samples.len() / channels;
-        self.received_frames += input_frames as u64;
-
-        tracing::debug!(
-            "Resampler input: {} frames, {} channels, {} samples, rate: {} Hz, first 3 samples: [{:.6}, {:.6}, {:.6}]",
-            input_frames,
-            channels,
-            samples.len(),
+        let samples = SharedBuffer::from_owner(OwnedF32(input.buffer));
+        let output = self.process_shared(
+            samples.into(),
             input.sample_rate,
-            samples.get(0).copied().unwrap_or(0.0),
-            samples.get(1).copied().unwrap_or(0.0),
-            samples.get(2).copied().unwrap_or(0.0)
-        );
-
-        // Deinterleave and append to buffer (zero-copy when possible)
-        for (i, &sample) in samples.iter().enumerate() {
-            self.input_buffer[i % channels].push(sample);
-        }
-
-        tracing::debug!(
-            "After deinterleave: channel 0 buffer has {} samples, first 3: [{:.6}, {:.6}, {:.6}]",
-            self.input_buffer[0].len(),
-            self.input_buffer[0]
-                .get(self.input_buffer[0].len().saturating_sub(input_frames))
-                .copied()
-                .unwrap_or(0.0),
-            self.input_buffer[0]
-                .get(self.input_buffer[0].len().saturating_sub(input_frames) + 1)
-                .copied()
-                .unwrap_or(0.0),
-            self.input_buffer[0]
-                .get(self.input_buffer[0].len().saturating_sub(input_frames) + 2)
-                .copied()
-                .unwrap_or(0.0)
-        );
-
-        let mut all_output_samples = Vec::new();
-        let mut chunks_processed = 0;
-
-        // Process as many chunks as we have data for
-        loop {
-            let frames_needed = self.resampler.input_frames_next();
-            let frames_available = self.input_buffer[0].len();
-
-            if frames_available < frames_needed {
-                // Not enough buffered data yet - this is normal for streaming
-                tracing::debug!(
-                    "Buffering: need {} frames, have {} frames (buffered {} more)",
-                    frames_needed,
-                    frames_available,
-                    input_frames
-                );
-                break;
-            }
-
-            // Clear chunk buffer and extract from input buffer
-            for channel in &mut self.chunk_buffer {
-                channel.clear();
-            }
-
-            for (channel_idx, channel_buf) in self.input_buffer.iter_mut().enumerate() {
-                // Drain frames_needed samples from the front
-                self.chunk_buffer[channel_idx].extend(channel_buf.drain(..frames_needed));
-            }
-
-            // Process chunk
-            let output_frames = self
-                .resampler
-                .process(&self.chunk_buffer, None)
-                .map_err(|e| Error::Execution(format!("Resampling failed: {}", e)))?;
-
-            // Interleave and append output
-            let frames_out = output_frames[0].len();
-            tracing::debug!(
-                "Chunk {}: consumed {} input frames → produced {} output frames, first 3 output: [{:.6}, {:.6}, {:.6}]",
-                chunks_processed,
-                frames_needed,
-                frames_out,
-                output_frames[0].get(0).copied().unwrap_or(0.0),
-                output_frames[0].get(1).copied().unwrap_or(0.0),
-                output_frames[0].get(2).copied().unwrap_or(0.0)
-            );
-
-            for frame_idx in 0..frames_out {
-                for channel_idx in 0..channels {
-                    all_output_samples.push(output_frames[channel_idx][frame_idx]);
-                }
-            }
-
-            chunks_processed += 1;
-        }
-
-        tracing::debug!(
-            "Resampler output: {} frames, {} samples, rate: {} Hz (processed {} chunks, {} frames buffered)",
-            all_output_samples.len() / channels,
-            all_output_samples.len(),
-            self.target_rate,
-            chunks_processed,
-            self.input_buffer[0].len()
-        );
-
-        let skip = self
-            .delay_remaining
-            .min(all_output_samples.len() / channels);
-        all_output_samples.drain(..skip * channels);
-        self.delay_remaining -= skip;
-        self.emitted_frames += (all_output_samples.len() / channels) as u64;
+            input.channels,
+            &HeapOutputAllocator,
+        )?;
         Ok(AudioData::new(
-            AudioBuffer::new_f32(all_output_samples),
+            AudioBuffer::new_f32(output.into_vec()),
             self.target_rate,
-            channels,
+            self.channels,
         ))
     }
 }

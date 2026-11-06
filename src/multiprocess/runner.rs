@@ -1,6 +1,10 @@
 //! Plugin-side helper for native Rust binaries acting as a
 //! multiprocess node.
 //!
+//! This is the copying compatibility runner. For direct mapped input/output
+//! ownership, enable `native-worker` and use `multiprocess::native_worker::run`
+//! with an existing `StreamingNode` implementation.
+//!
 //! Replaces the hand-rolled iceoryx2 boilerplate every plugin binary
 //! would otherwise reinvent. Same channel naming, same wire format,
 //! same READY signal as the Python multiprocess runner.

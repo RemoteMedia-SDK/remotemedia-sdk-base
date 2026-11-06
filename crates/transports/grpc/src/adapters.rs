@@ -20,6 +20,9 @@ pub fn now_micros() -> u64 {
         .as_micros() as u64
 }
 /// Convert core RuntimeData to Protobuf DataBuffer
+///
+/// This portable adapter materializes owned protobuf bytes. It is a copying
+/// transport boundary, even when the runtime payload has shared ownership.
 pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
     let mut metadata_map = std::collections::HashMap::new();
     let data_type = match data {
@@ -51,7 +54,7 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             ..
         } => {
             DataType::Video(VideoFrame {
-                pixel_data: pixel_data.clone(),
+                pixel_data: pixel_data.to_vec(),
                 width: *width,
                 height: *height,
                 format: *format as i32, // Convert PixelFormat enum to i32
@@ -65,7 +68,7 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             data, shape, dtype, ..
         } => {
             DataType::Tensor(TensorBuffer {
-                data: data.clone(),
+                data: data.to_vec(),
                 shape: shape.iter().map(|&s| s as u64).collect(),
                 dtype: *dtype,
                 layout: String::new(), // Empty layout - nodes document expected layout
@@ -79,7 +82,7 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             c_contiguous,
             f_contiguous,
         } => DataType::Numpy(NumpyBuffer {
-            data: data.clone(),
+            data: data.to_vec(),
             shape: shape.iter().map(|&s| s as u64).collect(),
             dtype: dtype.clone(),
             strides: strides.iter().map(|&s| s as i64).collect(),
@@ -118,7 +121,7 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             })
         }
         RuntimeData::Binary(bytes) => DataType::Binary(BinaryBuffer {
-            data: bytes.clone(),
+            data: bytes.to_vec(),
             mime_type: "application/octet-stream".to_string(),
         }),
         // Image-over-gRPC fallback: ship as Binary with a mime-type
@@ -127,7 +130,7 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
         // WebRTC, not gRPC. The round-trip degrades to Binary on the
         // receiving side (format/width/height are lost).
         RuntimeData::Image { data, format, .. } => DataType::Binary(BinaryBuffer {
-            data: data.clone(),
+            data: data.to_vec(),
             mime_type: format
                 .mime_type()
                 .unwrap_or("application/octet-stream")
@@ -266,7 +269,7 @@ pub fn data_buffer_to_runtime_data_with_arrival(
             };
 
             Some(RuntimeData::Video {
-                pixel_data: video.pixel_data.clone(),
+                pixel_data: video.pixel_data.clone().into(),
                 width: video.width,
                 height: video.height,
                 format,
@@ -279,7 +282,7 @@ pub fn data_buffer_to_runtime_data_with_arrival(
             })
         }
         Some(DataType::Tensor(tensor)) => Some(RuntimeData::Tensor {
-            data: tensor.data.clone(),
+            data: tensor.data.clone().into(),
             shape: tensor.shape.iter().map(|&s| s as i32).collect(),
             dtype: tensor.dtype,
             metadata: None,
@@ -296,9 +299,9 @@ pub fn data_buffer_to_runtime_data_with_arrival(
         Some(DataType::Text(text)) => String::from_utf8(text.text_data.clone())
             .ok()
             .map(|content| RuntimeData::Text(tag_text_str(&content, &text.channel))),
-        Some(DataType::Binary(bin)) => Some(RuntimeData::Binary(bin.data.clone())),
+        Some(DataType::Binary(bin)) => Some(RuntimeData::Binary(bin.data.clone().into())),
         Some(DataType::Numpy(numpy)) => Some(RuntimeData::Numpy {
-            data: numpy.data.clone(),
+            data: numpy.data.clone().into(),
             shape: numpy.shape.iter().map(|&s| s as usize).collect(),
             dtype: numpy.dtype.clone(),
             strides: numpy.strides.iter().map(|&s| s as isize).collect(),

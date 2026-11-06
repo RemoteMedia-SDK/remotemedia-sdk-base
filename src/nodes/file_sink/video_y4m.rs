@@ -212,7 +212,7 @@ mod tests {
 
     fn rgb_frame(w: u32, h: u32, fill: u8) -> RuntimeData {
         RuntimeData::Video {
-            pixel_data: vec![fill; (w * h * 3) as usize],
+            pixel_data: vec![fill; (w * h * 3) as usize].into(),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,

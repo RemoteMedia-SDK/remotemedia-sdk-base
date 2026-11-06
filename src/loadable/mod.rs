@@ -1,30 +1,23 @@
-//! In-process loadable native plugins.
+//! Plugin resolution and factory registration.
 //!
-//! Loads `.so` / `.dll` / `.dylib` files that export the
-//! `loadable_node_abi::NodePlugin` root module, adapts them into
-//! `StreamingNodeFactory` via `factory::LoadableNodeBundle`.
+//! `factory::LoadableNodeBundle` loads native DLL/SO/dylib plugins into the
+//! host process using the versioned ABI, including retained bulk buffer owners.
+//! Explicit mapped Python and native package declarations select subprocess
+//! factories with descriptor transport and per-session mapped pools. They require
+//! separate host authorization; plugin metadata alone never grants mapping trust.
 //!
-//! Plugins run in the host's address space — no spawn, no IPC. The
-//! FFI surface is `abi_stable` + `async_ffi` (so the boundary
-//! survives rustc/feature drift), and the payload bytes are the
-//! same `crate::multiprocess::data_transfer::RuntimeData` binary
-//! format used by the multiprocess path.
-//!
-//! That gives a clean trade-off matrix at the registry level:
-//!
-//! | Path                 | Address space | Wire format              |
-//! |----------------------|---------------|--------------------------|
-//! | `loadable::factory`  | in-process    | `RuntimeData::to_bytes`  |
-//! | `multiprocess::factory` | own process | `RuntimeData::to_bytes`  |
-//! | `python::multiprocess` | own process | `RuntimeData::to_bytes`  |
-//!
-//! Same wire format means a `RuntimeData` payload is transcribed
-//! once on the producer side and decoded once on the consumer side
-//! regardless of the runtime host the plugin happens to be using.
+//! Legacy source Python and multiprocess adapters retain their serialized data
+//! paths. Selecting a mapped declaration never silently falls back to those paths.
 
 pub mod factory;
 pub mod plugin_toml;
 pub mod resolver;
+
+#[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+pub mod mapped_native;
+
+#[cfg(all(feature = "mapped-python", any(windows, target_os = "linux")))]
+pub mod mapped_python;
 
 #[cfg(feature = "python-source-plugin")]
 pub mod source_python;

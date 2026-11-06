@@ -66,7 +66,7 @@ remotemedia-core-derive = { git = "https://github.com/RemoteMedia-SDK/remotemedi
 # Plugin authors depend on `loadable-node-abi` directly so they don't
 # pull all of core; core depends on it (optionally) for the host-side
 # `LoadableNodeBundle` adapter.
-loadable-node-abi = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3", optional = true }
+loadable-node-abi = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3", optional = true, features = ["runtime"] }
 abi_stable = { version = "0.11", optional = true }
 async-ffi = { version = "0.5", features = ["abi_stable"], optional = true }
 # Self-describing binary serializer for the loadable wire format —
@@ -92,7 +92,8 @@ bitflags = "2.4"
 arc-swap = "1.8"
 
 # Audio processing (for native nodes)
-rubato = "0.15"
+rubato = "=1.0.1"
+audioadapter-buffers = "=2.0.0"
 bytemuck = { version = "1.14", features = ["derive"] }
 # `ort`, `ndarray`, `rustfft`, `tokenizers`, `half` were pulled out
 # alongside the heavy ONNX nodes (SileroVAD, WhisperToVad, LFM25Audio,
@@ -257,6 +258,11 @@ harness = false
 [features]
 default = []
 multiprocess = ["iceoryx2", "iceoryx2-log"]
+# Typed mapped native workers. Independent of the explicit legacy iceoryx2 codec.
+native-worker = ["dep:remotemedia-plugin-sdk", "remotemedia-plugin-sdk/native-worker"]
+linux-worker-supervisor = ["native-worker", "remotemedia-plugin-sdk/linux-worker-supervisor"]
+mapped-python = ["native-worker", "remotemedia-plugin-sdk/mapped-python"]
+mapped-python-uv = ["mapped-python", "remotemedia-plugin-sdk/mapped-python-uv"]
 # In-process compiled native plugins via abi_stable + dlopen. Shares the
 # `multiprocess::data_transfer` binary wire format so plugins look the
 # same on the wire whether they're loaded in-process or run as a
@@ -403,7 +409,8 @@ jsonschema = "0.29"
 async-trait = "0.1"
 
 # Audio processing
-rubato = "0.15"
+rubato = "=1.0.1"
+audioadapter-buffers = "=2.0.0"
 rustfft = "6.2"
 bytemuck = { version = "1.14", features = ["derive"] }
 ort = { version = "=2.0.0-rc.12", features = ["half", "download-binaries", "cuda", "coreml"] }

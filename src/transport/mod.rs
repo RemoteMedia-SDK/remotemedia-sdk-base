@@ -33,6 +33,11 @@ pub mod control_transport;
 pub mod data;
 pub mod embedded_python_env;
 mod managed_ardy;
+#[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+mod mapped_placement;
+mod node_materialization;
+pub use node_materialization::NodeMaterializationCopies;
+mod output_delivery;
 pub mod pacer;
 pub mod perf_aggregator;
 pub mod plugin_registry;

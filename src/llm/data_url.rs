@@ -46,7 +46,7 @@ mod tests {
 
     fn img_png(bytes: &[u8]) -> RuntimeData {
         RuntimeData::Image {
-            data: bytes.to_vec(),
+            data: bytes.to_vec().into(),
             format: ImageFormat::Png,
             width: 1,
             height: 1,
@@ -68,7 +68,7 @@ mod tests {
     #[test]
     fn jpeg_uses_correct_mime() {
         let img = RuntimeData::Image {
-            data: vec![0xFF, 0xD8, 0xFF],
+            data: vec![0xFF, 0xD8, 0xFF].into(),
             format: ImageFormat::Jpeg,
             width: 1,
             height: 1,
@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn raw_pixels_rejected_with_actionable_error() {
         let img = RuntimeData::Image {
-            data: vec![0u8; 4],
+            data: vec![0u8; 4].into(),
             format: ImageFormat::Raw {
                 pixel_format: crate::data::PixelFormat::Rgb24,
             },

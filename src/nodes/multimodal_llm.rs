@@ -329,7 +329,7 @@ impl MultimodalLLMNode {
             .collect();
 
         Some(RuntimeData::Tensor {
-            data,
+            data: data.into(),
             shape: vec![embedding.len() as i32],
             dtype: 0, // float32
             metadata: None,
@@ -833,7 +833,7 @@ mod tests {
 
     fn img() -> RuntimeData {
         RuntimeData::Image {
-            data: vec![1, 2, 3, 4],
+            data: vec![1, 2, 3, 4].into(),
             format: ImageFormat::Png,
             width: 1,
             height: 1,
@@ -995,7 +995,7 @@ mod tests {
     #[test]
     fn unsupported_input_still_rejected() {
         let node = MultimodalLLMNode::with_config(MultimodalLLMConfig::default());
-        let bin = RuntimeData::Binary(vec![0u8; 4]);
+        let bin = RuntimeData::Binary(vec![0u8; 4].into());
         let err = node.input_to_part(&bin).unwrap_err();
         assert!(format!("{}", err).contains("does not accept"));
     }

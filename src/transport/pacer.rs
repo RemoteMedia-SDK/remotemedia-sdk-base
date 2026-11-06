@@ -75,13 +75,6 @@ impl Default for OnMiss {
     }
 }
 
-/// Rate-limit state for fan_tx backpressure drop warnings. Shared
-/// across all per-tick callbacks within a single Pacer's `run()` loop.
-struct DropSummary {
-    count: u64,
-    last_log: Instant,
-}
-
 /// Rate-limit state for transient tick errors. These are expected while
 /// transport-backed nodes are waiting for their external edge/track to bind,
 /// and warning once per pacer tick makes startup logs unreadable.
@@ -318,18 +311,6 @@ impl Pacer {
     /// Main loop: pull a tick, dispatch, measure, apply on-miss
     /// policy, repeat. Exits when the tick source returns `None`.
     async fn run(mut self) {
-        // Aggregated fan_tx-full drop counter shared across all per-tick
-        // callbacks. A paced node firing at 30 Hz with a saturated
-        // downstream channel would otherwise emit ~30 warns/sec — the
-        // log spam buries every other diagnostic. Drops are accumulated
-        // here and surfaced as a single summary warn at most once per
-        // `DROP_LOG_INTERVAL`.
-        const DROP_LOG_INTERVAL: Duration = Duration::from_secs(5);
-        let drop_summary: Arc<std::sync::Mutex<DropSummary>> =
-            Arc::new(std::sync::Mutex::new(DropSummary {
-                count: 0,
-                last_log: Instant::now() - DROP_LOG_INTERVAL,
-            }));
         const TRANSIENT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
         let mut transient_error_summary = TickErrorSummary {
             count: 0,
@@ -351,7 +332,6 @@ impl Pacer {
             let cb_drop_late = Arc::clone(&drop_late);
             let cb_perf = self.perf.clone();
             let cb_first_emit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let cb_drop_summary = Arc::clone(&drop_summary);
             let cb: Box<dyn FnMut(RuntimeData) -> Result<()> + Send> = Box::new(move |out| {
                 if cb_drop_late.load(std::sync::atomic::Ordering::Relaxed) {
                     // Late frame; the on-miss policy chose to
@@ -359,6 +339,7 @@ impl Pacer {
                     // emitted once at miss-detection time.
                     return Ok(());
                 }
+                crate::transport::output_delivery::send_output(&cb_fan_tx, &cb_node_id, out)?;
                 // Perf instrumentation: record one output per
                 // emit, with latency measured from the start of
                 // this tick. Without this, paced nodes
@@ -371,26 +352,7 @@ impl Pacer {
                     let is_first = !cb_first_emit.swap(true, std::sync::atomic::Ordering::Relaxed);
                     perf.record_output(&cb_node_id, lat_us, is_first);
                 }
-                if let Err(e) = cb_fan_tx.try_send(out) {
-                    // Aggregate drops across ticks; emit a single
-                    // summary at most once per DROP_LOG_INTERVAL so
-                    // a saturated downstream channel doesn't flood
-                    // the log at the tick rate.
-                    if let Ok(mut s) = cb_drop_summary.lock() {
-                        s.count = s.count.saturating_add(1);
-                        if s.last_log.elapsed() >= DROP_LOG_INTERVAL {
-                            tracing::warn!(
-                                pacer_node = %cb_node_id,
-                                dropped = s.count,
-                                interval_s = DROP_LOG_INTERVAL.as_secs(),
-                                last_error = %e,
-                                "Pacer: fan_tx backpressure (suppressed per-frame warns)"
-                            );
-                            s.count = 0;
-                            s.last_log = Instant::now();
-                        }
-                    }
-                }
+
                 Ok(())
             });
 

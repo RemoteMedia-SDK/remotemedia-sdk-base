@@ -1,4 +1,3 @@
-use crate::audio::buffer::AudioData;
 /// Streaming wrapper for FastResampleNode
 ///
 /// Adapts the synchronous FastResampleNode (FastAudioNode trait) to work
@@ -6,11 +5,12 @@ use crate::audio::buffer::AudioData;
 use crate::data::RuntimeData;
 use crate::error::{Error, Result};
 use crate::nodes::{
-    audio::{FastAudioNode, FastResampleNode, ResampleQuality},
+    audio::{FastResampleNode, ResampleQuality},
     AsyncStreamingNode,
 };
 use async_trait::async_trait;
 use remotemedia_traits::runtime_context::{InitializeContextRead, NodeRuntimeContextRead};
+use remotemedia_types::{HeapOutputAllocator, OutputAllocator};
 use serde_json::Value;
 // `parking_lot::Mutex` chosen deliberately: all locking sites in this
 // file cover pure synchronous CPU work (rubato resampling, atomic config
@@ -48,13 +48,12 @@ impl ResampleStreamingNode {
     }
 }
 
-#[async_trait]
-impl AsyncStreamingNode for ResampleStreamingNode {
-    fn node_type(&self) -> &str {
-        "FastResampleNode"
-    }
-
-    async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
+impl ResampleStreamingNode {
+    fn process_allocated(
+        &self,
+        data: RuntimeData,
+        allocator: &dyn OutputAllocator,
+    ) -> Result<RuntimeData> {
         // if not audio, passthrough
         if data.data_type() != "audio" {
             return Ok(data);
@@ -122,12 +121,12 @@ impl AsyncStreamingNode for ResampleStreamingNode {
             }
         }
         let buffered_us = inner.buffered_duration_us();
-        let resampled = inner.process_audio(AudioData::new(
-            crate::audio::buffer::AudioBuffer::new_f32(f32_samples.into_vec()),
+        let samples = inner.process_shared(
+            f32_samples,
             input_sample_rate,
             input_channels as usize,
-        ))?;
-        let samples = resampled.buffer.as_f32().unwrap().to_vec();
+            allocator,
+        )?;
         let timestamp_us = in_ts_us.map(|pts| pts.saturating_sub(buffered_us));
         let mut metadata = in_meta;
         if let Some(meta) = metadata.as_mut() {
@@ -163,10 +162,10 @@ impl AsyncStreamingNode for ResampleStreamingNode {
         })
     }
 
-    async fn process_streaming<F>(
+    fn stream_allocated<F>(
         &self,
         data: RuntimeData,
-        _session_id: Option<String>,
+        allocator: &dyn OutputAllocator,
         mut callback: F,
     ) -> Result<usize>
     where
@@ -195,10 +194,10 @@ impl AsyncStreamingNode for ResampleStreamingNode {
                     self.tail.lock().take();
                     *current = epoch;
                 }
-                let output = inner.flush_audio()?;
+                let output = inner.flush_shared(allocator)?;
                 let mut tail = self.tail.lock().take();
                 if let Some(RuntimeData::Audio { samples, .. }) = &mut tail {
-                    *samples = output.buffer.as_f32().unwrap().to_vec().into();
+                    *samples = output.into();
                 }
                 tail
             };
@@ -208,9 +207,57 @@ impl AsyncStreamingNode for ResampleStreamingNode {
             }
             callback(data)?;
         } else {
-            callback(self.process(data).await?)?;
+            callback(self.process_allocated(data, allocator)?)?;
         }
         Ok(count + 1)
+    }
+}
+
+#[async_trait]
+impl AsyncStreamingNode for ResampleStreamingNode {
+    fn node_type(&self) -> &str {
+        "FastResampleNode"
+    }
+    async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
+        self.process_allocated(data, &HeapOutputAllocator)
+    }
+    async fn process_with_ctx(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData> {
+        if !matches!(data, RuntimeData::Audio { .. }) {
+            return Ok(data);
+        }
+        let allocator = ctx
+            .output_allocator()
+            .ok_or_else(|| Error::Execution("resampler requires an output allocator".into()))?;
+        self.process_allocated(data, allocator.as_ref())
+    }
+    async fn process_streaming<F>(
+        &self,
+        data: RuntimeData,
+        _session_id: Option<String>,
+        callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        self.stream_allocated(data, &HeapOutputAllocator, callback)
+    }
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+        callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        let allocator = ctx
+            .output_allocator()
+            .ok_or_else(|| Error::Execution("resampler requires an output allocator".into()))?;
+        self.stream_allocated(data, allocator.as_ref(), callback)
     }
 }
 
@@ -269,7 +316,7 @@ pub struct AutoResampleStreamingNode {
     node_id: String,
     config: AutoResampleConfig,
     /// Lazily initialized resampler
-    inner: Mutex<Option<FastResampleNode>>,
+    inner: Mutex<Option<ResampleStreamingNode>>,
     /// Resolved target rate (set during initialization or from config)
     resolved_target_rate: Mutex<Option<u32>>,
     /// Resolved source rate (detected from first chunk)
@@ -328,30 +375,27 @@ impl AutoResampleStreamingNode {
     }
 
     /// Initialize the resampler with detected/configured rates.
-    async fn ensure_initialized(
+    fn ensure_initialized(
         &self,
         source_rate: u32,
         target_rate: u32,
         channels: usize,
     ) -> Result<()> {
         let mut inner = self.inner.lock();
-        if inner.is_some() {
-            return Ok(()); // Already initialized
+        if let Some(existing) = inner.as_ref() {
+            if existing.target_rate == target_rate {
+                return Ok(());
+            }
+            if !existing.inner.lock().can_reconfigure() {
+                return Err(Error::Execution(
+                    "resampler target rate changed with an unfinished utterance; flush before reconfiguration".into(),
+                ));
+            }
         }
 
         // Store resolved values
         *self.resolved_source_rate.lock() = Some(source_rate);
         *self.resolved_channels.lock() = Some(channels);
-
-        // If source and target are the same, we can skip resampling
-        if source_rate == target_rate {
-            tracing::info!(
-                "[{}] No resampling needed (source == target = {}Hz)",
-                self.node_id,
-                source_rate
-            );
-            return Ok(());
-        }
 
         tracing::info!(
             "[{}] Creating resampler: {}Hz -> {}Hz, {} channels, quality: {:?}",
@@ -365,157 +409,108 @@ impl AutoResampleStreamingNode {
         let resampler =
             FastResampleNode::new(source_rate, target_rate, self.config.quality, channels)?;
 
-        *inner = Some(resampler);
+        *inner = Some(
+            ResampleStreamingNode::new(resampler, target_rate)
+                .with_output_stream_id(self.config.output_stream_id.clone()),
+        );
         Ok(())
     }
 }
 
+impl AutoResampleStreamingNode {
+    fn prepare(&self, data: &RuntimeData) -> Result<()> {
+        if let RuntimeData::Audio {
+            sample_rate,
+            channels,
+            ..
+        } = data
+        {
+            let source = self.config.source_rate.unwrap_or(*sample_rate);
+            let target = self
+                .resolved_target_rate
+                .lock()
+                .or(self.config.target_rate)
+                .unwrap_or(*sample_rate);
+            let channels = self.config.channels.unwrap_or(*channels as usize);
+            self.ensure_initialized(source, target, channels)?;
+        }
+        Ok(())
+    }
+    fn process_allocated(
+        &self,
+        data: RuntimeData,
+        allocator: &dyn OutputAllocator,
+    ) -> Result<RuntimeData> {
+        self.prepare(&data)?;
+        match self.inner.lock().as_ref() {
+            Some(inner) => inner.process_allocated(data, allocator),
+            None => Ok(data),
+        }
+    }
+    fn stream_allocated<F>(
+        &self,
+        data: RuntimeData,
+        allocator: &dyn OutputAllocator,
+        mut callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        self.prepare(&data)?;
+        match self.inner.lock().as_ref() {
+            Some(inner) => inner.stream_allocated(data, allocator, callback),
+            None => {
+                callback(data)?;
+                Ok(1)
+            }
+        }
+    }
+}
 #[async_trait]
 impl AsyncStreamingNode for AutoResampleStreamingNode {
     fn node_type(&self) -> &str {
         "FastResampleNode"
     }
-
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
-        // Passthrough non-audio data
-        if data.data_type() != "audio" {
+        self.process_allocated(data, &HeapOutputAllocator)
+    }
+    async fn process_with_ctx(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData> {
+        if !matches!(data, RuntimeData::Audio { .. }) {
             return Ok(data);
         }
-
-        // Extract audio data + carry-through fields. See ResampleStreamingNode
-        // for why we move these out (preserves pts_us metadata for the
-        // lipsync chain and lets us route by stream_id).
-        let (
-            f32_samples,
-            input_sample_rate,
-            input_channels,
-            in_stream_id,
-            in_ts_us,
-            in_arrival_us,
-            in_meta,
-        ) = match data {
-            RuntimeData::Audio {
-                samples,
-                sample_rate,
-                channels,
-                stream_id,
-                timestamp_us,
-                arrival_ts_us,
-                metadata,
-            } => (
-                samples,
-                sample_rate,
-                channels as usize,
-                stream_id,
-                timestamp_us,
-                arrival_ts_us,
-                metadata,
-            ),
-            other => return Ok(other),
-        };
-        let out_stream_id = self.config.output_stream_id.clone().or(in_stream_id);
-
-        // Determine source rate (from config or incoming data)
-        let source_rate = self.config.source_rate.unwrap_or(input_sample_rate);
-
-        // Determine target rate (from config, resolved value, or passthrough)
-        let target_rate = {
-            let resolved = *self.resolved_target_rate.lock();
-            resolved
-                .or(self.config.target_rate)
-                .unwrap_or(input_sample_rate)
-        };
-
-        // Determine channels (from config or incoming data)
-        let channels = self.config.channels.unwrap_or(input_channels);
-
-        // Ensure resampler is initialized
-        self.ensure_initialized(source_rate, target_rate, channels)
-            .await?;
-
-        // If no resampling needed, passthrough (carry-through fields)
-        if source_rate == target_rate {
-            return Ok(RuntimeData::Audio {
-                samples: f32_samples,
-                sample_rate: target_rate,
-                channels: channels as u32,
-                stream_id: out_stream_id,
-                timestamp_us: in_ts_us,
-                arrival_ts_us: in_arrival_us,
-                metadata: in_meta,
-            });
-        }
-
-        // Process through resampler
-        let mut inner_guard = self.inner.lock();
-        let inner = inner_guard.as_mut().ok_or_else(|| {
-            Error::Execution(format!("[{}] Resampler not initialized", self.node_id))
-        })?;
-
-        let chunk_size = 1024;
-        let total_samples = f32_samples.len();
-
-        if total_samples <= chunk_size {
-            // Small buffer - process directly
-            let audio_data = AudioData::new(
-                crate::audio::buffer::AudioBuffer::new_f32(f32_samples.into_vec()),
-                input_sample_rate,
-                channels,
-            );
-
-            let resampled = inner.process_audio(audio_data)?;
-            let f32_samples = resampled
-                .buffer
-                .as_f32()
-                .ok_or_else(|| Error::Execution("Resampler output must be F32".into()))?;
-
-            return Ok(RuntimeData::Audio {
-                samples: f32_samples.to_vec().into(),
-                sample_rate: resampled.sample_rate,
-                channels: resampled.channels as u32,
-                stream_id: out_stream_id,
-                timestamp_us: in_ts_us,
-                arrival_ts_us: in_arrival_us,
-                metadata: in_meta,
-            });
-        }
-
-        // Large buffer - process in chunks
-        let mut all_output_samples = Vec::new();
-
-        for chunk_start in (0..total_samples).step_by(chunk_size) {
-            let chunk_end = (chunk_start + chunk_size).min(total_samples);
-            let chunk_samples = &f32_samples[chunk_start..chunk_end];
-
-            let mut chunk_vec = chunk_samples.to_vec();
-            if chunk_vec.len() < chunk_size {
-                chunk_vec.resize(chunk_size, 0.0);
-            }
-
-            let chunk_data = AudioData::new(
-                crate::audio::buffer::AudioBuffer::new_f32(chunk_vec),
-                input_sample_rate,
-                channels,
-            );
-
-            let resampled_chunk = inner.process_audio(chunk_data)?;
-            let chunk_out = resampled_chunk
-                .buffer
-                .as_f32()
-                .ok_or_else(|| Error::Execution("Resampler output must be F32".into()))?;
-
-            all_output_samples.extend_from_slice(chunk_out);
-        }
-
-        Ok(RuntimeData::Audio {
-            samples: all_output_samples.into(),
-            sample_rate: target_rate,
-            channels: channels as u32,
-            stream_id: out_stream_id,
-            timestamp_us: in_ts_us,
-            arrival_ts_us: in_arrival_us,
-            metadata: in_meta,
-        })
+        let allocator = ctx
+            .output_allocator()
+            .ok_or_else(|| Error::Execution("resampler requires an output allocator".into()))?;
+        self.process_allocated(data, allocator.as_ref())
+    }
+    async fn process_streaming<F>(
+        &self,
+        data: RuntimeData,
+        _session_id: Option<String>,
+        callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        self.stream_allocated(data, &HeapOutputAllocator, callback)
+    }
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+        callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        let allocator = ctx
+            .output_allocator()
+            .ok_or_else(|| Error::Execution("resampler requires an output allocator".into()))?;
+        self.stream_allocated(data, allocator.as_ref(), callback)
     }
 }
 
@@ -568,21 +563,32 @@ impl StreamingNode for AutoResampleStreamingNodeWrapper {
     async fn process_async(
         &self,
         data: RuntimeData,
-        _ctx: &dyn NodeRuntimeContextRead,
+        ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData> {
-        self.inner.process(data).await
+        self.inner.process_with_ctx(data, ctx).await
     }
 
     async fn process_multi_async(
         &self,
         inputs: HashMap<String, RuntimeData>,
-        _ctx: &dyn NodeRuntimeContextRead,
+        ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData> {
         if let Some((_name, data)) = inputs.into_iter().next() {
-            self.inner.process(data).await
+            self.inner.process_with_ctx(data, ctx).await
         } else {
             Err(Error::Execution("No input data provided".into()))
         }
+    }
+
+    async fn process_streaming_async(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+        callback: Box<dyn FnMut(RuntimeData) -> Result<()> + Send>,
+    ) -> Result<usize> {
+        self.inner
+            .process_streaming_with_ctx(data, ctx, callback)
+            .await
     }
 
     fn is_multi_input(&self) -> bool {

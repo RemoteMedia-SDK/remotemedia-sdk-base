@@ -44,6 +44,9 @@ use tokio::task::JoinHandle;
 /// Configuration for PipelineExecutor
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
+    /// Policy for explicit materializations in host Rust node contexts. Separate
+    /// from mapped worker ingress; this alone is not graph-wide certification.
+    pub node_materialization_policy: remotemedia_types::CopyPolicy,
     /// Scheduler configuration
     pub scheduler_config: SchedulerConfig,
     /// Drift metrics thresholds
@@ -61,16 +64,57 @@ pub struct ExecutorConfig {
     /// resolves relative to where the manifest lives, not where the
     /// program was launched from.
     pub manifest_base_dir: Option<std::path::PathBuf>,
+    /// Bounded mapped storage reserved independently for every cold-built session.
+    /// Required by registered session workers. Local producers receive this same
+    /// allocator. This is placement configuration, not a zero-copy certification.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub mapped_pool: Option<crate::multiprocess::native_worker::PoolConfig>,
+    /// Input materialization policy for explicitly registered mapped workers.
+    /// Defaults to strict rejection. This does not certify other adapters or node internals.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub mapped_input_policy: remotemedia_types::CopyPolicy,
+    /// Host-authorized local native worker packages selected by plugin.toml.
+    #[cfg(all(
+        feature = "loadable",
+        feature = "native-worker",
+        any(windows, target_os = "linux")
+    ))]
+    pub mapped_native_plugins: Option<crate::loadable::mapped_native::MappedNativePluginRuntime>,
+    /// Host-authorized manifest-driven mapped Python source plugin runtime.
+    /// When selected, source plugins must declare a matching mapped contract.
+    #[cfg(all(
+        feature = "loadable",
+        feature = "mapped-python",
+        any(windows, target_os = "linux")
+    ))]
+    pub mapped_python_plugins: Option<crate::loadable::mapped_python::MappedPythonPluginRuntime>,
 }
 
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
+            node_materialization_policy: remotemedia_types::CopyPolicy::AllowCopies,
             scheduler_config: SchedulerConfig::default(),
             drift_thresholds: DriftThresholds::default(),
             enable_drift_metrics: true,
             session_id_prefix: "session".to_string(),
             manifest_base_dir: None,
+            #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+            mapped_pool: None,
+            #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+            mapped_input_policy: remotemedia_types::CopyPolicy::RequireZeroCopy,
+            #[cfg(all(
+                feature = "loadable",
+                feature = "native-worker",
+                any(windows, target_os = "linux")
+            ))]
+            mapped_native_plugins: None,
+            #[cfg(all(
+                feature = "loadable",
+                feature = "mapped-python",
+                any(windows, target_os = "linux")
+            ))]
+            mapped_python_plugins: None,
         }
     }
 }
@@ -80,8 +124,14 @@ impl Default for ExecutorConfig {
 /// SessionHandle provides a type-safe interface for streaming data
 /// through a pipeline session. It owns the channels and task handle.
 pub struct SessionHandle {
+    node_materialization_copies: super::NodeMaterializationCopies,
     /// Unique session identifier
     pub session_id: String,
+    output_allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    mapped_pool: Option<crate::multiprocess::native_worker::SharedPool>,
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    mapped_input_copies: crate::multiprocess::native_worker::WorkerInputCopies,
     /// Channel for sending input data to the session (None after input complete).
     ///
     /// Bounded — see `DEFAULT_ROUTER_INPUT_CAPACITY` in `session_router`.
@@ -113,6 +163,42 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Retain per-node explicit materialization ledgers through joined shutdown.
+    pub fn node_materialization_copies(&self) -> super::NodeMaterializationCopies {
+        self.node_materialization_copies.clone()
+    }
+
+    /// Allocate ingress media directly in the storage used by this session's
+    /// producers. Loans and published outputs retain storage after session close.
+    /// Allocation may block; this is not an audio-callback API.
+    pub fn output_allocator(&self) -> Arc<dyn remotemedia_types::OutputAllocator> {
+        self.output_allocator.clone()
+    }
+
+    /// The session's mapped pool, when configured. Pool identity is independent
+    /// for every cold-built session; a warm session retains its original pool.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub fn mapped_pool(&self) -> Option<&crate::multiprocess::native_worker::SharedPool> {
+        self.mapped_pool.as_ref()
+    }
+
+    /// Retain this session's input ledgers independently of the session handle.
+    /// The returned scope remains readable after `wait` consumes the handle.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub fn mapped_input_copies(&self) -> crate::multiprocess::native_worker::WorkerInputCopies {
+        self.mapped_input_copies.clone()
+    }
+
+    /// Per-node host-to-worker copy reports for this session. Worker shutdown
+    /// does not erase counters. Quiesce workers before treating these as final;
+    /// this does not report arbitrary model, codec, or transport copies.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub fn mapped_input_copy_reports(
+        &self,
+    ) -> std::collections::BTreeMap<String, remotemedia_types::CopyReport> {
+        self.mapped_input_copies.reports()
+    }
+
     /// Send input data to the session.
     ///
     /// The data will be processed through the pipeline and outputs
@@ -305,7 +391,8 @@ impl SessionHandle {
             .map(|input| ParticipantSessionHandle::new(input, participant))
     }
 
-    /// Close the session gracefully
+    /// Request graceful shutdown. This sends the signal without joining the
+    /// router; call [`Self::wait`] afterward to await node cleanup and termination.
     pub async fn close(&mut self) -> Result<()> {
         if !self.is_active {
             return Ok(());
@@ -644,6 +731,13 @@ impl PipelineExecutor {
                 .await
                 .map_err(|e| Error::Manifest(format!("plugin resolution failed: {e}")))?;
             match resolved {
+                crate::loadable::resolver::ResolvedPlugin::MappedNative {
+                    plugin_toml,
+                    package_root,
+                } => {
+                    self.load_mapped_native_plugin(plugin_toml, package_root)
+                        .await?;
+                }
                 crate::loadable::resolver::ResolvedPlugin::Cdylib { path } => {
                     self.load_cdylib_plugin(path).await?;
                 }
@@ -700,10 +794,33 @@ impl PipelineExecutor {
         Ok(())
     }
 
-    /// Register a `SourcePythonFactory` per `node_types` entry from the
-    /// resolved plugin.toml. Each factory spawns its own Python
-    /// subprocess on `create()`.
-    #[cfg(all(feature = "loadable", feature = "python-source-plugin"))]
+    #[cfg(feature = "loadable")]
+    async fn load_mapped_native_plugin(
+        &self,
+        plugin_toml: crate::loadable::plugin_toml::PluginToml,
+        package_root: std::path::PathBuf,
+    ) -> Result<()> {
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        if let Some(runtime) = &self.config.mapped_native_plugins {
+            let metadata = plugin_toml
+                .rust
+                .as_ref()
+                .ok_or_else(|| Error::ConfigError("mapped native plugin missing [rust]".into()))?;
+            // Validate every declaration before modifying the shared registry.
+            let factories = runtime.factories(metadata, package_root)?;
+            let mut registry = self.registry.write().await;
+            for factory in factories {
+                registry.register_session_worker(Arc::new(factory));
+            }
+            return Ok(());
+        }
+        let _ = (plugin_toml, package_root);
+        Err(Error::ConfigError("[rust.mapped] requires host-authorized mapped_native_plugins configuration and native-worker support".into()))
+    }
+
+    /// Select mapped session templates or the feature-gated legacy factory
+    /// from resolved source-plugin metadata and host runtime configuration.
+    #[cfg(feature = "loadable")]
     async fn load_source_python_plugin(
         &self,
         plugin_toml: crate::loadable::plugin_toml::PluginToml,
@@ -716,39 +833,46 @@ impl PipelineExecutor {
                 plugin_toml.plugin.name
             ))
         })?;
-        let mut registry = self.registry.write().await;
-        for node_type in &py.node_types {
-            let plugin = crate::loadable::source_python::SourcePythonPlugin {
-                node_type: node_type.clone(),
-                entry_module: py.entry_module.clone(),
-                module_root: module_root.clone(),
-                requires: py.requires.clone(),
-                hash: hash.clone(),
-            };
-            let factory = std::sync::Arc::new(
-                crate::loadable::source_python::SourcePythonFactory::new(plugin),
-            );
-            registry.register(factory);
+        #[cfg(all(feature = "mapped-python", any(windows, target_os = "linux")))]
+        if let Some(runtime) = &self.config.mapped_python_plugins {
+            // Validate the entire declaration before modifying the shared registry.
+            let factories = runtime.factories(py, module_root)?;
+            let mut registry = self.registry.write().await;
+            for factory in factories {
+                registry.register_session_worker(Arc::new(factory));
+            }
+            return Ok(());
         }
-        Ok(())
-    }
-
-    /// Stub when `python-source-plugin` feature is disabled — surfaces
-    /// the precise build-config error instead of a confusing "node
-    /// type not found" downstream.
-    #[cfg(all(feature = "loadable", not(feature = "python-source-plugin")))]
-    async fn load_source_python_plugin(
-        &self,
-        plugin_toml: crate::loadable::plugin_toml::PluginToml,
-        _module_root: std::path::PathBuf,
-        _hash: String,
-    ) -> Result<()> {
-        Err(Error::Manifest(format!(
-            "plugin '{}' is a Python source plugin but the `python-source-plugin` \
-             feature on remotemedia-core was not enabled at build time. \
-             Rebuild with `--features python-source-plugin`.",
-            plugin_toml.plugin.name
-        )))
+        if py.mapped.is_some() {
+            return Err(Error::ConfigError(
+                "[python.mapped] requires host-authorized mapped_python_plugins configuration and mapped-python support".into(),
+            ));
+        }
+        #[cfg(feature = "python-source-plugin")]
+        {
+            let mut registry = self.registry.write().await;
+            for node_type in &py.node_types {
+                let plugin = crate::loadable::source_python::SourcePythonPlugin {
+                    node_type: node_type.clone(),
+                    entry_module: py.entry_module.clone(),
+                    module_root: module_root.clone(),
+                    requires: py.requires.clone(),
+                    hash: hash.clone(),
+                };
+                let factory = std::sync::Arc::new(
+                    crate::loadable::source_python::SourcePythonFactory::new(plugin),
+                );
+                registry.register(factory);
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "python-source-plugin"))]
+        {
+            let _ = (module_root, hash);
+            Err(Error::ConfigError(
+                "Python source plugin requires python-source-plugin support or a configured mapped-python runtime".into(),
+            ))
+        }
     }
 
     /// Access the process-wide [`SessionControlBus`].
@@ -776,7 +900,10 @@ impl PipelineExecutor {
         let count = self
             .session_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        format!("{}_{}_{}", self.config.session_id_prefix, self.instance_tag, count)
+        format!(
+            "{}_{}_{}",
+            self.config.session_id_prefix, self.instance_tag, count
+        )
     }
 
     /// Register a custom node factory
@@ -793,6 +920,16 @@ impl PipelineExecutor {
     pub async fn register_factory(&self, factory: Arc<dyn StreamingNodeFactory>) {
         let mut registry = self.registry.write().await;
         registry.register(factory);
+    }
+
+    /// Register trusted mapped code for automatic binding to each session pool.
+    /// Registering an ordinary factory of the same type replaces this placement.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub async fn register_session_worker(
+        &self,
+        factory: Arc<dyn crate::multiprocess::native_worker::SessionWorkerFactory>,
+    ) {
+        self.registry.write().await.register_session_worker(factory);
     }
 
     /// Attach a [`WarmSessionPool`] as this executor's default pool.
@@ -1145,10 +1282,28 @@ impl PipelineExecutor {
             manifest.nodes.iter().map(|n| n.id.clone()).collect();
         let manifest = self.negotiate_capabilities(manifest).await?;
         tracing::info!("cold_build_session: negotiate_capabilities ok");
+        let session_id = self.generate_session_id();
+        let registry_snapshot = self.registry.read().await.clone();
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        let (registry_snapshot, mapped_pool, mapped_input_copies) = {
+            let mut registry = registry_snapshot;
+            let (pool, copies) = super::mapped_placement::bind_session_workers(
+                &manifest,
+                &mut registry,
+                self.config.mapped_pool.as_ref(),
+                &session_id,
+                self.config.mapped_input_policy,
+            )?;
+            (registry, pool, copies)
+        };
+        let output_allocator: Arc<dyn remotemedia_types::OutputAllocator> =
+            Arc::new(remotemedia_types::HeapOutputAllocator);
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        let output_allocator = mapped_pool.as_ref().map_or(output_allocator, |pool| {
+            Arc::new(pool.clone()) as Arc<dyn remotemedia_types::OutputAllocator>
+        });
         let manifest = self.managed_llama_servers.prepare(&manifest).await?;
         let manifest = Arc::new(self.managed_ardy_daemons.prepare(&manifest).await?);
-
-        let session_id = self.generate_session_id();
 
         // Create kind-split output router. Each kind (Audio / Video /
         // Data) gets its own bounded channel — see
@@ -1161,17 +1316,11 @@ impl PipelineExecutor {
                 crate::transport::session_router::DEFAULT_ROUTER_OUTPUT_CAPACITY,
             );
 
-        // Get a snapshot of the registry for the session
-        let registry_snapshot = {
-            let registry = self.registry.read().await;
-            Arc::new(registry.clone())
-        };
-
         // Create session router with scheduler config and drift thresholds
         let (mut router, shutdown_tx) = SessionRouter::with_config(
             session_id.clone(),
             manifest.clone(),
-            registry_snapshot,
+            Arc::new(registry_snapshot),
             output_router,
             Some(self.config.scheduler_config.clone()),
             if self.config.enable_drift_metrics {
@@ -1180,6 +1329,9 @@ impl PipelineExecutor {
                 None
             },
         )?;
+        router.set_output_allocator(output_allocator.clone());
+        let node_materialization_copies =
+            router.set_node_materialization_policy(self.config.node_materialization_policy);
 
         let inserted: std::collections::HashSet<String> = manifest
             .nodes
@@ -1284,7 +1436,13 @@ impl PipelineExecutor {
             data_rx,
         } = output_receivers;
         Ok(SessionHandle {
+            node_materialization_copies,
             session_id,
+            output_allocator,
+            #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+            mapped_pool,
+            #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+            mapped_input_copies,
             input_tx: Some(input_tx),
             output_audio_rx: Some(audio_rx),
             output_video_rx: Some(video_rx),
@@ -1318,7 +1476,9 @@ impl PipelineExecutor {
     ) -> std::collections::HashMap<String, crate::executor::streaming_scheduler::NodeStats> {
         let mut merged = self.scheduler.get_all_node_stats().await;
         for ctrl in self.live_controls() {
-            let Some(tel) = ctrl.telemetry() else { continue };
+            let Some(tel) = ctrl.telemetry() else {
+                continue;
+            };
             for (id, s) in tel.scheduler().get_all_node_stats().await {
                 merged
                     .entry(id)

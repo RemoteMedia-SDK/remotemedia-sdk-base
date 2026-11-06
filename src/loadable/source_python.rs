@@ -219,6 +219,40 @@ struct SourcePythonNode {
     _child: Arc<std::sync::Mutex<std::process::Child>>,
 }
 
+impl Drop for SourcePythonNode {
+    fn drop(&mut self) {
+        // std::process::Child does not terminate its process on drop.
+        let mut child = self._child.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // A Windows venv launcher owns a second Python process. Terminate
+        // that owned tree before reaping the launcher, or the model survives
+        // session.close() with its GPU allocation and inherited pipe handles.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let result = std::process::Command::new("taskkill.exe")
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .output();
+            if !matches!(result, Ok(ref output) if output.status.success()) {
+                tracing::warn!(
+                    pid = child.id(),
+                    "Failed to terminate Python runner process tree"
+                );
+            }
+        }
+        if let Err(error) = child.kill() {
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                tracing::warn!(pid = child.id(), %error, "Failed to terminate Python runner");
+                return;
+            }
+        }
+        let _ = child.wait();
+    }
+}
+
 #[async_trait]
 impl StreamingNode for SourcePythonNode {
     fn node_type(&self) -> &str {
@@ -409,7 +443,7 @@ fn decode_output(bytes: &[u8]) -> Result<RuntimeData, Error> {
                 other => Some(other),
             };
             Ok(RuntimeData::Tensor {
-                data,
+                data: data.into(),
                 shape: shape.into_iter().map(|d| d as i32).collect(),
                 dtype: dtype as i32,
                 metadata,

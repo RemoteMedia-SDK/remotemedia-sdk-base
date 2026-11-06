@@ -1338,6 +1338,7 @@ impl SessionControl {
         data: RuntimeData,
         sender: broadcast::Sender<RuntimeData>,
     ) {
+        let data = data.into_shared();
         if node_id == "__system__" && port.is_none() {
             // CRITICAL: hold `system_retained` across both retain-append AND
             // broadcast::send so a concurrent subscribe_system either sees this
@@ -1485,6 +1486,7 @@ impl SessionControl {
         port: Option<&str>,
         data: RuntimeData,
     ) -> Option<RuntimeData> {
+        let data = data.into_shared();
         let port_owned = port.map(|s| s.to_string());
 
         // 1. Broadcast to tap subscribers (fire-and-forget; slow subs lag).
@@ -1556,7 +1558,7 @@ impl SessionControl {
 
         match tokio::time::timeout(slot.deadline, reply_rx).await {
             Ok(Ok(InterceptDecision::Pass)) => Some(data),
-            Ok(Ok(InterceptDecision::Replace(replacement))) => Some(replacement),
+            Ok(Ok(InterceptDecision::Replace(replacement))) => Some(replacement.into_shared()),
             Ok(Ok(InterceptDecision::Drop)) => None,
             Ok(Err(_canceled)) => {
                 tracing::warn!(
