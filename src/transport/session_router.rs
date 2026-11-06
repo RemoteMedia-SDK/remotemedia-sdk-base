@@ -314,6 +314,7 @@ pub struct DataPacket {
 /// - Integrates StreamingScheduler for timeout, retry, and circuit breaker (spec 026)
 /// - Tracks per-stream drift metrics for health monitoring (spec 026)
 pub struct SessionRouter {
+    bound_output_allocators: HashMap<String, Arc<remotemedia_types::BoundOutputAllocator>>,
     buffer_contracts: Option<
         std::collections::BTreeMap<
             String,
@@ -580,6 +581,7 @@ impl SessionRouter {
         ));
 
         let router = Self {
+            bound_output_allocators: HashMap::new(),
             buffer_contracts: None,
             node_materialization: super::NodeMaterializationCopies::new(
                 &session_id,
@@ -814,6 +816,7 @@ impl SessionRouter {
     pub async fn initialize_nodes(&mut self) -> Result<()> {
         use futures::future::try_join_all;
         self.snapshot_bindings = None;
+        self.bound_output_allocators.clear();
 
         let total = self.manifest.nodes.len();
         tracing::info!(
@@ -848,10 +851,16 @@ impl SessionRouter {
                 .and_then(|contracts| contracts.get(&node_spec.id))
                 .and_then(Option::as_ref)
             {
+                let allocator = Arc::new(remotemedia_types::BoundOutputAllocator::new(
+                    self.output_allocator.clone(),
+                ));
+                self.bound_output_allocators
+                    .insert(node_spec.id.clone(), allocator.clone());
                 node = Box::new(super::buffer_validation::BufferCheckedNode::new(
                     node_spec.id.clone(),
                     contract.clone(),
                     node,
+                    Some(allocator),
                 ));
             }
             created.push((node_spec.id.clone(), node_spec.node_type.clone(), node));
@@ -1399,7 +1408,12 @@ impl SessionRouter {
                 .any(|n| n.id == node_id && n.is_output_node);
 
             let (main_handle, fan_handle) = Self::spawn_node_pipeline(
-                self.output_allocator.clone(),
+                self.bound_output_allocators
+                    .get(&node_id)
+                    .map(|allocator| {
+                        allocator.clone() as Arc<dyn remotemedia_types::OutputAllocator>
+                    })
+                    .unwrap_or_else(|| self.output_allocator.clone()),
                 self.node_materialization.context(&node_id)?,
                 node_id.clone(),
                 node,

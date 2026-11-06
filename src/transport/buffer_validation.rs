@@ -1,10 +1,10 @@
 //! Runtime layout/bound checks for explicitly declared node contracts.
 //! Validation borrows buffers; forwarding moves/promotes owners without copying.
-//! Allocation lineage, producer binding and live retention budgets remain separate.
+//! Host provenance is checked; live retention budgets remain separate.
 use crate::nodes::{InitializeContextRead, NodeRuntimeContextRead, StreamingNode, Tick};
 use crate::{data::RuntimeData, Error};
 use remotemedia_traits::{
-    buffer_contract::{BufferContract, BufferPortContract},
+    buffer_contract::{BufferContract, BufferPortContract, BufferProduction},
     capabilities::{CapabilityBehavior, MediaCapabilities},
     ports::SnapshotPort,
     rpc::{RpcMethod, RpcRequest, RpcResponder},
@@ -20,6 +20,8 @@ type Callback = Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>;
 struct Checks {
     node_id: String,
     contract: BufferContract,
+    forwarding: remotemedia_types::ForwardingScope,
+    allocator: Option<Arc<remotemedia_types::BoundOutputAllocator>>,
 }
 impl Checks {
     fn check(&self, data: &RuntimeData, port: &str, output: bool) -> Result<(), Error> {
@@ -42,6 +44,13 @@ impl Checks {
             }
             None => Err("bulk payload has no exact port contract".into()),
         };
+        let validation = validation.and_then(|()| {
+            if output {
+                self.check_production(data)
+            } else {
+                Ok(())
+            }
+        });
         validation.map_err(|reason| {
             Error::Execution(format!(
                 "buffer contract node '{}' {} port '{}': {reason}; no implicit conversion adapter",
@@ -50,6 +59,45 @@ impl Checks {
                 if port.is_empty() { "<default>" } else { port },
             ))
         })
+    }
+
+    fn check_production(&self, data: &RuntimeData) -> Result<(), String> {
+        let allocated = || {
+            self.allocator
+                .as_ref()
+                .is_some_and(|allocator| allocator.owns_payload(data))
+        };
+        let (valid, reason) = match self.contract.production {
+            BufferProduction::ForwardInput => (
+                self.forwarding.accepts_output(data),
+                "output does not retain an input admitted to this node",
+            ),
+            BufferProduction::OutputAllocator => (
+                allocated(),
+                "output has no provenance from this node's bound allocator",
+            ),
+            BufferProduction::ForwardOrOutputAllocator => (
+                self.forwarding.accepts_output(data) || allocated(),
+                "output has neither admitted-input nor bound-allocator provenance",
+            ),
+            BufferProduction::PrivateStorage => return Ok(()),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(reason.into())
+        }
+    }
+
+    fn admit(&self, data: RuntimeData) -> RuntimeData {
+        if matches!(
+            self.contract.production,
+            BufferProduction::ForwardInput | BufferProduction::ForwardOrOutputAllocator
+        ) {
+            self.forwarding.accept(data)
+        } else {
+            data.into_shared()
+        }
     }
 
     fn callback(self: &Arc<Self>, mut callback: Callback) -> (Callback, CallbackFailure) {
@@ -93,10 +141,20 @@ pub struct BufferCheckedNode {
     checks: Arc<Checks>,
 }
 impl BufferCheckedNode {
-    pub fn new(node_id: String, contract: BufferContract, inner: Box<dyn StreamingNode>) -> Self {
+    pub fn new(
+        node_id: String,
+        contract: BufferContract,
+        inner: Box<dyn StreamingNode>,
+        allocator: Option<Arc<remotemedia_types::BoundOutputAllocator>>,
+    ) -> Self {
         Self {
             inner,
-            checks: Arc::new(Checks { node_id, contract }),
+            checks: Arc::new(Checks {
+                node_id,
+                contract,
+                allocator,
+                forwarding: Default::default(),
+            }),
         }
     }
 
@@ -135,7 +193,11 @@ impl StreamingNode for BufferCheckedNode {
         ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
         self.checks.check(&data, "", false)?;
-        self.output(self.inner.process_async(data.into_shared(), ctx).await?)
+        self.output(
+            self.inner
+                .process_async(self.checks.admit(data), ctx)
+                .await?,
+        )
     }
 
     async fn process_multi_async(
@@ -149,7 +211,7 @@ impl StreamingNode for BufferCheckedNode {
         // Move normalization preserves legacy Vec allocations before user fan-out.
         inputs = inputs
             .into_iter()
-            .map(|(port, data)| (port, data.into_shared()))
+            .map(|(port, data)| (port, self.checks.admit(data)))
             .collect();
         self.output(self.inner.process_multi_async(inputs, ctx).await?)
     }
@@ -164,7 +226,7 @@ impl StreamingNode for BufferCheckedNode {
         let (callback, failure) = self.checks.callback(callback);
         failure.result(
             self.inner
-                .process_streaming_async(data.into_shared(), ctx, callback)
+                .process_streaming_async(self.checks.admit(data), ctx, callback)
                 .await,
         )
     }
@@ -186,7 +248,7 @@ impl StreamingNode for BufferCheckedNode {
     ) -> Result<bool, Error> {
         self.checks.check(&message, "", false)?;
         self.inner
-            .process_control_message(message.into_shared(), ctx)
+            .process_control_message(self.checks.admit(message), ctx)
             .await
     }
 
