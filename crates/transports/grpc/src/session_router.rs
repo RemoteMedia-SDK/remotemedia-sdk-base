@@ -30,6 +30,7 @@ use remotemedia_core::nodes::{StreamingNode, StreamingNodeRegistry};
 use remotemedia_core::telemetry::{
     approx_payload_bytes, NoQueue, QueueCapacity, SessionDescriptor, SessionTelemetry,
 };
+use remotemedia_core::telemetry::publisher::record_node_error;
 use remotemedia_core::transport::perf_aggregator::PerfAggregator;
 use remotemedia_core::transport::session_control::{NodeState, SessionControl};
 use std::collections::HashMap;
@@ -1346,24 +1347,5 @@ impl SessionRouter {
             .send(packet)
             .await
             .map_err(|e| format!("Failed to feed chunk: {}", e))
-    }
-}
-
-
-/// Count a dispatch error and publish a rate-limited `node_error` event.
-fn record_node_error(
-    tel: &SessionTelemetry,
-    idx: Option<usize>,
-    control: Option<&SessionControl>,
-    node_id: &str,
-    message: &str,
-) {
-    let Some(i) = idx else { return };
-    if let Some(ev) = tel.record_error(i, message) {
-        if let Some(ctrl) = control {
-            remotemedia_core::telemetry::publisher::publish_node_error(
-                ctrl, node_id, &ev.message, ev.count,
-            );
-        }
     }
 }

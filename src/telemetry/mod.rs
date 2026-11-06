@@ -313,7 +313,7 @@ impl EdgeCell {
         self.end_stall(us);
     }
 
-    /// Count one frame dropped because the receiver had closed.
+    /// Count a frame rejected by a closed receiver or failed queue admission.
     #[inline]
     pub fn record_drop(&self) {
         self.drops.fetch_add(1, Relaxed);

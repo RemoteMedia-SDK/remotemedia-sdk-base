@@ -42,6 +42,8 @@ mod tasks;
 use tasks::TaskGroup;
 mod children;
 use children::Children;
+mod input_queue;
+use input_queue::InputQueue;
 #[cfg(test)]
 mod task_failure_tests;
 
@@ -448,7 +450,7 @@ const RELAXED: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxe
 struct PipelineTasks {
     /// Input sender for each node (keyed by node id). The router pushes
     /// source-bound and `to_node`-addressed packets through these.
-    input_txs: HashMap<String, mpsc::Sender<RuntimeData>>,
+    input_txs: HashMap<String, InputQueue>,
     /// Telemetry ingress edge index for each source node.
     ingress_edges: HashMap<String, usize>,
     /// All spawned tasks (main + fan-out per node). Awaited on shutdown.
@@ -458,7 +460,7 @@ struct PipelineTasks {
 /// One stream successor of a node: its input channel plus the telemetry edge
 /// index of the connection feeding it.
 struct Successor {
-    tx: mpsc::Sender<RuntimeData>,
+    tx: InputQueue,
     edge: Option<usize>,
 }
 
@@ -1362,15 +1364,8 @@ impl SessionRouter {
             None => self.bind_snapshot_inputs()?,
         };
         let (shutdown, _) = tokio::sync::watch::channel(false);
-        let mut input_txs: HashMap<String, mpsc::Sender<RuntimeData>> = HashMap::new();
-        let mut input_rxs: HashMap<String, mpsc::Receiver<RuntimeData>> = HashMap::new();
-
-        // Pass 1: create an input channel for every node we have cached.
-        for node_id in self.cached_nodes.keys() {
-            let (tx, rx) = mpsc::channel::<RuntimeData>(NODE_INPUT_CAPACITY);
-            input_txs.insert(node_id.clone(), tx);
-            input_rxs.insert(node_id.clone(), rx);
-        }
+        let (input_txs, mut input_rxs) =
+            input_queue::channels(self.cached_nodes.keys(), &self.bound_output_allocators);
 
         // Use the validated snapshot readers; other edges become stream channels.
         let mut stream_successors: HashMap<String, Vec<Successor>> = HashMap::new();
@@ -1422,7 +1417,7 @@ impl SessionRouter {
             };
             let input_weak = input_txs
                 .get(&node_id)
-                .map(|tx| tx.downgrade())
+                .map(|tx| tx.sender.downgrade())
                 .expect("input channel created in pass 1");
             let egress_edge = self.descriptor.egress_edge(&node_id);
             let snap_inputs = snapshot_inputs.remove(&node_id).unwrap_or_default();
@@ -1566,33 +1561,13 @@ impl SessionRouter {
                                 desc
                             );
                         }
-                        // try_send first so a full successor is observable as a
-                        // stall; then fall back to the same awaited send as
-                        // before, so delivery and backpressure are unchanged.
-                        let edge = succ.edge.and_then(|e| tel.edge(e));
-                        let delivered = match succ.tx.try_send(kept.clone()) {
-                            Ok(()) => true,
-                            Err(mpsc::error::TrySendError::Full(v)) => {
-                                let stall_start = std::time::Instant::now();
-                                if let Some(e) = edge {
-                                    e.begin_stall();
-                                }
-                                let ok = succ.tx.send(v).await.is_ok();
-                                if let Some(e) = edge {
-                                    e.end_stall(stall_start.elapsed().as_micros() as u64);
-                                }
-                                ok
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => false,
-                        };
-                        match (delivered, edge) {
-                            (true, Some(e)) => e.record_frame(kept_bytes),
-                            (false, Some(e)) => e.record_drop(),
-                            _ => {}
-                        }
+                        let delivered = succ
+                            .tx
+                            .deliver(kept.clone(), &tel, succ.edge, fan_control.as_deref())
+                            .await;
                         if !delivered {
                             tracing::debug!(
-                                "Session {}: node '{}' successor closed; drop",
+                                "Session {}: node '{}' successor did not accept output",
                                 fan_session_id,
                                 fan_node_id
                             );
@@ -2210,16 +2185,9 @@ impl SessionRouter {
                     }
                     r = dispatch_fut => {
                         if let Err(e) = r {
-                            if let Some(ev) = tel.record_error(node_idx, &e.to_string()) {
-                                if let Some(ctrl) = &control {
-                                    crate::telemetry::publisher::publish_node_error(
-                                        ctrl,
-                                        &main_node_id,
-                                        &ev.message,
-                                        ev.count,
-                                    );
-                                }
-                            }
+                            crate::telemetry::publisher::record_node_error(
+                                &tel, Some(node_idx), control.as_deref(), &main_node_id, &e.to_string(),
+                            );
                             tracing::error!(
                                 "Session {}: node '{}' execution error: {}",
                                 main_session_id,
@@ -2308,7 +2276,7 @@ impl SessionRouter {
     async fn route_input(
         &self,
         packet: DataPacket,
-        input_txs: &HashMap<String, mpsc::Sender<RuntimeData>>,
+        input_txs: &HashMap<String, InputQueue>,
         ingress_edges: &HashMap<String, usize>,
     ) {
         let arrival_ts_us = std::time::SystemTime::now()
@@ -2355,34 +2323,17 @@ impl SessionRouter {
                     describe_runtime_data(&input_data)
                 );
             }
-            let ingress = ingress_edges
-                .get(target)
-                .and_then(|&e| self.telemetry.edge(e));
-            let delivered = match tx.try_send(input_data.clone()) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(v)) => {
-                    let stall_start = std::time::Instant::now();
-                    if let Some(e) = ingress {
-                        e.begin_stall();
-                    }
-                    let ok = tx.send(v).await.is_ok();
-                    if let Some(e) = ingress {
-                        e.end_stall(stall_start.elapsed().as_micros() as u64);
-                    }
-                    ok
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-            };
-            if let Some(e) = ingress {
-                if delivered {
-                    e.record_frame(approx_payload_bytes(&input_data));
-                } else {
-                    e.record_drop();
-                }
-            }
+            let delivered = tx
+                .deliver(
+                    input_data.clone(),
+                    &self.telemetry,
+                    ingress_edges.get(target).copied(),
+                    self.control.as_deref(),
+                )
+                .await;
             if !delivered {
                 tracing::warn!(
-                    "Session {}: node '{}' input channel closed; drop packet",
+                    "Session {}: node '{}' input queue did not accept packet",
                     self.session_id,
                     target
                 );
