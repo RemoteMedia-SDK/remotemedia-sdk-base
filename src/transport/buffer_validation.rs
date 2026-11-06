@@ -17,6 +17,8 @@ use std::{
 
 type Callback = Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>;
 
+mod snapshots;
+
 struct Checks {
     #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
     mapped_pool: Option<crate::multiprocess::native_worker::SharedPool>,
@@ -24,6 +26,7 @@ struct Checks {
     contract: BufferContract,
     forwarding: remotemedia_types::ForwardingScope,
     allocator: Option<Arc<remotemedia_types::BoundOutputAllocator>>,
+    snapshot_failure: CallbackFailure,
 }
 impl Checks {
     fn validate_domain(
@@ -49,6 +52,7 @@ impl Checks {
     }
 
     fn check(&self, data: &RuntimeData, port: &str, output: bool) -> Result<(), Error> {
+        self.snapshot_failure.result(Ok(()))?;
         let ports: &BTreeMap<String, BufferPortContract> = if output {
             &self.contract.outputs
         } else {
@@ -147,6 +151,16 @@ impl Checks {
 #[derive(Clone, Default)]
 struct CallbackFailure(Arc<Mutex<Option<String>>>);
 impl CallbackFailure {
+    fn capture<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+        if let Err(error) = &result {
+            self.0
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| error.to_string());
+        }
+        result
+    }
+
     fn result<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
         if let Some(error) = &*self.0.lock().unwrap() {
             Err(Error::Execution(error.clone()))
@@ -158,8 +172,8 @@ impl CallbackFailure {
 
 /// Wrap a node after static contract checking. Input validation precedes every
 /// media/control invocation; output validation precedes every return/yield.
-/// This checks host layouts and sizes, not arbitrary internal copies. Snapshot
-/// bindings fail explicitly until their fallible read path can enforce contracts.
+/// Snapshot readers validate both boundaries and retain owners. A failed snapshot
+/// read is latched so legacy optional reads cannot hide a contract violation.
 pub struct BufferCheckedNode {
     inner: Box<dyn StreamingNode>,
     checks: Arc<Checks>,
@@ -180,6 +194,7 @@ impl BufferCheckedNode {
                 contract,
                 allocator,
                 forwarding: Default::default(),
+                snapshot_failure: Default::default(),
             }),
         }
     }
@@ -201,6 +216,16 @@ impl BufferCheckedNode {
         self.checks.check(&data, "", true)?;
         Ok(data.into_shared())
     }
+
+    fn finish<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
+        let value = self.checks.snapshot_failure.result(result)?;
+        // Validate currently visible publications even without a consumer. Any
+        // later concurrent publication is checked again by the bound reader.
+        for reader in self.snapshot_outputs().values() {
+            reader.runtime_snapshot()?;
+        }
+        Ok(value)
+    }
 }
 
 #[async_trait::async_trait]
@@ -219,11 +244,7 @@ impl StreamingNode for BufferCheckedNode {
     }
 
     async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
-        self.inner.initialize(ctx).await?;
-        if !self.inner.snapshot_outputs().is_empty() {
-            return Err(Error::Execution(format!("buffer contract node '{}': snapshot output validation requires a fallible publication/read adapter", self.checks.node_id)));
-        }
-        Ok(())
+        self.finish(self.inner.initialize(ctx).await)
     }
 
     async fn process_async(
@@ -232,10 +253,12 @@ impl StreamingNode for BufferCheckedNode {
         ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
         self.checks.check(&data, "", false)?;
-        self.output(
-            self.inner
-                .process_async(self.checks.admit(data), ctx)
-                .await?,
+        self.finish(
+            self.output(
+                self.inner
+                    .process_async(self.checks.admit(data), ctx)
+                    .await?,
+            ),
         )
     }
 
@@ -244,6 +267,7 @@ impl StreamingNode for BufferCheckedNode {
         mut inputs: HashMap<String, RuntimeData>,
         ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
+        self.checks.snapshot_failure.result(Ok(()))?;
         for (port, data) in &inputs {
             self.checks.check(data, port, false)?;
         }
@@ -252,7 +276,7 @@ impl StreamingNode for BufferCheckedNode {
             .into_iter()
             .map(|(port, data)| (port, self.checks.admit(data)))
             .collect();
-        self.output(self.inner.process_multi_async(inputs, ctx).await?)
+        self.finish(self.output(self.inner.process_multi_async(inputs, ctx).await?))
     }
 
     async fn process_streaming_async(
@@ -263,10 +287,12 @@ impl StreamingNode for BufferCheckedNode {
     ) -> Result<usize, Error> {
         self.checks.check(&data, "", false)?;
         let (callback, failure) = self.checks.callback(callback);
-        failure.result(
-            self.inner
-                .process_streaming_async(self.checks.admit(data), ctx, callback)
-                .await,
+        self.finish(
+            failure.result(
+                self.inner
+                    .process_streaming_async(self.checks.admit(data), ctx, callback)
+                    .await,
+            ),
         )
     }
 
@@ -276,8 +302,9 @@ impl StreamingNode for BufferCheckedNode {
         ctx: &dyn NodeRuntimeContextRead,
         callback: Callback,
     ) -> Result<(), Error> {
+        self.checks.snapshot_failure.result(Ok(()))?;
         let (callback, failure) = self.checks.callback(callback);
-        failure.result(self.inner.tick(tick, ctx, callback).await)
+        self.finish(failure.result(self.inner.tick(tick, ctx, callback).await))
     }
 
     async fn process_control_message(
@@ -285,17 +312,53 @@ impl StreamingNode for BufferCheckedNode {
         message: RuntimeData,
         ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<bool, Error> {
+        if super::session_control::aux_port_of(&message).as_deref() == Some("shutdown") {
+            // Cleanup must run even after a latched contract failure. Once it
+            // returns, remote readers may legitimately be closed; do not poll
+            // them again. Preserve any earlier snapshot failure in the result.
+            return self
+                .checks
+                .snapshot_failure
+                .result(self.inner.process_control_message(message, ctx).await);
+        }
         self.checks.check(&message, "", false)?;
-        self.inner
-            .process_control_message(self.checks.admit(message), ctx)
-            .await
+        self.finish(
+            self.inner
+                .process_control_message(self.checks.admit(message), ctx)
+                .await,
+        )
     }
 
-    fn validate_snapshot_input(&self, port: &str, _: &dyn SnapshotPort) -> Result<(), Error> {
-        Err(Error::Execution(format!("buffer contract node '{}' input '{port}': snapshot validation requires a fallible read adapter", self.checks.node_id)))
+    fn validate_snapshot_input(&self, port: &str, reader: &dyn SnapshotPort) -> Result<(), Error> {
+        snapshots::validate_binding(&self.checks, port, reader, false)?;
+        self.inner.validate_snapshot_input(port, reader)
+    }
+    fn bind_snapshot_input(
+        &self,
+        port: &str,
+        reader: Arc<dyn SnapshotPort>,
+    ) -> Result<Arc<dyn SnapshotPort>, Error> {
+        self.validate_snapshot_input(port, reader.as_ref())?;
+        // Preserve any node-specific binding adapter before checking the reader
+        // that will actually be exposed to execution contexts.
+        let reader = self.inner.bind_snapshot_input(port, reader)?;
+        snapshots::validate_binding(&self.checks, port, reader.as_ref(), false)?;
+        Ok(snapshots::checked(
+            self.checks.clone(),
+            port.to_owned(),
+            reader,
+            false,
+        ))
     }
     fn snapshot_outputs(&self) -> HashMap<String, Arc<dyn SnapshotPort>> {
-        self.inner.snapshot_outputs()
+        self.inner
+            .snapshot_outputs()
+            .into_iter()
+            .map(|(port, reader)| {
+                let checked = snapshots::checked(self.checks.clone(), port.clone(), reader, true);
+                (port, checked)
+            })
+            .collect()
     }
     fn rpc_methods(&self) -> Vec<RpcMethod> {
         self.inner.rpc_methods()
@@ -306,7 +369,8 @@ impl StreamingNode for BufferCheckedNode {
         ctx: &dyn NodeRuntimeContextRead,
         replies: &mut RpcResponder,
     ) -> Result<(), Error> {
-        self.inner.call_rpc(request, ctx, replies).await
+        self.checks.snapshot_failure.result(Ok(()))?;
+        self.finish(self.inner.call_rpc(request, ctx, replies).await)
     }
     fn pacing_nature(&self) -> PacingNature {
         self.inner.pacing_nature()
@@ -344,6 +408,7 @@ impl StreamingNode for BufferCheckedNode {
         caps: MediaCapabilities,
         ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<(), Error> {
-        self.inner.on_capability_update(addr, caps, ctx).await
+        self.checks.snapshot_failure.result(Ok(()))?;
+        self.finish(self.inner.on_capability_update(addr, caps, ctx).await)
     }
 }

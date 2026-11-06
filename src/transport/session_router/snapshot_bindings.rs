@@ -52,11 +52,11 @@ impl SessionRouter {
                     "{description}: producer did not expose the declared snapshot output"
                 ))
             })?;
-            consumer
-                .validate_snapshot_input(input, reader.as_ref())
+            let reader = consumer
+                .bind_snapshot_input(input, reader.clone())
                 .map_err(|error| Error::Execution(format!("{description}: {error}")))?;
             let inputs = bindings.inputs.entry(connection.to.clone()).or_default();
-            if inputs.insert(input.to_owned(), reader.clone()).is_some() {
+            if inputs.insert(input.to_owned(), reader).is_some() {
                 return Err(Error::Execution(format!(
                     "{description}: multiple connections bind the same snapshot input"
                 )));

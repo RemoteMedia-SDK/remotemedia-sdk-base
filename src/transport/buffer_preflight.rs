@@ -102,7 +102,7 @@ pub fn inspect_buffer_sharing_with_resources(
         let contract = inspect_factory(&mut report, node, registry, resources);
         if let Some(contract) = &contract {
             inspect_node(&mut report, node, contract, resources);
-            inspect_snapshot_bindings(&mut report, node, registry);
+            inspect_snapshot_bindings(&mut report, node, registry, contract);
         } else {
             report.issue(&node.id, format!("{} has no buffer contract; declare allocation, layout, protocol and retention support", node.node_type));
             report.declared_node_retention = None;
@@ -157,20 +157,23 @@ fn inspect_snapshot_bindings(
     report: &mut BufferPreflightReport,
     node: &NodeManifest,
     registry: &StreamingNodeRegistry,
+    contract: &BufferContract,
 ) {
     let Some(factory) = registry.get_factory(&node.node_type) else {
         return;
     };
-    let has_snapshot = factory
-        .input_port_kinds()
-        .values()
-        .chain(factory.output_port_kinds().values())
-        .any(|kind| *kind == remotemedia_traits::ports::PortKind::Snapshot);
-    if has_snapshot {
-        report.issue(
-            &node.id,
-            "snapshot contract enforcement requires a fallible publication/read adapter",
-        );
+    for (kinds, ports) in [
+        (factory.input_port_kinds(), &contract.inputs),
+        (factory.output_port_kinds(), &contract.outputs),
+    ] {
+        for (name, kind) in kinds {
+            if kind == remotemedia_traits::ports::PortKind::Snapshot && !ports.contains_key(&name) {
+                report.issue(
+                    &node.id,
+                    format!("snapshot port '{name}' requires an exact buffer contract"),
+                );
+            }
+        }
     }
 }
 
