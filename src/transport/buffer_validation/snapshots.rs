@@ -69,7 +69,7 @@ impl CheckedSnapshot {
             Ok(Some(snapshot))
         } else {
             Ok(Some(Arc::new(TimestampedSnapshot {
-                value: self.checks.admit(snapshot.value.clone()),
+                value: self.checks.admit(snapshot.value.clone())?,
                 pts_us: snapshot.pts_us,
                 written_at_us: snapshot.written_at_us,
                 seq: snapshot.seq,

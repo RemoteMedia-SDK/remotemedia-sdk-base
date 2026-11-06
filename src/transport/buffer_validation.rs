@@ -1,6 +1,6 @@
 //! Runtime layout/bound checks for explicitly declared node contracts.
 //! Validation borrows buffers; forwarding moves/promotes owners without copying.
-//! Host provenance is checked; live retention budgets remain separate.
+//! Host provenance and live admitted-input/bound-output retention are checked.
 use crate::nodes::{InitializeContextRead, NodeRuntimeContextRead, StreamingNode, Tick};
 use crate::{data::RuntimeData, Error};
 use remotemedia_traits::{
@@ -17,6 +17,7 @@ use std::{
 
 type Callback = Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>;
 
+mod retention;
 mod snapshots;
 
 struct Checks {
@@ -27,6 +28,7 @@ struct Checks {
     forwarding: remotemedia_types::ForwardingScope,
     allocator: Option<Arc<remotemedia_types::BoundOutputAllocator>>,
     snapshot_failure: CallbackFailure,
+    retention: Option<remotemedia_types::BufferBudget>,
 }
 impl Checks {
     fn validate_domain(
@@ -117,15 +119,26 @@ impl Checks {
         }
     }
 
-    fn admit(&self, data: RuntimeData) -> RuntimeData {
-        if matches!(
-            self.contract.production,
-            BufferProduction::ForwardInput | BufferProduction::ForwardOrOutputAllocator
-        ) {
-            self.forwarding.accept(data)
-        } else {
-            data.into_shared()
-        }
+    fn admit(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
+        let data = match &self.retention {
+            Some(budget) => budget.admit(data).map_err(|error| {
+                Error::Execution(format!(
+                    "buffer retention budget node '{}': {error}",
+                    self.node_id,
+                ))
+            })?,
+            None => data,
+        };
+        Ok(
+            if matches!(
+                self.contract.production,
+                BufferProduction::ForwardInput | BufferProduction::ForwardOrOutputAllocator
+            ) {
+                self.forwarding.accept(data)
+            } else {
+                data.into_shared()
+            },
+        )
     }
 
     fn callback(self: &Arc<Self>, mut callback: Callback) -> (Callback, CallbackFailure) {
@@ -185,6 +198,14 @@ impl BufferCheckedNode {
         inner: Box<dyn StreamingNode>,
         allocator: Option<Arc<remotemedia_types::BoundOutputAllocator>>,
     ) -> Self {
+        let snapshot_failure = CallbackFailure::default();
+        let retention = match retention::bind(&contract, allocator.as_deref()) {
+            Ok(budget) => budget,
+            Err(error) => {
+                let _ = snapshot_failure.capture::<()>(Err(error));
+                None
+            }
+        };
         Self {
             inner,
             checks: Arc::new(Checks {
@@ -194,7 +215,8 @@ impl BufferCheckedNode {
                 contract,
                 allocator,
                 forwarding: Default::default(),
-                snapshot_failure: Default::default(),
+                snapshot_failure,
+                retention,
             }),
         }
     }
@@ -244,6 +266,7 @@ impl StreamingNode for BufferCheckedNode {
     }
 
     async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
+        self.checks.snapshot_failure.result(Ok(()))?;
         self.finish(self.inner.initialize(ctx).await)
     }
 
@@ -256,7 +279,7 @@ impl StreamingNode for BufferCheckedNode {
         self.finish(
             self.output(
                 self.inner
-                    .process_async(self.checks.admit(data), ctx)
+                    .process_async(self.checks.admit(data)?, ctx)
                     .await?,
             ),
         )
@@ -274,8 +297,8 @@ impl StreamingNode for BufferCheckedNode {
         // Move normalization preserves legacy Vec allocations before user fan-out.
         inputs = inputs
             .into_iter()
-            .map(|(port, data)| (port, self.checks.admit(data)))
-            .collect();
+            .map(|(port, data)| self.checks.admit(data).map(|data| (port, data)))
+            .collect::<Result<_, _>>()?;
         self.finish(self.output(self.inner.process_multi_async(inputs, ctx).await?))
     }
 
@@ -290,7 +313,7 @@ impl StreamingNode for BufferCheckedNode {
         self.finish(
             failure.result(
                 self.inner
-                    .process_streaming_async(self.checks.admit(data), ctx, callback)
+                    .process_streaming_async(self.checks.admit(data)?, ctx, callback)
                     .await,
             ),
         )
@@ -324,7 +347,7 @@ impl StreamingNode for BufferCheckedNode {
         self.checks.check(&message, "", false)?;
         self.finish(
             self.inner
-                .process_control_message(self.checks.admit(message), ctx)
+                .process_control_message(self.checks.admit(message)?, ctx)
                 .await,
         )
     }
