@@ -562,8 +562,8 @@ async fn handle_inbound_frame(
 
         Some(PbOp::InterceptReply(reply)) => {
             let decision = pb_decision_to_core(reply.decision)?;
-            ctrl.complete_intercept(reply.correlation_id, decision);
-            Ok(())
+            ctrl.complete_intercept(reply.correlation_id, decision)
+                .map_err(|e| error(ControlErrorCode::Internal, e.to_string(), None))
         }
 
         Some(PbOp::SetNodeState(set)) => {

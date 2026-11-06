@@ -560,7 +560,7 @@ pub struct SessionControl {
     intercepts: DashMap<InterceptKey, Arc<InterceptSlot>>,
     /// Handle to the router's input channel so `publish` can inject packets.
     /// Set by `attach_input_sender` after the router is constructed.
-    input_tx: RwLock<Option<super::SessionPacketSender>>,
+    input_tx: parking_lot::RwLock<Option<super::SessionPacketSender>>,
     rpc_inputs: DashMap<String, mpsc::Sender<RpcInvocation>>,
     /// Monotonic sequence for injected packets (kept separate from the
     /// transport's own sequence to make out-of-band traffic identifiable).
@@ -741,7 +741,7 @@ impl SessionControl {
             office_observation: parking_lot::RwLock::new(None),
             taps: DashMap::new(),
             intercepts: DashMap::new(),
-            input_tx: RwLock::new(None),
+            input_tx: parking_lot::RwLock::new(None),
             rpc_inputs: DashMap::new(),
             inject_seq: std::sync::atomic::AtomicU64::new(0),
             close_tx,
@@ -963,12 +963,23 @@ impl SessionControl {
     /// Wire the router's input channel so `publish` can reach nodes.
     /// Called once from `SessionRouter::attach_control`.
     pub async fn attach_input_sender(&self, tx: impl Into<super::SessionPacketSender>) {
-        *self.input_tx.write().await = Some(tx.into());
+        *self.input_tx.write() = Some(tx.into());
     }
 
     /// Clone the router input sender for transport-level participant joins.
     pub async fn input_sender(&self) -> Option<super::SessionPacketSender> {
-        self.input_tx.read().await.clone()
+        self.input_tx.read().clone()
+    }
+
+    fn admit_external_control(&self, mut data: RuntimeData) -> Result<RuntimeData> {
+        if let Some(tx) = self.input_tx.read().as_ref() {
+            tx.admit_payload(&mut data).map_err(|error| {
+                crate::Error::Execution(format!(
+                    "session {} control ingress buffer budget: {error}", self.session_id
+                ))
+            })?;
+        }
+        Ok(data)
     }
 
     // ─── Client-facing API (driven by `handle_frame`) ──────────────────────
@@ -1154,8 +1165,7 @@ impl SessionControl {
                 }
             }
         }
-        let tx_guard = self.input_tx.read().await;
-        let tx = tx_guard.as_ref().ok_or_else(|| {
+        let tx = self.input_tx.read().clone().ok_or_else(|| {
             crate::Error::Execution("session control not yet attached to router".into())
         })?;
 
@@ -1189,6 +1199,7 @@ impl SessionControl {
             ));
         }
         // Write to the tap (broadcast channel) for this node/port.
+        let data = self.admit_external_control(data)?;
         self.publish_tap(&addr.node_id, addr.port.as_deref(), data);
         Ok(())
     }
@@ -1231,15 +1242,32 @@ impl SessionControl {
 
     /// Complete a pending intercept. Called by the transport when the
     /// client sends an `InterceptReply` frame.
-    pub fn complete_intercept(&self, correlation_id: u64, decision: InterceptDecision) {
+    /// A rejected replacement leaves the pending intercept open for retry, Pass
+    /// or Drop until its original deadline. No unadmitted buffer is delivered.
+    pub fn complete_intercept(
+        &self,
+        correlation_id: u64,
+        decision: InterceptDecision,
+    ) -> Result<()> {
         // We don't know which (node,port) owns this correlation_id without
         // searching — intercepts are few, so a linear scan is fine.
         for entry in self.intercepts.iter() {
-            if let Some((_, tx)) = entry.value().pending.remove(&correlation_id) {
-                let _ = tx.send(decision);
-                return;
+            if let dashmap::mapref::entry::Entry::Occupied(pending) =
+                entry.value().pending.entry(correlation_id)
+            {
+                let decision = match decision {
+                    InterceptDecision::Replace(data) => {
+                        InterceptDecision::Replace(self.admit_external_control(data)?)
+                    }
+                    other => other,
+                };
+                let tx = pending.remove();
+                return tx.send(decision).map_err(|_| {
+                    crate::Error::Execution("intercept receiver closed".into())
+                });
             }
         }
+        Ok(())
     }
 
     /// Dispatch a client-originated frame. This is the single entry point the
@@ -1273,7 +1301,7 @@ impl SessionControl {
                 correlation_id,
                 decision,
             } => {
-                self.complete_intercept(correlation_id, decision);
+                self.complete_intercept(correlation_id, decision)?;
                 Ok(FrameOutcome::Done)
             }
             ControlFrame::SetNodeState { node_id, state } => {
@@ -2005,7 +2033,8 @@ mod tests {
         let ControlEvent::InterceptRequest { correlation_id, .. } = ev else {
             panic!("expected InterceptRequest");
         };
-        ctrl.complete_intercept(correlation_id, InterceptDecision::Replace(text("redacted")));
+        ctrl.complete_intercept(correlation_id, InterceptDecision::Replace(text("redacted")))
+            .unwrap();
 
         let out = data_task.await.unwrap().unwrap();
         match out {

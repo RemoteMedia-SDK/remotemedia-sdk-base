@@ -71,15 +71,17 @@ pub struct InterceptReplyHandle {
 
 impl InterceptReplyHandle {
     /// Resolve a pending intercept. The `correlation_id` must match one
-    /// previously received from [`InterceptSession::requests`].
-    pub async fn complete(&self, correlation_id: u64, decision: InterceptDecision) {
-        self.inner.complete(correlation_id, decision).await;
+    /// previously received from [`InterceptSession::requests`]. Rejected bulk
+    /// replacements return an admission error and leave the request open until
+    /// its deadline, allowing retry or an explicit Pass/Drop decision.
+    pub async fn complete(&self, correlation_id: u64, decision: InterceptDecision) -> Result<(), Error> {
+        self.inner.complete(correlation_id, decision).await
     }
 }
 
 #[async_trait]
 trait InterceptReplyBackend: Send + Sync {
-    async fn complete(&self, correlation_id: u64, decision: InterceptDecision);
+    async fn complete(&self, correlation_id: u64, decision: InterceptDecision) -> Result<(), Error>;
 }
 
 struct InProcReplyBackend {
@@ -88,8 +90,8 @@ struct InProcReplyBackend {
 
 #[async_trait]
 impl InterceptReplyBackend for InProcReplyBackend {
-    async fn complete(&self, correlation_id: u64, decision: InterceptDecision) {
-        self.control.complete_intercept(correlation_id, decision);
+    async fn complete(&self, correlation_id: u64, decision: InterceptDecision) -> Result<(), Error> {
+        self.control.complete_intercept(correlation_id, decision)
     }
 }
 
@@ -307,6 +309,10 @@ impl ControlTransport for InProcControlTransport {
 }
 
 #[cfg(test)]
+#[path = "control_transport/buffer_admission_tests.rs"]
+mod buffer_admission_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::session_control::{SessionControl, SessionControlBus};
@@ -434,7 +440,8 @@ mod tests {
                 req.correlation_id,
                 InterceptDecision::Replace(RuntimeData::Text("rewritten".into())),
             )
-            .await;
+            .await
+            .unwrap();
 
         // on_node_output should return the replacement.
         let result = tokio::time::timeout(Duration::from_millis(500), data_task)

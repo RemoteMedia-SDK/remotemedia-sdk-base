@@ -335,8 +335,8 @@ impl NapiInterceptSession {
                 )));
             }
         };
-        self.reply.complete(cid, decision).await;
-        Ok(())
+        self.reply.complete(cid, decision).await
+            .map_err(|e| Error::from_reason(e.to_string()))
     }
 }
 

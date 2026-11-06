@@ -416,7 +416,8 @@ impl PyInterceptSession {
         };
         let reply = self.reply.clone();
         future_into_py(py, async move {
-            reply.complete(correlation_id, decision).await;
+            reply.complete(correlation_id, decision).await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Python::attach(|py| Ok(py.None()))
         })
     }

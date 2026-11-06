@@ -84,12 +84,22 @@ impl SessionPacketSender {
     }
 
     fn admit(&self, mut packet: DataPacket) -> std::result::Result<DataPacket, IngressSendError> {
-        if let Some(budget) = self.budget.get_or_init(|| None) {
-            if let Err(error) = budget.admit_in_place(&mut packet.data) {
-                return Err(IngressSendError::Budget { packet, error });
-            }
+        if let Err(error) = self.admit_payload(&mut packet.data) {
+            return Err(IngressSendError::Budget { packet, error });
         }
         Ok(packet)
+    }
+
+    /// Control publications and intercept replacements are external ingress too,
+    /// even though they do not travel through the router's packet queue.
+    pub(crate) fn admit_payload(
+        &self,
+        data: &mut crate::data::RuntimeData,
+    ) -> std::result::Result<(), BufferAllocationError> {
+        match self.budget.get_or_init(|| None) {
+            Some(budget) => budget.admit_in_place(data),
+            None => Ok(()),
+        }
     }
 
     /// Wait for channel space; fail immediately when owner/byte credit is exhausted.

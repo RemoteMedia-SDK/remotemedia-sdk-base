@@ -34,14 +34,23 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::transport::Server;
 
+#[path = "support/control_budget.rs"]
+mod control_budget;
+
 // ── Test server bringup ─────────────────────────────────────────────────────
 
 async fn start_server() -> (String, Arc<PipelineExecutor>, tokio::task::JoinHandle<()>) {
+    start_server_with_config(Default::default()).await
+}
+
+async fn start_server_with_config(
+    config: remotemedia_core::transport::ExecutorConfig,
+) -> (String, Arc<PipelineExecutor>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{}", addr);
 
-    let executor = Arc::new(PipelineExecutor::new().unwrap());
+    let executor = Arc::new(PipelineExecutor::with_config(config).unwrap());
     let control = ControlServiceImpl::new(executor.control_bus());
 
     let srv = Server::builder()
