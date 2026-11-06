@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 // Re-export submodules
 pub mod avatar_session;
+pub mod buffer_preflight;
 pub mod cancel_gate;
 pub mod client;
 pub mod control_transport;

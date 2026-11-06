@@ -1,7 +1,7 @@
 //! Bind trusted worker registrations and local producers to one pool per session.
 //! This selects storage/placement; it does not certify arbitrary node internals
 //! or observers as end-to-end zero-copy.
-use crate::manifest::{Manifest, NodeManifest, RuntimeHint};
+use crate::manifest::{Manifest, NodeManifest};
 use crate::multiprocess::native_worker::{PoolConfig, SessionId, SharedPool, WorkerInputCopies};
 use crate::nodes::StreamingNodeRegistry;
 use crate::{Error, Result};
@@ -54,24 +54,16 @@ pub(super) fn bind_session_workers(
 }
 
 fn incompatible_placement(node: &NodeManifest) -> Option<&'static str> {
-    if node.host.is_some() {
-        return Some("host routing is unsupported for same-host mapped workers");
-    }
-    if let Some(execution) = &node.execution {
-        if !matches!(
-            execution.placement.as_str(),
-            "" | "local" | "prefer_local" | "auto"
-        ) || execution.fallback.is_some()
-        {
-            return Some("execution placement/fallback conflicts with the registered local worker");
+    use super::buffer_preflight::{local_placement_conflict, LocalPlacementConflict};
+    local_placement_conflict(node).map(|conflict| match conflict {
+        LocalPlacementConflict::Host => "host routing is unsupported for same-host mapped workers",
+        LocalPlacementConflict::Execution => {
+            "execution placement/fallback conflicts with the registered local worker"
         }
-    }
-    if !matches!(node.runtime_hint, None | Some(RuntimeHint::Auto)) {
-        return Some("runtime_hint conflicts with registered subprocess execution");
-    }
-    #[cfg(feature = "docker")]
-    if node.docker.is_some() {
-        return Some("Docker placement is unsupported for mapped workers");
-    }
-    None
+        LocalPlacementConflict::Runtime => {
+            "runtime_hint conflicts with registered subprocess execution"
+        }
+        #[cfg(feature = "docker")]
+        LocalPlacementConflict::Docker => "Docker placement is unsupported for mapped workers",
+    })
 }

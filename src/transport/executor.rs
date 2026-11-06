@@ -44,6 +44,9 @@ use tokio::task::JoinHandle;
 /// Configuration for PipelineExecutor
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
+    /// Optional static buffer-contract gate before node creation. This checks
+    /// declarations only, not dynamic payloads or whole-pipeline copy freedom.
+    pub buffer_preflight: Option<super::buffer_preflight::BufferPreflightConfig>,
     /// Policy for explicit materializations in host Rust node contexts. Separate
     /// from mapped worker ingress; this alone is not graph-wide certification.
     pub node_materialization_policy: remotemedia_types::CopyPolicy,
@@ -93,6 +96,7 @@ pub struct ExecutorConfig {
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
+            buffer_preflight: None,
             node_materialization_policy: remotemedia_types::CopyPolicy::AllowCopies,
             scheduler_config: SchedulerConfig::default(),
             drift_thresholds: DriftThresholds::default(),
@@ -124,6 +128,7 @@ impl Default for ExecutorConfig {
 /// SessionHandle provides a type-safe interface for streaming data
 /// through a pipeline session. It owns the channels and task handle.
 pub struct SessionHandle {
+    buffer_preflight: Option<super::buffer_preflight::BufferPreflightReport>,
     node_materialization_copies: super::NodeMaterializationCopies,
     /// Unique session identifier
     pub session_id: String,
@@ -163,6 +168,12 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Static declaration report captured during cold build and retained when
+    /// prewarmed/reused. An empty issue list is not zero-copy certification.
+    pub fn buffer_preflight(&self) -> Option<&super::buffer_preflight::BufferPreflightReport> {
+        self.buffer_preflight.as_ref()
+    }
+
     /// Retain per-node explicit materialization ledgers through joined shutdown.
     pub fn node_materialization_copies(&self) -> super::NodeMaterializationCopies {
         self.node_materialization_copies.clone()
@@ -640,6 +651,26 @@ pub struct PipelineExecutor {
 }
 
 impl PipelineExecutor {
+    fn inspect_buffer_preflight(
+        &self,
+        manifest: &Manifest,
+        registry: &StreamingNodeRegistry,
+    ) -> Result<Option<super::buffer_preflight::BufferPreflightReport>> {
+        self.config
+            .buffer_preflight
+            .as_ref()
+            .map(|config| {
+                let report = super::buffer_preflight::inspect_buffer_sharing(
+                    manifest,
+                    registry,
+                    config.node_retention_budget,
+                );
+                report.enforce(config.policy)?;
+                Ok(report)
+            })
+            .transpose()
+    }
+
     /// Create a new PipelineExecutor with default configuration
     pub fn new() -> Result<Self> {
         Self::with_config(ExecutorConfig::default())
@@ -1284,6 +1315,7 @@ impl PipelineExecutor {
         tracing::info!("cold_build_session: negotiate_capabilities ok");
         let session_id = self.generate_session_id();
         let registry_snapshot = self.registry.read().await.clone();
+        self.inspect_buffer_preflight(&manifest, &registry_snapshot)?;
         #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
         let (registry_snapshot, mapped_pool, mapped_input_copies) = {
             let mut registry = registry_snapshot;
@@ -1304,6 +1336,8 @@ impl PipelineExecutor {
         });
         let manifest = self.managed_llama_servers.prepare(&manifest).await?;
         let manifest = Arc::new(self.managed_ardy_daemons.prepare(&manifest).await?);
+        // Recheck any managed-service rewrites against the final factory set.
+        let buffer_preflight = self.inspect_buffer_preflight(&manifest, &registry_snapshot)?;
 
         // Create kind-split output router. Each kind (Audio / Video /
         // Data) gets its own bounded channel — see
@@ -1436,6 +1470,7 @@ impl PipelineExecutor {
             data_rx,
         } = output_receivers;
         Ok(SessionHandle {
+            buffer_preflight,
             node_materialization_copies,
             session_id,
             output_allocator,
