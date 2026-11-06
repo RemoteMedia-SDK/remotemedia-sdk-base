@@ -230,7 +230,7 @@ impl NapiSubscription {
             guard.recv().await
         };
         match result {
-            Ok(rd) => Ok(Some(NapiRuntimeData { inner: rd })),
+            Ok(rd) => Ok(Some(NapiRuntimeData::from_runtime(rd))),
             Err(RecvError::Lagged(count)) if self.rpc => Err(Error::from_reason(format!(
                 "RPC reply subscription lagged by {count} frames; pending calls cannot complete reliably"
             ))),
@@ -307,7 +307,7 @@ impl NapiInterceptSession {
         };
         Ok(result.map(|req| InterceptItem {
             correlation_id: req.correlation_id,
-            data: NapiRuntimeData { inner: req.data },
+            data: NapiRuntimeData::from_runtime(req.data),
         }))
     }
 

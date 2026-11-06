@@ -52,6 +52,7 @@ use remotemedia_core::transport::{
 };
 
 use super::control_session::NapiAttachedSession;
+use super::output_loans::NapiOutputAllocator;
 use super::pipeline::NapiRuntimeData;
 
 type InputSlot = Arc<Mutex<Option<SessionInputSender>>>;
@@ -99,6 +100,7 @@ pub struct NapiStreamingSession {
     data_rx: RxSlot,
     handle: HandleSlot,
     _executor: Arc<PipelineExecutor>,
+    output_allocator: Arc<dyn remotemedia_types::OutputAllocator>,
 }
 
 #[napi]
@@ -107,6 +109,14 @@ impl NapiStreamingSession {
     #[napi(getter)]
     pub fn session_id(&self) -> String {
         self.session_id.clone()
+    }
+
+    /// Produce directly in the session ingress provider without escaped JS aliases.
+    #[napi]
+    pub fn output_allocator(&self) -> NapiOutputAllocator {
+        NapiOutputAllocator {
+            inner: self.output_allocator.clone(),
+        }
     }
 
     /// Push one input frame into the pipeline.
@@ -222,7 +232,7 @@ impl NapiStreamingSession {
                     *d_guard = d_taken;
                     return Ok(Some(PipelineEvent {
                         kind: kind.to_string(),
-                        data: NapiRuntimeData { inner: rd },
+                        data: NapiRuntimeData::from_runtime(rd),
                     }));
                 }
                 Outcome::Closed("audio") => {
@@ -286,7 +296,7 @@ async fn recv_kind(rx_arc: &RxSlot) -> Result<Option<NapiRuntimeData>> {
     if result.is_none() {
         *guard = None;
     }
-    Ok(result.map(|rd| NapiRuntimeData { inner: rd }))
+    Ok(result.map(|rd| NapiRuntimeData::from_runtime(rd)))
 }
 
 /// Create a long-lived streaming session for the given manifest.
@@ -345,6 +355,7 @@ pub(crate) async fn build_session(
         .ok_or_else(|| Error::from_reason("session output receivers already taken"))?;
 
     Ok(NapiStreamingSession {
+        output_allocator: handle.output_allocator(),
         session_id,
         input_sender: Arc::new(Mutex::new(Some(input_sender))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.audio_rx))),

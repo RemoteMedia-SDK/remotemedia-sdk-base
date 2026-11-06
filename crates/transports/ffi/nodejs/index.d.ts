@@ -483,6 +483,7 @@ export const WebRtcServer: WebRtcServerFactory | undefined;
 // =============================================================================
 
 export * from './proto-utils';
+export * from './native-buffers';
 
 import * as protoUtilsModule from './proto-utils';
 export const protoUtils: typeof protoUtilsModule;

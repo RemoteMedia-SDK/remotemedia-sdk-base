@@ -42,6 +42,43 @@ This crate provides bindings to the `remotemedia-runtime-core` for multiple lang
 └─────────────────────────────────────────────────────┘
 ```
 
+## Node.js owning handles and explicit copies
+
+The pipeline NAPI API retains immutable native payloads in `NapiRuntimeData`.
+Forward these handles to `sendInput()` without exporting their bytes. Binary
+slices retain the original owner, and `sharesBufferWith()` compares storage
+identity without exposing a writable pointer.
+
+`getBinary()`, `getAudioSamples()`, video/tensor/NumPy getters and the
+`AudioBuffer`/`VideoFrame` getters return independent writable snapshots.
+They are safe after the native handle is collected. Their previous borrowed
+pointer behavior did not retain an owner and allowed mutation of shared Rust
+storage. Pass `true` as the final `requireZeroCopy` argument to reject nonempty
+snapshot imports/exports. Existing JS buffers remain compatibility inputs and
+are copied once. SharedArrayBuffer-backed inputs reject before borrowing bytes;
+explicitly snapshot those in JavaScript first.
+
+```js
+const session = await runtime.createStreamingSession(manifestJson);
+const loan = session.outputAllocator().allocateAudio(480, 48000, 1);
+for (let i = 0; i < 480; i++) loan.set(i, Math.sin(i / 10));
+const input = loan.publish(); // later set/fill/publish calls throw
+await session.sendInput(input);
+const output = await session.recvAudio();
+console.log(input.sharesBufferWith(output)); // true for a pass-through graph
+console.log(output.readAudioSample(0));       // scalar access, no bulk copy
+await session.close();
+```
+
+Loans use the session ingress provider and budget. They expose scalar `set` and
+`fill`, not a writable ArrayBuffer that could escape to another worker.
+This supports direct generation; scalar-call throughput is unbenchmarked, and
+arbitrary JavaScript/WASM typed-array output is not certified zero-copy.
+`nodejsBufferCopyReport()` returns JSON with process-wide strict/compatibility
+logical byte counters for this boundary only. It excludes legacy iceoryx
+publisher/subscriber staging, WebRTC, codecs and JavaScript's own copies.
+These APIs do not negotiate strict mode for the complete graph.
+
 ## Installation
 
 ### Development (Editable Install)

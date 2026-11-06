@@ -1,15 +1,15 @@
-//! Node.js FFI bindings for RemoteMedia zero-copy IPC
+//! Node.js owning pipeline handles and compatibility IPC bindings
 //!
 //! This module provides napi-rs bindings for iceoryx2 shared memory IPC,
-//! enabling Node.js applications to participate in zero-copy data pipelines
-//! with Python and Rust nodes.
+//! and owning native pipeline payloads. Legacy IPC publisher/subscriber paths
+//! still stage payload copies; they do not inherit the pipeline buffer policy.
 //!
 //! # Architecture
 //!
 //! - **node.rs**: iceoryx2 Node wrapper for IPC management
 //! - **channel.rs**: Channel creation and configuration
-//! - **subscriber.rs**: Zero-copy sample receiving
-//! - **publisher.rs**: Zero-copy sample publishing
+//! - **subscriber.rs**: Compatibility sample receiving
+//! - **publisher.rs**: Compatibility sample publishing
 //! - **sample.rs**: Sample lifecycle (LoanedSample, ReceivedSample)
 //! - **session.rs**: Session-scoped channel isolation
 //! - **threadsafe.rs**: ThreadsafeFunction helpers for callbacks
@@ -30,10 +30,12 @@
 //! │    └─ ThreadsafeFunction.call() when data ready │
 //! ├─────────────────────────────────────────────────┤
 //! │  JavaScript Main Thread                         │
-//! │    └─ Callback receives zero-copy buffer        │
+//! │    └─ Callback receives an owned snapshot        │
 //! └─────────────────────────────────────────────────┘
 //! ```
 
+mod buffers;
+mod output_loans;
 pub mod channel;
 pub mod control_session;
 pub mod error;
