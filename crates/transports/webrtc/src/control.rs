@@ -603,8 +603,33 @@ fn pb_node_state_to_core(value: i32) -> Result<NodeState, String> {
 
 #[cfg(feature = "grpc-signaling")]
 fn pb_to_runtime_data(data: crate::generated::DataBuffer) -> Result<RuntimeData, String> {
-    crate::adapters::data_buffer_to_runtime_data(&data)
+    crate::adapters::data_buffer_into_runtime_data(data)
         .ok_or_else(|| "unsupported or unset DataBuffer variant".to_string())
+}
+
+#[cfg(test)]
+mod buffer_owner_tests {
+    use super::*;
+
+    #[test]
+    fn control_decode_adopts_the_wire_buffers_owned_allocation() {
+        let bytes = vec![9; 16];
+        let pointer = bytes.as_ptr();
+        let buffer = crate::generated::DataBuffer {
+            data_type: Some(crate::generated::data_buffer::DataType::Binary(
+                crate::generated::BinaryBuffer {
+                    data: bytes,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let RuntimeData::Binary(owner) = pb_to_runtime_data(buffer).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(owner.as_ptr(), pointer);
+        assert_eq!(&*owner, &[9; 16]);
+    }
 }
 
 #[cfg(feature = "grpc-signaling")]

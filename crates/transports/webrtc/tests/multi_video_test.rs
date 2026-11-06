@@ -32,7 +32,7 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 fn create_video_frame(stream_id: Option<String>, width: u32, height: u32) -> RuntimeData {
     let frame_size = (width * height * 3 / 2) as usize; // YUV420P
     RuntimeData::Video {
-        pixel_data: vec![128u8; frame_size],
+        pixel_data: vec![128u8; frame_size].into(),
         width,
         height,
         format: PixelFormat::Yuv420p,

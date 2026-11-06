@@ -35,11 +35,10 @@
 //! assert!(registry.has_node_type("MyPythonNode"));
 //! ```
 
-use remotemedia_core::nodes::python_streaming::PythonStreamingNode;
 use remotemedia_core::nodes::streaming_registry::create_default_streaming_registry;
-use remotemedia_core::nodes::{
-    AsyncNodeWrapper, StreamingNode, StreamingNodeFactory, StreamingNodeRegistry,
-};
+#[cfg(feature = "multiprocess")]
+use remotemedia_core::nodes::{python_streaming::PythonStreamingNode, AsyncNodeWrapper};
+use remotemedia_core::nodes::{StreamingNode, StreamingNodeFactory, StreamingNodeRegistry};
 use remotemedia_core::Error;
 use serde_json::Value;
 use std::sync::Arc;
@@ -88,12 +87,22 @@ impl StreamingNodeFactory for PythonNodeFactory {
         params: &Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        let node = if let Some(sid) = session_id {
-            PythonStreamingNode::with_session(node_id, &self.node_type_name, params, sid)?
-        } else {
-            PythonStreamingNode::new(node_id, &self.node_type_name, params)?
-        };
-        Ok(Box::new(AsyncNodeWrapper(Arc::new(node))))
+        #[cfg(not(feature = "multiprocess"))]
+        {
+            let _ = (node_id, params, session_id);
+            return Err(Error::Execution(
+                "PythonNodeFactory requires the WebRTC multiprocess feature".into(),
+            ));
+        }
+        #[cfg(feature = "multiprocess")]
+        {
+            let node = if let Some(sid) = session_id {
+                PythonStreamingNode::with_session(node_id, &self.node_type_name, params, sid)?
+            } else {
+                PythonStreamingNode::new(node_id, &self.node_type_name, params)?
+            };
+            Ok(Box::new(AsyncNodeWrapper(Arc::new(node))))
+        }
     }
 
     fn node_type(&self) -> &str {
@@ -190,6 +199,19 @@ pub fn create_custom_registry_with_factories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "multiprocess"))]
+    #[test]
+    fn python_creation_requires_the_multiprocess_feature() {
+        let factory = PythonNodeFactory::new("TestNode", false);
+        let result = factory.create("test".into(), &serde_json::json!({}), None);
+        let Err(error) = result else {
+            panic!("Python creation must reject without the multiprocess feature");
+        };
+        assert!(error
+            .to_string()
+            .contains("requires the WebRTC multiprocess feature"));
+    }
 
     #[test]
     fn test_python_node_factory_creation() {

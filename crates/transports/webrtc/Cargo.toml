@@ -39,7 +39,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 base64 = "0.22"
-bytes = "1.5"
+# from_owner retains immutable runtime owners in WebRTC samples.
+bytes = "1.11"
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3" }
 async-trait = { workspace = true }
 clap = { version = "4.5", features = ["derive", "env"], optional = true }
 bollard = { workspace = true }
@@ -50,11 +52,9 @@ thiserror = { workspace = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv"] }
-remotemedia-core-multiprocess = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["multiprocess"], optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv"] }
-remotemedia-core-multiprocess = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["multiprocess"], optional = true }
 
 [dev-dependencies]
 remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk" }
@@ -96,7 +96,7 @@ avatar-live2d = ["avatar-core"]
 avatar-cc = ["avatar-core"]
 avatar = ["avatar-core"]
 full = ["codecs", "h264", "grpc-signaling", "ws-signaling"]
-multiprocess = ["dep:remotemedia-core-multiprocess"]
+multiprocess = ["remotemedia-core/multiprocess"]
 
 [[test]]
 name = "video_integration_test"

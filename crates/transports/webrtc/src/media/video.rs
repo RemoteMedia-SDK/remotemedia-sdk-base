@@ -38,12 +38,35 @@ pub struct VideoFrame {
     pub height: u32,
     /// Pixel format
     pub format: VideoFormat,
-    /// Frame data (format-dependent layout)
-    pub data: Vec<u8>,
+    /// Immutable owning frame storage. Clones retain the same allocation.
+    pub data: remotemedia_types::SharedBytes,
     /// Timestamp in microseconds
     pub timestamp_us: u64,
     /// Whether this is a keyframe
     pub is_keyframe: bool,
+}
+
+impl VideoFrame {
+    /// Retain the raw frame owner while adapting to the runtime's media shape.
+    pub fn as_runtime_data(&self) -> remotemedia_types::RuntimeData {
+        use remotemedia_types::{PixelFormat, RuntimeData};
+        RuntimeData::Video {
+            pixel_data: self.data.clone(),
+            width: self.width,
+            height: self.height,
+            format: match self.format {
+                VideoFormat::I420 => PixelFormat::I420,
+                VideoFormat::NV12 => PixelFormat::NV12,
+                VideoFormat::RGB24 => PixelFormat::Rgb24,
+            },
+            codec: None,
+            frame_number: 0,
+            timestamp_us: self.timestamp_us,
+            is_keyframe: self.is_keyframe,
+            stream_id: None,
+            arrival_ts_us: None,
+        }
+    }
 }
 
 /// Video encoder configuration
@@ -344,7 +367,7 @@ mod tests {
             width: 640,
             height: 480,
             format: VideoFormat::I420,
-            data: vec![0u8; 640 * 480 * 3 / 2], // I420 size
+            data: vec![0u8; 640 * 480 * 3 / 2].into(), // I420 size
             timestamp_us: 1000000,
             is_keyframe: true,
         };

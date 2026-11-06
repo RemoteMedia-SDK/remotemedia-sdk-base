@@ -82,7 +82,10 @@ struct AudioPcmPacketizer {
 impl AudioPcmPacketizer {
     fn new(frame_size: usize) -> Self {
         assert!(frame_size > 0);
-        Self { frame_size, pending: std::collections::VecDeque::new() }
+        Self {
+            frame_size,
+            pending: std::collections::VecDeque::new(),
+        }
     }
 
     fn append(&mut self, samples: &[f32]) {
@@ -496,25 +499,7 @@ impl VideoTrack {
     /// Converts VideoFrame to RuntimeData, encodes with core, sends via RTP.
     /// For new code, use `send_video_runtime_data` directly with RuntimeData::Video.
     pub async fn send_video(&self, frame: &VideoFrame) -> Result<()> {
-        // Convert VideoFrame to RuntimeData
-        let runtime_data = RuntimeData::Video {
-            pixel_data: frame.data.clone(),
-            width: frame.width,
-            height: frame.height,
-            format: match frame.format {
-                VideoFormat::I420 => PixelFormat::I420,
-                VideoFormat::NV12 => PixelFormat::NV12,
-                VideoFormat::RGB24 => PixelFormat::Rgb24,
-            },
-            codec: None, // Raw frame
-            frame_number: 0,
-            timestamp_us: frame.timestamp_us,
-            is_keyframe: frame.is_keyframe,
-            stream_id: None,
-            arrival_ts_us: None,
-        };
-
-        self.send_video_runtime_data(runtime_data).await
+        self.send_video_runtime_data(frame.as_runtime_data()).await
     }
 
     /// Send video frame over RTP (encodes using core VideoEncoderNode)
@@ -595,12 +580,7 @@ impl VideoTrack {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Create WebRTC sample with encoded bitstream
-        let sample = Sample {
-            data: bitstream.into(),
-            duration: frame_duration,
-            timestamp: capture_wall_clock,
-            ..Default::default()
-        };
+        let sample = sample_from_owner(bitstream, frame_duration, capture_wall_clock);
 
         // Send sample (webrtc-rs handles RTP packetization per RFC 7741/6184)
         self.track
@@ -675,7 +655,13 @@ impl VideoTrack {
 
         // Create encoded RuntimeData from RTP payload
         let encoded_data = RuntimeData::Video {
-            pixel_data: payload.to_vec(),
+            pixel_data: remotemedia_types::CopyContext::legacy()
+                .materialize(
+                    remotemedia_types::CopyReason::BorrowedInput,
+                    payload.len() as u64,
+                    || payload.to_vec().into(),
+                )
+                .expect("legacy policy permits borrowed RTP materialization"),
             width: 1280, // Will be overridden by decoder
             height: 720,
             format: PixelFormat::Encoded,
@@ -741,6 +727,23 @@ impl VideoTrack {
         }
     }
 }
+
+fn sample_from_owner(
+    data: remotemedia_types::SharedBytes,
+    duration: Duration,
+    timestamp: std::time::SystemTime,
+) -> Sample {
+    Sample {
+        data: bytes::Bytes::from_owner(data),
+        duration,
+        timestamp,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+#[path = "tracks/owner_tests.rs"]
+mod owner_tests;
 
 #[cfg(test)]
 mod tests {

@@ -15,6 +15,14 @@ use crate::generated::{
 };
 use remotemedia_core::data::{split_text_str, PixelFormat, RuntimeData, VideoCodec};
 use remotemedia_core::transport::TransportData;
+use remotemedia_types::{CopyContext, CopyReason, CopyRejected};
+
+mod owned;
+pub use owned::{data_buffer_into_runtime_data, data_buffer_into_runtime_data_with_context};
+
+#[cfg(test)]
+#[path = "adapters/ownership_tests.rs"]
+mod ownership_tests;
 
 /// Convert core PixelFormat to protobuf PixelFormat
 fn pixel_format_to_proto(format: PixelFormat) -> i32 {
@@ -67,6 +75,24 @@ fn proto_to_video_codec(codec: i32) -> Option<VideoCodec> {
 
 /// Convert core RuntimeData to Protobuf DataBuffer
 pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
+    runtime_data_to_data_buffer_with_context(data, CopyContext::legacy())
+        .expect("legacy policy permits protobuf materialization")
+}
+
+/// Owned protobuf fields materialize bulk bytes. Reject before conversion in
+/// strict mode; count logical payload bytes separately from metadata/framing.
+pub fn runtime_data_to_data_buffer_with_context(
+    data: &RuntimeData,
+    context: &CopyContext,
+) -> Result<DataBuffer, CopyRejected> {
+    context.materialize(
+        CopyReason::PortableSerialization,
+        data.bulk_payload_bytes() as u64,
+        || encode_data_buffer(data),
+    )
+}
+
+fn encode_data_buffer(data: &RuntimeData) -> DataBuffer {
     let data_type = match data {
         RuntimeData::Audio {
             samples,
@@ -98,7 +124,7 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             stream_id: _,     // stream_id not included in protobuf (yet)
             arrival_ts_us: _, // spec 026: not included in protobuf
         } => DataType::Video(VideoFrame {
-            pixel_data: pixel_data.clone(),
+            pixel_data: pixel_data.to_vec(),
             width: *width,
             height: *height,
             format: pixel_format_to_proto(*format),
@@ -111,7 +137,7 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             data, shape, dtype, ..
         } => {
             DataType::Tensor(TensorBuffer {
-                data: data.clone(),
+                data: data.to_vec(),
                 shape: shape.iter().map(|&s| s as u64).collect(),
                 dtype: *dtype,
                 layout: String::new(), // Empty layout - nodes document expected layout
@@ -135,14 +161,14 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             })
         }
         RuntimeData::Binary(bytes) => DataType::Binary(BinaryBuffer {
-            data: bytes.clone(),
+            data: bytes.to_vec(),
             mime_type: "application/octet-stream".to_string(),
         }),
         // Image-over-WebRTC fallback: ship as Binary with a mime-type
         // hint. A first-class `ImageBuffer` proto entry is a follow-up
         // spec; vision-LLM pipelines today run image input in-process.
         RuntimeData::Image { data, format, .. } => DataType::Binary(BinaryBuffer {
-            data: data.clone(),
+            data: data.to_vec(),
             mime_type: format
                 .mime_type()
                 .unwrap_or("application/octet-stream")
@@ -156,7 +182,7 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             c_contiguous,
             f_contiguous,
         } => DataType::Numpy(NumpyBuffer {
-            data: data.clone(),
+            data: data.to_vec(),
             shape: shape.iter().map(|&s| s as u64).collect(),
             dtype: dtype.clone(),
             strides: strides.iter().map(|&s| s as i64).collect(),
@@ -237,6 +263,35 @@ fn now_micros() -> u64 {
 ///
 /// Note: arrival_ts_us is stamped at conversion time per spec 026
 pub fn data_buffer_to_runtime_data(buffer: &DataBuffer) -> Option<RuntimeData> {
+    data_buffer_to_runtime_data_with_context(buffer, CopyContext::legacy())
+        .expect("legacy policy permits protobuf materialization")
+}
+
+/// Borrowed protobuf fields require their own runtime allocation. Malformed f32
+/// byte lengths reject instead of silently discarding trailing sample bytes.
+pub fn data_buffer_to_runtime_data_with_context(
+    buffer: &DataBuffer,
+    context: &CopyContext,
+) -> Result<Option<RuntimeData>, CopyRejected> {
+    let bytes = match &buffer.data_type {
+        Some(DataType::Audio(audio)) => {
+            if audio.samples.len() % 4 != 0 || audio.format != AudioFormat::F32 as i32 {
+                return Ok(None);
+            }
+            audio.samples.len()
+        }
+        Some(DataType::Video(frame)) => frame.pixel_data.len(),
+        Some(DataType::Tensor(tensor)) => tensor.data.len(),
+        Some(DataType::Binary(binary)) => binary.data.len(),
+        Some(DataType::Numpy(numpy)) => numpy.data.len(),
+        _ => 0,
+    };
+    context.materialize(CopyReason::PortableDeserialization, bytes as u64, || {
+        decode_data_buffer(buffer)
+    })
+}
+
+fn decode_data_buffer(buffer: &DataBuffer) -> Option<RuntimeData> {
     // Stamp arrival time at transport ingest (spec 026)
     let arrival_ts_us = Some(now_micros());
 
@@ -262,39 +317,18 @@ pub fn data_buffer_to_runtime_data(buffer: &DataBuffer) -> Option<RuntimeData> {
                     .and_then(|bytes| serde_json::from_slice(bytes).ok()),
             })
         }
-        Some(DataType::Video(video)) => Some(RuntimeData::Video {
-            pixel_data: video.pixel_data.clone(),
-            width: video.width,
-            height: video.height,
-            format: proto_to_pixel_format(video.format),
-            frame_number: video.frame_number,
-            timestamp_us: video.timestamp_us,
-            codec: proto_to_video_codec(video.codec),
-            is_keyframe: video.is_keyframe,
-            stream_id: None, // stream_id not in protobuf (yet)
-            arrival_ts_us,
-        }),
-        Some(DataType::Tensor(tensor)) => Some(RuntimeData::Tensor {
-            data: tensor.data.clone(),
-            shape: tensor.shape.iter().map(|&s| s as i32).collect(),
-            dtype: tensor.dtype,
-            metadata: None,
-        }),
+        Some(
+            data @ (DataType::Video(_)
+            | DataType::Tensor(_)
+            | DataType::Binary(_)
+            | DataType::Numpy(_)),
+        ) => owned::decode_bytes(data.clone(), arrival_ts_us),
         Some(DataType::Json(json)) => serde_json::from_str(&json.json_payload)
             .ok()
             .map(RuntimeData::Json),
         Some(DataType::Text(text)) => String::from_utf8(text.text_data.clone())
             .ok()
             .map(RuntimeData::Text),
-        Some(DataType::Binary(bin)) => Some(RuntimeData::Binary(bin.data.clone())),
-        Some(DataType::Numpy(numpy)) => Some(RuntimeData::Numpy {
-            data: numpy.data.clone(),
-            shape: numpy.shape.iter().map(|&s| s as usize).collect(),
-            dtype: numpy.dtype.clone(),
-            strides: numpy.strides.iter().map(|&s| s as isize).collect(),
-            c_contiguous: numpy.c_contiguous,
-            f_contiguous: numpy.f_contiguous,
-        }),
         Some(DataType::File(file)) => Some(RuntimeData::File {
             path: file.path.clone(),
             filename: if file.filename.is_empty() {

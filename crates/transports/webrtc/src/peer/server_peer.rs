@@ -1076,7 +1076,7 @@ impl ServerPeer {
                                         match crate::generated::DataBuffer::decode(&data_buffer[..]) {
                                             Ok(data_buffer) => {
                                                 // Convert Protobuf DataBuffer → RuntimeData
-                                                if let Some(runtime_data) = crate::adapters::data_buffer_to_runtime_data(&data_buffer) {
+                                                if let Some(runtime_data) = crate::adapters::data_buffer_into_runtime_data(data_buffer) {
                                                     info!("Decoded RuntimeData from data channel: type={}", runtime_data.data_type());
 
                                                     let transport_data = remotemedia_core::transport::TransportData {
@@ -1107,7 +1107,7 @@ impl ServerPeer {
                                             // Deserialize Protobuf DataBuffer from reassembled chunks
                                             match crate::generated::DataBuffer::decode(&reassembled_bytes[..]) {
                                                 Ok(data_buffer) => {
-                                                    if let Some(runtime_data) = crate::adapters::data_buffer_to_runtime_data(&data_buffer) {
+                                                    if let Some(runtime_data) = crate::adapters::data_buffer_into_runtime_data(data_buffer) {
                                                         info!("Reassembled and decoded RuntimeData from chunks: type={}", runtime_data.data_type());
 
                                                         let transport_data = remotemedia_core::transport::TransportData {

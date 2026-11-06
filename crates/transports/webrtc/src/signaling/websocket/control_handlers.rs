@@ -452,7 +452,7 @@ fn coerce_payload_to_runtime_data(payload: &Value) -> Result<RuntimeData, String
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .map_err(|e| format!("bad base64 in binary_b64: {e}"))?;
-        return Ok(RuntimeData::Binary(bytes));
+        return Ok(RuntimeData::Binary(bytes.into()));
     }
     // Fall through: if the payload is itself a bare string treat it as text,
     // and a bare object as JSON. Keeps the wire comfortable for simple cases.

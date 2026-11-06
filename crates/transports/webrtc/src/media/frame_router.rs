@@ -374,7 +374,7 @@ mod tests {
         use remotemedia_core::data::video::PixelFormat;
 
         let data = RuntimeData::Video {
-            pixel_data: vec![0u8; 100],
+            pixel_data: vec![0u8; 100].into(),
             width: 640,
             height: 480,
             format: PixelFormat::Yuv420p,
@@ -431,7 +431,7 @@ mod tests {
         use remotemedia_core::data::video::PixelFormat;
 
         let data = RuntimeData::Video {
-            pixel_data: vec![128u8; 100],
+            pixel_data: vec![128u8; 100].into(),
             width: 640,
             height: 480,
             format: PixelFormat::Rgb24,
