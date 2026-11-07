@@ -231,6 +231,29 @@ binding checks use `--no-default-features --features python`; its benchmark
 library dependency no longer silently re-enables core defaults. Optional codec
 features still need their normal FFmpeg/toolchain setup.
 
+### NumPy inside compatibility JSON
+
+With `native-numpy` enabled, nested arrays in compatibility JSON use a packed
+base64 codec. Private/strided packing and encoding each count the array's logical
+payload bytes; published C-contiguous byte owners skip the packing step. Base64
+encoding remains a counted materialization. On input,
+decoding counts one reconstruction and moves that allocation into an owning,
+read-only NumPy view. A decoded native-endian view can then enter the ordinary
+buffer path without copying. Array slices retain this storage after session close.
+
+The codec preserves plain dtype byte order and datetime units, normalizes layout
+to C order, and validates shape/size/encoded length before allocating decoded
+payload storage. Object, structured, subarray and zero-size dtypes are unsupported.
+Use an explicit `array.copy()` when writable independent output is needed.
+
+Rust `python_to_json_with_context` and `json_to_python_with_context` retain the
+supplied policy through nested containers. Strict conversion rejects nonempty
+array encoding/decoding and opaque pickle conversion. Existing context-free APIs
+use the process-local legacy ledger. Session input reports count only ingress;
+ordinary output decoding is attributed to the legacy ledger. Opaque compatibility
+pickle internals, JSON string/container cloning elsewhere, and network/codec work
+are outside this codec's counters. JSON/base64 is not a zero-copy transport.
+
 ## API Reference
 
 ### `execute_pipeline(manifest_json: str, enable_metrics: bool = False) -> Any`

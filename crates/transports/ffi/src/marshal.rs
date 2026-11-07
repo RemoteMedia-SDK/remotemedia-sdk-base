@@ -15,6 +15,10 @@ use remotemedia_types::CopyContext;
 #[path = "marshal/buffer_tests.rs"]
 mod buffer_tests;
 mod buffers;
+pub(crate) use buffers::storage::{materialize, view as payload_view};
+#[cfg(test)]
+#[path = "marshal/json_tests.rs"]
+mod json_tests;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -83,7 +87,7 @@ impl PyObjectCache {
 /// If a cache is provided, complex objects that can't be serialized to JSON
 /// will be stored in the cache and a reference will be returned instead of pickling.
 pub fn python_to_json(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
-    python_to_json_impl(py, obj, None)
+    python_to_json_with_context(py, obj, None, CopyContext::legacy())
 }
 
 /// Convert with optional cache support
@@ -92,17 +96,25 @@ pub fn python_to_json_with_cache(
     obj: &Bound<'_, PyAny>,
     cache: Option<&PyObjectCache>,
 ) -> PyResult<Value> {
-    python_to_json_impl(py, obj, cache)
+    python_to_json_with_context(py, obj, cache, CopyContext::legacy())
 }
 
-fn python_to_json_impl(
+pub fn python_to_json_with_context(
     py: Python,
     obj: &Bound<'_, PyAny>,
     cache: Option<&PyObjectCache>,
+    context: &CopyContext,
 ) -> PyResult<Value> {
     // None
     if obj.is_none() {
         return Ok(Value::Null);
+    }
+
+    // Check before scalar extraction: NumPy permits conversion of some
+    // singleton arrays to scalars, which would discard their shape/dtype.
+    #[cfg(feature = "native-numpy")]
+    if crate::numpy_bridge::is_numpy_array(py, obj) {
+        return crate::numpy_bridge::numpy_to_json_with_context(py, obj, context);
     }
 
     // Boolean (check before int, as bool is subclass of int in Python)
@@ -133,7 +145,7 @@ fn python_to_json_impl(
     if let Ok(list) = obj.downcast::<PyList>() {
         let mut vec = Vec::new();
         for item in list.iter() {
-            vec.push(python_to_json_impl(py, &item, cache)?);
+            vec.push(python_to_json_with_context(py, &item, cache, context)?);
         }
         return Ok(Value::Array(vec));
     }
@@ -142,7 +154,7 @@ fn python_to_json_impl(
     if let Ok(tuple) = obj.downcast::<PyTuple>() {
         let mut vec = Vec::new();
         for item in tuple.iter() {
-            vec.push(python_to_json_impl(py, &item, cache)?);
+            vec.push(python_to_json_with_context(py, &item, cache, context)?);
         }
         return Ok(Value::Array(vec));
     }
@@ -152,18 +164,12 @@ fn python_to_json_impl(
         let mut map = serde_json::Map::new();
         for (key, value) in dict.iter() {
             let key_str = key.extract::<String>()?;
-            map.insert(key_str, python_to_json_impl(py, &value, cache)?);
+            map.insert(
+                key_str,
+                python_to_json_with_context(py, &value, cache, context)?,
+            );
         }
         return Ok(Value::Object(map));
-    }
-
-    // Numpy array - serialize with metadata for cross-language support (only with native-numpy feature)
-    #[cfg(feature = "native-numpy")]
-    {
-        if crate::numpy_bridge::is_numpy_array(py, obj) {
-            tracing::info!("Converting numpy array to JSON with metadata");
-            return crate::numpy_bridge::numpy_to_json(py, obj);
-        }
     }
 
     // Unsupported type - try to cache it if cache is available, otherwise pickle
@@ -190,6 +196,14 @@ fn python_to_json_impl(
         );
 
         return Ok(Value::Object(ref_obj));
+    }
+
+    // An opaque serializer has no inspectable payload contract. Strict mode
+    // cannot grant permission based on an unknown byte count or invoke reducers.
+    if context.policy() == remotemedia_types::CopyPolicy::RequireZeroCopy {
+        return Err(pyo3::exceptions::PyBufferError::new_err(
+            "opaque Python serialization is unsupported under require_zero_copy",
+        ));
     }
 
     // No cache - must pickle
@@ -260,6 +274,15 @@ pub fn json_to_python_with_cache<'py>(
     value: &Value,
     cache: Option<&PyObjectCache>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    json_to_python_with_context(py, value, cache, CopyContext::legacy())
+}
+
+pub fn json_to_python_with_context<'py>(
+    py: Python<'py>,
+    value: &Value,
+    cache: Option<&PyObjectCache>,
+    context: &CopyContext,
+) -> PyResult<Bound<'py, PyAny>> {
     match value {
         Value::Null => Ok(py.None().into_bound(py)),
 
@@ -281,7 +304,7 @@ pub fn json_to_python_with_cache<'py>(
         Value::Array(arr) => {
             let py_list = PyList::empty(py);
             for item in arr {
-                let py_item = json_to_python_with_cache(py, item, cache)?;
+                let py_item = json_to_python_with_context(py, item, cache, context)?;
                 py_list.append(py_item)?;
             }
             Ok(py_list.into_any())
@@ -293,7 +316,7 @@ pub fn json_to_python_with_cache<'py>(
             {
                 if crate::numpy_bridge::is_numpy_json(value) {
                     tracing::info!("Converting JSON back to numpy array");
-                    return crate::numpy_bridge::json_to_numpy(py, value);
+                    return crate::numpy_bridge::json_to_numpy_with_context(py, value, context);
                 }
             }
 
@@ -326,6 +349,11 @@ pub fn json_to_python_with_cache<'py>(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
             {
+                if context.policy() == remotemedia_types::CopyPolicy::RequireZeroCopy {
+                    return Err(pyo3::exceptions::PyBufferError::new_err(
+                        "opaque Python deserialization is unsupported under require_zero_copy",
+                    ));
+                }
                 if let Some(Value::String(base64_data)) = obj.get("data") {
                     tracing::info!(
                         "Unpickling Python object: {}",
@@ -357,7 +385,7 @@ pub fn json_to_python_with_cache<'py>(
             // Regular dict - recursively convert values (may contain __pyobj__ references)
             let py_dict = PyDict::new(py);
             for (key, value) in obj {
-                py_dict.set_item(key, json_to_python_with_cache(py, value, cache)?)?;
+                py_dict.set_item(key, json_to_python_with_context(py, value, cache, context)?)?;
             }
             Ok(py_dict.into_any())
         }
@@ -397,6 +425,40 @@ pub fn runtime_data_into_python(py: Python<'_>, data: RuntimeData) -> PyResult<P
     runtime_data_to_python(py, &data.into_shared())
 }
 
+/// Export JSON metadata without cloning embedded encoded payload strings.
+fn json_runtime_output(py: Python<'_>, v: &Value, context: &CopyContext) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("type", "json")?;
+
+    let metadata_dict = PyDict::new(py);
+    let mut has_metadata = false;
+    let value = if let Some(obj) = v.as_object().filter(|obj| {
+        !obj.contains_key("__numpy__")
+            && !obj.contains_key("__pickled__")
+            && !obj.contains_key("__pyobj__")
+    }) {
+        let fields = PyDict::new(py);
+        for (key, value) in obj {
+            if key.starts_with("participant.") {
+                if let Some(text) = value.as_str() {
+                    metadata_dict.set_item(key, text)?;
+                    has_metadata = true;
+                }
+            } else {
+                fields.set_item(key, json_to_python_with_context(py, value, None, context)?)?;
+            }
+        }
+        fields.into_any()
+    } else {
+        json_to_python_with_context(py, v, None, context)?
+    };
+    dict.set_item("value", value)?;
+    if has_metadata {
+        dict.set_item("metadata", metadata_dict)?;
+    }
+    Ok(dict.into())
+}
+
 pub fn runtime_data_to_python_with_context(
     py: Python<'_>,
     data: &RuntimeData,
@@ -408,39 +470,7 @@ pub fn runtime_data_to_python_with_context(
     // T007: Convert RuntimeData to Python objects
     match data {
         RuntimeData::Text(s) => Ok(s.into_py_any(py)?),
-        RuntimeData::Json(v) => {
-            // Wrap as {"type": "json", "value": <value>} so that
-            // _wrap_for_data / Data._from_runtime_dict on the Python side can
-            // detect this as kind="json" rather than treating it as an opaque
-            // audio-style dict or falling through to "unset".
-            let dict = PyDict::new(py);
-            dict.set_item("type", "json")?;
-
-            let mut clean_v = v.clone();
-            let metadata_dict = PyDict::new(py);
-            let mut has_metadata = false;
-
-            if let Some(obj) = clean_v.as_object_mut() {
-                let keys: Vec<String> = obj
-                    .keys()
-                    .filter(|k| k.starts_with("participant."))
-                    .cloned()
-                    .collect();
-                for k in keys {
-                    if let Some(serde_json::Value::String(s)) = obj.remove(&k) {
-                        metadata_dict.set_item(&k, s)?;
-                        has_metadata = true;
-                    }
-                }
-            }
-
-            let value = json_to_python(py, &clean_v)?;
-            dict.set_item("value", value)?;
-            if has_metadata {
-                dict.set_item("metadata", metadata_dict)?;
-            }
-            Ok(dict.into())
-        }
+        RuntimeData::Json(v) => json_runtime_output(py, v, context),
         RuntimeData::ControlMessage { .. } => {
             // Control message not fully supported yet
             let dict = PyDict::new(py);
@@ -552,7 +582,7 @@ pub fn python_to_runtime_data_with_context(
                         if context.policy() == remotemedia_types::CopyPolicy::RequireZeroCopy {
                             buffers::metadata_json(py, &value_obj)?
                         } else {
-                            python_to_json(py, &value_obj)?
+                            python_to_json_with_context(py, &value_obj, None, context)?
                         };
                     if let Ok(Some(metadata_val)) = dict.get_item("metadata") {
                         if let Ok(metadata_dict) = metadata_val.downcast::<PyDict>() {
@@ -616,7 +646,7 @@ pub fn python_to_runtime_data_with_context(
     let json_val = if context.policy() == remotemedia_types::CopyPolicy::RequireZeroCopy {
         buffers::metadata_json(py, obj)?
     } else {
-        python_to_json(py, obj)?
+        python_to_json_with_context(py, obj, None, context)?
     };
     Ok(RuntimeData::Json(json_val))
 }

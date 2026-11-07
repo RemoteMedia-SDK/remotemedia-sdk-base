@@ -135,7 +135,7 @@ fn immutable_python_bytes_are_owned_without_copy_and_survive_gil_release() {
         .unwrap();
 }
 
-fn array<'py>(py: Python<'py>, expression: &str) -> Bound<'py, PyAny> {
+pub(super) fn array<'py>(py: Python<'py>, expression: &str) -> Bound<'py, PyAny> {
     let locals = PyDict::new(py);
     locals.set_item("np", py.import("numpy").unwrap()).unwrap();
     py.eval(

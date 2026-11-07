@@ -12,12 +12,21 @@ pub(super) fn copy<T>(
     bytes: usize,
     operation: impl FnOnce() -> PyResult<T>,
 ) -> PyResult<T> {
+    materialize(context, CopyReason::BorrowedInput, bytes, operation)
+}
+
+pub(crate) fn materialize<T>(
+    context: &CopyContext,
+    reason: CopyReason,
+    bytes: usize,
+    operation: impl FnOnce() -> PyResult<T>,
+) -> PyResult<T> {
     context
-        .materialize_result(CopyReason::BorrowedInput, bytes as u64, operation)
+        .materialize_result(reason, bytes as u64, operation)
         .map_err(|error| pyo3::exceptions::PyBufferError::new_err(error.to_string()))?
 }
 
-pub(super) fn view(py: Python<'_>, payload: PayloadStorage) -> PyResult<Py<PyAny>> {
+pub(crate) fn view(py: Python<'_>, payload: PayloadStorage) -> PyResult<Py<PyAny>> {
     let data = match payload {
         PayloadStorage::Audio(data) => BufferData::Audio(data),
         PayloadStorage::Bytes(data) => BufferData::Bytes(data),
