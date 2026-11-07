@@ -284,12 +284,20 @@ impl StreamingNodeFactory for SynchronizedAudioVideoNodeFactory {
 
 pub(crate) struct PassThroughNodeFactory;
 impl StreamingNodeFactory for PassThroughNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        super::media_buffer_contract::metadata_or_forwarding(params).map(Some)
+    }
+
     fn create(
         &self,
         node_id: String,
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
+        self.try_buffer_contract(params)?;
         let params_str = params.to_string();
         let node = PassThroughNode::new(node_id, &params_str)?;
         Ok(Box::new(SyncNodeWrapper(node)))
@@ -307,6 +315,13 @@ impl StreamingNodeFactory for PassThroughNodeFactory {
                     "Passes input through unchanged — useful for testing and pipeline wiring",
                 )
                 .category("utility")
+                .config_schema(serde_json::json!({
+                    "type":"object",
+                    "properties":{
+                        "buffer_limits": super::media_buffer_contract::schema(),
+                        "passthrough_layouts": super::media_buffer_contract::passthrough_schema()
+                    }
+                }))
                 .accepts([
                     RuntimeDataType::Audio,
                     RuntimeDataType::Text,
