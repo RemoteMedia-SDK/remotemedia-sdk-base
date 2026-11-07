@@ -33,6 +33,7 @@ async fn registering_a_cancelled_child_wakes_a_suspended_supervisor() {
 async fn successful_child_completion_does_not_cancel_the_body() {
     let children = Children::default();
     children.add("finished child", tokio::spawn(async {}));
+    children.add_fallible("finished fallible child", tokio::spawn(async { Ok(()) }));
     let (release, wait) = oneshot::channel();
     let mut running = tokio::spawn(supervise(children, async move {
         wait.await.unwrap();
@@ -45,6 +46,73 @@ async fn successful_child_completion_does_not_cancel_the_body() {
     );
     release.send(()).unwrap();
     running.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn returned_child_error_wakes_a_suspended_supervisor() {
+    let children = Children::default();
+    let (ready, started) = oneshot::channel();
+    let mut running = tokio::spawn(supervise(children.clone(), async move {
+        ready.send(()).unwrap();
+        std::future::pending().await
+    }));
+    started.await.unwrap();
+    children.add_fallible(
+        "source",
+        tokio::spawn(async { Err(crate::Error::Execution("allocation failed sentinel".into())) }),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut running).await;
+    if result.is_err() {
+        running.abort();
+        let _ = running.await;
+        panic!("returned child error did not wake supervisor");
+    }
+    let error = result.unwrap().unwrap().unwrap_err().to_string();
+    assert!(
+        error.contains("source") && error.contains("allocation failed sentinel"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn body_completion_preserves_a_finished_child_error_once() {
+    let children = Children::default();
+    let child =
+        tokio::spawn(async { Err(crate::Error::Execution("returned child sentinel".into())) });
+    while !child.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    children.add_fallible("finished source", child);
+    let error = supervise(children, async { Ok(()) })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error.matches("returned child sentinel").count(),
+        1,
+        "{error}"
+    );
+    assert!(error.contains("finished source"), "{error}");
+}
+
+#[tokio::test]
+async fn stopping_a_fallible_child_joins_its_owner_without_reporting_expected_abort() {
+    let children = Children::default();
+    let retained = Arc::new(());
+    let owner = retained.clone();
+    let (ready, started) = oneshot::channel();
+    children.add_fallible(
+        "held source",
+        tokio::spawn(async move {
+            let _owner = owner;
+            ready.send(()).unwrap();
+            std::future::pending().await
+        }),
+    );
+    started.await.unwrap();
+    assert_eq!(Arc::strong_count(&retained), 2);
+    assert!(children.stop().await.is_empty());
+    assert_eq!(Arc::strong_count(&retained), 1);
 }
 
 #[tokio::test]

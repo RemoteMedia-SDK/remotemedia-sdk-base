@@ -197,7 +197,9 @@ impl ChildOwningNode {
         if self.failing_lane == Some(lane) {
             self.lane_release.notified().await;
             if self.returned_error {
-                return Err(Error::Execution("child lane returned error sentinel".into()));
+                return Err(Error::Execution(
+                    "child lane returned error sentinel".into(),
+                ));
             }
             panic!("child lane panic sentinel");
         }
@@ -318,7 +320,11 @@ async fn pacer_returned_error_joins_children_with_suspended_main() {
     exercise_owned_failure_kind(Some(1), true, true).await;
 }
 
-async fn exercise_owned_failure_kind(failing_lane: Option<usize>, active_main: bool, returned_error: bool) {
+async fn exercise_owned_failure_kind(
+    failing_lane: Option<usize>,
+    active_main: bool,
+    returned_error: bool,
+) {
     let manifest = create_test_manifest(vec![("bad", "ChildOwningNode")], vec![]);
     let (output, _unread) = ClientOutputRouter::new(1);
     let (mut router, _keep_shutdown_open) = SessionRouter::new(

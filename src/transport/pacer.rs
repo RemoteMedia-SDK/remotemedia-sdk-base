@@ -303,14 +303,15 @@ impl Pacer {
 
     /// Spawn the Pacer's main loop on the current tokio runtime.
     /// Returns the `JoinHandle` so the caller can `.abort()` it on
-    /// shutdown.
-    pub fn spawn(self) -> JoinHandle<()> {
+    /// shutdown. The owner must join and propagate the returned node error.
+    pub fn spawn(self) -> JoinHandle<Result<()>> {
         tokio::spawn(self.run())
     }
 
     /// Main loop: pull a tick, dispatch, measure, apply on-miss
-    /// policy, repeat. Exits when the tick source returns `None`.
-    async fn run(mut self) {
+    /// policy, repeat. Exits when the tick source returns `None`. Returned node
+    /// errors fail the source, except the existing transient unbound-WebRTC case.
+    async fn run(mut self) -> Result<()> {
         const TRANSIENT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
         let mut transient_error_summary = TickErrorSummary {
             count: 0,
@@ -356,9 +357,8 @@ impl Pacer {
                 Ok(())
             });
 
-            // Invoke the node's tick. Errors are logged + swallowed —
-            // a misbehaving node should not crash the Pacer. The
-            // callback may fire 0..N times depending on the node.
+            // Preserve failures (including callback rejection and allocation
+            // errors) for the owning session. A quiet tick is Ok with no output.
             if let Err(e) = self.node.tick(tick.clone(), &self.ctx, cb).await {
                 if is_transient_unbound_tick_error(&e) {
                     transient_error_summary.count = transient_error_summary.count.saturating_add(1);
@@ -374,11 +374,7 @@ impl Pacer {
                         transient_error_summary.last_log = Instant::now();
                     }
                 } else {
-                    tracing::warn!(
-                        pacer_node = %self.node_id,
-                        error = %e,
-                        "Pacer: tick returned error"
-                    );
+                    return Err(e);
                 }
             }
 
@@ -416,6 +412,7 @@ impl Pacer {
             pacer_node = %self.node_id,
             "Pacer: tick source exhausted, exiting"
         );
+        Ok(())
     }
 }
 
@@ -459,6 +456,7 @@ mod tests {
     /// tick's frame_idx; pure, no state, no async.
     struct CountingTickNode {
         node_id: String,
+        first_error: Option<&'static str>,
     }
     #[async_trait::async_trait]
     impl StreamingNode for CountingTickNode {
@@ -494,6 +492,11 @@ mod tests {
             _: &dyn NodeRuntimeContextRead,
             mut cb: Box<dyn FnMut(RuntimeData) -> Result<()> + Send>,
         ) -> std::result::Result<(), crate::Error> {
+            if tick.frame_idx == 0 {
+                if let Some(message) = self.first_error {
+                    return Err(crate::Error::Execution(message.into()));
+                }
+            }
             cb(RuntimeData::Json(serde_json::json!({
                 "frame_idx": tick.frame_idx
             })))
@@ -508,6 +511,7 @@ mod tests {
     async fn pacer_drives_node_once_per_tick_then_exits() {
         let node: Arc<dyn StreamingNode> = Arc::new(CountingTickNode {
             node_id: "tick".into(),
+            first_error: None,
         });
         let ctx = NodeRuntimeContext::for_test("sess-1", "tick");
 
@@ -536,7 +540,93 @@ mod tests {
             }
         }
 
-        let _ = handle.await;
+        handle.await.unwrap().unwrap();
         assert_eq!(frames, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn pacer_returns_closed_and_full_output_queue_errors() {
+        for closed in [false, true] {
+            let node = Arc::new(CountingTickNode {
+                node_id: "rejected".into(),
+                first_error: None,
+            });
+            let (tx, rx) = mpsc::channel(1);
+            tx.try_send(RuntimeData::Json(serde_json::json!("already full")))
+                .unwrap();
+            let _receiver = if closed {
+                drop(rx);
+                None
+            } else {
+                Some(rx)
+            };
+            let source = Box::new(CannedSource {
+                ticks: [Tick {
+                    clock_id: "test".into(),
+                    frame_idx: 0,
+                    pts_us: 0,
+                    deadline_us: 1000,
+                }]
+                .into(),
+            });
+            let result = Pacer::new(
+                "rejected",
+                node,
+                NodeRuntimeContext::for_test("s", "rejected"),
+                tx,
+                source,
+                OnMiss::Log,
+            )
+            .spawn()
+            .await
+            .unwrap();
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(if closed { "closed" } else { "full" }),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pacer_retries_only_the_existing_unbound_webrtc_case() {
+        for transient in [false, true] {
+            let message = if transient {
+                "WebRTC edge test is not bound"
+            } else {
+                "copy policy denied"
+            };
+            let node = Arc::new(CountingTickNode {
+                node_id: "retry".into(),
+                first_error: Some(message),
+            });
+            let (tx, mut rx) = mpsc::channel(2);
+            let ticks = (0..2)
+                .map(|frame_idx| Tick {
+                    clock_id: "test".into(),
+                    frame_idx,
+                    pts_us: 0,
+                    deadline_us: 1000,
+                })
+                .collect();
+            let result = Pacer::new(
+                "retry",
+                node,
+                NodeRuntimeContext::for_test("s", "retry"),
+                tx,
+                Box::new(CannedSource { ticks }),
+                OnMiss::Log,
+            )
+            .spawn()
+            .await
+            .unwrap();
+            if transient {
+                result.unwrap();
+                assert!(matches!(rx.recv().await, Some(RuntimeData::Json(_))));
+            } else {
+                assert!(result.unwrap_err().to_string().contains(message));
+            }
+            assert!(rx.recv().await.is_none());
+        }
     }
 }

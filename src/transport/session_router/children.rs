@@ -10,10 +10,12 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{sync::watch, task::JoinHandle};
+mod task;
+use task::Task;
 
 struct Child {
     name: String,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<Task>,
     failure: Option<String>,
     shutdown: Option<watch::Sender<bool>>,
 }
@@ -28,7 +30,7 @@ impl Child {
         // JoinHandle must never be polled again after completion. Keep any
         // failure for stop(), including cancellation while the lane was active.
         self.handle = None;
-        self.failure = result.err().map(|error| format!("{}: {error}", self.name));
+        self.failure = task::error(result, false).map(|error| format!("{}: {error}", self.name));
         self.failure.is_some()
     }
 
@@ -37,9 +39,8 @@ impl Child {
             return Some(failure);
         }
         let handle = self.handle.as_mut()?;
-        let error = handle.await.err()?;
         // stop() intentionally aborts non-cooperative lanes before joining.
-        (!error.is_cancelled()).then(|| format!("{}: {error}", self.name))
+        task::error(handle.await, true).map(|error| format!("{}: {error}", self.name))
     }
 }
 impl Drop for Child {
@@ -62,13 +63,11 @@ struct ChildState {
 pub(super) struct Children(Arc<ChildState>);
 impl Children {
     pub(super) fn add(&self, name: impl Into<String>, handle: JoinHandle<()>) {
-        self.0.tasks.lock().push(Child {
-            name: name.into(),
-            handle: Some(handle),
-            failure: None,
-            shutdown: None,
-        });
-        self.0.observer.wake();
+        self.insert(name.into(), Task::Plain(handle), None);
+    }
+
+    pub(super) fn add_fallible(&self, name: impl Into<String>, handle: JoinHandle<Result<()>>) {
+        self.insert(name.into(), Task::Fallible(handle), None);
     }
 
     pub(super) fn add_cooperative(
@@ -77,11 +76,15 @@ impl Children {
         shutdown: watch::Sender<bool>,
         handle: JoinHandle<()>,
     ) {
+        self.insert(name.into(), Task::Plain(handle), Some(shutdown));
+    }
+
+    fn insert(&self, name: String, handle: Task, shutdown: Option<watch::Sender<bool>>) {
         self.0.tasks.lock().push(Child {
-            name: name.into(),
+            name,
             handle: Some(handle),
             failure: None,
-            shutdown: Some(shutdown),
+            shutdown,
         });
         self.0.observer.wake();
     }

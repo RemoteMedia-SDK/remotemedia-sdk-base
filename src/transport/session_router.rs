@@ -1885,7 +1885,7 @@ impl SessionRouter {
             //
             // Outputs flow into the same `fan_tx` reactive emits use,
             // so downstream wiring is identical regardless of pacing.
-            let pacer_handle: Option<tokio::task::JoinHandle<()>> = {
+            let pacer_handle: Option<tokio::task::JoinHandle<Result<()>>> = {
                 use crate::nodes::PacingNature;
                 use crate::transport::pacer::{
                     OnMiss, Pacer, TickSource, WallTickSource, WireTickSource,
@@ -1935,7 +1935,7 @@ impl SessionRouter {
             };
 
             if let Some(handle) = pacer_handle {
-                children.add("pacer", handle);
+                children.add_fallible("pacer", handle);
             }
             loop {
                 let input = tokio::select! {
