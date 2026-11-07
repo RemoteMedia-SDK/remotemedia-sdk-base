@@ -184,8 +184,21 @@ async fn exercise_failure(backpressured: bool) {
 struct ChildOwningNode {
     main: PanickingNode,
     lanes_started: [Arc<Notify>; 3],
+    failing_lane: Option<usize>,
+    lane_release: Arc<Notify>,
     payload: remotemedia_types::SharedBuffer<u8>,
     dropped: Arc<AtomicBool>,
+}
+
+impl ChildOwningNode {
+    async fn hold_lane(&self, lane: usize) -> Result<()> {
+        self.lanes_started[lane].notify_one();
+        if self.failing_lane == Some(lane) {
+            self.lane_release.notified().await;
+            panic!("child lane panic sentinel");
+        }
+        std::future::pending().await
+    }
 }
 
 impl Drop for ChildOwningNode {
@@ -231,8 +244,7 @@ impl StreamingNode for ChildOwningNode {
         _caps: crate::capabilities::MediaCapabilities,
         _ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
     ) -> Result<()> {
-        self.lanes_started[0].notify_one();
-        std::future::pending().await
+        self.hold_lane(0).await
     }
 
     fn pacing_nature(&self) -> crate::nodes::PacingNature {
@@ -245,8 +257,7 @@ impl StreamingNode for ChildOwningNode {
         _ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
         _cb: Box<dyn FnMut(RuntimeData) -> Result<()> + Send>,
     ) -> Result<()> {
-        self.lanes_started[1].notify_one();
-        std::future::pending().await
+        self.hold_lane(1).await
     }
 
     fn rpc_methods(&self) -> Vec<remotemedia_traits::rpc::RpcMethod> {
@@ -260,13 +271,36 @@ impl StreamingNode for ChildOwningNode {
         _ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
         _replies: &mut remotemedia_traits::rpc::RpcResponder,
     ) -> Result<()> {
-        self.lanes_started[2].notify_one();
-        std::future::pending().await
+        self.hold_lane(2).await
     }
 }
 
 #[tokio::test]
 async fn main_panic_joins_capability_pacer_and_nested_rpc_before_returning() {
+    exercise_owned_failure(None, true).await;
+}
+
+#[tokio::test]
+async fn capability_panic_joins_children_with_idle_main() {
+    exercise_owned_failure(Some(0), false).await;
+}
+
+#[tokio::test]
+async fn capability_panic_joins_children_with_suspended_main() {
+    exercise_owned_failure(Some(0), true).await;
+}
+
+#[tokio::test]
+async fn pacer_panic_joins_children_with_idle_main() {
+    exercise_owned_failure(Some(1), false).await;
+}
+
+#[tokio::test]
+async fn pacer_panic_joins_children_with_suspended_main() {
+    exercise_owned_failure(Some(1), true).await;
+}
+
+async fn exercise_owned_failure(failing_lane: Option<usize>, active_main: bool) {
     let manifest = create_test_manifest(vec![("bad", "ChildOwningNode")], vec![]);
     let (output, _unread) = ClientOutputRouter::new(1);
     let (mut router, _keep_shutdown_open) = SessionRouter::new(
@@ -278,6 +312,7 @@ async fn main_panic_joins_capability_pacer_and_nested_rpc_before_returning() {
     .unwrap();
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
+    let lane_release = Arc::new(Notify::new());
     let lanes_started = std::array::from_fn(|_| Arc::new(Notify::new()));
     let dropped = Arc::new(AtomicBool::new(false));
     let released = Arc::new(AtomicBool::new(false));
@@ -293,19 +328,29 @@ async fn main_panic_joins_capability_pacer_and_nested_rpc_before_returning() {
                 release: release.clone(),
             },
             lanes_started: lanes_started.clone(),
+            failing_lane,
+            lane_release: lane_release.clone(),
             payload: retained.clone(),
             dropped: dropped.clone(),
         }),
     );
     let control = SessionControl::new("child-ownership");
+    let mut close = control.close_subscriber();
+    let original = retained.as_ptr();
     router.attach_control(control.clone()).await;
     let input = router.get_input_sender();
-    let running = tokio::spawn(router.run_after_init());
-    input.send(packet("bad", 0)).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), started.notified())
+    let mut running = tokio::spawn(router.run_after_init());
+    if active_main {
+        input.send(packet("bad", 0)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+    }
+    // Pacer startup proves that initialization and child registration completed.
+    tokio::time::timeout(Duration::from_secs(2), lanes_started[1].notified())
         .await
         .unwrap();
-    // Publish only after the main process starts: the retained capability seed
+    // Publish only after startup: the retained capability seed
     // must not block initialization before the child handlers are spawned.
     control.publish_capability("audio:child-ownership", Default::default());
     control
@@ -315,25 +360,51 @@ async fn main_panic_joins_capability_pacer_and_nested_rpc_before_returning() {
         )
         .await
         .unwrap();
-    for lane in &lanes_started {
+    for lane in [&lanes_started[0], &lanes_started[2]] {
         tokio::time::timeout(Duration::from_secs(2), lane.notified())
             .await
             .unwrap();
     }
     assert!(!dropped.load(Ordering::SeqCst));
-    release.notify_one();
-    let error = tokio::time::timeout(Duration::from_secs(2), running)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("active task panic sentinel"), "{error}");
+    if failing_lane.is_some() {
+        lane_release.notify_one();
+    } else {
+        release.notify_one();
+    }
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut running).await;
+    if result.is_err() {
+        // A failed regression must still drain the router and its children.
+        _keep_shutdown_open.send(()).await.unwrap();
+        running.await.unwrap().ok();
+        panic!("child failure did not terminate the session");
+    }
+    let error = result.unwrap().unwrap().unwrap_err().to_string();
+    let sentinel = if failing_lane.is_some() {
+        "child lane panic sentinel"
+    } else {
+        "active task panic sentinel"
+    };
+    assert!(error.contains(sentinel), "{error}");
+    if failing_lane == Some(1) {
+        assert!(error.contains("pacer"), "{error}");
+    }
+    if failing_lane == Some(0) {
+        assert!(
+            error.contains("capability") && error.contains("audio:child-ownership"),
+            "{error}"
+        );
+    }
+    let CloseReason::Error(reason) = close.recv().await.unwrap() else {
+        panic!("normal close hid child failure")
+    };
+    assert_eq!(reason, error);
+    assert!(input.send(packet("bad", 9999)).await.is_err());
     assert!(
         dropped.load(Ordering::SeqCst),
         "session returned while a child still owned the node"
     );
     assert!(!released.load(Ordering::SeqCst));
+    assert_eq!(retained.as_ptr(), original);
     assert_eq!(retained.as_ref(), &[3, 1, 4, 1]);
     drop(retained);
     assert!(released.load(Ordering::SeqCst));

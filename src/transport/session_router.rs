@@ -46,6 +46,8 @@ mod input_queue;
 use input_queue::InputQueue;
 #[cfg(test)]
 mod task_failure_tests;
+#[cfg(test)]
+mod children_tests;
 
 use crate::capabilities::{CapabilityBehavior, CapabilityResolver, ResolutionContext};
 use crate::data::RuntimeData;
