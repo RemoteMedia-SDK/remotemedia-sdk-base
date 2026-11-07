@@ -251,6 +251,7 @@ impl TickSource for WallTickSource {
 /// stored alongside the node's main + fan-out tasks and aborted on
 /// session shutdown.
 pub struct Pacer {
+    completion: Option<tokio::sync::oneshot::Sender<()>>,
     node_id: String,
     node: Arc<dyn StreamingNode>,
     ctx: NodeRuntimeContext,
@@ -284,6 +285,7 @@ impl Pacer {
     ) -> Self {
         Self {
             node_id: node_id.into(),
+            completion: None,
             node,
             ctx,
             fan_tx,
@@ -298,6 +300,14 @@ impl Pacer {
     /// don't care about telemetry stay terse.
     pub fn with_perf(mut self, perf: Arc<PerfAggregator>) -> Self {
         self.perf = Some(perf);
+        self
+    }
+
+    pub(crate) fn with_completion(
+        mut self,
+        completion: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Self {
+        self.completion = completion;
         self
     }
 
@@ -387,7 +397,9 @@ impl Pacer {
 
             // Preserve failures (including callback rejection and allocation
             // errors) for the owning session. A quiet tick is Ok with no output.
-            if let Err(e) = self.node.tick(tick.clone(), &self.ctx, cb).await {
+            let result = self.dispatch_tick(tick.clone(), cb).await;
+            let finished = matches!(result, Ok(true));
+            if let Err(e) = result {
                 if is_transient_unbound_tick_error(&e) {
                     transient_error_summary.count = transient_error_summary.count.saturating_add(1);
                     if transient_error_summary.last_log.elapsed() >= TRANSIENT_ERROR_LOG_INTERVAL {
@@ -404,6 +416,10 @@ impl Pacer {
                 } else {
                     return Err(e);
                 }
+            }
+
+            if finished {
+                break;
             }
 
             let elapsed = started.elapsed();
@@ -441,6 +457,26 @@ impl Pacer {
             "Pacer: tick source exhausted, exiting"
         );
         Ok(())
+    }
+
+    /// Close escaped contexts on every return path; only successful ticks can
+    /// commit the request to the router. Dropping this future closes the scope.
+    async fn dispatch_tick(
+        &mut self,
+        tick: Tick,
+        output: Box<dyn FnMut(RuntimeData) -> Result<()> + Send>,
+    ) -> Result<bool> {
+        let (context, scope) = self.ctx.for_source_tick();
+        let result = self.node.tick(tick, &context, output).await;
+        let requested = scope.close();
+        result?;
+        if !requested {
+            return Ok(false);
+        }
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(());
+        }
+        Ok(true)
     }
 }
 

@@ -363,6 +363,7 @@ mod runtime_context_default_tests {
 
     fn ctx_for(node_id: &str, session_id: &str) -> NodeRuntimeContext {
         NodeRuntimeContext {
+            source_completion: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from(session_id),
             node_id: Arc::from(node_id),

@@ -45,11 +45,14 @@ use children::Children;
 mod input_queue;
 use input_queue::InputQueue;
 #[cfg(test)]
-mod task_failure_tests;
-#[cfg(test)]
 mod children_tests;
+mod source_completion;
+#[cfg(test)]
+mod source_completion_tests;
 #[cfg(test)]
 mod source_drain_tests;
+#[cfg(test)]
+mod task_failure_tests;
 
 use crate::capabilities::{CapabilityBehavior, CapabilityResolver, ResolutionContext};
 use crate::data::RuntimeData;
@@ -452,6 +455,7 @@ const RELAXED: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxe
 /// lifetime of the session. Built in [`SessionRouter::spawn_pipeline_tasks`]
 /// and torn down in [`SessionRouter::teardown_pipeline_tasks`].
 struct PipelineTasks {
+    source_completions: source_completion::SourceCompletions,
     /// Input sender for each node (keyed by node id). The router pushes
     /// source-bound and `to_node`-addressed packets through these.
     input_txs: HashMap<String, InputQueue>,
@@ -1285,12 +1289,20 @@ impl SessionRouter {
         // job here is to shovel input packets into the right source node's
         // input channel. Each node's bounded input mpsc provides natural
         // backpressure back through `input_rx`.
+        let mut sources_finished = false;
         let explicit_close = loop {
             let ingress_start = std::time::Instant::now();
             tokio::select! {
                 biased;
 
                 _ = pipeline.tasks.wait_for_failure() => break true,
+
+                _ = pipeline.source_completions.wait(), if !sources_finished => {
+                    sources_finished = true;
+                    // Refuse new ingress, but deliver packets already accepted
+                    // before the final source committed completion.
+                    input_rx.close();
+                },
 
                 result = input_rx.recv() => {
                     match result {
@@ -1414,6 +1426,8 @@ impl SessionRouter {
         let nodes = std::mem::take(&mut self.cached_nodes);
 
         let mut handles = Vec::with_capacity(nodes.len() * 2);
+        let mut source_completions =
+            source_completion::SourceCompletions::for_graph(&self.graph, &nodes);
 
         for (node_id, node) in nodes {
             let input_rx = match input_rxs.remove(&node_id) {
@@ -1449,6 +1463,7 @@ impl SessionRouter {
                 .iter()
                 .any(|n| n.id == node_id && n.is_output_node);
 
+            let completion = source_completions.register(node.pacing_nature());
             let (main_handle, fan_handle) = Self::spawn_node_pipeline(
                 self.bound_output_allocators
                     .get(&node_id)
@@ -1479,6 +1494,7 @@ impl SessionRouter {
                     input_weak,
                 },
                 shutdown.subscribe(),
+                completion,
             );
 
             handles.push((format!("{node_id} main"), main_handle));
@@ -1493,6 +1509,7 @@ impl SessionRouter {
             .collect();
 
         Ok(PipelineTasks {
+            source_completions,
             input_txs,
             ingress_edges,
             tasks: TaskGroup::new(shutdown, handles),
@@ -1530,6 +1547,7 @@ impl SessionRouter {
         perf: Arc<PerfAggregator>,
         nt: NodeTelemetryHandle,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
+        completion: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> (JoinHandle<Result<()>>, JoinHandle<Result<()>>) {
         let (fan_tx, mut fan_rx) = mpsc::channel::<RuntimeData>(NODE_FANOUT_CAPACITY);
         let NodeTelemetryHandle {
@@ -1942,7 +1960,8 @@ impl SessionRouter {
                         src,
                         OnMiss::default(),
                     )
-                    .with_perf(perf.clone());
+                    .with_perf(perf.clone())
+                    .with_completion(completion);
                     pacer.spawn_draining(shutdown.clone())
                 })
             };
@@ -2369,6 +2388,7 @@ impl SessionRouter {
     /// Await every spawned task after dropping the router's own input_txs.
     async fn teardown_pipeline_tasks(pipeline: PipelineTasks, explicit_close: bool) -> Result<()> {
         let PipelineTasks {
+            source_completions: _,
             input_txs,
             ingress_edges: _,
             tasks,
@@ -2675,6 +2695,7 @@ mod tests {
         let cancelled = tokio::spawn(std::future::pending::<Result<()>>());
         cancelled.abort();
         let pipeline = PipelineTasks {
+            source_completions: source_completion::SourceCompletions::new(false),
             input_txs: HashMap::new(),
             ingress_edges: HashMap::new(),
             tasks: TaskGroup::new(

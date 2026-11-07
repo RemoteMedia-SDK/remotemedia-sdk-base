@@ -50,6 +50,7 @@
 //! downcasts on access via [`Self::state`].
 
 use std::any::Any;
+mod source_completion;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -84,6 +85,7 @@ pub use crate::nodes::ports::SnapshotPort;
 /// See the module-level docs for lifecycle, scopes, and lifecycle.
 #[derive(Clone)]
 pub struct NodeRuntimeContext {
+    pub(crate) source_completion: Option<Arc<std::sync::atomic::AtomicU8>>,
     /// Policy and attributed ledger for explicit host node materializations.
     pub materialization: remotemedia_types::CopyContext,
     /// Output storage provider. Clones retain the selected provider; loans and
@@ -200,6 +202,7 @@ impl NodeRuntimeContext {
             session_state,
             cancel_gate: Arc::new(CancelGate::new()),
             output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
+            source_completion: None,
         }
     }
 
@@ -347,6 +350,9 @@ impl NodeRuntimeContext {
 // — no edits needed at the call site for the common case.
 
 impl NodeRuntimeContextRead for NodeRuntimeContext {
+    fn finish_source(&self) -> crate::Result<()> {
+        NodeRuntimeContext::finish_source(self)
+    }
     fn copy_context(&self) -> Option<remotemedia_types::CopyContext> {
         Some(self.materialization.clone())
     }
@@ -505,6 +511,7 @@ mod tests {
         struct A;
         struct B;
         let ctx = NodeRuntimeContext {
+            source_completion: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
@@ -530,6 +537,7 @@ mod tests {
         };
 
         let ctx = NodeRuntimeContext {
+            source_completion: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
@@ -581,6 +589,7 @@ mod tests {
             counter: std::sync::atomic::AtomicU32::new(0),
         });
         let ctx = NodeRuntimeContext {
+            source_completion: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
@@ -620,6 +629,7 @@ mod tests {
         snapshots.insert("weights".to_string(), Arc::new(out.input()));
 
         let ctx = NodeRuntimeContext {
+            source_completion: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
@@ -650,6 +660,7 @@ mod tests {
         snapshots.insert("port".to_string(), Arc::new(out.input()));
 
         let ctx = NodeRuntimeContext {
+            source_completion: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
@@ -727,6 +738,7 @@ mod tests {
         let mut snapshots: HashMap<String, Arc<dyn SnapshotPort>> = HashMap::new();
         snapshots.insert("weights".into(), Arc::new(out.input()));
         let ctx = NodeRuntimeContext {
+            source_completion: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
