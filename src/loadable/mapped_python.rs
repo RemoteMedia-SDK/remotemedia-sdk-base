@@ -1,7 +1,7 @@
 //! Host authorization and manifest selection for mapped source Python plugins.
-use super::plugin_toml::PluginPythonMeta;
+use super::plugin_toml::{PluginPythonMapped, PluginPythonMeta};
 use crate::multiprocess::mapped_python::{
-    MappedPythonConfig, MappedPythonFactory, MappedPythonWheels,
+    MappedPythonBundle, MappedPythonConfig, MappedPythonFactory, MappedPythonWheels,
 };
 use crate::{Error, Result};
 use remotemedia_py_env::PythonEnvConfig;
@@ -17,6 +17,37 @@ pub struct MappedPythonPluginRuntime {
 }
 
 impl MappedPythonPluginRuntime {
+    /// Select matching wheels and, on Linux, the bundled namespace supervisor.
+    /// Linux uses the configured unshare executable or `/usr/bin/unshare`.
+    ///
+    /// # Safety
+    /// The trust and immutability requirements of [`Self::new`] apply to the
+    /// complete bundle and the selected system unshare executable as well.
+    pub unsafe fn from_bundle(
+        directory: &std::path::Path,
+        mut environment: PythonEnvConfig,
+        trusted_roots: Vec<PathBuf>,
+    ) -> Result<Self> {
+        let bundle = MappedPythonBundle::load(directory)?;
+        if let Some(supervisor) = bundle.supervisor {
+            let unshare = environment
+                .process_namespace
+                .take()
+                .map(|namespace| namespace.unshare)
+                .unwrap_or_else(|| PathBuf::from("/usr/bin/unshare"));
+            environment.process_namespace = Some(remotemedia_py_env::ProcessNamespace {
+                supervisor,
+                unshare,
+            });
+        } else if environment.process_namespace.is_some() {
+            return Err(Error::ConfigError(
+                "Windows bundle cannot use Linux process_namespace".into(),
+            ));
+        }
+        // SAFETY: caller accepts new's contract for the selected bundle.
+        unsafe { Self::new(bundle.wheels, environment, trusted_roots) }
+    }
+
     /// Authorize automatic registration for these exact resolved package roots.
     /// Roots are canonicalized now and again when loading each plugin. This is
     /// identity selection, not an integrity check or a filesystem sandbox.
@@ -94,16 +125,34 @@ impl MappedPythonPluginRuntime {
                     wheels: self.wheels.clone(),
                     environment: self.environment.clone(),
                 };
-                // SAFETY: this exact package was authorized under new's contract.
-                let factory = unsafe { MappedPythonFactory::for_sessions(config) }
-                    .with_snapshot_inputs(mapped.snapshot_inputs.clone())?
-                    .with_snapshot_outputs(mapped.snapshot_outputs.clone())?;
-                Ok(if mapped.output_copy_protocol.is_some() {
-                    factory.with_output_copies()
-                } else {
-                    factory
-                })
+                self.configure_factory(config, mapped)
             })
             .collect()
+    }
+
+    fn configure_factory(
+        &self,
+        config: MappedPythonConfig,
+        mapped: &PluginPythonMapped,
+    ) -> Result<MappedPythonFactory> {
+        // SAFETY: factories has checked this exact package against the roots
+        // authorized under new's contract, including its runtime artifacts.
+        let factory = unsafe { MappedPythonFactory::for_sessions(config) }
+            .with_snapshot_inputs(mapped.snapshot_inputs.clone())?
+            .with_snapshot_outputs(mapped.snapshot_outputs.clone())?;
+        let factory = if let Some(namespace) = &self.environment.process_namespace {
+            // SAFETY: the runtime's caller authorizes these matching executables.
+            unsafe {
+                factory
+                    .with_linux_namespace(namespace.supervisor.clone(), namespace.unshare.clone())
+            }?
+        } else {
+            factory
+        };
+        Ok(if mapped.output_copy_protocol.is_some() {
+            factory.with_output_copies()
+        } else {
+            factory
+        })
     }
 }
