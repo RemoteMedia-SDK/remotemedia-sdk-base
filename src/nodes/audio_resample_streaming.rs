@@ -110,7 +110,11 @@ impl ResampleStreamingNode {
                 *current = epoch;
             } else if epoch < *current {
                 return Ok(RuntimeData::Audio {
-                    samples: Vec::new().into(),
+                    samples: allocator
+                        .allocate_audio(0)
+                        .map_err(|e| Error::Execution(format!("resampler output allocation: {e}")))?
+                        .freeze()
+                        .into(),
                     sample_rate: self.target_rate,
                     channels: input_channels,
                     stream_id: out_stream_id,

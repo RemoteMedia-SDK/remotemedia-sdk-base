@@ -163,8 +163,11 @@ impl FastResampleNode {
         let remaining = usize::try_from(expected.saturating_sub(self.emitted_frames as u128))
             .map_err(|_| size_error())?;
         if remaining == 0 {
+            let output = allocator
+                .allocate_audio(0)
+                .map_err(|e| Error::Execution(format!("resampler output allocation: {e}")))?;
             self.reset();
-            return Ok(Vec::new().into());
+            return Ok(output.freeze());
         }
         let block = self.resampler.output_frames_next();
         let raw = remaining

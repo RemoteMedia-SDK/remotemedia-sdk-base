@@ -1180,6 +1180,13 @@ impl StreamingNodeFactory for AudioChunkerNodeFactory {
 
 pub(crate) struct FastResampleNodeFactory;
 impl StreamingNodeFactory for FastResampleNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        super::audio_buffer_contract::from_params(params)
+    }
+
     fn create(
         &self,
         node_id: String,
@@ -1190,6 +1197,7 @@ impl StreamingNodeFactory for FastResampleNodeFactory {
         use crate::nodes::audio_resample_streaming::{
             AutoResampleConfig, AutoResampleStreamingNode, ResampleStreamingNode,
         };
+        self.try_buffer_contract(params)?;
 
         // Parse optional source_rate (can be "auto" or omitted for auto-detection)
         let source_rate = params
@@ -1297,6 +1305,7 @@ impl StreamingNodeFactory for FastResampleNodeFactory {
                             ],
                             "description": "Source sample rate in Hz. Use 'auto' or omit to detect from incoming audio."
                         },
+                        "buffer_limits": super::audio_buffer_contract::schema(),
                         "target_rate": {
                             "oneOf": [
                                 { "type": "integer", "minimum": 8000, "maximum": 192000 },
