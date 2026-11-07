@@ -83,3 +83,42 @@ pub(super) fn schema() -> Value {
         }
     })
 }
+
+/// Metadata by default; callers can explicitly admit bounded bulk passthrough.
+pub(super) fn metadata_or_forwarding(params: &Value) -> Result<BufferContract> {
+    let Some(value) = params.get("passthrough_layouts") else {
+        if params.get("buffer_limits").is_some() {
+            return Err(Error::ConfigError(
+                "buffer_limits requires explicit passthrough_layouts".into(),
+            ));
+        }
+        return Ok(BufferContract::metadata_only(BufferProtocol::RustOwners));
+    };
+    let layouts: Vec<BufferLayout> = serde_json::from_value(value.clone())
+        .map_err(|error| Error::ConfigError(format!("passthrough_layouts: {error}")))?;
+    let first = layouts
+        .first()
+        .ok_or_else(|| Error::ConfigError("passthrough_layouts must not be empty".into()))?;
+    let mut contract = forwarding(params, first.clone())?.ok_or_else(|| {
+        Error::ConfigError("passthrough_layouts requires bounded buffer_limits".into())
+    })?;
+    for port in contract
+        .inputs
+        .values_mut()
+        .chain(contract.outputs.values_mut())
+    {
+        port.layouts = layouts.clone();
+        port.validate_definition().map_err(Error::ConfigError)?;
+    }
+    Ok(contract)
+}
+
+pub(super) fn passthrough_schema() -> Value {
+    json!({"type":"array", "minItems":1,
+    "description":"Optional bulk layouts forwarded unchanged. Requires buffer_limits. Tensor declarations must select exactly one dtype convention.",
+    "items":{"type":"string","enum":[
+        BufferLayout::AudioInterleavedF32, BufferLayout::VideoBytes, BufferLayout::ImageBytes,
+        BufferLayout::TensorRuntime, BufferLayout::TensorPythonIpc, BufferLayout::TensorProtobuf,
+        BufferLayout::NumpyCContiguous, BufferLayout::NumpyFContiguous, BufferLayout::Binary
+    ]}})
+}

@@ -453,6 +453,13 @@ impl StreamingNodeFactory for SpeculativeAudioCommitNodeFactory {
 
 pub(crate) struct TextCollectorNodeFactory;
 impl StreamingNodeFactory for TextCollectorNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        super::media_buffer_contract::metadata_or_forwarding(params).map(Some)
+    }
+
     fn create(
         &self,
         _node_id: String,
@@ -461,6 +468,7 @@ impl StreamingNodeFactory for TextCollectorNodeFactory {
     ) -> Result<Box<dyn StreamingNode>, Error> {
         use crate::nodes::text_collector::{TextCollectorConfig, TextCollectorNode};
         use crate::nodes::SyncNodeWrapper;
+        self.try_buffer_contract(params)?;
         let config: TextCollectorConfig =
             serde_json::from_value(params.clone()).unwrap_or_default();
         let node = TextCollectorNode::with_config(config);
@@ -478,14 +486,18 @@ impl StreamingNodeFactory for TextCollectorNodeFactory {
     fn schema(&self) -> Option<crate::nodes::schema::NodeSchema> {
         use crate::nodes::schema::{NodeSchema, RuntimeDataType};
         use crate::nodes::text_collector::TextCollectorConfig;
-        Some(
-            NodeSchema::new("TextCollectorNode")
-                .description("Accumulates streaming text tokens and yields complete sentences")
-                .category("text")
-                .accepts([RuntimeDataType::Text])
-                .produces([RuntimeDataType::Text])
-                .config_schema_from::<TextCollectorConfig>(),
-        )
+        let mut schema = NodeSchema::new("TextCollectorNode")
+            .description("Accumulates streaming text tokens and yields complete sentences")
+            .category("text")
+            .accepts([RuntimeDataType::Text])
+            .produces([RuntimeDataType::Text])
+            .config_schema_from::<TextCollectorConfig>();
+        if let Some(config) = schema.config_schema.as_mut() {
+            config["properties"]["buffer_limits"] = super::media_buffer_contract::schema();
+            config["properties"]["passthrough_layouts"] =
+                super::media_buffer_contract::passthrough_schema();
+        }
+        Some(schema)
     }
 }
 
