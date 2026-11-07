@@ -289,6 +289,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_owned_storage_retains_nested_views_across_threads() {
+        let values = std::sync::Arc::new(vec![0.25; 12]);
+        let released = std::sync::Arc::downgrade(&values);
+        let pointer = values.as_ptr() as usize;
+        let data = SharedBuffer::from_owner(OwnedF32(AudioBuffer::from_arc_f32(values)));
+        assert_eq!(data.as_ptr() as usize, pointer);
+        let retained = data.slice(2..10).unwrap().slice(1..5).unwrap();
+        assert!(retained.slice(0..usize::MAX).is_err());
+        drop(data);
+        assert!(released.upgrade().is_some());
+        std::thread::spawn(move || {
+            assert_eq!(retained.as_ptr() as usize, pointer + 12);
+            assert_eq!(retained.as_slice(), &[0.25; 4]);
+        })
+        .join()
+        .unwrap();
+        assert!(released.upgrade().is_none());
+    }
+
+    #[test]
     fn test_fast_resample_creation() {
         let node = FastResampleNode::new(44100, 16000, ResampleQuality::Medium, 2);
         assert!(node.is_ok());

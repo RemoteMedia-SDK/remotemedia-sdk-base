@@ -26,6 +26,7 @@ mod tests {
         let mut buffer = pool.acquire();
         buffer.resize(128, 0.0);
         let pointer = buffer.as_ptr();
+        assert_eq!(pointer as usize % std::mem::align_of::<f32>(), 0);
         let mut output = remotemedia_types::BufferLoan::from_owner(buffer);
         output.fill(0.25);
         let published = output.freeze();
@@ -34,7 +35,7 @@ mod tests {
         drop(published);
         assert!(pool.is_empty());
         assert_eq!(retained.as_slice(), &[0.25; 4]);
-        drop(retained);
+        std::thread::spawn(move || drop(retained)).join().unwrap();
         assert_eq!(pool.acquire().as_ptr(), pointer);
     }
 
@@ -72,10 +73,11 @@ mod tests {
         let clone = samples.clone();
         assert_eq!(clone.as_ptr(), pointer);
         let slice = samples.into_shared().slice(1..127).unwrap();
+        assert!(slice.slice(usize::MAX..usize::MAX).is_err());
         drop(clone);
         assert!(pool.is_empty());
         assert_eq!(slice.as_slice(), &[0.5; 126]);
-        drop(slice);
+        std::thread::spawn(move || drop(slice)).join().unwrap();
         assert_eq!(pool.len(), 1);
         let reused = pool.acquire();
         assert_eq!(reused.as_ptr(), pointer);
