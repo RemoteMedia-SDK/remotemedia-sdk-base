@@ -65,9 +65,12 @@ impl CheckedSnapshot {
         }
         self.checks
             .check(&snapshot.value, &self.port, self.output)?;
-        if self.output {
+        if self.output && self.checks.contract.production != BufferProduction::PrivateStorage {
             Ok(Some(snapshot))
         } else {
+            // Retain credit on observed private publications, just as for input
+            // snapshots. The raw producer's unpublished/internal storage is not
+            // allocator-bound; this admission cannot bound those allocations.
             Ok(Some(Arc::new(TimestampedSnapshot {
                 value: self.checks.admit(snapshot.value.clone())?,
                 pts_us: snapshot.pts_us,

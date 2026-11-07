@@ -147,15 +147,25 @@ impl Checks {
         let captured = failure.clone();
         let guarded = Box::new(move |data: RuntimeData| {
             captured.result(Ok(()))?;
-            let result = checks
-                .check(&data, "", true)
-                .and_then(|()| callback(data.into_shared()));
+            let result = checks.output(data).and_then(&mut callback);
             if let Err(error) = &result {
                 *captured.0.lock().unwrap() = Some(error.to_string());
             }
             result
         });
         (guarded, failure)
+    }
+
+    fn output(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
+        self.check(&data, "", true)?;
+        // Private producers cannot reserve before their native allocation, but
+        // every returned/published view must retain credit before it escapes.
+        // Forwarded and allocator-owned outputs already carry their receipts.
+        if self.contract.production == BufferProduction::PrivateStorage {
+            self.admit(data)
+        } else {
+            Ok(data.into_shared())
+        }
     }
 }
 
@@ -235,8 +245,7 @@ impl BufferCheckedNode {
     }
 
     fn output(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
-        self.checks.check(&data, "", true)?;
-        Ok(data.into_shared())
+        self.checks.output(data)
     }
 
     fn finish<T>(&self, result: Result<T, Error>) -> Result<T, Error> {
