@@ -15,12 +15,17 @@ pub enum PythonExecutionMode {
     Multiprocess,
     /// Run in-process via PyO3 (Android, or opt-in on Linux/macOS)
     InProcess,
+    /// Explicit owning-buffer hooks with a call-selected output allocator.
+    InProcessShared,
 }
 
 impl PythonExecutionMode {
     /// Check if this is in-process mode
     pub fn is_inprocess(&self) -> bool {
-        matches!(self, PythonExecutionMode::InProcess)
+        matches!(
+            self,
+            PythonExecutionMode::InProcess | PythonExecutionMode::InProcessShared
+        )
     }
 
     /// Check if this is multiprocess mode
@@ -78,6 +83,13 @@ impl Default for PythonNodeConfig {
 }
 
 impl PythonNodeConfig {
+    /// Select synchronous `process_shared` / `process_streaming_shared` hooks.
+    /// Nodes must publish allocator-backed outputs; private arrays are rejected.
+    pub fn with_shared_buffers(mut self) -> Self {
+        self.execution_mode = PythonExecutionMode::InProcessShared;
+        self
+    }
+
     /// Create a new config with just the node type (python_class defaults to node_type)
     pub fn new(node_type: impl Into<String>) -> Self {
         let node_type = node_type.into();

@@ -254,6 +254,52 @@ impl InProcessExecutorBridge {
             node_handles: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    async fn loaded_node(
+        &self,
+        node_id: &str,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, PythonNodeHandle>> {
+        tokio::sync::RwLockReadGuard::try_map(self.node_handles.read().await, |handles| {
+            handles.get(node_id)
+        })
+        .map_err(|_| Error::Execution(format!("Python node not loaded: {node_id}")))
+    }
+
+    /// Execute the owning Python contract without a portable wire roundtrip.
+    pub async fn execute_shared(
+        &self,
+        node_id: &str,
+        input: RuntimeData,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData> {
+        let handle = self.loaded_node(node_id).await?;
+        handle.process_shared_with_ctx(input, ctx)
+    }
+
+    /// Deliver shared outputs incrementally; callback rejection stops Python.
+    pub async fn execute_streaming_shared<F>(
+        &self,
+        node_id: &str,
+        input: RuntimeData,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+        callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        let handle = self.loaded_node(node_id).await?;
+        handle.process_streaming_shared_with_ctx(input, ctx, callback)
+    }
+
+    /// Legacy Python conversions are not certified by a strict call context.
+    pub fn validate_legacy_context(ctx: &dyn crate::nodes::NodeRuntimeContextRead) -> Result<()> {
+        match ctx.copy_context() {
+            Some(context) if context.policy() == remotemedia_types::CopyPolicy::AllowCopies => Ok(()),
+            _ => Err(Error::Execution(
+                "Legacy in-process Python requires allow_copies; select shared-buffer execution for strict calls".into(),
+            )),
+        }
+    }
 }
 
 #[cfg(feature = "inprocess-python")]
@@ -273,10 +319,7 @@ impl ExecutorBridge for InProcessExecutorBridge {
         );
 
         // Get the Python node handle
-        let handles = self.node_handles.read().await;
-        let handle = handles
-            .get(node_id)
-            .ok_or_else(|| Error::Execution(format!("Python node not loaded: {}", node_id)))?;
+        let handle = self.loaded_node(node_id).await?;
 
         // Deserialize input data
         let runtime_data = data_transfer::from_bytes(&input_data)
@@ -355,10 +398,7 @@ impl ExecutorBridge for InProcessExecutorBridge {
         );
 
         // Get the Python node handle
-        let handles = self.node_handles.read().await;
-        let handle = handles
-            .get(node_id)
-            .ok_or_else(|| Error::Execution(format!("Python node not loaded: {}", node_id)))?;
+        let handle = self.loaded_node(node_id).await?;
 
         // Deserialize input data
         let runtime_data = data_transfer::from_bytes(&input_data)

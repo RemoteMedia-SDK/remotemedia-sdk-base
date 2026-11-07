@@ -29,6 +29,11 @@ futures.workspace = true
 # Auto-registration
 inventory.workspace = true
 
+[dev-dependencies]
+pyo3.workspace = true
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3" }
+remotemedia-shared-memory = { path = "../../../remotemedia-plugin-sdk/crates/shared-memory" }
+
 [features]
 default = ["multiprocess"]
 # Python multiprocess execution with iceoryx2 IPC (not available on Android/Sproot)

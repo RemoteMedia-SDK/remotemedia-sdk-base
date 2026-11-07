@@ -4,8 +4,11 @@
 //! via the PyO3 bridge, avoiding the overhead of multiprocess IPC.
 //!
 //! Requires the `inprocess` feature which enables PyO3 integration.
+#[cfg(test)]
+mod tests;
+
 use remotemedia_core::data::RuntimeData;
-use remotemedia_core::nodes::{AsyncStreamingNode, InitializeContextRead};
+use remotemedia_core::nodes::{AsyncStreamingNode, InitializeContextRead, NodeRuntimeContextRead};
 use remotemedia_core::python::multiprocess::data_transfer;
 use remotemedia_core::Error;
 use serde_json::Value;
@@ -22,7 +25,10 @@ pub struct InProcessPythonNode {
     node_type: String,
     python_class: String,
     params: Value,
-    executor: Mutex<Option<Box<dyn ExecutorBridge>>>,
+    executor: Mutex<Option<InProcessExecutorBridge>>,
+    shared_buffers: bool,
+    multi_output: bool,
+    session_id: Option<String>,
     control: Mutex<Option<Arc<remotemedia_core::transport::session_control::SessionControl>>>,
 }
 
@@ -36,6 +42,9 @@ impl InProcessPythonNode {
             python_class: python_class.to_string(),
             params: params.clone(),
             executor: Mutex::new(None),
+            shared_buffers: false,
+            multi_output: false,
+            session_id: None,
             control: Mutex::new(None),
         })
     }
@@ -45,9 +54,11 @@ impl InProcessPythonNode {
         node_id: String,
         python_class: &str,
         params: &Value,
-        _session_id: String,
+        session_id: String,
     ) -> Result<Self, Error> {
-        Self::new(node_id, python_class, params)
+        let mut node = Self::new(node_id, python_class, params)?;
+        node.session_id = Some(session_id);
+        Ok(node)
     }
 
     pub async fn ensure_initialized(&self) -> Result<(), Error> {
@@ -67,23 +78,37 @@ impl InProcessPythonNode {
                 bridge.set_control(Arc::clone(ctrl));
             }
 
-            // Create context for initialization
-            let _context = remotemedia_core::nodes::NodeContext {
-                node_id: self.node_id.clone(),
-                node_type: self.node_type.clone(),
-                params: self.params.clone(),
-                session_id: None, // In-process doesn't use sessions
-                metadata: std::collections::HashMap::new(),
-            };
-
             // Initialize the bridge using initialize_node
             bridge
                 .initialize_node(&self.node_id, &self.node_type, &self.params)
                 .await?;
 
-            *executor_guard = Some(Box::new(bridge));
+            *executor_guard = Some(bridge);
         }
         Ok(())
+    }
+
+    fn validate_call(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<(), Error> {
+        if ctx.node_id() != self.node_id
+            || self
+                .session_id
+                .as_deref()
+                .is_some_and(|id| id != ctx.session_id())
+        {
+            return Err(Error::Execution(
+                "In-process Python call identity mismatch".into(),
+            ));
+        }
+        if self.shared_buffers {
+            if ctx.output_allocator().is_none() {
+                return Err(Error::Execution(
+                    "Shared in-process Python requires an output allocator".into(),
+                ));
+            }
+            Ok(())
+        } else {
+            InProcessExecutorBridge::validate_legacy_context(ctx)
+        }
     }
 }
 
@@ -108,6 +133,11 @@ impl AsyncStreamingNode for InProcessPythonNode {
     }
 
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
+        if self.shared_buffers {
+            return Err(Error::Execution(
+                "Shared in-process Python requires a runtime context".into(),
+            ));
+        }
         self.ensure_initialized().await?;
 
         let executor_guard = self.executor.lock().await;
@@ -133,6 +163,52 @@ impl AsyncStreamingNode for InProcessPythonNode {
         Ok(output)
     }
 
+    async fn process_with_ctx(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        self.validate_call(ctx)?;
+        if !self.shared_buffers {
+            return self.process(data).await;
+        }
+        self.ensure_initialized().await?;
+        let guard = self.executor.lock().await;
+        let executor = guard
+            .as_ref()
+            .ok_or_else(|| Error::Execution("Python executor unavailable".into()))?;
+        executor.execute_shared(&self.node_id, data, ctx).await
+    }
+
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+        mut callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        self.validate_call(ctx)?;
+        if !self.shared_buffers {
+            return self
+                .process_streaming(data, Some(ctx.session_id().to_owned()), callback)
+                .await;
+        }
+        if !self.multi_output {
+            callback(self.process_with_ctx(data, ctx).await?)?;
+            return Ok(1);
+        }
+        self.ensure_initialized().await?;
+        let guard = self.executor.lock().await;
+        let executor = guard
+            .as_ref()
+            .ok_or_else(|| Error::Execution("Python executor unavailable".into()))?;
+        executor
+            .execute_streaming_shared(&self.node_id, data, ctx, callback)
+            .await
+    }
+
     async fn process_streaming<F>(
         &self,
         data: RuntimeData,
@@ -142,6 +218,11 @@ impl AsyncStreamingNode for InProcessPythonNode {
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
+        if self.shared_buffers {
+            return Err(Error::Execution(
+                "Shared in-process Python requires a runtime context".into(),
+            ));
+        }
         self.ensure_initialized().await?;
 
         let executor_guard = self.executor.lock().await;
@@ -195,11 +276,14 @@ impl remotemedia_core::nodes::StreamingNodeFactory for DynamicInProcessPythonNod
         params: &Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn remotemedia_core::nodes::StreamingNode>, Error> {
-        let node = if let Some(sid) = session_id {
+        let mut node = if let Some(sid) = session_id {
             InProcessPythonNode::with_session(node_id, &self.config.python_class, params, sid)?
         } else {
             InProcessPythonNode::new(node_id, &self.config.python_class, params)?
         };
+        node.shared_buffers =
+            self.config.execution_mode == crate::registry::PythonExecutionMode::InProcessShared;
+        node.multi_output = self.config.is_multi_output;
         Ok(Box::new(remotemedia_core::nodes::AsyncNodeWrapper(
             Arc::new(node),
         )))
