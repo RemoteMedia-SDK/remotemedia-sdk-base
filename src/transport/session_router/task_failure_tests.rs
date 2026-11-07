@@ -185,6 +185,7 @@ struct ChildOwningNode {
     main: PanickingNode,
     lanes_started: [Arc<Notify>; 3],
     failing_lane: Option<usize>,
+    returned_error: bool,
     lane_release: Arc<Notify>,
     payload: remotemedia_types::SharedBuffer<u8>,
     dropped: Arc<AtomicBool>,
@@ -195,6 +196,9 @@ impl ChildOwningNode {
         self.lanes_started[lane].notify_one();
         if self.failing_lane == Some(lane) {
             self.lane_release.notified().await;
+            if self.returned_error {
+                return Err(Error::Execution("child lane returned error sentinel".into()));
+            }
             panic!("child lane panic sentinel");
         }
         std::future::pending().await
@@ -301,6 +305,20 @@ async fn pacer_panic_joins_children_with_suspended_main() {
 }
 
 async fn exercise_owned_failure(failing_lane: Option<usize>, active_main: bool) {
+    exercise_owned_failure_kind(failing_lane, active_main, false).await;
+}
+
+#[tokio::test]
+async fn pacer_returned_error_joins_children_with_idle_main() {
+    exercise_owned_failure_kind(Some(1), false, true).await;
+}
+
+#[tokio::test]
+async fn pacer_returned_error_joins_children_with_suspended_main() {
+    exercise_owned_failure_kind(Some(1), true, true).await;
+}
+
+async fn exercise_owned_failure_kind(failing_lane: Option<usize>, active_main: bool, returned_error: bool) {
     let manifest = create_test_manifest(vec![("bad", "ChildOwningNode")], vec![]);
     let (output, _unread) = ClientOutputRouter::new(1);
     let (mut router, _keep_shutdown_open) = SessionRouter::new(
@@ -329,6 +347,7 @@ async fn exercise_owned_failure(failing_lane: Option<usize>, active_main: bool) 
             },
             lanes_started: lanes_started.clone(),
             failing_lane,
+            returned_error,
             lane_release: lane_release.clone(),
             payload: retained.clone(),
             dropped: dropped.clone(),
@@ -379,7 +398,9 @@ async fn exercise_owned_failure(failing_lane: Option<usize>, active_main: bool) 
         panic!("child failure did not terminate the session");
     }
     let error = result.unwrap().unwrap().unwrap_err().to_string();
-    let sentinel = if failing_lane.is_some() {
+    let sentinel = if returned_error {
+        "child lane returned error sentinel"
+    } else if failing_lane.is_some() {
         "child lane panic sentinel"
     } else {
         "active task panic sentinel"
