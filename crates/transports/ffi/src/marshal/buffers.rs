@@ -19,6 +19,32 @@ pub(super) fn metadata_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<
     serde_json::from_str(&encoded).map_err(value_error)
 }
 
+/// Metadata is plain JSON. Reserved compatibility-codec keys are literal here;
+/// loading JSON also preserves u64 integers without a float intermediate.
+pub(super) fn metadata_to_python<'py>(
+    py: Python<'py>,
+    value: &Value,
+) -> PyResult<Bound<'py, PyAny>> {
+    let encoded = serde_json::to_string(value).map_err(value_error)?;
+    py.import("json")?.call_method1("loads", (encoded,))
+}
+
+pub(super) fn control(py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<RuntimeData> {
+    let mut fields = metadata_json(py, dict.as_any())?;
+    fields
+        .as_object_mut()
+        .ok_or_else(|| value_error("control fields must be an object"))?
+        .remove("type");
+    let envelope = Value::Object(serde_json::Map::from_iter([(
+        "ControlMessage".into(),
+        fields,
+    )]));
+    let metadata: RuntimeMetadata = serde_json::from_value(envelope).map_err(value_error)?;
+    metadata
+        .attach(PayloadStorage::None, TensorEncoding::Runtime)
+        .map_err(value_error)
+}
+
 fn bulk_kind(kind: &str) -> Option<(&'static str, &'static str)> {
     match kind {
         "audio" => Some(("Audio", "samples")),
@@ -91,7 +117,7 @@ pub(super) fn export(
         .as_object()
         .and_then(|map| map.values().next())
         .ok_or_else(|| value_error("bulk metadata is not an object"))?;
-    let dict = json_to_python(py, fields)?.cast_into::<PyDict>()?;
+    let dict = metadata_to_python(py, fields)?.cast_into::<PyDict>()?;
     dict.set_item("type", data.data_type())?;
     dict.set_item(field, view)?;
     if let RuntimeData::Image { format, .. } = data {

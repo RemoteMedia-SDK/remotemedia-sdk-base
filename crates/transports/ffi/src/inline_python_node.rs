@@ -479,6 +479,7 @@ fn string_types_to_runtime(types: &[String]) -> Vec<RuntimeDataType> {
             "binary" | "bytes" => Some(RuntimeDataType::Binary),
             "tensor" => Some(RuntimeDataType::Tensor),
             "numpy" => Some(RuntimeDataType::Numpy),
+            "control_message" => Some(RuntimeDataType::ControlMessage),
             _ => None,
         })
         .collect()

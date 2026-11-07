@@ -231,6 +231,32 @@ binding checks use `--no-default-features --features python`; its benchmark
 library dependency no longer silently re-enables core defaults. Optional codec
 features still need their normal FFmpeg/toolchain setup.
 
+### Control messages and literal metadata
+
+Python FFI accepts and returns canonical control dictionaries, for example:
+
+```python
+control = {
+    "type": "control_message",
+    "message_type": {"type": "CancelSpeculation", "from_timestamp": 10, "to_timestamp": 20},
+    "segment_id": "segment-1",
+    "timestamp_ms": 123,
+    "metadata": {"reason": "replacement"},
+}
+await session.send_input(control, require_zero_copy=True)
+```
+
+`BatchHint` carries `suggested_batch_size`; `DeadlineWarning` carries `deadline_us`.
+The shared metadata schema validates fields and integer ranges; malformed controls
+raise errors instead of becoming ordinary JSON data. Inline node declarations can
+use `"control_message"` in their accepted/produced types.
+
+Control and media metadata remain plain JSON, including literal `__numpy__` and
+`__pickled__` keys. They never invoke compatibility payload codecs. Integer fields
+retain their full unsigned range, and Python buffer/ndarray objects inside control
+metadata reject rather than being packed. Control headers and metadata are still
+serialized; the zero-copy guarantee concerns supported bulk payload storage.
+
 ### NumPy inside compatibility JSON
 
 With `native-numpy` enabled, nested arrays in compatibility JSON use a packed

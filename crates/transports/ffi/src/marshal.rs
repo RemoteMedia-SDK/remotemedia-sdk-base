@@ -17,6 +17,9 @@ mod buffer_tests;
 mod buffers;
 pub(crate) use buffers::storage::{materialize, view as payload_view};
 #[cfg(test)]
+#[path = "marshal/control_tests.rs"]
+mod control_tests;
+#[cfg(test)]
 #[path = "marshal/json_tests.rs"]
 mod json_tests;
 use serde_json::Value;
@@ -478,14 +481,20 @@ pub fn runtime_data_to_python_with_context(
     match data {
         RuntimeData::Text(s) => Ok(s.into_py_any(py)?),
         RuntimeData::Json(v) => json_runtime_output(py, v, context),
-        RuntimeData::ControlMessage { .. } => {
-            // Control message not fully supported yet
+        RuntimeData::ControlMessage {
+            message_type,
+            segment_id,
+            timestamp_ms,
+            metadata,
+        } => {
             let dict = PyDict::new(py);
             dict.set_item("type", "control_message")?;
-            dict.set_item(
-                "note",
-                "Control message data not fully supported in FFI yet",
-            )?;
+            let kind = serde_json::to_value(message_type)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            dict.set_item("message_type", buffers::metadata_to_python(py, &kind)?)?;
+            dict.set_item("segment_id", segment_id)?;
+            dict.set_item("timestamp_ms", timestamp_ms)?;
+            dict.set_item("metadata", buffers::metadata_to_python(py, metadata)?)?;
             Ok(dict.into())
         }
         RuntimeData::File {
@@ -568,6 +577,7 @@ pub fn python_to_runtime_data_with_context(
         if let Ok(Some(type_val)) = dict.get_item("type") {
             let type_str: String = type_val.extract()?;
             match type_str.as_str() {
+                "control_message" => return buffers::control(py, dict),
                 "text" => {
                     let data: String = dict
                         .get_item("data")?
