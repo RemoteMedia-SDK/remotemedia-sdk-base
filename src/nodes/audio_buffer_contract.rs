@@ -1,4 +1,4 @@
-//! Opt-in bounds for built-in DSP whose contextual hooks retain or allocate owners.
+//! Opt-in bounds for built-in audio nodes that retain or allocate owners.
 //! Executor buffer preflight binds and enforces these declarations. The raw node
 //! API is not a budget/validation boundary; omitting limits leaves support unknown.
 use crate::{Error, Result};

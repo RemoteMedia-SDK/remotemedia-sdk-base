@@ -646,6 +646,27 @@ impl StreamingNodeFactory for SyntheticLipSyncNodeFactory {
 pub(crate) struct AudioFileWriterNodeFactory;
 
 impl StreamingNodeFactory for AudioFileWriterNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        let Some(mut contract) = super::audio_buffer_contract::from_params(params)? else {
+            return Ok(None);
+        };
+        if !cfg!(target_endian = "little") {
+            return Err(Error::ConfigError(
+                "AudioFileWriterNode direct WAV output requires little-endian samples".into(),
+            ));
+        }
+        if contract.outputs[""].max_payload_bytes < contract.inputs[""].max_payload_bytes {
+            return Err(Error::ConfigError(
+                "AudioFileWriterNode buffer_limits output bound must cover its input bound".into(),
+            ));
+        }
+        contract.production = remotemedia_traits::buffer_contract::BufferProduction::ForwardInput;
+        Ok(Some(contract))
+    }
+
     fn create(
         &self,
         _node_id: String,
@@ -654,6 +675,7 @@ impl StreamingNodeFactory for AudioFileWriterNodeFactory {
     ) -> Result<Box<dyn StreamingNode>, Error> {
         use crate::nodes::file_sink::{AudioFileWriterConfig, AudioFileWriterNode};
         use std::path::PathBuf;
+        self.try_buffer_contract(params)?;
         let output_path = params
             .get("output_path")
             .and_then(|v| v.as_str())
@@ -687,6 +709,14 @@ impl StreamingNodeFactory for AudioFileWriterNodeFactory {
                 .category("io")
                 .accepts([RuntimeDataType::Audio])
                 .produces([RuntimeDataType::Audio])
+                .config_schema(serde_json::json!({
+                    "type": "object",
+                    "required": ["output_path"],
+                    "properties": {
+                        "output_path": {"type": "string", "description": "Target WAV file; created on first audio input."},
+                        "buffer_limits": super::audio_buffer_contract::schema()
+                    }
+                }))
                 .capabilities(NodeCapabilitiesSchema {
                     parallelizable: false,
                     batch_aware: false,
