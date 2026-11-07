@@ -201,7 +201,7 @@ impl VideoFormatConverterBackend for FFmpegFormatConverter {
         }
 
         Ok(RuntimeData::Video {
-            pixel_data: converted_pixel_data,
+            pixel_data: converted_pixel_data.into(),
             width,
             height,
             format: self.config.target_format,
@@ -304,18 +304,13 @@ mod tests {
             ..Default::default()
         };
 
-        let converter = VideoFormatConverterNode::new(config);
-        if converter.is_err() {
-            return;
-        }
-
-        let converter = converter.unwrap();
+        let converter = VideoFormatConverterNode::new(config).unwrap();
 
         // Create YUV420P frame
         let width = 640u32;
         let height = 480u32;
         let frame_size = (width * height * 3 / 2) as usize;
-        let pixel_data = vec![128u8; frame_size];
+        let pixel_data: remotemedia_types::SharedBytes = vec![128u8; frame_size].into();
 
         let input_frame = RuntimeData::Video {
             pixel_data: pixel_data.clone(),
@@ -331,21 +326,17 @@ mod tests {
         };
 
         // Convert to same format (should be no-op)
-        let result = converter.process(input_frame).await;
-
-        match result {
-            Ok(RuntimeData::Video {
-                format: PixelFormat::Yuv420p,
-                pixel_data: out_data,
-                ..
-            }) => {
-                // Should return same data
-                assert_eq!(out_data.len(), pixel_data.len());
-            }
-            Err(_) => {
-                // May fail if FFmpeg not available
-            }
-            _ => panic!("Expected YUV420P video frame"),
-        }
+        let RuntimeData::Video {
+            format,
+            pixel_data: output,
+            ..
+        } = converter.process(input_frame).await.unwrap()
+        else {
+            panic!("Expected video frame")
+        };
+        assert_eq!(format, PixelFormat::Yuv420p);
+        assert_eq!(output.as_ptr(), pixel_data.as_ptr());
+        assert!(output.shares_storage(&pixel_data));
+        assert_eq!(output.as_slice(), pixel_data.as_slice());
     }
 }

@@ -245,7 +245,7 @@ impl VideoScalerBackend for FFmpegScaler {
         }
 
         Ok(RuntimeData::Video {
-            pixel_data: scaled_pixel_data,
+            pixel_data: scaled_pixel_data.into(),
             width: target_width,
             height: target_height,
             format,
@@ -351,7 +351,7 @@ mod tests {
         let pixel_data = vec![128u8; frame_size];
 
         let input_frame = RuntimeData::Video {
-            pixel_data,
+            pixel_data: pixel_data.into(),
             width: src_width,
             height: src_height,
             format: PixelFormat::Yuv420p,
@@ -410,7 +410,7 @@ mod tests {
         let pixel_data = vec![128u8; frame_size];
 
         let input_frame = RuntimeData::Video {
-            pixel_data,
+            pixel_data: pixel_data.into(),
             width: src_width,
             height: src_height,
             format: PixelFormat::Yuv420p,

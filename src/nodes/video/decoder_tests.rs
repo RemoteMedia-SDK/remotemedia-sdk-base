@@ -42,7 +42,7 @@ mod tests {
         if let Ok(decoder) = VideoDecoderNode::new(config) {
             // Test 1: Reject raw frames (codec=None)
             let raw_frame = RuntimeData::Video {
-                pixel_data: vec![128u8; 1_382_400], // 720p YUV
+                pixel_data: vec![128u8; 1_382_400].into(), // 720p YUV
                 width: 1280,
                 height: 720,
                 format: PixelFormat::Yuv420p,
@@ -84,7 +84,7 @@ mod tests {
         if let Ok(decoder) = VideoDecoderNode::new(config) {
             // Create corrupted encoded frame (invalid bitstream)
             let corrupted_frame = RuntimeData::Video {
-                pixel_data: vec![0xFF; 100], // Invalid VP8 data
+                pixel_data: vec![0xFF; 100].into(), // Invalid VP8 data
                 width: 1280,
                 height: 720,
                 format: PixelFormat::Encoded,
@@ -129,7 +129,7 @@ mod tests {
         if let Ok(decoder) = VideoDecoderNode::new(config) {
             // Create corrupted encoded frame
             let corrupted_frame = RuntimeData::Video {
-                pixel_data: vec![0xFF; 100],
+                pixel_data: vec![0xFF; 100].into(),
                 width: 1280,
                 height: 720,
                 format: PixelFormat::Encoded,
@@ -171,7 +171,7 @@ mod tests {
             // Create mock H.264 encoded frame
             // Note: This is not valid H.264 bitstream, so decoder may return empty frame
             let encoded_frame = RuntimeData::Video {
-                pixel_data: vec![0x00, 0x00, 0x01, 0x67], // NAL start code + SPS
+                pixel_data: vec![0x00, 0x00, 0x01, 0x67].into(), // NAL start code + SPS
                 width: 1280,
                 height: 720,
                 format: PixelFormat::Encoded,
@@ -213,7 +213,7 @@ mod tests {
             // Create mock AV1 encoded frame
             // Note: This is not valid AV1 bitstream, so decoder may return empty frame
             let encoded_frame = RuntimeData::Video {
-                pixel_data: vec![0x12, 0x00, 0x0A, 0x0A], // OBU header
+                pixel_data: vec![0x12, 0x00, 0x0A, 0x0A].into(), // OBU header
                 width: 1280,
                 height: 720,
                 format: PixelFormat::Encoded,

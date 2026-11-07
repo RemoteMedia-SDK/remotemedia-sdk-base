@@ -43,7 +43,7 @@ mod tests {
         if let Ok(encoder) = VideoEncoderNode::new(config) {
             // Test 1: Reject already-encoded frames
             let encoded_frame = RuntimeData::Video {
-                pixel_data: vec![0u8; 1000],
+                pixel_data: vec![0u8; 1000].into(),
                 width: 1280,
                 height: 720,
                 format: PixelFormat::Encoded,
@@ -87,7 +87,7 @@ mod tests {
             let pixel_data = vec![128u8; frame_size]; // Gray frame
 
             let raw_frame = RuntimeData::Video {
-                pixel_data,
+                pixel_data: pixel_data.into(),
                 width,
                 height,
                 format: PixelFormat::Yuv420p,
@@ -154,7 +154,7 @@ mod tests {
             let pixel_data = vec![128u8; frame_size];
 
             let raw_frame = RuntimeData::Video {
-                pixel_data,
+                pixel_data: pixel_data.into(),
                 width,
                 height,
                 format: PixelFormat::Yuv420p,
@@ -221,7 +221,7 @@ mod tests {
             }
 
             let raw_frame = RuntimeData::Video {
-                pixel_data,
+                pixel_data: pixel_data.into(),
                 width,
                 height,
                 format: PixelFormat::Rgb24,
@@ -272,7 +272,7 @@ mod tests {
             // RGB24 expects W*H*3 = 12_288 bytes. Send YUV-sized buffer instead.
             let undersized = vec![0u8; (width * height * 3 / 2) as usize];
             let bad_frame = RuntimeData::Video {
-                pixel_data: undersized,
+                pixel_data: undersized.into(),
                 width,
                 height,
                 format: PixelFormat::Rgb24,
@@ -311,7 +311,7 @@ mod tests {
             let pixel_data = vec![128u8; frame_size];
 
             let raw_frame = RuntimeData::Video {
-                pixel_data,
+                pixel_data: pixel_data.into(),
                 width,
                 height,
                 format: PixelFormat::Yuv420p,

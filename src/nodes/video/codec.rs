@@ -178,7 +178,7 @@ impl VideoEncoderBackend for FFmpegEncoder {
         // (the Y4M sink worked because it converts RGB→YUV itself).
         let y_size = (width * height) as usize;
         let uv_size = ((width / 2) * (height / 2)) as usize;
-        let yuv_buffer: Vec<u8> = match format {
+        let yuv_buffer: remotemedia_types::SharedBytes = match format {
             PixelFormat::Yuv420p | PixelFormat::I420 => {
                 let expected = y_size + 2 * uv_size;
                 if pixel_data.len() != expected {
@@ -204,6 +204,7 @@ impl VideoEncoderBackend for FFmpegEncoder {
                     )));
                 }
                 crate::data::video::rgb24_to_yuv420p(&pixel_data, width as usize, height as usize)
+                    .into()
             }
             PixelFormat::Rgba32 => {
                 let expected = (width * height * 4) as usize;
@@ -217,6 +218,7 @@ impl VideoEncoderBackend for FFmpegEncoder {
                     )));
                 }
                 crate::data::video::rgba32_to_yuv420p(&pixel_data, width as usize, height as usize)
+                    .into()
             }
             PixelFormat::NV12 => {
                 return Err(CodecError::InvalidInput(
@@ -410,7 +412,7 @@ impl VideoEncoderBackend for FFmpegEncoder {
         self.frame_count += 1;
 
         Ok(RuntimeData::Video {
-            pixel_data: bitstream,
+            pixel_data: bitstream.into(),
             width,
             height,
             format: PixelFormat::Encoded,
@@ -545,7 +547,7 @@ impl VideoDecoderBackend for FFmpegDecoder {
             }
 
             Ok(RuntimeData::Video {
-                pixel_data: decoded_pixel_data,
+                pixel_data: decoded_pixel_data.into(),
                 width: frame.width() as u32,
                 height: frame.height() as u32,
                 format: self.config.output_format,
@@ -560,7 +562,7 @@ impl VideoDecoderBackend for FFmpegDecoder {
             // No frame available yet (decoder may need more packets)
             // Return empty frame to indicate no output
             Ok(RuntimeData::Video {
-                pixel_data: vec![],
+                pixel_data: Vec::new().into(),
                 width: 0,
                 height: 0,
                 format: PixelFormat::Unspecified,

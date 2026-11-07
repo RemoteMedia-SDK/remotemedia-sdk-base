@@ -135,7 +135,7 @@ impl AsyncStreamingNode for VideoDecoderNode {
             Err(e) if self.config.error_resilience == "lenient" => {
                 warn!("Dropped corrupted frame: {}", e);
                 Ok(RuntimeData::Video {
-                    pixel_data: vec![],
+                    pixel_data: Vec::new().into(),
                     width: 0,
                     height: 0,
                     format: PixelFormat::Unspecified,
