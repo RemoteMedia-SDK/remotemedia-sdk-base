@@ -36,7 +36,9 @@ impl StreamingNodeFactory for DynamicPythonNodeFactory {
         params: &Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        if self.config.shared_buffer_contract.is_some() {
+        if self.config.shared_buffer_contract.is_some()
+            || self.config.shared_source_rate_hz.is_some()
+        {
             return Err(Error::ConfigError(
                 "in-process shared buffer declarations cannot use the legacy multiprocess factory"
                     .into(),

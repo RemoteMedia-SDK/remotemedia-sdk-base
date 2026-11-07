@@ -68,6 +68,10 @@ pub struct PythonNodeConfig {
     /// Authored bounds for the explicit in-process owning-buffer adapter.
     /// None leaves strict preflight unsupported; types alone imply no bounds.
     pub shared_buffer_contract: Option<remotemedia_traits::buffer_contract::BufferContract>,
+    /// Explicit wall-clock source rate for the owning `tick_shared(tick, ctx)` hook.
+    /// Range is 1..=1_000_000 Hz (the pacer's microsecond resolution).
+    /// None keeps input-driven execution.
+    pub shared_source_rate_hz: Option<u32>,
 }
 
 impl Default for PythonNodeConfig {
@@ -83,11 +87,19 @@ impl Default for PythonNodeConfig {
             produces: Vec::new(),
             execution_mode: PythonExecutionMode::default(),
             shared_buffer_contract: None,
+            shared_source_rate_hz: None,
         }
     }
 }
 
 impl PythonNodeConfig {
+    /// Select owning source execution. Each tick returns an iterable of published
+    /// outputs; an empty iterable is a quiet tick, not end-of-stream.
+    pub fn with_shared_source(mut self, rate_hz: u32) -> Self {
+        self.shared_source_rate_hz = Some(rate_hz);
+        self.with_shared_buffers()
+    }
+
     /// Select owning-buffer execution and declare its bounded runtime contract.
     /// Preflight and runtime guards validate this promise before/during execution.
     pub fn with_shared_buffer_contract(

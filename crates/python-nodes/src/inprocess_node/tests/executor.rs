@@ -8,6 +8,7 @@ use std::time::Duration;
 
 #[cfg(any(windows, target_os = "linux"))]
 mod mapped;
+mod source;
 
 #[tokio::test]
 async fn metadata_only_python_node_needs_no_bulk_budget_or_allocation_code() {

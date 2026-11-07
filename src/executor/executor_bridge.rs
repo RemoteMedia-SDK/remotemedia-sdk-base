@@ -291,6 +291,22 @@ impl InProcessExecutorBridge {
         handle.process_streaming_shared_with_ctx(input, ctx, callback)
     }
 
+    /// Execute a paced owning source with the current call's allocator and identity.
+    pub async fn execute_tick_shared<F>(
+        &self,
+        node_id: &str,
+        tick: crate::nodes::Tick,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+        callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        self.loaded_node(node_id)
+            .await?
+            .tick_shared_with_ctx(tick, ctx, callback)
+    }
+
     /// Legacy Python conversions are not certified by a strict call context.
     pub fn validate_legacy_context(ctx: &dyn crate::nodes::NodeRuntimeContextRead) -> Result<()> {
         match ctx.copy_context() {

@@ -10,6 +10,14 @@ pub(super) fn protocol() -> BufferProtocol {
 }
 
 pub(super) fn inspect(config: &PythonNodeConfig) -> Result<Option<BufferContract>, Error> {
+    if config.shared_source_rate_hz.is_some()
+        && (!matches!(config.shared_source_rate_hz, Some(1..=1_000_000))
+            || config.execution_mode != PythonExecutionMode::InProcessShared)
+    {
+        return Err(Error::ConfigError(
+            "shared Python sources require 1..=1000000 Hz and owning in-process execution".into(),
+        ));
+    }
     let Some(contract) = &config.shared_buffer_contract else {
         return Ok(None);
     };

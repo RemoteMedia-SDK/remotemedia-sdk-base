@@ -29,6 +29,7 @@ pub struct InProcessPythonNode {
     executor: Mutex<Option<InProcessExecutorBridge>>,
     shared_buffers: bool,
     multi_output: bool,
+    source_rate_hz: Option<u32>,
     session_id: Option<String>,
     control: Mutex<Option<Arc<remotemedia_core::transport::session_control::SessionControl>>>,
 }
@@ -45,6 +46,7 @@ impl InProcessPythonNode {
             executor: Mutex::new(None),
             shared_buffers: false,
             multi_output: false,
+            source_rate_hz: None,
             session_id: None,
             control: Mutex::new(None),
         })
@@ -89,6 +91,14 @@ impl InProcessPythonNode {
         Ok(())
     }
 
+    async fn initialized_executor(
+        &self,
+    ) -> Result<tokio::sync::MappedMutexGuard<'_, InProcessExecutorBridge>, Error> {
+        self.ensure_initialized().await?;
+        tokio::sync::MutexGuard::try_map(self.executor.lock().await, Option::as_mut)
+            .map_err(|_| Error::Execution("Python executor unavailable".into()))
+    }
+
     fn validate_call(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<(), Error> {
         if ctx.node_id() != self.node_id
             || self
@@ -116,6 +126,44 @@ impl InProcessPythonNode {
 #[cfg(feature = "inprocess")]
 #[async_trait::async_trait]
 impl AsyncStreamingNode for InProcessPythonNode {
+    fn pacing_nature(&self) -> remotemedia_traits::streaming::PacingNature {
+        self.source_rate_hz.map_or(
+            remotemedia_traits::streaming::PacingNature::Reactive,
+            remotemedia_traits::streaming::PacingNature::SourceWall,
+        )
+    }
+
+    async fn tick_with_ctx(
+        &self,
+        tick: remotemedia_traits::streaming::Tick,
+        ctx: &dyn NodeRuntimeContextRead,
+        callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
+    ) -> Result<(), Error> {
+        if self.source_rate_hz.is_none() {
+            return Ok(());
+        }
+        self.validate_call(ctx)?;
+        let executor = self.initialized_executor().await?;
+        executor
+            .execute_tick_shared(&self.node_id, tick, ctx, callback)
+            .await?;
+        Ok(())
+    }
+
+    async fn tick(
+        &self,
+        _tick: remotemedia_traits::streaming::Tick,
+        _session_id: Option<String>,
+        _callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
+    ) -> Result<(), Error> {
+        if self.source_rate_hz.is_some() {
+            return Err(Error::Execution(
+                "Shared Python source requires a runtime context".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn node_type(&self) -> &str {
         &self.node_type
     }
@@ -173,11 +221,7 @@ impl AsyncStreamingNode for InProcessPythonNode {
         if !self.shared_buffers {
             return self.process(data).await;
         }
-        self.ensure_initialized().await?;
-        let guard = self.executor.lock().await;
-        let executor = guard
-            .as_ref()
-            .ok_or_else(|| Error::Execution("Python executor unavailable".into()))?;
+        let executor = self.initialized_executor().await?;
         executor.execute_shared(&self.node_id, data, ctx).await
     }
 
@@ -200,11 +244,7 @@ impl AsyncStreamingNode for InProcessPythonNode {
             callback(self.process_with_ctx(data, ctx).await?)?;
             return Ok(1);
         }
-        self.ensure_initialized().await?;
-        let guard = self.executor.lock().await;
-        let executor = guard
-            .as_ref()
-            .ok_or_else(|| Error::Execution("Python executor unavailable".into()))?;
+        let executor = self.initialized_executor().await?;
         executor
             .execute_streaming_shared(&self.node_id, data, ctx, callback)
             .await
@@ -301,6 +341,7 @@ impl remotemedia_core::nodes::StreamingNodeFactory for DynamicInProcessPythonNod
         node.shared_buffers =
             self.config.execution_mode == crate::registry::PythonExecutionMode::InProcessShared;
         node.multi_output = self.config.is_multi_output;
+        node.source_rate_hz = self.config.shared_source_rate_hz;
         Ok(Box::new(remotemedia_core::nodes::AsyncNodeWrapper(
             Arc::new(node),
         )))
