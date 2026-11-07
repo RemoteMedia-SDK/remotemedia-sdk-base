@@ -280,6 +280,9 @@ impl SessionHandle {
         let audio = self.output_audio_rx.as_mut();
         let video = self.output_video_rx.as_mut();
         let data = self.output_data_rx.as_mut();
+        let has_audio = audio.is_some();
+        let has_video = video.is_some();
+        let has_data = data.is_some();
         if audio.is_none() && video.is_none() && data.is_none() {
             return Ok(None);
         }
@@ -305,10 +308,14 @@ impl SessionHandle {
             }
         };
         tokio::pin!(audio_fut, video_fut, data_fut);
+        // A closed kind is not session EOF: other kinds may still be producing
+        // or have buffered owners. Pattern mismatch disables that closed arm for
+        // this receive; `else` runs only after every present kind is exhausted.
         tokio::select! {
-            v = &mut audio_fut => Ok(v.map(TransportData::new)),
-            v = &mut video_fut => Ok(v.map(TransportData::new)),
-            v = &mut data_fut => Ok(v.map(TransportData::new)),
+            Some(v) = &mut audio_fut, if has_audio => Ok(Some(TransportData::new(v))),
+            Some(v) = &mut video_fut, if has_video => Ok(Some(TransportData::new(v))),
+            Some(v) = &mut data_fut, if has_data => Ok(Some(TransportData::new(v))),
+            else => Ok(None),
         }
     }
 
@@ -1589,6 +1596,8 @@ impl Default for PipelineExecutor {
 mod tests {
     use super::*;
     use crate::manifest::{Connection, ManifestMetadata, NodeManifest};
+
+    mod output_drain;
 
     fn create_test_manifest() -> Manifest {
         Manifest {
