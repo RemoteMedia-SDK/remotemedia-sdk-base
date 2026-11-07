@@ -431,29 +431,36 @@ fn json_runtime_output(py: Python<'_>, v: &Value, context: &CopyContext) -> PyRe
     dict.set_item("type", "json")?;
 
     let metadata_dict = PyDict::new(py);
-    let mut has_metadata = false;
+    if let Some(obj) = v.as_object() {
+        for (key, value) in obj
+            .iter()
+            .filter(|(key, _)| key.starts_with("participant."))
+        {
+            if let Some(text) = value.as_str() {
+                metadata_dict.set_item(key, text)?;
+            }
+        }
+    }
     let value = if let Some(obj) = v.as_object().filter(|obj| {
-        !obj.contains_key("__numpy__")
-            && !obj.contains_key("__pickled__")
-            && !obj.contains_key("__pyobj__")
+        let numpy = cfg!(feature = "native-numpy")
+            && obj.get("__numpy__").and_then(Value::as_bool) == Some(true);
+        let pickle = obj.get("__pickled__").and_then(Value::as_bool) == Some(true)
+            && obj.get("data").and_then(Value::as_str).is_some();
+        !numpy && !pickle
     }) {
         let fields = PyDict::new(py);
-        for (key, value) in obj {
-            if key.starts_with("participant.") {
-                if let Some(text) = value.as_str() {
-                    metadata_dict.set_item(key, text)?;
-                    has_metadata = true;
-                }
-            } else {
-                fields.set_item(key, json_to_python_with_context(py, value, None, context)?)?;
-            }
+        for (key, value) in obj
+            .iter()
+            .filter(|(key, _)| !key.starts_with("participant."))
+        {
+            fields.set_item(key, json_to_python_with_context(py, value, None, context)?)?;
         }
         fields.into_any()
     } else {
         json_to_python_with_context(py, v, None, context)?
     };
     dict.set_item("value", value)?;
-    if has_metadata {
+    if !metadata_dict.is_empty() {
         dict.set_item("metadata", metadata_dict)?;
     }
     Ok(dict.into())

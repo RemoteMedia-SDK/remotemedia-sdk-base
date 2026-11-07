@@ -160,6 +160,23 @@ fn recursive_json_and_runtime_export_keep_copy_context() {
             counts(&allow, CopyReason::PortableDeserialization).copied_bytes,
             4
         );
+        let mut envelope = match &data {
+            RuntimeData::Json(value) => value["nested"][0].clone(),
+            _ => unreachable!(),
+        };
+        envelope["participant.id"] = Value::String("outer-peer".into());
+        let root =
+            runtime_data_to_python_with_context(py, &RuntimeData::Json(envelope), &allow).unwrap();
+        assert_eq!(
+            root.bind(py)
+                .get_item("metadata")
+                .unwrap()
+                .get_item("participant.id")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "outer-peer"
+        );
         // A top-level reserved envelope also passes through the same decoder.
         let RuntimeData::Json(json) = data else {
             unreachable!()
