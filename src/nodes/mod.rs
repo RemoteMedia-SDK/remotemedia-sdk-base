@@ -191,7 +191,7 @@ pub mod audio_evidence;
 pub use audio_evidence::{AudioEvidenceConfig, AudioEvidenceNode, AudioEvidenceNodeFactory};
 
 pub mod audio_resample_streaming;
-mod audio_buffer_contract;
+mod media_buffer_contract;
 pub use audio_resample_streaming::ResampleStreamingNode;
 
 pub mod audio_format_converter_streaming;

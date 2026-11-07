@@ -133,7 +133,10 @@ impl StreamingNodeFactory for FastFormatConverterNodeFactory {
         &self,
         params: &Value,
     ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>> {
-        super::audio_buffer_contract::from_params(params)
+        super::media_buffer_contract::from_params(
+            params,
+            remotemedia_traits::buffer_contract::BufferLayout::AudioInterleavedF32,
+        )
     }
 
     fn create(
@@ -219,7 +222,7 @@ impl StreamingNodeFactory for FastFormatConverterNodeFactory {
                 .config_schema(serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "buffer_limits": super::audio_buffer_contract::schema(),
+                        "buffer_limits": super::media_buffer_contract::schema(),
                         "target_format": {
                             "type": "string",
                             "enum": ["f32", "i16", "i32"],

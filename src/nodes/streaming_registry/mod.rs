@@ -6,6 +6,7 @@ use crate::capabilities::{
 };
 use crate::nodes::calculator::CalculatorNode;
 use crate::nodes::passthrough::PassThroughNode;
+use remotemedia_traits::buffer_contract::BufferLayout;
 use remotemedia_traits::runtime_context::InitializeContextRead;
 // Temporarily disabled - incomplete implementation
 // use crate::nodes::sync_av::SynchronizedAudioVideoNode;
@@ -650,7 +651,9 @@ impl StreamingNodeFactory for AudioFileWriterNodeFactory {
         &self,
         params: &Value,
     ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
-        let Some(mut contract) = super::audio_buffer_contract::from_params(params)? else {
+        let Some(contract) =
+            super::media_buffer_contract::forwarding(params, BufferLayout::AudioInterleavedF32)?
+        else {
             return Ok(None);
         };
         if !cfg!(target_endian = "little") {
@@ -658,12 +661,6 @@ impl StreamingNodeFactory for AudioFileWriterNodeFactory {
                 "AudioFileWriterNode direct WAV output requires little-endian samples".into(),
             ));
         }
-        if contract.outputs[""].max_payload_bytes < contract.inputs[""].max_payload_bytes {
-            return Err(Error::ConfigError(
-                "AudioFileWriterNode buffer_limits output bound must cover its input bound".into(),
-            ));
-        }
-        contract.production = remotemedia_traits::buffer_contract::BufferProduction::ForwardInput;
         Ok(Some(contract))
     }
 
@@ -714,7 +711,7 @@ impl StreamingNodeFactory for AudioFileWriterNodeFactory {
                     "required": ["output_path"],
                     "properties": {
                         "output_path": {"type": "string", "description": "Target WAV file; created on first audio input."},
-                        "buffer_limits": super::audio_buffer_contract::schema()
+                        "buffer_limits": super::media_buffer_contract::schema()
                     }
                 }))
                 .capabilities(NodeCapabilitiesSchema {
@@ -922,6 +919,13 @@ impl StreamingNodeFactory for EnvelopeDebugLogNodeFactory {
 pub(crate) struct VideoFileWriterNodeFactory;
 
 impl StreamingNodeFactory for VideoFileWriterNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        super::media_buffer_contract::forwarding(params, BufferLayout::VideoBytes)
+    }
+
     fn create(
         &self,
         _node_id: String,
@@ -929,24 +933,13 @@ impl StreamingNodeFactory for VideoFileWriterNodeFactory {
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
         use crate::nodes::file_sink::{VideoFileWriterConfig, VideoFileWriterNode};
-        use std::path::PathBuf;
-        let output_path = params
-            .get("output_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                Error::Execution(
-                    "VideoFileWriterNode requires 'output_path' (target .y4m file)".into(),
-                )
-            })?;
-        let fps = params
-            .get("fps")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(30);
-        let node = VideoFileWriterNode::new(VideoFileWriterConfig {
-            output_path: PathBuf::from(output_path),
-            fps,
-        });
+        self.try_buffer_contract(params)?;
+        let config: VideoFileWriterConfig = serde_json::from_value(params.clone())
+            .map_err(|error| Error::ConfigError(format!("VideoFileWriterNode: {error}")))?;
+        if config.fps == 0 {
+            return Err(Error::ConfigError("Y4M frame rate must be positive".into()));
+        }
+        let node = VideoFileWriterNode::new(config);
         Ok(Box::new(AsyncNodeWrapper(Arc::new(node))))
     }
 
@@ -961,14 +954,22 @@ impl StreamingNodeFactory for VideoFileWriterNodeFactory {
         Some(
             NodeSchema::new("VideoFileWriterNode")
                 .description(
-                    "Writes RuntimeData::Video (RGB24) frames to a Y4M file on \
-                     disk. RGB→YUV420p conversion happens per frame; output is \
+                    "Writes RuntimeData::Video (RGB24/YUV420p/I420) frames to a Y4M file on \
+                     disk. RGB conversion fills a context-selected loan; output is \
                      ffmpeg-compatible. Pass-through: emits the input unchanged \
                      so it can sit on a tap edge.",
                 )
                 .category("io")
                 .accepts([RuntimeDataType::Video])
                 .produces([RuntimeDataType::Video])
+                .config_schema(serde_json::json!({
+                    "type":"object", "required":["output_path"],
+                    "properties":{
+                        "output_path":{"type":"string"},
+                        "fps":{"type":"integer","minimum":1,"maximum":u32::MAX,"default":30},
+                        "buffer_limits":super::media_buffer_contract::schema()
+                    }
+                }))
                 .capabilities(NodeCapabilitiesSchema {
                     parallelizable: false,
                     batch_aware: false,
@@ -1214,7 +1215,7 @@ impl StreamingNodeFactory for FastResampleNodeFactory {
         &self,
         params: &Value,
     ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
-        super::audio_buffer_contract::from_params(params)
+        super::media_buffer_contract::from_params(params, BufferLayout::AudioInterleavedF32)
     }
 
     fn create(
@@ -1335,7 +1336,7 @@ impl StreamingNodeFactory for FastResampleNodeFactory {
                             ],
                             "description": "Source sample rate in Hz. Use 'auto' or omit to detect from incoming audio."
                         },
-                        "buffer_limits": super::audio_buffer_contract::schema(),
+                        "buffer_limits": super::media_buffer_contract::schema(),
                         "target_rate": {
                             "oneOf": [
                                 { "type": "integer", "minimum": 8000, "maximum": 192000 },

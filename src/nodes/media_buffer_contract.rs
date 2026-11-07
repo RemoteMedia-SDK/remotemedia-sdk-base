@@ -1,4 +1,4 @@
-//! Opt-in bounds for built-in audio nodes that retain or allocate owners.
+//! Opt-in bounds for built-in media nodes that retain or allocate owners.
 //! Executor buffer preflight binds and enforces these declarations. The raw node
 //! API is not a budget/validation boundary; omitting limits leaves support unknown.
 use crate::{Error, Result};
@@ -9,18 +9,18 @@ use std::collections::BTreeMap;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AudioBufferLimits {
+struct MediaBufferLimits {
     domain: BufferDomain,
     max_input_bytes: u64,
     max_output_bytes: u64,
     retention: BufferRetention,
 }
 
-pub(super) fn from_params(params: &Value) -> Result<Option<BufferContract>> {
+pub(super) fn from_params(params: &Value, layout: BufferLayout) -> Result<Option<BufferContract>> {
     let Some(value) = params.get("buffer_limits") else {
         return Ok(None);
     };
-    let limits: AudioBufferLimits = serde_json::from_value(value.clone())
+    let limits: MediaBufferLimits = serde_json::from_value(value.clone())
         .map_err(|error| Error::ConfigError(format!("buffer_limits: {error}")))?;
     if !matches!(
         limits.domain,
@@ -40,7 +40,7 @@ pub(super) fn from_params(params: &Value) -> Result<Option<BufferContract>> {
         return Err(Error::ConfigError("buffer_limits needs addressable nonzero payload bounds and retention covering at least one maximum payload".into()));
     }
     let port = |max_payload_bytes| BufferPortContract {
-        layouts: vec![BufferLayout::AudioInterleavedF32],
+        layouts: vec![layout.clone()],
         domains: vec![limits.domain.clone()],
         max_payload_bytes,
     };
@@ -54,10 +54,23 @@ pub(super) fn from_params(params: &Value) -> Result<Option<BufferContract>> {
     }))
 }
 
+pub(super) fn forwarding(params: &Value, layout: BufferLayout) -> Result<Option<BufferContract>> {
+    let Some(mut contract) = from_params(params, layout)? else {
+        return Ok(None);
+    };
+    if contract.outputs[""].max_payload_bytes < contract.inputs[""].max_payload_bytes {
+        return Err(Error::ConfigError(
+            "forwarding buffer_limits output bound must cover its input bound".into(),
+        ));
+    }
+    contract.production = BufferProduction::ForwardInput;
+    Ok(Some(contract))
+}
+
 pub(super) fn schema() -> Value {
     json!({
         "type":"object", "additionalProperties":false,
-        "description":"Optional audio buffer declaration enforced by executor buffer preflight. Retention counts backing storage, including output capacity and escaped views; omit to leave support undeclared.",
+        "description":"Optional media buffer declaration enforced by executor buffer preflight. Retention counts backing storage, including conversion loans, output capacity and escaped views; omit to leave support undeclared.",
         "required":["domain","max_input_bytes","max_output_bytes","retention"],
         "properties":{
             "domain":{"type":"string","enum":["host","session_mapped"]},

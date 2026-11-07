@@ -19,11 +19,37 @@ pub use remotemedia_types::{PixelFormat, VideoCodec};
 /// Used by both the Y4M file writer and the VP8/H264/AV1 encoder
 /// so they convert the same way.
 pub fn rgb24_to_yuv420p(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; yuv420p_size(w, h).expect("valid RGB dimensions")];
+    rgb24_to_yuv420p_into(rgb, w, h, &mut out).expect("valid RGB and YUV spans");
+    out
+}
+
+/// Checked planar 4:2:0 extent, including padded chroma for odd RGB dimensions.
+pub fn yuv420p_size(w: usize, h: usize) -> crate::Result<usize> {
+    let size = w.checked_mul(h).and_then(|y| {
+        w.div_ceil(2)
+            .checked_mul(h.div_ceil(2))?
+            .checked_mul(2)?
+            .checked_add(y)
+    });
+    size.filter(|&size| w > 0 && h > 0 && size <= isize::MAX as usize)
+        .ok_or_else(|| crate::Error::InvalidData("invalid or overflowing YUV420 dimensions".into()))
+}
+
+/// Convert into the supplied destination, without allocation or staging.
+/// Reject invalid spans before writing any destination byte.
+pub fn rgb24_to_yuv420p_into(rgb: &[u8], w: usize, h: usize, out: &mut [u8]) -> crate::Result<()> {
+    if w.checked_mul(h).and_then(|pixels| pixels.checked_mul(3)) != Some(rgb.len())
+        || out.len() != yuv420p_size(w, h)?
+    {
+        return Err(crate::Error::InvalidData(
+            "RGB/YUV span length differs from dimensions".into(),
+        ));
+    }
     let y_size = w * h;
-    let chroma_w = (w + 1) / 2;
-    let chroma_h = (h + 1) / 2;
+    let chroma_w = w.div_ceil(2);
+    let chroma_h = h.div_ceil(2);
     let chroma_size = chroma_w * chroma_h;
-    let mut out = vec![0u8; y_size + 2 * chroma_size];
     let (y_plane, rest) = out.split_at_mut(y_size);
     let (cb_plane, cr_plane) = rest.split_at_mut(chroma_size);
 
@@ -64,7 +90,7 @@ pub fn rgb24_to_yuv420p(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
             cr_plane[cy * chroma_w + cx] = cr.round().clamp(0.0, 255.0) as u8;
         }
     }
-    out
+    Ok(())
 }
 
 /// BT.601 RGBA32 → YUV420p, ignoring the alpha channel.
