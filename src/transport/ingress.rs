@@ -32,7 +32,23 @@ pub(super) fn bind_allocator(
 #[derive(Clone)]
 pub struct SessionPacketSender {
     sender: mpsc::Sender<DataPacket>,
-    budget: Arc<OnceLock<Option<BufferBudget>>>,
+    budget: IngressAdmission,
+}
+
+/// Admission policy survives closing ingress, without keeping its queue open.
+#[derive(Clone, Default)]
+pub(crate) struct IngressAdmission(Arc<OnceLock<Option<BufferBudget>>>);
+
+impl IngressAdmission {
+    pub(crate) fn admit_payload(
+        &self,
+        data: &mut crate::data::RuntimeData,
+    ) -> std::result::Result<(), BufferAllocationError> {
+        match self.0.get_or_init(|| None) {
+            Some(budget) => budget.admit_in_place(data),
+            None => Ok(()),
+        }
+    }
 }
 
 impl From<mpsc::Sender<DataPacket>> for SessionPacketSender {
@@ -40,12 +56,16 @@ impl From<mpsc::Sender<DataPacket>> for SessionPacketSender {
     fn from(sender: mpsc::Sender<DataPacket>) -> Self {
         Self {
             sender,
-            budget: Arc::new(OnceLock::new()),
+            budget: IngressAdmission::default(),
         }
     }
 }
 
 impl SessionPacketSender {
+    pub(crate) fn admission(&self) -> IngressAdmission {
+        self.budget.clone()
+    }
+
     pub(crate) fn control_payload(
         &self,
         port: Option<&str>,
@@ -53,7 +73,7 @@ impl SessionPacketSender {
     ) -> Result<crate::data::RuntimeData> {
         let Some(port) = port else { return Ok(data) };
         use crate::data::RuntimeData::*;
-        if self.budget.get_or_init(|| None).is_some()
+        if self.budget.0.get_or_init(|| None).is_some()
             && matches!(
                 &data,
                 Audio { .. }
@@ -73,14 +93,14 @@ impl SessionPacketSender {
     /// an unconfigured sender as legacy, so already-queued inputs cannot be missed
     /// by a later claim that a budget was active from creation.
     pub(crate) fn bind_budget(&self, budget: BufferBudget) -> Result<()> {
-        self.budget.set(Some(budget)).map_err(|_| {
+        self.budget.0.set(Some(budget)).map_err(|_| {
             Error::ConfigError("ingress budget must be bound once, before the first send".into())
         })
     }
 
     /// An owning handle for monitoring usage through retained views and shutdown.
     pub fn buffer_budget(&self) -> Option<BufferBudget> {
-        self.budget.get().and_then(Clone::clone)
+        self.budget.0.get().and_then(Clone::clone)
     }
 
     fn admit(&self, mut packet: DataPacket) -> std::result::Result<DataPacket, IngressSendError> {
@@ -96,10 +116,7 @@ impl SessionPacketSender {
         &self,
         data: &mut crate::data::RuntimeData,
     ) -> std::result::Result<(), BufferAllocationError> {
-        match self.budget.get_or_init(|| None) {
-            Some(budget) => budget.admit_in_place(data),
-            None => Ok(()),
-        }
+        self.budget.admit_payload(data)
     }
 
     /// Wait for channel space; fail immediately when owner/byte credit is exhausted.

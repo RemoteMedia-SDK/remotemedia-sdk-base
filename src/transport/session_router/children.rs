@@ -1,12 +1,15 @@
 //! Child task ownership survives unwinding of the node's main body.
 use crate::{Error, Result};
-use futures::{task::AtomicWaker, FutureExt};
+use futures::{stream::FuturesUnordered, task::AtomicWaker, FutureExt, StreamExt};
 use parking_lot::Mutex;
 use std::{
     future::{poll_fn, Future},
     panic::AssertUnwindSafe,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 use tokio::{sync::watch, task::JoinHandle};
@@ -17,7 +20,13 @@ struct Child {
     name: String,
     handle: Option<Task>,
     failure: Option<String>,
-    shutdown: Option<watch::Sender<bool>>,
+    shutdown: Shutdown,
+}
+
+enum Shutdown {
+    Abort,
+    Cooperative(watch::Sender<bool>),
+    Drain(watch::Sender<bool>),
 }
 impl Child {
     fn poll_failure(&mut self, cx: &mut Context<'_>) -> bool {
@@ -34,13 +43,17 @@ impl Child {
         self.failure.is_some()
     }
 
-    async fn join_failure(&mut self) -> Option<String> {
+    async fn join_failure(&mut self, interrupted: &AtomicBool) -> Option<String> {
         if let Some(failure) = self.failure.take() {
             return Some(failure);
         }
         let handle = self.handle.as_mut()?;
-        // stop() intentionally aborts non-cooperative lanes before joining.
-        task::error(handle.await, true).map(|error| format!("{}: {error}", self.name))
+        let outcome = handle.await;
+        // Graceful producers should complete normally. Their cancellation is
+        // expected only after stop() or another child's failure interrupted drain.
+        let expected =
+            !matches!(self.shutdown, Shutdown::Drain(_)) || interrupted.load(Ordering::Acquire);
+        task::error(outcome, expected).map(|error| format!("{}: {error}", self.name))
     }
 }
 impl Drop for Child {
@@ -63,11 +76,20 @@ struct ChildState {
 pub(super) struct Children(Arc<ChildState>);
 impl Children {
     pub(super) fn add(&self, name: impl Into<String>, handle: JoinHandle<()>) {
-        self.insert(name.into(), Task::Plain(handle), None);
+        self.insert(name.into(), Task::Plain(handle), Shutdown::Abort);
     }
 
     pub(super) fn add_fallible(&self, name: impl Into<String>, handle: JoinHandle<Result<()>>) {
-        self.insert(name.into(), Task::Fallible(handle), None);
+        self.insert(name.into(), Task::Fallible(handle), Shutdown::Abort);
+    }
+
+    pub(super) fn add_draining(
+        &self,
+        name: impl Into<String>,
+        stop: watch::Sender<bool>,
+        handle: JoinHandle<Result<()>>,
+    ) {
+        self.insert(name.into(), Task::Fallible(handle), Shutdown::Drain(stop));
     }
 
     pub(super) fn add_cooperative(
@@ -76,10 +98,14 @@ impl Children {
         shutdown: watch::Sender<bool>,
         handle: JoinHandle<()>,
     ) {
-        self.insert(name.into(), Task::Plain(handle), Some(shutdown));
+        self.insert(
+            name.into(),
+            Task::Plain(handle),
+            Shutdown::Cooperative(shutdown),
+        );
     }
 
-    fn insert(&self, name: String, handle: Task, shutdown: Option<watch::Sender<bool>>) {
+    fn insert(&self, name: String, handle: Task, shutdown: Shutdown) {
         self.0.tasks.lock().push(Child {
             name,
             handle: Some(handle),
@@ -111,18 +137,55 @@ impl Children {
 
     /// Call only after this node body has stopped creating child tasks.
     pub(super) async fn stop(&self) -> Vec<String> {
+        self.finish(false).await
+    }
+
+    /// Finish an active producer before closing its output channel. Producers
+    /// must also observe session shutdown so explicit close can interrupt drain.
+    pub(super) async fn drain(&self) -> Vec<String> {
+        self.finish(true).await
+    }
+
+    async fn finish(&self, drain: bool) -> Vec<String> {
         let pending = std::mem::take(&mut *self.0.tasks.lock());
         for child in &pending {
-            if let Some(shutdown) = &child.shutdown {
+            let cooperative = match &child.shutdown {
+                Shutdown::Cooperative(stop) => Some(stop),
+                Shutdown::Drain(stop) if drain => Some(stop),
+                _ => None,
+            };
+            if let Some(shutdown) = cooperative {
                 // A lane with its own children must join them before finishing.
                 shutdown.send_replace(true);
             } else if let Some(handle) = &child.handle {
                 handle.abort();
             }
         }
+        // Draining takes ownership out of the active observer. Poll all joins
+        // here so a failed lane cannot hide behind another blocked producer.
+        let abort_drains: Vec<_> = pending
+            .iter()
+            .filter_map(|child| {
+                matches!(child.shutdown, Shutdown::Drain(_))
+                    .then(|| child.handle.as_ref().map(Task::abort_handle))
+                    .flatten()
+            })
+            .collect();
+        let interrupted = AtomicBool::new(!drain);
+        let mut joining: FuturesUnordered<_> = pending
+            .into_iter()
+            .map(|mut child| {
+                let interrupted = &interrupted;
+                async move { child.join_failure(interrupted).await }
+            })
+            .collect();
         let mut failures = Vec::new();
-        for mut child in pending {
-            if let Some(failure) = child.join_failure().await {
+        while let Some(failure) = joining.next().await {
+            if let Some(failure) = failure {
+                interrupted.store(true, Ordering::Release);
+                for handle in &abort_drains {
+                    handle.abort();
+                }
                 failures.push(failure);
             }
         }

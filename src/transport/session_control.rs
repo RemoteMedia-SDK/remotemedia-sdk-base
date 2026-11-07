@@ -545,6 +545,11 @@ impl Default for NodeState {
     }
 }
 
+struct ControlIngress {
+    sender: Option<super::SessionPacketSender>,
+    admission: super::ingress::IngressAdmission,
+}
+
 /// Per-session control state. Created alongside the `SessionRouter` and
 /// handed to the router via `attach_control`.
 pub struct SessionControl {
@@ -560,7 +565,7 @@ pub struct SessionControl {
     intercepts: DashMap<InterceptKey, Arc<InterceptSlot>>,
     /// Handle to the router's input channel so `publish` can inject packets.
     /// Set by `attach_input_sender` after the router is constructed.
-    input_tx: parking_lot::RwLock<Option<super::SessionPacketSender>>,
+    input_tx: parking_lot::RwLock<Option<ControlIngress>>,
     rpc_inputs: DashMap<String, mpsc::Sender<RpcInvocation>>,
     /// Monotonic sequence for injected packets (kept separate from the
     /// transport's own sequence to make out-of-band traffic identifiable).
@@ -963,17 +968,29 @@ impl SessionControl {
     /// Wire the router's input channel so `publish` can reach nodes.
     /// Called once from `SessionRouter::attach_control`.
     pub async fn attach_input_sender(&self, tx: impl Into<super::SessionPacketSender>) {
-        *self.input_tx.write() = Some(tx.into());
+        let sender = tx.into();
+        *self.input_tx.write() = Some(ControlIngress {
+            admission: sender.admission(),
+            sender: Some(sender),
+        });
+    }
+
+    /// Release only the internal sender; independent participant handles still
+    /// own their input lifetime. Keep admission checks active through draining.
+    pub(crate) fn finish_input(&self) {
+        if let Some(input) = self.input_tx.write().as_mut() {
+            input.sender = None;
+        }
     }
 
     /// Clone the router input sender for transport-level participant joins.
     pub async fn input_sender(&self) -> Option<super::SessionPacketSender> {
-        self.input_tx.read().clone()
+        self.input_tx.read().as_ref().and_then(|input| input.sender.clone())
     }
 
     fn admit_external_control(&self, mut data: RuntimeData) -> Result<RuntimeData> {
-        if let Some(tx) = self.input_tx.read().as_ref() {
-            tx.admit_payload(&mut data).map_err(|error| {
+        if let Some(input) = self.input_tx.read().as_ref() {
+            input.admission.admit_payload(&mut data).map_err(|error| {
                 crate::Error::Execution(format!(
                     "session {} control ingress buffer budget: {error}", self.session_id
                 ))
@@ -1165,9 +1182,15 @@ impl SessionControl {
                 }
             }
         }
-        let tx = self.input_tx.read().clone().ok_or_else(|| {
-            crate::Error::Execution("session control not yet attached to router".into())
-        })?;
+        let tx = {
+            let binding = self.input_tx.read();
+            let input = binding.as_ref().ok_or_else(|| {
+                crate::Error::Execution("session control not yet attached to router".into())
+            })?;
+            input.sender.clone().ok_or_else(|| {
+                crate::Error::Execution("session control input is complete".into())
+            })?
+        };
 
         let payload = tx.control_payload(addr.port.as_deref(), data)?;
 
@@ -1990,6 +2013,10 @@ pub fn global_bus() -> Option<Arc<SessionControlBus>> {
 // ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "session_control_input_tests.rs"]
+mod input_completion_tests;
 
 #[cfg(test)]
 mod tests {

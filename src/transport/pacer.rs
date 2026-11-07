@@ -43,7 +43,7 @@ use crate::nodes::{NodeRuntimeContext, StreamingNode, Tick};
 use crate::transport::perf_aggregator::PerfAggregator;
 use crate::Result;
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 /// What to do when a node's `tick()` overruns its per-frame deadline.
@@ -305,20 +305,48 @@ impl Pacer {
     /// Returns the `JoinHandle` so the caller can `.abort()` it on
     /// shutdown. The owner must join and propagate the returned node error.
     pub fn spawn(self) -> JoinHandle<Result<()>> {
-        tokio::spawn(self.run())
+        tokio::spawn(self.run(None))
+    }
+
+    /// Stop between ticks when the returned sender requests draining. An active
+    /// tick may finish publishing; session shutdown can still interrupt it.
+    pub(crate) fn spawn_draining(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> (JoinHandle<Result<()>>, watch::Sender<bool>) {
+        let (stop, stopping) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|requested| *requested) => Ok(()),
+                result = self.run(Some(stopping)) => result,
+            }
+        });
+        (handle, stop)
     }
 
     /// Main loop: pull a tick, dispatch, measure, apply on-miss
     /// policy, repeat. Exits when the tick source returns `None`. Returned node
     /// errors fail the source, except the existing transient unbound-WebRTC case.
-    async fn run(mut self) -> Result<()> {
+    async fn run(mut self, mut stopping: Option<watch::Receiver<bool>>) -> Result<()> {
         const TRANSIENT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
         let mut transient_error_summary = TickErrorSummary {
             count: 0,
             last_log: Instant::now() - TRANSIENT_ERROR_LOG_INTERVAL,
         };
 
-        while let Some(tick) = self.source.next().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = async {
+                    match &mut stopping {
+                        Some(stop) => { let _ = stop.wait_for(|requested| *requested).await; }
+                        None => std::future::pending().await,
+                    }
+                } => None,
+                tick = self.source.next() => tick,
+            };
+            let Some(tick) = next else { break };
             let started = Instant::now();
             let deadline = Duration::from_micros(tick.deadline_us);
             let budget = deadline.saturating_sub(Duration::from_micros(tick.pts_us));

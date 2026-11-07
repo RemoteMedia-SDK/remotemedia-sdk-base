@@ -15,6 +15,13 @@ pub(super) enum Task {
 }
 
 impl Task {
+    pub(super) fn abort_handle(&self) -> tokio::task::AbortHandle {
+        match self {
+            Self::Plain(handle) => handle.abort_handle(),
+            Self::Fallible(handle) => handle.abort_handle(),
+        }
+    }
+
     pub(super) fn abort(&self) {
         match self {
             Self::Plain(handle) => handle.abort(),

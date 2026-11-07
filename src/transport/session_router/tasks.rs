@@ -10,6 +10,10 @@ pub(super) struct TaskGroup {
 }
 
 impl TaskGroup {
+    pub(super) fn shutdown_signal(&self) -> watch::Sender<bool> {
+        self.shutdown.clone()
+    }
+
     pub(super) fn new(
         shutdown: watch::Sender<bool>,
         handles: Vec<(String, JoinHandle<Result<()>>)>,

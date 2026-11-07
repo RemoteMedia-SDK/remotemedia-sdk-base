@@ -3,6 +3,48 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::{oneshot, Notify};
 
 #[tokio::test]
+async fn unexpected_cancellation_during_drain_remains_a_failure() {
+    let children = Children::default();
+    let (stop, _stopping) = tokio::sync::watch::channel(false);
+    let child = tokio::spawn(std::future::pending::<crate::Result<()>>());
+    child.abort();
+    children.add_draining("cancelled source", stop, child);
+    let failures = children.drain().await;
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("cancelled source") && failures[0].contains("cancelled"));
+}
+
+#[tokio::test]
+async fn drain_failure_interrupts_another_blocked_draining_child() {
+    let children = Children::default();
+    let (stop, _stopping) = tokio::sync::watch::channel(false);
+    let retained = Arc::new(());
+    let owner = retained.clone();
+    let (ready, started) = oneshot::channel();
+    children.add_draining(
+        "held source",
+        stop.clone(),
+        tokio::spawn(async move {
+            let _owner = owner;
+            ready.send(()).unwrap();
+            std::future::pending().await
+        }),
+    );
+    started.await.unwrap();
+    children.add_draining(
+        "failed source",
+        stop,
+        tokio::spawn(async { Err(crate::Error::Execution("drain failure sentinel".into())) }),
+    );
+    let failures = tokio::time::timeout(Duration::from_secs(2), children.drain())
+        .await
+        .unwrap();
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("failed source: Execution error: drain failure sentinel"));
+    assert_eq!(Arc::strong_count(&retained), 1);
+}
+
+#[tokio::test]
 async fn registering_a_cancelled_child_wakes_a_suspended_supervisor() {
     let children = Children::default();
     let started = Arc::new(Notify::new());

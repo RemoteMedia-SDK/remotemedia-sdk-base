@@ -1335,7 +1335,18 @@ impl SessionRouter {
         // Graceful teardown. Dropping every source input_tx cascades through
         // the pipeline: each node's main task exits when its input_rx
         // closes, which drops its fan_tx, which closes the next hop.
-        let teardown = Self::teardown_pipeline_tasks(pipeline, explicit_close).await;
+        let force_shutdown = pipeline.tasks.shutdown_signal();
+        let teardown = Self::teardown_pipeline_tasks(pipeline, explicit_close);
+        tokio::pin!(teardown);
+        let teardown = tokio::select! {
+            result = &mut teardown => result,
+            _ = shutdown_rx.recv() => {
+                // Keep polling the same teardown future and original handles.
+                // A caller may explicitly close while graceful drain is blocked.
+                force_shutdown.send_replace(true);
+                teardown.await
+            }
+        };
 
         // Stop the publisher before the control bus is signalled closed. It
         // publishes one final snapshot (`final: true`) — node tasks have
@@ -1887,7 +1898,7 @@ impl SessionRouter {
             //
             // Outputs flow into the same `fan_tx` reactive emits use,
             // so downstream wiring is identical regardless of pacing.
-            let pacer_handle: Option<tokio::task::JoinHandle<Result<()>>> = {
+            let pacer_handle = {
                 use crate::nodes::PacingNature;
                 use crate::transport::pacer::{
                     OnMiss, Pacer, TickSource, WallTickSource, WireTickSource,
@@ -1932,17 +1943,17 @@ impl SessionRouter {
                         OnMiss::default(),
                     )
                     .with_perf(perf.clone());
-                    pacer.spawn()
+                    pacer.spawn_draining(shutdown.clone())
                 })
             };
 
-            if let Some(handle) = pacer_handle {
-                children.add_fallible("pacer", handle);
+            if let Some((handle, stop)) = pacer_handle {
+                children.add_draining("pacer", stop, handle);
             }
-            loop {
+            let drain = loop {
                 let input = tokio::select! {
                     biased;
-                    _ = shutdown.changed() => break,
+                    _ = shutdown.changed() => break false,
                     Some(control) = control_rx.recv() => control,
                     input = filt_rx.recv() => match input {
                         Some((generation, input)) if generation == input_generation.load(std::sync::atomic::Ordering::Acquire) => input,
@@ -1951,7 +1962,7 @@ impl SessionRouter {
                             cell.discarded.fetch_add(1, RELAXED);
                             continue;
                         }
-                        None => break,
+                        None => break true,
                     },
                 };
                 if node_trace_enabled() {
@@ -2008,7 +2019,7 @@ impl SessionRouter {
                         NodeState::Bypass => {
                             cell.bypassed.fetch_add(1, RELAXED);
                             if fan_tx.send(input).await.is_err() {
-                                break;
+                                break false;
                             }
                             continue;
                         }
@@ -2180,7 +2191,7 @@ impl SessionRouter {
 
                 let cancelled = tokio::select! {
                     biased;
-                    _ = shutdown.changed() => break,
+                    _ = shutdown.changed() => break false,
                     _ = main_cancel.notified() => {
                         tracing::info!(
                             session_id = %main_session_id,
@@ -2240,7 +2251,7 @@ impl SessionRouter {
                     .fetch_add(node_dispatch_start.elapsed().as_micros() as u64, RELAXED);
                 cell.in_flight_since_us.store(0, RELAXED);
                 probes.node_out.record_since(node_dispatch_start);
-            }
+            };
             // input_rx closed: drop fan_tx so the drain task exits once
             // it finishes forwarding any already-queued outputs.
             drop(fan_tx);
@@ -2248,7 +2259,11 @@ impl SessionRouter {
             // they need an explicit abort when the node task exits —
             // dropping the Arc<SessionControl> doesn't close the
             // broadcast (other subscribers may still hold it).
-            let mut failures = children.stop().await;
+            let mut failures = if drain {
+                children.drain().await
+            } else {
+                children.stop().await
+            };
             if let Err(error) = node_ref
                 .process_control_message(
                     crate::transport::session_control::wrap_aux_port(

@@ -146,6 +146,8 @@ pub struct SessionHandle {
     ///
     /// Bounded — see `DEFAULT_ROUTER_INPUT_CAPACITY` in `session_router`.
     input_tx: Option<super::SessionPacketSender>,
+    /// Releases the control plane's internal ingress owner on input completion.
+    input_control: Arc<super::session_control::SessionControl>,
     /// Per-kind receivers for sink output. See [`ClientOutputRouter`] for
     /// why kinds are split. Wrapped in `Option` so `take_output_receivers`
     /// can consume them — needed when a transport (e.g. WebRTC peer) wants
@@ -377,8 +379,13 @@ impl SessionHandle {
     /// This closes the input channel, allowing the session router to detect
     /// end-of-input and shut down gracefully after processing remaining data.
     /// Outputs can still be received via `recv_output()` after calling this.
+    /// Releases this handle and the control plane's internal input sender.
+    /// Previously cloned participant/input senders must also be dropped before
+    /// ingress closes. New control-plane media injection is rejected afterward;
+    /// buffer admission checks remain active while existing work drains.
     pub fn signal_input_complete(&mut self) {
         self.input_tx = None;
+        self.input_control.finish_input();
     }
 
     /// Clone-able, send-only handle onto this session's input.
@@ -1501,6 +1508,7 @@ impl PipelineExecutor {
             data_rx,
         } = output_receivers;
         Ok(SessionHandle {
+            input_control: control,
             buffer_preflight,
             node_materialization_copies,
             session_id,
