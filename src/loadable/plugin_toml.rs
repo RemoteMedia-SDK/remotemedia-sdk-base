@@ -144,6 +144,9 @@ pub struct PluginPythonMeta {
 #[serde(deny_unknown_fields)]
 pub struct PluginPythonMapped {
     pub runner_protocol: u16,
+    /// Optional output-copy negotiation; a capability request, not permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_copy_protocol: Option<u16>,
     #[serde(default)]
     pub snapshot_inputs: Vec<String>,
     #[serde(default)]

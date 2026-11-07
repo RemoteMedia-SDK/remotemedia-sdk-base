@@ -57,6 +57,13 @@ impl MappedPythonPluginRuntime {
                 mapped.runner_protocol
             )));
         }
+        if let Some(version) = mapped.output_copy_protocol {
+            if version != 1 {
+                return Err(Error::ConfigError(format!(
+                    "mapped Python output-copy protocol {version} is unsupported; expected 1"
+                )));
+            }
+        }
         let package_root = package_root
             .canonicalize()
             .map_err(|e| Error::ConfigError(format!("mapped Python package root: {e}")))?;
@@ -88,9 +95,14 @@ impl MappedPythonPluginRuntime {
                     environment: self.environment.clone(),
                 };
                 // SAFETY: this exact package was authorized under new's contract.
-                unsafe { MappedPythonFactory::for_sessions(config) }
+                let factory = unsafe { MappedPythonFactory::for_sessions(config) }
                     .with_snapshot_inputs(mapped.snapshot_inputs.clone())?
-                    .with_snapshot_outputs(mapped.snapshot_outputs.clone())
+                    .with_snapshot_outputs(mapped.snapshot_outputs.clone())?;
+                Ok(if mapped.output_copy_protocol.is_some() {
+                    factory.with_output_copies()
+                } else {
+                    factory
+                })
             })
             .collect()
     }
