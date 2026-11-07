@@ -64,6 +64,10 @@ pub struct PythonNodeConfig {
 
     /// Execution mode: "multiprocess" (default) or "inprocess" (PyO3)
     pub execution_mode: PythonExecutionMode,
+
+    /// Authored bounds for the explicit in-process owning-buffer adapter.
+    /// None leaves strict preflight unsupported; types alone imply no bounds.
+    pub shared_buffer_contract: Option<remotemedia_traits::buffer_contract::BufferContract>,
 }
 
 impl Default for PythonNodeConfig {
@@ -78,11 +82,22 @@ impl Default for PythonNodeConfig {
             accepts: Vec::new(),
             produces: Vec::new(),
             execution_mode: PythonExecutionMode::default(),
+            shared_buffer_contract: None,
         }
     }
 }
 
 impl PythonNodeConfig {
+    /// Select owning-buffer execution and declare its bounded runtime contract.
+    /// Preflight and runtime guards validate this promise before/during execution.
+    pub fn with_shared_buffer_contract(
+        mut self,
+        contract: remotemedia_traits::buffer_contract::BufferContract,
+    ) -> Self {
+        self.shared_buffer_contract = Some(contract);
+        self.with_shared_buffers()
+    }
+
     /// Select synchronous `process_shared` / `process_streaming_shared` hooks.
     /// Nodes must publish allocator-backed outputs; private arrays are rejected.
     pub fn with_shared_buffers(mut self) -> Self {

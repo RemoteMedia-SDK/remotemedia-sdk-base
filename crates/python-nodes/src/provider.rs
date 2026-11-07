@@ -36,6 +36,12 @@ impl StreamingNodeFactory for DynamicPythonNodeFactory {
         params: &Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
+        if self.config.shared_buffer_contract.is_some() {
+            return Err(Error::ConfigError(
+                "in-process shared buffer declarations cannot use the legacy multiprocess factory"
+                    .into(),
+            ));
+        }
         let node = if let Some(sid) = session_id {
             remotemedia_core::nodes::python_streaming::PythonStreamingNode::with_session(
                 node_id,

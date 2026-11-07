@@ -5,6 +5,9 @@ use remotemedia_core::nodes::{NodeRuntimeContext, StreamingNode, StreamingNodeFa
 use remotemedia_shared_memory::{PoolConfig, SessionId, SharedPool, SizeClass};
 use remotemedia_types::{CopyContext, CopyPolicy};
 
+mod contracts;
+mod executor;
+mod guards;
 mod router;
 
 fn node(mode: &str) -> Box<dyn StreamingNode> {

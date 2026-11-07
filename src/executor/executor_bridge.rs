@@ -345,8 +345,12 @@ impl ExecutorBridge for InProcessExecutorBridge {
         );
 
         // Parse config from params
-        let config: HashMap<String, serde_json::Value> = serde_json::from_value(params.clone())
-            .map_err(|e| Error::Execution(format!("Failed to parse config: {}", e)))?;
+        let config: HashMap<String, serde_json::Value> = if params.is_null() {
+            HashMap::new()
+        } else {
+            serde_json::from_value(params.clone())
+                .map_err(|e| Error::Execution(format!("Failed to parse config: {}", e)))?
+        };
 
         // For in-process, we need to specify the module and class based on node_type
         // This maps node type to Python module/class - configurable via params

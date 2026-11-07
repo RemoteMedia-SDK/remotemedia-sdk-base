@@ -4,6 +4,7 @@
 //! via the PyO3 bridge, avoiding the overhead of multiprocess IPC.
 //!
 //! Requires the `inprocess` feature which enables PyO3 integration.
+mod contracts;
 #[cfg(test)]
 mod tests;
 
@@ -270,12 +271,28 @@ impl DynamicInProcessPythonNodeFactory {
 
 #[cfg(feature = "inprocess")]
 impl remotemedia_core::nodes::StreamingNodeFactory for DynamicInProcessPythonNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        _params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        contracts::inspect(&self.config)
+    }
+
+    fn supports_buffer_protocol(
+        &self,
+        protocol: &remotemedia_traits::buffer_contract::BufferProtocol,
+    ) -> bool {
+        self.config.execution_mode == crate::registry::PythonExecutionMode::InProcessShared
+            && protocol == &contracts::protocol()
+    }
+
     fn create(
         &self,
         node_id: String,
         params: &Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn remotemedia_core::nodes::StreamingNode>, Error> {
+        self.try_buffer_contract(params)?;
         let mut node = if let Some(sid) = session_id {
             InProcessPythonNode::with_session(node_id, &self.config.python_class, params, sid)?
         } else {

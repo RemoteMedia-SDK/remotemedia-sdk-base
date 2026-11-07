@@ -1,18 +1,35 @@
 import numpy as np
 
 
+class TextNode:
+    def initialize(self, config):
+        pass
+
+    def process_shared(self, data, ctx):
+        return data.upper()
+
+    def finalize(self):
+        pass
+
+
 class SharedNode:
     def initialize(self, config):
         self.mode = config.get('mode', 'pass')
         self.produced = 0
         self.closed = False
+        self.kept = []
 
     def process_shared(self, data, ctx):
         if data['data_type'] == 'json':
+            if data['data'].get('clear'):
+                self.kept.clear()
             return {'data_type': 'json', 'data': {
                 'produced': self.produced, 'closed': self.closed,
                 'session': ctx.session_id, 'node': ctx.node_id,
+                'retained': len(self.kept),
             }}
+        if self.mode == 'retain':
+            self.kept.append(data['samples'][1:])
         if self.mode == 'private':
             return {**data, 'samples': np.array(data['samples'], copy=True)}
         if self.mode == 'gain':

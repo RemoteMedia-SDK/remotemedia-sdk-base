@@ -139,7 +139,7 @@ fn inspect_factory(
         }
     };
     match &contract.protocol {
-        BufferProtocol::RustOwners | BufferProtocol::NativeAbi { .. }
+        BufferProtocol::RustOwners | BufferProtocol::NativeAbi { .. } | BufferProtocol::InProcessPython { .. }
             if factory.supports_buffer_protocol(&contract.protocol) => {},
         BufferProtocol::MappedNative { .. } | BufferProtocol::MappedPython { .. }
             if factory.supports_buffer_protocol(&contract.protocol) => {
