@@ -213,6 +213,23 @@ pub trait IngestSource: Send + Sync {
     /// - On failure: `Idle` → `Connecting` → `Error`
     async fn start(&mut self) -> Result<IngestStream, Error>;
 
+    /// Start with exclusive producer storage from the selected session/domain.
+    ///
+    /// Implementations must publish directly from this allocator or return an
+    /// error; this entrypoint never falls back to compatibility staging. The
+    /// frame bound limits each audio packet, not downstream retained storage.
+    /// Inspect status and call `stop()` after stream closure to distinguish EOF
+    /// from a producer error. Sources without direct allocation reject by default.
+    async fn start_with_output_allocator(
+        &mut self,
+        _allocator: std::sync::Arc<dyn remotemedia_types::OutputAllocator>,
+        _max_frames: usize,
+    ) -> Result<IngestStream, Error> {
+        Err(Error::ConfigError(
+            "This ingestion source does not support direct output allocation".into(),
+        ))
+    }
+
     /// Stop ingesting gracefully
     ///
     /// Signals the source to disconnect cleanly. Any pending data may

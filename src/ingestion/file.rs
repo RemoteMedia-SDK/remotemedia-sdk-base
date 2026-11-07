@@ -38,6 +38,9 @@ use super::stream::{
 };
 use super::{IngestConfig, IngestPlugin, IngestSource};
 
+mod direct;
+mod wav;
+
 /// File ingest plugin
 ///
 /// Handles local file and stdin ingestion with `file://`, bare paths, and `-`.
@@ -150,6 +153,9 @@ pub struct FileIngestSource {
 
     /// Stopped flag
     stopped: Arc<AtomicBool>,
+
+    /// Joined worker for allocator-backed file production.
+    direct_task: Option<tokio::task::JoinHandle<Result<(), Error>>>,
 }
 
 impl FileIngestSource {
@@ -164,6 +170,7 @@ impl FileIngestSource {
             metadata: Arc::new(RwLock::new(None)),
             stop_tx: None,
             stopped: Arc::new(AtomicBool::new(false)),
+            direct_task: None,
         })
     }
 
@@ -181,9 +188,17 @@ impl FileIngestSource {
 
 #[async_trait]
 impl IngestSource for FileIngestSource {
+    async fn start_with_output_allocator(
+        &mut self,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+        max_frames: usize,
+    ) -> Result<IngestStream, Error> {
+        self.start_direct(allocator, max_frames).await
+    }
+
     async fn start(&mut self) -> Result<IngestStream, Error> {
         // Check if already started
-        if self.stop_tx.is_some() {
+        if self.stop_tx.is_some() || self.direct_task.is_some() {
             return Err(Error::ConfigError(
                 "Source already started. Call stop() first.".to_string(),
             ));
@@ -261,6 +276,14 @@ impl IngestSource for FileIngestSource {
         // Send stop signal
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
+        }
+
+        // Keep the handle in self across await: cancelling stop() must not
+        // detach the worker or allow a second producer to start over it.
+        if let Some(task) = self.direct_task.as_mut() {
+            let result = task.await;
+            self.direct_task = None;
+            result.map_err(|e| Error::Other(format!("File producer task failed: {e}")))??;
         }
 
         // Update status
