@@ -20,6 +20,31 @@ The HTTP client implements the `PipelineClient` trait and provides:
 - Streaming sessions with `create_stream_session()`
 - Health checks with `health_check()`
 
+### Client copy policy
+
+HTTP JSON is a copying compatibility format. The client owns an `AllowCopies`
+ledger by default; `client.copy_context()` retains it for inspection. To bind
+your own authority, call `client.with_copy_context(copies.clone())` before making
+requests. Stream handles retain that exact authority after the client is dropped.
+The supplied context covers all calls made through that client; give independent
+clients distinct contexts when separate accounting is required.
+
+Bulk JSON encoding/decoding reports logical payload bytes and rejects under
+`RequireZeroCopy`. Contiguous response and SSE wire chunks retain their storage.
+Fragmented responses/events and multiline SSE data require separately counted
+assembly and also reject under strict policy, including metadata-only fragments.
+Counts exclude JSON codec internals, metadata allocations and HTTP/TLS/kernel
+transfers. This API does not negotiate or certify zero-copy execution remotely;
+the server's independent policy migration is still in progress.
+
+SSE accepts LF/CRLF event boundaries, split UTF-8 and multiline data, with a
+16 MiB per-event limit. Malformed/truncated events and explicit `event: error`
+messages are returned by `receive()`. Session creation waits for the output
+subscription to connect, and a failed subscription attempts remote cleanup.
+`close()` aborts and joins local receive work, releases queued outputs and requests
+remote deletion; deletion errors are returned. Dropping a stream aborts local
+receive work but does not perform an asynchronous remote deletion.
+
 ### Server-Side
 
 The HTTP server implements the `PipelineTransport` trait and exposes:
