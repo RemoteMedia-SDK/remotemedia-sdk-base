@@ -7,12 +7,13 @@ use super::error::IpcError;
 use super::publisher::NapiPublisher;
 use super::subscriber::NapiSubscriber;
 use napi_derive::napi;
+use remotemedia_types::{CopyContext, CopyPolicy};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Channel configuration
 #[napi(object)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChannelConfig {
     /// Maximum number of samples that can be in flight (default: 64)
     pub capacity: Option<u32>,
@@ -44,7 +45,9 @@ impl ChannelConfig {
 
 /// IPC Channel for pub/sub communication
 #[napi]
+#[derive(Clone)]
 pub struct NapiChannel {
+    copies: CopyContext,
     /// Full channel name including session prefix
     name: String,
     /// Channel configuration
@@ -55,31 +58,13 @@ pub struct NapiChannel {
 
 #[napi]
 impl NapiChannel {
-    /// Create a new channel (internal use - use Session.channel() instead)
-    pub(crate) fn new(name: String, config: ChannelConfig) -> Self {
+    pub(crate) fn new(name: String, config: ChannelConfig, copies: CopyContext) -> Self {
         Self {
             name,
             config,
+            copies,
             is_open: Arc::new(AtomicBool::new(true)),
         }
-    }
-
-    /// Create a new channel handle sharing state with an existing channel
-    pub(crate) fn with_shared_state(
-        name: String,
-        config: ChannelConfig,
-        is_open: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            name,
-            config,
-            is_open,
-        }
-    }
-
-    /// Get the shared is_open state for creating handles
-    pub(crate) fn get_is_open(&self) -> Arc<AtomicBool> {
-        self.is_open.clone()
     }
 
     /// Get the full channel name
@@ -111,6 +96,8 @@ impl NapiChannel {
             self.name.clone(),
             self.config.max_payload_size(),
             self.config.capacity(),
+            self.is_open.clone(),
+            self.copies.clone(),
         )
     }
 
@@ -119,6 +106,12 @@ impl NapiChannel {
     pub fn create_subscriber(&self, buffer_size: Option<u32>) -> napi::Result<NapiSubscriber> {
         if !self.is_open() {
             return Err(IpcError::ChannelError("Channel is closed".to_string()).into());
+        }
+
+        if self.copies.policy() == CopyPolicy::RequireZeroCopy {
+            return Err(napi::Error::from_reason(
+                "Node subscriber ownership migration is incomplete; strict receive is unsupported",
+            ));
         }
 
         let buffer = buffer_size

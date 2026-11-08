@@ -14,7 +14,18 @@ pub(super) fn publish_runtime_data(
     data: &RuntimeData,
     copies: &CopyContext,
 ) -> Result<(), String> {
-    let length = encoded_len(data, copies, data_transfer::MAX_SLICE_LEN)?;
+    publish_runtime_data_with_limit(publisher, data, copies, data_transfer::MAX_SLICE_LEN)
+}
+
+/// Encode compatibility MessagePack directly into an exact native loan.
+/// This is an attributed serialization copy, not a descriptor publication.
+pub fn publish_runtime_data_with_limit(
+    publisher: &iceoryx2::port::publisher::Publisher<iceoryx2::service::ipc::Service, [u8], ()>,
+    data: &RuntimeData,
+    copies: &CopyContext,
+    limit: usize,
+) -> Result<(), String> {
+    let length = encoded_len(data, copies, limit)?;
     let mut sample = publisher
         .loan_slice_uninit(length)
         .map_err(|error| format!("loan: {error:?}"))?;

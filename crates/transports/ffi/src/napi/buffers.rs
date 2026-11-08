@@ -2,10 +2,28 @@
 mod input;
 pub(super) use input::InputBuffer;
 
-use napi::{Env, Error, JsBuffer, NapiValue, Result};
+use napi::{Env, Error, JsBuffer, NapiRaw, NapiValue, Result};
 use napi_derive::napi;
 use remotemedia_types::{CopyContext, CopyPolicy, CopyReason, SharedBuffer, SharedBytes};
 use std::sync::OnceLock;
+
+/// Allocate final JS-owned storage, avoiding napi-rs's external-Vec fallback copy.
+/// The caller must fill it before returning it to JS.
+pub(super) fn output_buffer(env: Env, len: usize) -> Result<napi::bindgen_prelude::Buffer> {
+    let output = if len == 0 {
+        empty_buffer(env)?
+    } else {
+        env.create_buffer(len)?.into_raw()
+    };
+    // SAFETY: this is a fresh ordinary Node Buffer in the current callback
+    // scope. No JS code runs and no alias escapes during the conversion.
+    unsafe {
+        <napi::bindgen_prelude::Buffer as napi::bindgen_prelude::FromNapiValue>::from_napi_value(
+            env.raw(),
+            output.raw(),
+        )
+    }
+}
 
 fn contexts() -> &'static [CopyContext; 2] {
     static CONTEXTS: OnceLock<[CopyContext; 2]> = OnceLock::new();

@@ -129,16 +129,33 @@ const tensor = NapiRuntimeData.tensor(data: Uint8Array, shape: number[], dtype: 
 ```typescript
 const publisher = channel.createPublisher();
 
-// Direct publish
+// Counted compatibility serialization into a native loan
 publisher.publish(runtimeData);
 
-// Zero-copy loan pattern (for large data)
+// Direct producer writes into native shared memory
 const loaned = publisher.loan(bufferSize);
-loaned.write(data);
+loaned.fill(0);
+loaned.set(0, 42);
 loaned.send();
 
 publisher.close();
 ```
+
+`send()` waits for actual native publication. `release()` cancels a loan; either
+operation consumes it exactly once and returns its producer credit. Dropping a
+loan also releases it, but explicit release avoids waiting for garbage collection.
+
+Use `loaned.write(buffer, offset)` or `publisher.publishRaw(buffer)` to import
+existing mutable bytes with one counted copy. SharedArrayBuffer inputs reject.
+`loaned.buffer` returns a counted, independent snapshot; modifying it does not
+write into the loan, and it remains valid after sending or releasing the loan.
+
+Create an IPC session with `requireZeroCopy: true` to reject nonempty copying
+operations. Direct `loan`/`set`/`fill`/`send` remains available. `session.copyReport()`
+returns that IPC session's JSON accounting report, separate from core pipeline
+accounting. Strict subscriber creation currently rejects because receive-side
+ownership migration is incomplete. The compatibility subscriber below still
+copies its payload. Synchronous per-byte setters are not a throughput benchmark.
 
 ### Subscriber
 

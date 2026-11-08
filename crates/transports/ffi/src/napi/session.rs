@@ -5,6 +5,7 @@
 use super::channel::{make_channel_name, ChannelConfig, NapiChannel};
 use super::error::IpcError;
 use napi_derive::napi;
+use remotemedia_types::{CopyContext, CopyPolicy};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -21,6 +22,8 @@ fn sessions() -> &'static RwLock<HashMap<String, Arc<SessionInner>>> {
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
+    /// Reject materializing IPC operations; direct producer loans remain available.
+    pub require_zero_copy: Option<bool>,
     /// Session identifier (8-64 alphanumeric chars + underscore/hyphen)
     pub id: String,
     /// Default channel configuration
@@ -29,6 +32,7 @@ pub struct SessionConfig {
 
 /// Internal session state
 struct SessionInner {
+    copies: CopyContext,
     id: String,
     default_config: ChannelConfig,
     channels: RwLock<HashMap<String, Arc<NapiChannel>>>,
@@ -49,6 +53,14 @@ impl NapiSession {
         validate_session_id(&config.id)?;
 
         let inner = Arc::new(SessionInner {
+            copies: CopyContext::new(
+                if config.require_zero_copy.unwrap_or(false) {
+                    CopyPolicy::RequireZeroCopy
+                } else {
+                    CopyPolicy::AllowCopies
+                },
+                format!("node-ipc:{}", config.id),
+            ),
             id: config.id.clone(),
             default_config: config.default_channel_config.unwrap_or_default(),
             channels: RwLock::new(HashMap::new()),
@@ -100,39 +112,37 @@ impl NapiSession {
         validate_channel_name(&name)?;
 
         let full_name = make_channel_name(&self.inner.id, &name);
-        let channel_config = config.unwrap_or_else(|| self.inner.default_config.clone());
-
-        // Check if channel already exists
-        {
-            let channels = self.inner.channels.read().unwrap();
-            if let Some(existing) = channels.get(&name) {
-                // Return a new handle sharing state with the existing channel
-                return Ok(NapiChannel::with_shared_state(
-                    full_name,
-                    channel_config,
-                    existing.get_is_open(),
-                ));
+        let mut channels = self.inner.channels.write().unwrap();
+        if !self.is_active() {
+            return Err(IpcError::SessionError("Session is closed".into()).into());
+        }
+        if let Some(existing) = channels.get(&name) {
+            if config
+                .as_ref()
+                .is_some_and(|config| *config != existing.config())
+            {
+                return Err(IpcError::ChannelError(
+                    "Cannot reconfigure an existing channel".into(),
+                )
+                .into());
             }
+            return Ok((**existing).clone());
         }
-
-        // Create new channel
-        let channel = NapiChannel::new(full_name.clone(), channel_config.clone());
-        let is_open = channel.get_is_open();
-
-        // Store reference (sharing the same is_open state)
-        {
-            let mut channels = self.inner.channels.write().unwrap();
-            channels.insert(
-                name.clone(),
-                Arc::new(NapiChannel::with_shared_state(
-                    full_name,
-                    channel_config,
-                    is_open,
-                )),
-            );
-        }
+        let channel = NapiChannel::new(
+            full_name,
+            config.unwrap_or_else(|| self.inner.default_config.clone()),
+            self.inner.copies.clone(),
+        );
+        channels.insert(name, Arc::new(channel.clone()));
 
         Ok(channel)
+    }
+
+    /// IPC-session accounting, distinct from a core pipeline SessionRouter ledger.
+    #[napi]
+    pub fn copy_report(&self) -> napi::Result<String> {
+        serde_json::to_string(&self.inner.copies.report())
+            .map_err(|error| napi::Error::from_reason(error.to_string()))
     }
 
     /// List all channels in this session
@@ -145,7 +155,9 @@ impl NapiSession {
     /// Close the session and all its channels
     #[napi]
     pub fn close(&self) {
-        self.inner.is_active.store(false, Ordering::SeqCst);
+        if !self.inner.is_active.swap(false, Ordering::SeqCst) {
+            return;
+        }
 
         // Close all channels
         {

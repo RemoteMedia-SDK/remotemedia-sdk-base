@@ -39,6 +39,7 @@ pub(crate) mod control_frames;
 mod native_copy_reporting;
 #[cfg(feature = "multiprocess")]
 mod native_wire;
+pub use native_wire::publish_runtime_data_with_limit;
 mod python_wire;
 
 /// Typed mapped runner for existing node traits and direct output allocation.

@@ -1,7 +1,7 @@
 /**
  * RemoteMedia Native Node.js Bindings
  *
- * Zero-copy IPC between Node.js, Python, and Rust via iceoryx2.
+ * Native shared-memory producer loans and explicit copying compatibility APIs.
  */
 
 // =============================================================================
@@ -100,7 +100,7 @@ export function isControlMessage(data: RuntimeData): data is RuntimeData & { typ
 // =============================================================================
 
 /**
- * A received sample with zero-copy buffer access.
+ * Compatibility receive wrapper. Its Buffer getter currently makes a snapshot.
  */
 export interface ReceivedSample {
   readonly buffer: Buffer;
@@ -115,9 +115,14 @@ export interface ReceivedSample {
  * A loaned sample buffer for zero-copy publishing.
  */
 export interface LoanedSample {
+  /** Counted independent snapshot; writes do not modify the native loan. */
   readonly buffer: Buffer;
   readonly size: number;
   readonly isConsumed: boolean;
+  set(index: number, value: number): void;
+  fill(value: number): void;
+  /** Counted import from ordinary, non-shared Buffer storage. */
+  write(data: Buffer, offset?: number): void;
   send(): void;
   release(): void;
 }
@@ -163,7 +168,9 @@ export interface Publisher {
   readonly maxLoans: number;
   loan(size: number): LoanedSample;
   tryLoan(size: number): LoanedSample | null;
-  publish(data: RuntimeData): void;
+  /** Counted MessagePack serialization; incompatible with strict bulk publication. */
+  publish(data: import('./native-buffers').NapiRuntimeData): void;
+  publishRaw(data: Buffer): void;
   close(): void;
 }
 
@@ -205,6 +212,7 @@ export interface Channel {
 
 export interface SessionConfig {
   id: string;
+  requireZeroCopy?: boolean;
   defaultChannelConfig?: ChannelConfig;
 }
 
@@ -213,6 +221,8 @@ export interface Session {
   readonly isActive: boolean;
   channel(name: string, config?: ChannelConfig): Channel;
   listChannels(): string[];
+  /** JSON report for this IPC session, separate from core pipeline accounting. */
+  copyReport(): string;
   close(): void;
 }
 
