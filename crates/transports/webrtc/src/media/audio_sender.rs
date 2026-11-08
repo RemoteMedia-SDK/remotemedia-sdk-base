@@ -119,6 +119,9 @@ struct AudioRingBuffer {
     /// retry so they bail out instead of hanging when the sender is
     /// being torn down.
     shutdown: AtomicBool,
+    /// Separate from capacity notifications so the sender cannot consume a
+    /// producer's space-available wakeup while waiting for closure.
+    closed: Notify,
 }
 
 impl AudioRingBuffer {
@@ -132,6 +135,7 @@ impl AudioRingBuffer {
             capacity,
             space_available: Notify::new(),
             shutdown: AtomicBool::new(false),
+            closed: Notify::new(),
         }
     }
 
@@ -244,6 +248,31 @@ impl AudioRingBuffer {
         drop(buffer);
         drop(discarded);
         self.space_available.notify_waiters();
+        self.closed.notify_waiters();
+    }
+
+    async fn wait_closed(&self) {
+        let closed = self.closed.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if !self.shutdown.load(Ordering::Acquire) {
+            closed.await;
+        }
+    }
+
+    /// Cancel a pending transport write or pacing wait when ownership closes.
+    async fn run_until_closed<T>(&self, work: impl std::future::Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            _ = self.wait_closed() => None,
+            output = work => Some(output),
+        }
+    }
+
+    fn wait_for(&self, runtime: &tokio::runtime::Runtime, duration: Duration) -> bool {
+        runtime
+            .block_on(async { self.run_until_closed(tokio::time::sleep(duration)).await })
+            .is_some()
     }
 }
 
@@ -279,6 +308,12 @@ struct SenderLifetime {
 
 impl Drop for SenderLifetime {
     fn drop(&mut self) {
+        self.request_shutdown();
+    }
+}
+
+impl SenderLifetime {
+    fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         self.buffer.signal_shutdown();
         if let Some(publisher) = self.media_clock.write().take() {
@@ -423,80 +458,88 @@ impl AudioSender {
             }
 
             // Try to get a frame from the buffer
-            if let Some(frame) = buffer.try_pop() {
-                // Update RTP timestamp
-                let old_ts = timestamp.fetch_add(frame.sample_count, Ordering::AcqRel);
-
-                // Create WebRTC sample
-                let sample = Sample {
-                    data: frame.data,
-                    duration: frame.duration,
-                    timestamp: std::time::SystemTime::now(),
-                    ..Default::default()
-                };
-
-                // Send the sample using the dedicated runtime
-                let track_clone = Arc::clone(&track);
-                let send_result = rt.block_on(async { track_clone.write_sample(&sample).await });
-
-                if let Err(e) = send_result {
-                    warn!("Failed to send audio frame: {}", e);
-                } else {
-                    frame_count += 1;
-
-                    // Phase 5.1: publish a media_clock tick after each
-                    // successful Opus frame send. Subscribers (wire-
-                    // bound `WireTickSource`s driving Pacer instances
-                    // for `ClockedToOutboundMedia` nodes) read the
-                    // event and invoke their node's `tick()` once per
-                    // outbound frame. No-op when no publisher is
-                    // attached.
-                    let publisher = media_clock.read().clone();
-                    if let Some(publisher) = publisher {
-                        publisher.publish(frame.duration);
-                    }
-
-                    // Log first frame and periodically
-                    if frame_count == 1 {
-                        info!("Audio sender: FIRST frame sent successfully!");
-                    } else if frame_count.is_multiple_of(50) {
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        let buffer_len = buffer.len();
-                        info!(
-                            "Audio sender: {} frames sent in {:.2}s, buffer: {} frames, timestamp: {}",
-                            frame_count, elapsed, buffer_len, old_ts
-                        );
-                    }
-                }
-
-                // PACING: sleep until the next frame's wall-clock
-                // deadline, accounting for the time write_sample took.
-                let now = Instant::now();
-                let deadline = match next_deadline {
-                    // Stream just (re)started: anchor here so the first
-                    // frame after an empty buffer doesn't sprint.
-                    None => now + frame.duration,
-                    // Behind by more than MAX_CATCHUP — give up the
-                    // catch-up budget and re-anchor at now. Avoids
-                    // bursting packets that would only make jitter worse.
-                    Some(d) if now > d + MAX_CATCHUP => now + frame.duration,
-                    Some(d) => d + frame.duration,
-                };
-                next_deadline = Some(deadline);
-                if let Some(wait) = deadline.checked_duration_since(now) {
-                    std::thread::sleep(wait);
-                }
-                // If `wait` was None we're behind schedule — skip the
-                // sleep and let the next iteration pop the next frame
-                // immediately. The deadline stays consistent so we
-                // self-correct on the very next on-time frame.
-            } else {
-                // Buffer is empty — drop the deadline so the next frame
-                // re-anchors at its arrival time instead of trying to
-                // "catch up" to a stale clock.
+            let Some(frame) = buffer.try_pop() else {
+                // Empty streams re-anchor pacing at the next arrival.
                 next_deadline = None;
-                std::thread::sleep(Duration::from_millis(5));
+                if !buffer.wait_for(&rt, Duration::from_millis(5)) {
+                    break;
+                }
+                continue;
+            };
+            // Update RTP timestamp
+            let old_ts = timestamp.fetch_add(frame.sample_count, Ordering::AcqRel);
+
+            // Create WebRTC sample
+            let sample = Sample {
+                data: frame.data,
+                duration: frame.duration,
+                timestamp: std::time::SystemTime::now(),
+                ..Default::default()
+            };
+
+            // Send the sample using the dedicated runtime
+            let track_clone = Arc::clone(&track);
+            let Some(send_result) = rt.block_on(async {
+                buffer
+                    .run_until_closed(track_clone.write_sample(&sample))
+                    .await
+            }) else {
+                break;
+            };
+
+            if let Err(e) = send_result {
+                warn!("Failed to send audio frame: {}", e);
+            } else {
+                frame_count += 1;
+
+                // Phase 5.1: publish a media_clock tick after each
+                // successful Opus frame send. Subscribers (wire-
+                // bound `WireTickSource`s driving Pacer instances
+                // for `ClockedToOutboundMedia` nodes) read the
+                // event and invoke their node's `tick()` once per
+                // outbound frame. No-op when no publisher is
+                // attached.
+                let publisher = media_clock.read().clone();
+                if let Some(publisher) = publisher {
+                    publisher.publish(frame.duration);
+                }
+
+                // Log first frame and periodically
+                if frame_count == 1 {
+                    info!("Audio sender: FIRST frame sent successfully!");
+                } else if frame_count.is_multiple_of(50) {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let buffer_len = buffer.len();
+                    info!(
+                        "Audio sender: {} frames sent in {:.2}s, buffer: {} frames, timestamp: {}",
+                        frame_count, elapsed, buffer_len, old_ts
+                    );
+                }
             }
+
+            // PACING: sleep until the next frame's wall-clock
+            // deadline, accounting for the time write_sample took.
+            let now = Instant::now();
+            let deadline = match next_deadline {
+                // Stream just (re)started: anchor here so the first
+                // frame after an empty buffer doesn't sprint.
+                None => now + frame.duration,
+                // Behind by more than MAX_CATCHUP — give up the
+                // catch-up budget and re-anchor at now. Avoids
+                // bursting packets that would only make jitter worse.
+                Some(d) if now > d + MAX_CATCHUP => now + frame.duration,
+                Some(d) => d + frame.duration,
+            };
+            next_deadline = Some(deadline);
+            if let Some(wait) = deadline.checked_duration_since(now) {
+                if !buffer.wait_for(&rt, wait) {
+                    break;
+                }
+            }
+            // If `wait` was None we're behind schedule — skip the
+            // sleep and let the next iteration pop the next frame
+            // immediately. The deadline stays consistent so we
+            // self-correct on the very next on-time frame.
         }
 
         info!(
@@ -609,15 +652,7 @@ impl AudioSender {
     /// Shutdown the sender and wait for thread to complete
     pub async fn shutdown(&self) -> Result<()> {
         debug!("Shutting down AudioSender");
-        self.shutdown.store(true, Ordering::Release);
-        // Phase 5.9: stop the media_clock channel so subscribed wire
-        // pacers exit their `next()` loop with `None`. Idempotent if no
-        // publisher is attached.
-        self.detach_media_clock();
-        // Also flip the buffer's shutdown flag and wake every parked
-        // producer; otherwise a producer awaiting space hangs forever
-        // because the transmission thread has stopped popping.
-        self.buffer.signal_shutdown();
+        self.request_shutdown();
 
         // Wait for thread to finish
         if let Some(handle) = self.thread_handle.lock().await.take() {
@@ -627,6 +662,16 @@ impl AudioSender {
         }
 
         Ok(())
+    }
+
+    /// Close before acquiring producer locks: queued/blocked owners must release
+    /// before a track can acquire its packetizer and join the sender.
+    pub(crate) fn request_shutdown(&self) {
+        self.lifetime.request_shutdown();
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
     }
 }
 

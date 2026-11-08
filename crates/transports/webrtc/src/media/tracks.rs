@@ -101,6 +101,10 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 #[path = "audio_track_owner_tests.rs"]
 mod audio_owner_tests;
 
+#[cfg(test)]
+#[path = "audio_shutdown_tests.rs"]
+mod audio_shutdown_tests;
+
 #[cfg(all(test, not(feature = "video")))]
 #[tokio::test]
 async fn video_copy_disabled_backend_keeps_explicit_error_without_materialization() {
@@ -269,6 +273,9 @@ impl AudioTrack {
         let sender = sender_guard
             .as_ref()
             .ok_or_else(|| Error::MediaTrackError("AudioSender not initialized".to_string()))?;
+        if sender.is_shutdown() {
+            return Err(Error::MediaTrackError("AudioSender is shut down".into()));
+        }
 
         if let Some(replacement) = replacement {
             // End the previous format once, before replacing its encoder.
@@ -385,16 +392,19 @@ impl AudioTrack {
 
     /// Shutdown the audio track and wait for sender thread to complete
     pub async fn shutdown(&self) -> Result<()> {
-        // Take the sender under the async write-lock, then await the
-        // actual shutdown (the `.take()` returns owned).
-        let taken = {
-            let mut packetizer = self.packetizer.lock().await;
-            packetizer.clear();
-            self.sender.write().await.take()
-        };
-        if let Some(sender) = taken {
+        // Closing needs only a shared sender read, which can coexist with a
+        // producer holding that read while backpressured on enqueue.
+        let sender = self.sender.read().await.clone();
+        if let Some(sender) = &sender {
+            sender.request_shutdown();
+        }
+        self.packetizer.lock().await.clear();
+        if let Some(sender) = sender {
             sender.shutdown().await?;
         }
+        // Keep the closed sender observable until joining completes. Concurrent
+        // shutdown calls must not mistake a taken handle for completed teardown.
+        self.sender.write().await.take();
         Ok(())
     }
 

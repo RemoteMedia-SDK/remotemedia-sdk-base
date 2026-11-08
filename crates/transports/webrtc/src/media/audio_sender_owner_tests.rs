@@ -2,6 +2,29 @@ use super::*;
 use remotemedia_types::{BufferBudget, RuntimeData};
 use std::task::Poll;
 
+#[tokio::test]
+async fn audio_stop_cancels_pending_transport_work_and_releases_its_owner() {
+    let queue = AudioRingBuffer::new(2);
+    let budget = BufferBudget::new(1, 32);
+    let frame = owned_frame(&budget, 1);
+    let mut work = Box::pin(queue.run_until_closed(async move {
+        std::future::pending::<()>().await;
+        drop(frame);
+    }));
+    assert!(matches!(futures::poll!(&mut work), Poll::Pending));
+    assert_eq!(budget.usage().owners, 1);
+    queue.signal_shutdown();
+    assert!(tokio::time::timeout(Duration::from_secs(1), work)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(budget.usage().owners, 0);
+    assert!(queue
+        .run_until_closed(async { panic!("closed work must not run") })
+        .await
+        .is_none());
+}
+
 fn owned_frame(budget: &BufferBudget, value: u8) -> AudioFrame {
     let RuntimeData::Binary(owner) = budget
         .admit(RuntimeData::Binary(vec![value; 32].into()))
