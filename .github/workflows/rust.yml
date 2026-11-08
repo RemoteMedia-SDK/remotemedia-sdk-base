@@ -18,7 +18,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
   # Cargo.toml [patch]es plugin-sdk crates to ../remotemedia-plugin-sdk.
-  PLUGIN_SDK_REV: 8dd9b5cf2df1196c1e8b12e8368f7a404aa6b69a
+  PLUGIN_SDK_REV: 74b80267a7812730883e3767055686f79561f3ff
 
 jobs:
   check:
