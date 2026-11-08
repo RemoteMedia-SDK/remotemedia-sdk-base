@@ -24,9 +24,7 @@ pub(super) fn decoder_packet(data: SharedBytes, copies: &CopyContext) -> Result<
             return Ok(owner.0.clone());
         }
     }
-    let attempt = copies
-        .begin(CopyReason::ForeignPoolIngress, data.len() as u64)
-        .map_err(|error| CodecError::DecodingFailed(error.to_string()))?;
+    let attempt = copies.begin(CopyReason::ForeignPoolIngress, data.len() as u64)?;
     let mut packet = PacketMut::new(data.len());
     packet.data_mut().copy_from_slice(&data);
     attempt.complete();
@@ -63,9 +61,7 @@ fn publish_packets(mut packets: Vec<Packet>, copies: &CopyContext) -> Result<(Sh
             CodecError::EncodingFailed("Encoded packet size exceeds addressable storage".into())
         })
     })?;
-    let attempt = copies
-        .begin(CopyReason::VecMaterialization, bytes as u64)
-        .map_err(|error| CodecError::EncodingFailed(error.to_string()))?;
+    let attempt = copies.begin(CopyReason::VecMaterialization, bytes as u64)?;
     let mut output = Vec::new();
     output.try_reserve_exact(bytes).map_err(|error| {
         CodecError::EncodingFailed(format!("Cannot allocate aggregate encoded packet: {error}"))

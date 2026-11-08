@@ -53,14 +53,73 @@ pub fn rgb24_to_yuv420p_into(rgb: &[u8], w: usize, h: usize, out: &mut [u8]) -> 
     let (y_plane, rest) = out.split_at_mut(y_size);
     let (cb_plane, cr_plane) = rest.split_at_mut(chroma_size);
 
+    rgb_to_yuv420p_planes(
+        rgb,
+        w,
+        h,
+        3,
+        [(y_plane, w), (cb_plane, chroma_w), (cr_plane, chroma_w)],
+    )
+}
+
+/// Validate a visible plane without requiring or touching trailing row padding.
+pub(crate) fn validate_plane_span(
+    len: usize,
+    stride: usize,
+    columns: usize,
+    rows: usize,
+) -> crate::Result<()> {
+    let extent = rows
+        .checked_sub(1)
+        .and_then(|rows| rows.checked_mul(stride))
+        .and_then(|offset| offset.checked_add(columns));
+    if columns == 0
+        || stride < columns
+        || extent.map_or(true, |extent| extent > len || extent > isize::MAX as usize)
+    {
+        return Err(crate::Error::InvalidData(
+            "invalid or overflowing video plane span".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Compute directly into packed or strided Y/U/V planes. All extents are checked
+/// before the first write; alpha is ignored for four-channel input.
+pub(crate) fn rgb_to_yuv420p_planes(
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+    channels: usize,
+    planes: [(&mut [u8], usize); 3],
+) -> crate::Result<()> {
+    yuv420p_size(w, h)?;
+    if !matches!(channels, 3 | 4)
+        || w.checked_mul(h).and_then(|n| n.checked_mul(channels)) != Some(rgb.len())
+    {
+        return Err(crate::Error::InvalidData(
+            "RGB span length differs from dimensions".into(),
+        ));
+    }
+    let chroma_w = w.div_ceil(2);
+    let chroma_h = h.div_ceil(2);
+    for ((plane, stride), (columns, rows)) in
+        planes
+            .iter()
+            .zip([(w, h), (chroma_w, chroma_h), (chroma_w, chroma_h)])
+    {
+        validate_plane_span(plane.len(), *stride, columns, rows)?;
+    }
+    let [(y_plane, y_stride), (cb_plane, cb_stride), (cr_plane, cr_stride)] = planes;
+
     for y in 0..h {
         for x in 0..w {
-            let i = (y * w + x) * 3;
+            let i = (y * w + x) * channels;
             let r = rgb[i] as f32;
             let g = rgb[i + 1] as f32;
             let b = rgb[i + 2] as f32;
             let y_val = 0.299 * r + 0.587 * g + 0.114 * b;
-            y_plane[y * w + x] = y_val.round().clamp(0.0, 255.0) as u8;
+            y_plane[y * y_stride + x] = y_val.round().clamp(0.0, 255.0) as u8;
         }
     }
 
@@ -74,7 +133,7 @@ pub fn rgb24_to_yuv420p_into(rgb: &[u8], w: usize, h: usize, out: &mut [u8]) -> 
                 for dx in 0..2 {
                     let py = (cy * 2 + dy).min(h - 1);
                     let px = (cx * 2 + dx).min(w - 1);
-                    let i = (py * w + px) * 3;
+                    let i = (py * w + px) * channels;
                     r_sum += rgb[i] as f32;
                     g_sum += rgb[i + 1] as f32;
                     b_sum += rgb[i + 2] as f32;
@@ -86,60 +145,21 @@ pub fn rgb24_to_yuv420p_into(rgb: &[u8], w: usize, h: usize, out: &mut [u8]) -> 
             let b = b_sum / count;
             let cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b;
             let cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-            cb_plane[cy * chroma_w + cx] = cb.round().clamp(0.0, 255.0) as u8;
-            cr_plane[cy * chroma_w + cx] = cr.round().clamp(0.0, 255.0) as u8;
+            cb_plane[cy * cb_stride + cx] = cb.round().clamp(0.0, 255.0) as u8;
+            cr_plane[cy * cr_stride + cx] = cr.round().clamp(0.0, 255.0) as u8;
         }
     }
     Ok(())
 }
 
-/// BT.601 RGBA32 → YUV420p, ignoring the alpha channel.
+/// BT.601 RGBA32 -> YUV420p, ignoring the alpha channel.
 pub fn rgba32_to_yuv420p(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let y_size = w * h;
-    let chroma_w = (w + 1) / 2;
-    let chroma_h = (h + 1) / 2;
-    let chroma_size = chroma_w * chroma_h;
-    let mut out = vec![0u8; y_size + 2 * chroma_size];
-    let (y_plane, rest) = out.split_at_mut(y_size);
-    let (cb_plane, cr_plane) = rest.split_at_mut(chroma_size);
-
-    for y in 0..h {
-        for x in 0..w {
-            let i = (y * w + x) * 4;
-            let r = rgba[i] as f32;
-            let g = rgba[i + 1] as f32;
-            let b = rgba[i + 2] as f32;
-            let y_val = 0.299 * r + 0.587 * g + 0.114 * b;
-            y_plane[y * w + x] = y_val.round().clamp(0.0, 255.0) as u8;
-        }
-    }
-
-    for cy in 0..chroma_h {
-        for cx in 0..chroma_w {
-            let mut r_sum = 0.0f32;
-            let mut g_sum = 0.0f32;
-            let mut b_sum = 0.0f32;
-            let mut count = 0.0f32;
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let py = (cy * 2 + dy).min(h - 1);
-                    let px = (cx * 2 + dx).min(w - 1);
-                    let i = (py * w + px) * 4;
-                    r_sum += rgba[i] as f32;
-                    g_sum += rgba[i + 1] as f32;
-                    b_sum += rgba[i + 2] as f32;
-                    count += 1.0;
-                }
-            }
-            let r = r_sum / count;
-            let g = g_sum / count;
-            let b = b_sum / count;
-            let cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b;
-            let cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-            cb_plane[cy * chroma_w + cx] = cb.round().clamp(0.0, 255.0) as u8;
-            cr_plane[cy * chroma_w + cx] = cr.round().clamp(0.0, 255.0) as u8;
-        }
-    }
+    let mut out = vec![0; yuv420p_size(w, h).expect("valid RGBA dimensions")];
+    let chroma_w = w.div_ceil(2);
+    let (y, uv) = out.split_at_mut(w * h);
+    let (u, v) = uv.split_at_mut(chroma_w * h.div_ceil(2));
+    rgb_to_yuv420p_planes(rgba, w, h, 4, [(y, w), (u, chroma_w), (v, chroma_w)])
+        .expect("valid RGBA and YUV spans");
     out
 }
 

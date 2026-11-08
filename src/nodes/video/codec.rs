@@ -34,6 +34,9 @@ pub enum CodecError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error(transparent)]
+    CopyRejected(#[from] remotemedia_types::CopyRejected),
 }
 
 /// Video encoder backend trait
@@ -49,6 +52,17 @@ pub trait VideoEncoderBackend: Send + Sync {
     /// * `Ok(RuntimeData)` - Encoded frame with codec=Some(...)
     /// * `Err(CodecError)` - Encoding failure
     fn encode(&mut self, input: RuntimeData) -> Result<RuntimeData>;
+
+    /// Execute with caller-owned copy authority. Backends must opt in explicitly.
+    fn encode_with_copy_context(
+        &mut self,
+        _input: RuntimeData,
+        _copies: &remotemedia_types::CopyContext,
+    ) -> Result<RuntimeData> {
+        Err(CodecError::NotAvailable(
+            "encoder does not support contextual copy accounting".into(),
+        ))
+    }
 
     /// Get the codec this encoder produces
     fn codec(&self) -> VideoCodec;
@@ -102,6 +116,14 @@ impl FFmpegEncoder {
 #[cfg(feature = "video")]
 impl VideoEncoderBackend for FFmpegEncoder {
     fn encode(&mut self, input: RuntimeData) -> Result<RuntimeData> {
+        self.encode_with_copy_context(input, remotemedia_types::CopyContext::legacy())
+    }
+
+    fn encode_with_copy_context(
+        &mut self,
+        input: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<RuntimeData> {
         // Extract raw video frame
         let (pixel_data, width, height, format, frame_number, timestamp_us) = match input {
             RuntimeData::Video {
@@ -138,77 +160,7 @@ impl VideoEncoderBackend for FFmpegEncoder {
             ));
         }
 
-        // Encoder requires even dimensions for YUV 4:2:0 chroma sub-sampling.
-        if width % 2 != 0 || height % 2 != 0 {
-            return Err(CodecError::InvalidInput(format!(
-                "VideoEncoder requires even dimensions for YUV 4:2:0; got {}x{}",
-                width, height
-            )));
-        }
-
-        // Convert input to YUV420p planar (Y || U || V) once, regardless of
-        // the source pixel format. Earlier revisions of this method assumed
-        // pixel_data was already YUV420p and silently memcpy'd whatever bytes
-        // came in into the Y/U/V planes — feeding RGB into the encoder
-        // produced a green-tinted, horizontally banded output over WebRTC
-        // (the Y4M sink worked because it converts RGB→YUV itself).
-        let y_size = (width * height) as usize;
-        let uv_size = ((width / 2) * (height / 2)) as usize;
-        let yuv_buffer: remotemedia_types::SharedBytes = match format {
-            PixelFormat::Yuv420p | PixelFormat::I420 => {
-                let expected = y_size + 2 * uv_size;
-                if pixel_data.len() != expected {
-                    return Err(CodecError::InvalidInput(format!(
-                        "YUV420p frame buffer size mismatch: got {} bytes, expected {} for {}x{}",
-                        pixel_data.len(),
-                        expected,
-                        width,
-                        height
-                    )));
-                }
-                pixel_data
-            }
-            PixelFormat::Rgb24 => {
-                let expected = (width * height * 3) as usize;
-                if pixel_data.len() != expected {
-                    return Err(CodecError::InvalidInput(format!(
-                        "RGB24 frame buffer size mismatch: got {} bytes, expected {} for {}x{}",
-                        pixel_data.len(),
-                        expected,
-                        width,
-                        height
-                    )));
-                }
-                crate::data::video::rgb24_to_yuv420p(&pixel_data, width as usize, height as usize)
-                    .into()
-            }
-            PixelFormat::Rgba32 => {
-                let expected = (width * height * 4) as usize;
-                if pixel_data.len() != expected {
-                    return Err(CodecError::InvalidInput(format!(
-                        "RGBA32 frame buffer size mismatch: got {} bytes, expected {} for {}x{}",
-                        pixel_data.len(),
-                        expected,
-                        width,
-                        height
-                    )));
-                }
-                crate::data::video::rgba32_to_yuv420p(&pixel_data, width as usize, height as usize)
-                    .into()
-            }
-            PixelFormat::NV12 => {
-                return Err(CodecError::InvalidInput(
-                    "NV12 input not yet supported by VideoEncoder; convert to Yuv420p upstream"
-                        .to_string(),
-                ));
-            }
-            PixelFormat::Encoded | PixelFormat::Unspecified => {
-                return Err(CodecError::InvalidInput(format!(
-                    "Unsupported pixel format for encoding: {:?}",
-                    format
-                )));
-            }
-        };
+        let frame = super::frames::encoder_frame(&pixel_data, width, height, format, copies)?;
 
         // Lazy initialize encoder on first frame
         if self.encoder.is_none() {
@@ -333,37 +285,9 @@ impl VideoEncoderBackend for FFmpegEncoder {
 
         let encoder = self.encoder.as_mut().unwrap();
 
-        // Create frame and copy YUV plane data
-        use ac_ffmpeg::codec::{
-            video::{frame::get_pixel_format, VideoFrameMut},
-            Encoder,
-        };
+        use ac_ffmpeg::codec::Encoder;
         use ac_ffmpeg::time::{TimeBase, Timestamp};
-
-        let pixel_format = get_pixel_format("yuv420p");
         let time_base = TimeBase::new(1, self.config.framerate as i32);
-
-        let mut frame = VideoFrameMut::black(pixel_format, width as usize, height as usize);
-
-        {
-            let mut planes_mut = frame.planes_mut();
-            if !planes_mut.is_empty() {
-                let y_plane = planes_mut[0].data_mut();
-                let copy_len = y_plane.len().min(y_size);
-                y_plane[..copy_len].copy_from_slice(&yuv_buffer[..copy_len]);
-            }
-            if planes_mut.len() > 1 {
-                let u_plane = planes_mut[1].data_mut();
-                let copy_len = u_plane.len().min(uv_size);
-                u_plane[..copy_len].copy_from_slice(&yuv_buffer[y_size..y_size + copy_len]);
-            }
-            if planes_mut.len() > 2 {
-                let v_plane = planes_mut[2].data_mut();
-                let copy_len = v_plane.len().min(uv_size);
-                v_plane[..copy_len]
-                    .copy_from_slice(&yuv_buffer[y_size + uv_size..y_size + uv_size + copy_len]);
-            }
-        }
 
         // Set timestamp
         let pts = Timestamp::new(self.frame_count as i64, time_base);
@@ -376,10 +300,7 @@ impl VideoEncoderBackend for FFmpegEncoder {
 
         // Preserve a single packet's immutable FFmpeg owner. Multiple packets
         // require contiguous aggregation in the existing RuntimeData wire shape.
-        // Context-free backend calls retain explicit legacy attribution until
-        // the execution-context migration covers the other codec boundaries.
-        let (bitstream, is_keyframe) =
-            super::packets::take_encoded(encoder, remotemedia_types::CopyContext::legacy())?;
+        let (bitstream, is_keyframe) = super::packets::take_encoded(encoder, copies)?;
 
         self.frame_count += 1;
 

@@ -194,6 +194,52 @@ impl AsyncStreamingNode for VideoEncoderNode {
         "VideoEncoder"
     }
 
+    async fn process_with_ctx(
+        &self,
+        input: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let copies = ctx.copy_context().ok_or_else(|| {
+            Error::Execution("VideoEncoder requires context copy authority".into())
+        })?;
+        let encoder = Arc::clone(&self.encoder);
+        tokio::task::spawn_blocking(move || {
+            encoder
+                .lock()
+                .unwrap()
+                .encode_with_copy_context(input, &copies)
+        })
+        .await
+        .map_err(|e| Error::Execution(format!("Encoder task failed: {e}")))?
+        .map_err(|e| Error::Execution(format!("Encoding failed: {e}")))
+    }
+
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: HashMap<String, RuntimeData>,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let input = inputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Execution("No input data provided".into()))?
+            .1;
+        self.process_with_ctx(input, ctx).await
+    }
+
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        input: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+        mut callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        callback(self.process_with_ctx(input, ctx).await?)?;
+        Ok(1)
+    }
+
     async fn process(&self, input: RuntimeData) -> Result<RuntimeData, Error> {
         // Validate input is raw video frame (codec must be None)
         match &input {
