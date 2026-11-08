@@ -5,7 +5,7 @@
 // Public API types - fields and methods used by library consumers, not internally
 #![allow(dead_code)]
 
-use crate::channels::{DataChannelMessage, DataChannelSplitter, MAX_CHUNK_SIZE};
+mod wire_output;
 use crate::media::tracks::rtp_to_runtime_data;
 use crate::peer::PeerManager;
 use crate::session::{Session, SessionId};
@@ -772,69 +772,16 @@ impl SessionRouter {
             }
             _ => {
                 // Route non-media RuntimeData through the data channel.
-                use crate::adapters::runtime_data_to_data_buffer;
-                use prost::Message;
+                let encoded = crate::adapters::encode_runtime_data_with_context(data, &self.copies)
+                    .map_err(|e| Error::Other(e.into()))?;
 
-                // Serialize to protobuf DataBuffer
-                let buffer = runtime_data_to_data_buffer(data);
-                let encoded = buffer.encode_to_vec();
-
-                if encoded.len() > MAX_CHUNK_SIZE {
-                    // Large payload: split into chunks
-                    self.send_data_channel_chunks(&peer, &encoded).await
-                } else {
-                    // Small payload: single RuntimeData message
-                    self.send_data_channel_message(&peer, &encoded).await
+                let limit = wire_output::message_size_limit(&peer).await?;
+                for message in wire_output::prepare_messages(encoded, &self.session_id, limit)? {
+                    peer.send_data_channel_message_with_context(&message, &self.copies).await?;
                 }
+                Ok(())
             }
         }
-    }
-
-    /// Send a single RuntimeData message over the data channel.
-    async fn send_data_channel_message(
-        &self,
-        peer: &crate::peer::PeerConnection,
-        encoded: &[u8],
-    ) -> Result<()> {
-        let msg = DataChannelMessage::runtime_data(encoded.to_vec());
-        peer.send_data_channel_message(&msg).await
-    }
-
-    /// Send a large payload as chunked messages over the data channel.
-    async fn send_data_channel_chunks(
-        &self,
-        peer: &crate::peer::PeerConnection,
-        encoded: &[u8],
-    ) -> Result<()> {
-        use uuid::Uuid;
-
-        let stream_id = self.session_id.clone();
-        let message_id = Uuid::new_v4().to_string();
-        let splitter = DataChannelSplitter::new(&stream_id, &message_id);
-        let chunks = splitter.split(encoded);
-        let num_chunks = chunks.len();
-
-        trace!(
-            stream_id = %stream_id,
-            message_id = %message_id,
-            chunks = num_chunks,
-            total_bytes = encoded.len(),
-            "Sending chunked data channel message"
-        );
-
-        for chunk_info in chunks {
-            let msg = DataChannelMessage::chunk(chunk_info);
-            peer.send_data_channel_message(&msg).await?;
-        }
-
-        debug!(
-            stream_id = %stream_id,
-            message_id = %message_id,
-            chunks = num_chunks,
-            "Completed sending chunked message"
-        );
-
-        Ok(())
     }
 
     /// Send data to output channel (T128).
@@ -1357,6 +1304,10 @@ impl SessionRouter {
         self.peer_bitrate_states.read().await.clone()
     }
 }
+
+#[cfg(test)]
+#[path = "router_wire_tests.rs"]
+mod wire_tests;
 
 #[cfg(test)]
 mod tests {

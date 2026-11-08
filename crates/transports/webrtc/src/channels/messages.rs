@@ -257,7 +257,19 @@ impl DataChannelMessage {
         })?
     }
 
+    /// Encoded envelope length without materializing bulk payload bytes.
+    pub fn encoded_len(&self) -> Result<usize, DataChannelEncodeError> {
+        Ok(self.as_envelope()?.encoded_len())
+    }
+
     fn encode_envelope(&self) -> Result<Vec<u8>, DataChannelEncodeError> {
+        let envelope = self.as_envelope()?;
+        let mut buf = Vec::with_capacity(envelope.encoded_len());
+        envelope.encode(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn as_envelope(&self) -> Result<DataChannelEnvelope, DataChannelEncodeError> {
         let mut envelope = DataChannelEnvelope {
             version: 1,
             kind: 0,
@@ -358,9 +370,7 @@ impl DataChannelMessage {
             }
         }
 
-        let mut buf = Vec::new();
-        envelope.encode(&mut buf)?;
-        Ok(buf)
+        Ok(envelope)
     }
 
     /// Deserialize message from binary protobuf envelope (with deprecated JSON fallback)

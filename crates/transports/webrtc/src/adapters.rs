@@ -18,6 +18,8 @@ use remotemedia_core::transport::TransportData;
 use remotemedia_types::{CopyContext, CopyReason, CopyRejected};
 
 mod owned;
+mod wire;
+pub use wire::encode_runtime_data_with_context;
 pub use owned::{data_buffer_into_runtime_data, data_buffer_into_runtime_data_with_context};
 
 #[cfg(test)]
@@ -96,6 +98,17 @@ pub fn runtime_data_to_data_buffer_with_context(
     )
 }
 
+fn audio_metadata(
+    sample_rate: u32, channels: u32, num_samples: usize,
+    metadata: &Option<serde_json::Value>,
+) -> AudioBuffer {
+    AudioBuffer {
+        samples: bytes::Bytes::new(), sample_rate, channels,
+        format: AudioFormat::F32 as i32, num_samples: num_samples as u64,
+        metadata_json: metadata.as_ref().map(|m| serde_json::to_vec(m).unwrap_or_default()),
+    }
+}
+
 fn encode_data_buffer(data: &RuntimeData) -> DataBuffer {
     let data_type = match data {
         RuntimeData::Audio {
@@ -108,13 +121,7 @@ fn encode_data_buffer(data: &RuntimeData) -> DataBuffer {
             arrival_ts_us: _, // spec 026: not included in protobuf
         } => DataType::Audio(AudioBuffer {
             samples: samples.iter().flat_map(|f| f.to_le_bytes()).collect(),
-            sample_rate: *sample_rate,
-            channels: *channels,
-            format: AudioFormat::F32 as i32,
-            num_samples: samples.len() as u64,
-            metadata_json: metadata
-                .as_ref()
-                .map(|m| serde_json::to_vec(m).unwrap_or_default()),
+            ..audio_metadata(*sample_rate, *channels, samples.len(), metadata)
         }),
         RuntimeData::Video {
             pixel_data,

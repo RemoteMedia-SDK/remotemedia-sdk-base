@@ -21,7 +21,6 @@ use crate::media::{
 #[cfg(feature = "ws-signaling")]
 use crate::signaling::{current_timestamp_ns, WebRtcEventBridge};
 use crate::{config::WebRtcTransportConfig, peer::PeerConnection, Error, Result};
-use prost::Message;
 use remotemedia_core::{
     data::RuntimeData,
     manifest::Manifest,
@@ -223,13 +222,13 @@ impl PerTrackDispatcher {
                         warn!("audio shard closed before speech_end (peer {})", self.peer_id);
                     }
                 }
-                if let Err(e) = Self::send_data_channel(&self.data_channel, &transport_data.data).await {
+                if let Err(e) = Self::send_data_channel(&self.data_channel, &transport_data.data, &self.copies).await {
                     error!("data channel send failed (peer {}): {}", self.peer_id, e);
                 }
             }
             RuntimeData::Json(_) | RuntimeData::Text(_) => {
                 if let Err(e) =
-                    Self::send_data_channel(&self.data_channel, &transport_data.data).await
+                    Self::send_data_channel(&self.data_channel, &transport_data.data, &self.copies).await
                 {
                     error!("data channel send failed (peer {}): {}", self.peer_id, e);
                 }
@@ -374,14 +373,15 @@ impl PerTrackDispatcher {
     async fn send_data_channel(
         data_channel: &Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
         runtime_data: &RuntimeData,
+        copies: &remotemedia_types::CopyContext,
     ) -> Result<()> {
         let dc_guard = data_channel.read().await;
         let Some(dc) = dc_guard.as_ref() else {
             trace!("no data channel available; dropping json/text output");
             return Ok(());
         };
-        let data_buffer = crate::adapters::runtime_data_to_data_buffer(runtime_data);
-        let encoded = data_buffer.encode_to_vec();
+        let encoded = crate::adapters::encode_runtime_data_with_context(runtime_data, copies)
+            .map_err(|e| Error::Other(e.into()))?;
         if let Err(e) = dc.send(&bytes::Bytes::from(encoded)).await {
             return Err(Error::WebRtcError(format!(
                 "Data channel send failed: {}",
@@ -1396,8 +1396,9 @@ impl ServerPeer {
                 let dc_guard = data_channel.read().await;
                 if let Some(dc) = dc_guard.as_ref() {
                     // Convert RuntimeData to Protobuf DataBuffer
-                    let data_buffer = crate::adapters::runtime_data_to_data_buffer(&runtime_data);
-                    let encoded = data_buffer.encode_to_vec();
+                    let encoded = crate::adapters::encode_runtime_data_with_context(
+                        &runtime_data, remotemedia_types::CopyContext::legacy(),
+                    ).map_err(|e| Error::Other(e.into()))?;
 
                     debug!(
                         "Sending {} data ({} bytes) through data channel",

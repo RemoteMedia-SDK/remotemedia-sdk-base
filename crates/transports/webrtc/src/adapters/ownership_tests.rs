@@ -1,7 +1,7 @@
 use super::*;
 use remotemedia_types::{CopyCounts, CopyPolicy, SharedBytes};
 
-fn cases() -> Vec<DataType> {
+pub(super) fn cases() -> Vec<DataType> {
     vec![
         DataType::Binary(BinaryBuffer {
             data: vec![7; 16].into(),
