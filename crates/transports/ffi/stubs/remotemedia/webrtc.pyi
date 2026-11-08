@@ -29,6 +29,7 @@ class WebRtcServerConfig:
     max_peers: int
     audio_codec: str
     video_codec: str
+    transport_materialization_policy: str
 
     def __init__(
         self,
@@ -41,6 +42,7 @@ class WebRtcServerConfig:
         max_peers: int = 10,
         audio_codec: str = "opus",
         video_codec: str = "vp9",
+        transport_materialization_policy: str = "allow_copies",
     ) -> None: ...
 
 class PeerCapabilities:

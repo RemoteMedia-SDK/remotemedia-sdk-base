@@ -67,6 +67,9 @@ pub struct WebRtcServerConfig {
 
     /// Video codec ("vp8", "vp9", or "h264")
     pub video_codec: Option<String>,
+
+    /// Instrumented transport policy; defaults to allow_copies.
+    pub transport_materialization_policy: Option<String>,
 }
 
 impl WebRtcServerConfig {
@@ -114,6 +117,12 @@ impl WebRtcServerConfig {
             audio_codec,
             video_codec,
             reconnect: core_config::ReconnectConfig::default(),
+            transport_materialization_policy: core_config::parse_transport_copy_policy(
+                self.transport_materialization_policy
+                    .as_deref()
+                    .unwrap_or("allow_copies"),
+            )
+            .map_err(Error::from_reason)?,
         };
 
         // Validate the config

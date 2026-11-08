@@ -178,7 +178,7 @@ impl WebRtcServerCore {
         let manifest = Arc::new(manifest);
 
         // Create PipelineExecutor
-        let runner = Arc::new(PipelineExecutor::new().map_err(|e| {
+        let runner = Arc::new(PipelineExecutor::with_config(self.config.to_executor_config()).map_err(|e| {
             WebRtcError::Internal(format!("Failed to create PipelineExecutor: {}", e))
         })?);
 

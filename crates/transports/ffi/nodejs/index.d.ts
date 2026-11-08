@@ -224,6 +224,12 @@ export function createSession(config: SessionConfig): Session;
 export function getSession(sessionId: string): Session | null;
 export function listSessions(): string[];
 
+/** Load a .so/.dylib loadable node plugin for future streaming sessions. */
+export function loadPlugin(path: string): string[];
+
+/** Return node types exposed by plugins loaded in this process. */
+export function listLoadedPlugins(): string[][];
+
 // =============================================================================
 // IPC Node Management
 // =============================================================================
@@ -265,6 +271,8 @@ export interface WebRtcServerConfig {
   audioCodec?: 'opus';
   /** Video codec */
   videoCodec?: 'vp8' | 'vp9' | 'h264';
+  /** Policy for instrumented transport copies; defaults to allow_copies. */
+  transportMaterializationPolicy?: 'allow_copies' | 'require_zero_copy';
 }
 
 /** Peer media capabilities */

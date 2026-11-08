@@ -3,6 +3,7 @@
 //! This module provides language-agnostic configuration types that are
 //! converted to/from language-specific types in the napi and python modules.
 
+use remotemedia_types::CopyPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -133,6 +134,10 @@ pub struct WebRtcServerConfig {
     /// Reconnection configuration for external signaling mode
     #[serde(default)]
     pub reconnect: ReconnectConfig,
+
+    /// Policy for instrumented transport copies; independent of node policies.
+    #[serde(default)]
+    pub transport_materialization_policy: CopyPolicy,
 }
 
 fn default_max_peers() -> u32 {
@@ -151,11 +156,31 @@ impl Default for WebRtcServerConfig {
             audio_codec: AudioCodec::Opus,
             video_codec: VideoCodec::Vp9,
             reconnect: ReconnectConfig::default(),
+            transport_materialization_policy: CopyPolicy::AllowCopies,
         }
     }
 }
 
+/// Parse the canonical policy names shared by Python and Node configuration.
+pub(crate) fn parse_transport_copy_policy(value: &str) -> Result<CopyPolicy, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|_| {
+        "transport_materialization_policy must be allow_copies or require_zero_copy".to_owned()
+    })
+}
+
+#[cfg(test)]
+#[path = "transport_policy_tests.rs"]
+mod transport_policy_tests;
+
 impl WebRtcServerConfig {
+    /// Preserve transport policy when creating an executor for either FFI frontend.
+    pub fn to_executor_config(&self) -> remotemedia_core::transport::ExecutorConfig {
+        remotemedia_core::transport::ExecutorConfig {
+            transport_materialization_policy: self.transport_materialization_policy,
+            ..Default::default()
+        }
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         // Check mutual exclusivity of port and signaling_url
@@ -378,6 +403,7 @@ mod tests {
             audio_codec: AudioCodec::Opus,
             video_codec: VideoCodec::Vp9,
             reconnect: ReconnectConfig::default(),
+            transport_materialization_policy: CopyPolicy::AllowCopies,
         };
         assert!(config.validate().is_ok());
         assert!(config.is_embedded());
@@ -396,6 +422,7 @@ mod tests {
             audio_codec: AudioCodec::Opus,
             video_codec: VideoCodec::Vp8,
             reconnect: ReconnectConfig::default(),
+            transport_materialization_policy: CopyPolicy::AllowCopies,
         };
         assert!(config.validate().is_ok());
         assert!(!config.is_embedded());
