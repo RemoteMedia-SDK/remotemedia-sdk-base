@@ -492,6 +492,19 @@ async fn dispatch_frame(
             Ok(())
         }
 
+        // Client-hosted endpoints (add-agent-harness-integration) are served by
+        // gRPC `PipelineControl.Attach`; the WebRTC control channel doesn't carry
+        // the hosting/presence streams. Refuse explicitly instead of dropping.
+        Some(PbOp::HostEndpoint(_))
+        | Some(PbOp::UnhostEndpoint(_))
+        | Some(PbOp::EndpointReply(_))
+        | Some(PbOp::WatchEndpoints(_)) => Err(error_inner(
+            ControlErrorCode::Protocol,
+            "endpoint hosting is not supported on the WebRTC control channel; \
+             use gRPC PipelineControl.Attach",
+            None,
+        )),
+
         Some(PbOp::Hello(_)) | None => Err(error_inner(
             ControlErrorCode::Protocol,
             "unexpected frame",
