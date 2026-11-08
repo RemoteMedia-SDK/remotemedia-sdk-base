@@ -121,6 +121,18 @@ message ControlFrame {
     ClearNodeState   clear_node_state = 9;
     // Change this session's telemetry level / snapshot interval.
     SetTelemetry     set_telemetry    = 10;
+
+    // ── Client-hosted endpoints (openspec: add-agent-harness-integration) ──
+    // Register an endpoint hosted by this attach. Answered by
+    // `EndpointHosted`. The registration ends when the attach closes.
+    HostEndpoint     host_endpoint    = 11;
+    // Stop hosting an endpoint registered by this attach.
+    UnhostEndpoint   unhost_endpoint  = 12;
+    // Reply chunk for an `EndpointCall`. Answered by `EndpointReplyAck`.
+    EndpointReply    endpoint_reply   = 13;
+    // Stream endpoint presence changes (`EndpointPresenceEvent`), starting
+    // with one `hosted = true` event per currently hosted endpoint.
+    WatchEndpoints   watch_endpoints  = 14;
   }
 }
 
@@ -165,6 +177,50 @@ message SetTelemetry {
   uint32 interval_ms = 2;
 }
 
+// One method an endpoint serves. `mode`: "reply" | "stream" | "ff".
+message EndpointMethod {
+  string name = 1;
+  string mode = 2;
+}
+
+// Endpoint hosting is a control operation: when the server is configured
+// with a bearer token the attach must carry it, and servers may disable
+// hosting entirely (observe-only), in which case the result is `forbidden`.
+message HostEndpoint {
+  // Endpoint id; must not equal a node id or a reserved virtual node.
+  string name = 1;
+  // Empty = accept any method (mode taken from the request).
+  repeated EndpointMethod methods = 2;
+  // "agent" | "service" (default "service").
+  string host_kind = 3;
+  // Informational adapter name (agent hosts).
+  string adapter = 4;
+  // Calls in flight at this host before new calls fail with `overloaded`.
+  // 0 = server default (64).
+  uint32 queue_capacity = 5;
+  // Replace an existing host (its pending calls fail with `responder_gone`).
+  bool takeover = 6;
+}
+
+message UnhostEndpoint { string name = 1; }
+
+message EndpointReply {
+  string name = 1;
+  // `call_id` from the `EndpointCall` event.
+  string call_id = 2;
+  // "value" | "end" | "error".
+  string kind = 3;
+  // JSON value for kind = "value".
+  string data_json = 4;
+  // Error kind for kind = "error" ("unavailable", "error", ...).
+  string error = 5;
+  string message = 6;
+  // Optional JSON metadata (adapter, route, escalated).
+  string meta_json = 7;
+}
+
+message WatchEndpoints {}
+
 // ============================================================================
 // Server -> Client events
 // ============================================================================
@@ -183,7 +239,70 @@ message ControlEvent {
     ErrorEvent       error             = 4;
     // Sent exactly once as the final frame when the session closes.
     SessionClosed    session_closed    = 5;
+
+    // ── Client-hosted endpoints (openspec: add-agent-harness-integration) ──
+    // Result of a `HostEndpoint` frame.
+    EndpointHosted        endpoint_hosted    = 6;
+    // A call for an endpoint this attach hosts (delivered only to the host).
+    EndpointCall          endpoint_call      = 7;
+    // A delivered call was cancelled (deadline | caller | session_closed).
+    EndpointCancelled     endpoint_cancelled = 8;
+    // Presence change. Also sent to a host whose registration ended
+    // (`reason`: "taken_over" | "session_closed" | "unhosted").
+    EndpointPresenceEvent endpoint_presence  = 9;
+    // Result of an `EndpointReply` frame.
+    EndpointReplyAck      endpoint_reply_ack = 10;
   }
+}
+
+message EndpointHosted {
+  string name = 1;
+  bool ok = 2;
+  // On failure: "already_hosted" | "name_conflict" | "forbidden" |
+  // "session_closed" | "invalid".
+  string error = 3;
+  string message = 4;
+}
+
+message EndpointCall {
+  string name = 1;
+  // Host-unique id ("<caller_node>/<corr_id>"); echo it in `EndpointReply`.
+  string call_id = 2;
+  string caller_node = 3;
+  string session_id = 4;
+  string method = 5;
+  // "reply" | "stream" | "ff".
+  string mode = 6;
+  // JSON array.
+  string args_json = 7;
+  // JSON object.
+  string kwargs_json = 8;
+  // Deadline remaining at delivery.
+  uint64 deadline_ms = 9;
+  string route_hint = 10;
+  string adapter_hint = 11;
+}
+
+message EndpointCancelled {
+  string name = 1;
+  string call_id = 2;
+  // "deadline" | "caller" | "session_closed".
+  string reason = 3;
+}
+
+message EndpointPresenceEvent {
+  string name = 1;
+  bool hosted = 2;
+  string reason = 3;
+}
+
+message EndpointReplyAck {
+  string name = 1;
+  string call_id = 2;
+  bool accepted = 3;
+  // When not accepted: "late" | "cancelled" | "unknown_call" |
+  // "responder_gone" | "invalid".
+  string reason = 4;
 }
 
 message Attached {
@@ -252,6 +371,9 @@ message SessionSummaryPb {
   string origin = 7;
   // Whether hot-path telemetry counters exist for this session.
   bool has_telemetry = 8;
+  // A call reached an agent-hosted endpoint, or the session was marked
+  // agent-backed (openspec: add-agent-harness-integration).
+  bool agent_backed = 9;
 }
 
 message ListSessionsRequest {}
