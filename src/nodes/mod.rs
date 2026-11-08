@@ -45,6 +45,10 @@ pub use runtime_context::{AnySessionState, NodeRuntimeContext, SnapshotPort};
 #[cfg(feature = "video")]
 pub mod video;
 
+// Self-driven video sources: screen / app window and webcam capture.
+#[cfg(any(feature = "microphone", feature = "screen-capture", feature = "webcam"))]
+pub mod capture;
+
 // Temporarily disabled - incomplete implementation
 // pub mod sync_av;
 // pub mod video_processor;

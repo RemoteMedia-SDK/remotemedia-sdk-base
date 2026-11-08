@@ -178,6 +178,14 @@ impl NodeProvider for CoreNodesProvider {
             registry.register(Arc::new(VadToFaceNodeFactory));
         }
 
+        // Capture sources: microphone, screen / app window and webcam.
+        #[cfg(feature = "microphone")]
+        registry.register(Arc::new(super::capture::MicInputNodeFactory));
+        #[cfg(feature = "screen-capture")]
+        registry.register(Arc::new(super::capture::ScreenCaptureNodeFactory));
+        #[cfg(feature = "webcam")]
+        registry.register(Arc::new(super::capture::WebcamCaptureNodeFactory));
+
         // Speculative VAD gate (spec 007). The coordinator moved out
         // with silero-vad.
         registry.register(Arc::new(SpeculativeVADGateFactory));
