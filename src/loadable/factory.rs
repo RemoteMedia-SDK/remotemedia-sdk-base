@@ -128,6 +128,9 @@ impl OutputSink for ChannelSink {
 pub struct LoadableNodeBundle {
     plugin: NodePluginRef,
     factories: Vec<Arc<dyn StreamingNodeFactory>>,
+    /// Build identity (name, version, sha256 digest, load time), computed
+    /// once when the library is loaded.
+    implementation: crate::telemetry::NodeImplementation,
 }
 
 impl LoadableNodeBundle {
@@ -149,7 +152,16 @@ impl LoadableNodeBundle {
             })
             .collect();
 
-        Ok(Self { plugin, factories })
+        Ok(Self {
+            plugin,
+            factories,
+            implementation: crate::telemetry::NodeImplementation::loadable_from_path(path),
+        })
+    }
+
+    /// Build identity of the loaded library.
+    pub fn implementation(&self) -> &crate::telemetry::NodeImplementation {
+        &self.implementation
     }
 
     /// abi_stable handle to the loaded plugin's root module.
@@ -165,7 +177,7 @@ impl LoadableNodeBundle {
     /// Register every factory into the given registry.
     pub fn register_into(&self, registry: &mut StreamingNodeRegistry) {
         for f in &self.factories {
-            registry.register(Arc::clone(f));
+            registry.register_with_implementation(Arc::clone(f), self.implementation.clone());
         }
     }
 }

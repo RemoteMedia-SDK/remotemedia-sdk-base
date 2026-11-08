@@ -276,6 +276,9 @@ pub struct AutoResampleStreamingNode {
     resolved_source_rate: Mutex<Option<u32>>,
     /// Resolved channels (detected from first chunk)
     resolved_channels: Mutex<Option<usize>>,
+    /// `(source, target, channels)` already set up, so a passthrough
+    /// (source == target, no resampler built) is decided once, not per chunk.
+    set_up_for: Mutex<Option<(u32, u32, usize)>>,
 }
 
 impl AutoResampleStreamingNode {
@@ -291,6 +294,7 @@ impl AutoResampleStreamingNode {
             resolved_target_rate: Mutex::new(resolved_target),
             resolved_source_rate: Mutex::new(resolved_source),
             resolved_channels: Mutex::new(resolved_channels),
+            set_up_for: Mutex::new(None),
         }
     }
 
@@ -335,9 +339,11 @@ impl AutoResampleStreamingNode {
         channels: usize,
     ) -> Result<()> {
         let mut inner = self.inner.lock();
-        if inner.is_some() {
+        if inner.is_some() || *self.set_up_for.lock() == Some((source_rate, target_rate, channels))
+        {
             return Ok(()); // Already initialized
         }
+        *self.set_up_for.lock() = Some((source_rate, target_rate, channels));
 
         // Store resolved values
         *self.resolved_source_rate.lock() = Some(source_rate);
@@ -601,35 +607,20 @@ impl StreamingNode for AutoResampleStreamingNodeWrapper {
     /// method will call `set_source_rate(48000)` and `set_channels(2)` on
     /// the inner resample node, ensuring proper resampling when data arrives.
     fn configure_from_upstream(&self, upstream_caps: &MediaCapabilities) -> Result<()> {
-        // Extract audio constraints from upstream output
+        // Set directly (parking_lot locks): the handshake runs before any
+        // data flows, and a background task could lose the race with the
+        // first chunk.
         if let Some(MediaConstraints::Audio(audio)) = upstream_caps.default_output() {
-            // Extract sample rate
             if let Some(ConstraintValue::Exact(rate)) = &audio.sample_rate {
-                let inner = self.inner.clone();
-                let rate = *rate;
-
-                // Use tokio::spawn to run async code from sync context
-                // This is safe because we're just setting values, not blocking
-                tokio::spawn(async move {
-                    inner.set_source_rate(rate).await;
-                });
-
+                *self.inner.resolved_source_rate.lock() = Some(*rate);
                 tracing::info!(
                     "[{}] Configured source rate from upstream: {}Hz",
                     self.inner.node_id,
                     rate
                 );
             }
-
-            // Extract channel count
             if let Some(ConstraintValue::Exact(channels)) = &audio.channels {
-                let inner = self.inner.clone();
-                let channels = *channels as usize;
-
-                tokio::spawn(async move {
-                    inner.set_channels(channels).await;
-                });
-
+                *self.inner.resolved_channels.lock() = Some(*channels as usize);
                 tracing::debug!(
                     "[{}] Configured channels from upstream: {}",
                     self.inner.node_id,
@@ -637,8 +628,66 @@ impl StreamingNode for AutoResampleStreamingNodeWrapper {
                 );
             }
         }
-
         Ok(())
+    }
+
+    /// Handshake: take the target rate from what downstream accepts,
+    /// keeping the source rate when it is accepted (no needless resampling)
+    /// and otherwise the nearest accepted rate. Channels pass through: this
+    /// node does not convert them. An explicit `target_rate` param wins, and
+    /// is an error when downstream does not accept it.
+    fn configure_for_downstream(
+        &self,
+        accepted: &MediaCapabilities,
+    ) -> Result<Option<MediaCapabilities>> {
+        use crate::transport::caps_handshake::{choose, describe_constraint, AudioFormat};
+        let Some(MediaConstraints::Audio(acc)) = accepted.default_input() else {
+            return Ok(None);
+        };
+        let inner = &self.inner;
+        let source = inner
+            .config
+            .source_rate
+            .or(*inner.resolved_source_rate.lock());
+        let channels = inner
+            .config
+            .channels
+            .or(*inner.resolved_channels.lock())
+            .map(|c| c as u32);
+        let target = match (inner.config.target_rate, &acc.sample_rate) {
+            (Some(t), Some(c)) if !c.satisfies(&t) => {
+                return Err(Error::Execution(format!(
+                    "target_rate {t} is set, but downstream accepts {}; set target_rate to one of \
+                     those or leave it unset to follow downstream",
+                    describe_constraint(c, "Hz")
+                )))
+            }
+            (Some(t), _) => Some(t),
+            (None, Some(c)) => choose(source, c),
+            (None, None) => source,
+        };
+        if inner.config.target_rate.is_none() {
+            if let Some(t) = target {
+                *inner.resolved_target_rate.lock() = Some(t);
+                tracing::info!(
+                    "[{}] Target rate from downstream: {}Hz{}",
+                    inner.node_id,
+                    t,
+                    if source == Some(t) {
+                        " (passthrough)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        Ok(Some(
+            AudioFormat {
+                sample_rate: target,
+                channels,
+            }
+            .to_caps(),
+        ))
     }
 
     fn capability_behavior(&self) -> crate::capabilities::CapabilityBehavior {

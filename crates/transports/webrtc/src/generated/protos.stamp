@@ -2,4 +2,4 @@
 # generated from. Written by the `regen-protos` build; do not edit by hand.
 3d77b6736af6a726  webrtc_signaling.proto
 ba8f86591d84f8bb  common.proto
-deabbbd79bf75cc8  control.proto
+5c383af8fde50f39  control.proto

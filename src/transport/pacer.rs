@@ -312,7 +312,7 @@ impl Pacer {
     /// Returns the `JoinHandle` so the caller can `.abort()` it on
     /// shutdown.
     pub fn spawn(self) -> JoinHandle<()> {
-        tokio::spawn(self.run())
+        tokio::spawn(tracing::Instrument::in_current_span(self.run()))
     }
 
     /// Main loop: pull a tick, dispatch, measure, apply on-miss

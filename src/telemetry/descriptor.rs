@@ -1,5 +1,6 @@
 //! Serializable description of a running session's topology.
 
+use super::identity::{params_hash, NodeImplementation};
 use super::redact::redact_params;
 use crate::capabilities::MediaCapabilities;
 use crate::executor::PipelineGraph;
@@ -51,6 +52,11 @@ pub struct NodeDescriptor {
     /// Node params with sensitive values redacted.
     pub params: serde_json::Value,
     pub queue_capacity: QueueCapacity,
+    /// Which build of the node type this session runs.
+    pub implementation: NodeImplementation,
+    /// `sha256:<hex>` of the effective params (post-override, key-order
+    /// independent; redacted values contribute only the marker).
+    pub params_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -147,6 +153,8 @@ impl SessionDescriptor {
                     capabilities,
                     params: redact_params(&n.params),
                     queue_capacity: queue_capacity.clone(),
+                    implementation: registry.implementation(&n.node_type),
+                    params_hash: params_hash(&n.params),
                 }
             })
             .collect();

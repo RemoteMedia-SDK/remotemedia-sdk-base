@@ -217,9 +217,28 @@ struct NodeExecutionState {
     latency_min_us: AtomicU64,
     /// Fast path max latency
     latency_max_us: AtomicU64,
+    /// The error of the most recent failure: the cause a "circuit breaker
+    /// open" error reports (written on failure only, never on the hot path).
+    last_failure: parking_lot::Mutex<Option<String>>,
 }
 
 impl NodeExecutionState {
+    /// The error for a call refused because the breaker is open, naming the
+    /// failure that tripped it.
+    fn circuit_open_error(&self, node_id: &str) -> Error {
+        match self.last_failure.lock().as_deref() {
+            Some(cause) => Error::Execution(format!(
+                "Circuit breaker open for node '{}' after repeated failures; last error: {}",
+                node_id, cause
+            )),
+            None => Error::Execution(format!("Circuit breaker open for node '{}'", node_id)),
+        }
+    }
+
+    fn remember_failure(&self, e: &Error) {
+        *self.last_failure.lock() = Some(e.to_string());
+    }
+
     fn new(node_id: &str, threshold: usize) -> Result<Self> {
         let latency_metrics = LatencyMetrics::new(node_id)
             .map_err(|e| Error::Execution(format!("Failed to create latency metrics: {}", e)))?;
@@ -228,6 +247,7 @@ impl NodeExecutionState {
             circuit_breaker: Mutex::new(CircuitBreaker::new(threshold)),
             circuit_open: AtomicBool::new(false),
             consecutive_failures: AtomicU64::new(0),
+            last_failure: parking_lot::Mutex::new(None),
             failure_threshold: threshold as u64,
             latency_metrics,
             execution_count: AtomicU64::new(0),
@@ -442,10 +462,7 @@ impl StreamingScheduler {
 
         // Check circuit breaker (takes mutex only if needed for state transition)
         if node_state.check_circuit_breaker().await {
-            return Err(Error::Execution(format!(
-                "Circuit breaker open for node '{}'",
-                node_id
-            )));
+            return Err(node_state.circuit_open_error(node_id));
         }
 
         // Acquire semaphore permit
@@ -541,6 +558,9 @@ impl StreamingScheduler {
 
         // Record failure to node state
         node_state.record_failure(duration_us).await;
+        if let Some(e) = &last_error {
+            node_state.remember_failure(e);
+        }
 
         // Update pipeline metrics (if enabled)
         if self.config.enable_metrics {
@@ -591,10 +611,7 @@ impl StreamingScheduler {
 
         // Lock-free circuit breaker check (atomic read only)
         if node_state.is_circuit_open() {
-            return Err(Error::Execution(format!(
-                "Circuit breaker open for node '{}'",
-                node_id
-            )));
+            return Err(node_state.circuit_open_error(node_id));
         }
 
         // Try non-blocking semaphore acquire first (fast path)
@@ -631,6 +648,7 @@ impl StreamingScheduler {
 
                 // Lock-free failure recording (atomics only, no mutex)
                 node_state.record_failure_fast(duration_us);
+                node_state.remember_failure(&e);
 
                 Err(e)
             }

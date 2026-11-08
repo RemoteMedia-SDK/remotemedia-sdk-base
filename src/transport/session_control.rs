@@ -67,9 +67,16 @@
 //!   WebSocket wrapping lives in the transport crates.
 
 use crate::data::RuntimeData;
+use crate::transport::endpoint::{
+    CancelReason, EndpointCallStream, EndpointError, EndpointHost, EndpointInfo, EndpointPresence,
+    EndpointRegistry, EndpointSpec,
+};
 use crate::transport::session_router::DataPacket;
 use crate::Result;
 use dashmap::DashMap;
+use remotemedia_traits::call::{
+    CallReplyEnvelope, CallReplyEvent, CallRequestEnvelope, CALL_REPLY_METHOD,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,6 +120,54 @@ impl Drop for RpcCallScope {
 pub(super) struct RpcCaller {
     pub id: u64,
     pub closed: watch::Receiver<bool>,
+}
+
+/// A node's native RPC lane.
+#[derive(Clone)]
+pub(super) struct RpcLane {
+    pub tx: mpsc::Sender<RpcInvocation>,
+    /// The node declared only `__call_reply__`.
+    pub call_reply_only: bool,
+}
+
+/// Capacity of a node's serial `__call_reply__` delivery lane.
+const CALL_REPLY_LANE_CAPACITY: usize = 64;
+
+async fn caller_scope_closed(caller: &mut Option<RpcCaller>) {
+    match caller {
+        Some(c) => {
+            if !*c.closed.borrow() {
+                let _ = c.closed.changed().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Typed-RPC reply JSON (`{corr_id, kind, data}`) for one endpoint reply
+/// chunk. Errors carry `data: "<kind>: <message>"` (what typed-RPC clients
+/// read) plus the machine-readable `error` kind.
+pub(crate) fn typed_rpc_reply(
+    corr_id: &serde_json::Value,
+    env: &CallReplyEnvelope,
+) -> serde_json::Value {
+    let mut reply = match &env.event {
+        CallReplyEvent::Value { data } => serde_json::json!({
+            "corr_id": corr_id, "kind": "value", "data": data,
+        }),
+        CallReplyEvent::End => serde_json::json!({"corr_id": corr_id, "kind": "end"}),
+        CallReplyEvent::Error { error, message } => serde_json::json!({
+            "corr_id": corr_id,
+            "kind": "error",
+            "data": if message.is_empty() { error.to_string() } else { format!("{error}: {message}") },
+            "error": error.as_str(),
+            "message": message,
+        }),
+    };
+    if let (Some(meta), Some(obj)) = (&env.meta, reply.as_object_mut()) {
+        obj.insert("meta".into(), meta.clone());
+    }
+    reply
 }
 
 pub(super) struct RpcInvocation {
@@ -372,14 +427,23 @@ pub struct SessionSummary {
     pub node_count: u32,
     /// Whether hot-path telemetry counters are available for this session.
     pub has_telemetry: bool,
+    /// True once any endpoint call reached a `HostKind::Agent` host, or a
+    /// component called [`SessionControl::mark_agent_backed`] (e.g. a chat
+    /// node targeting an agent gateway). Benchmarks must not treat such
+    /// sessions' latency as representative.
+    pub agent_backed: bool,
 }
 
 /// Session lifecycle events broadcast by [`SessionControlBus::watch`].
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SessionLifecycleEvent {
-    Created { session: SessionSummary },
-    Updated { session: SessionSummary },
+    Created {
+        session: SessionSummary,
+    },
+    Updated {
+        session: SessionSummary,
+    },
     Closed {
         session_id: String,
         reason: Option<String>,
@@ -561,7 +625,13 @@ pub struct SessionControl {
     /// Handle to the router's input channel so `publish` can inject packets.
     /// Set by `attach_input_sender` after the router is constructed.
     input_tx: RwLock<Option<mpsc::Sender<DataPacket>>>,
-    rpc_inputs: DashMap<String, mpsc::Sender<RpcInvocation>>,
+    rpc_inputs: DashMap<String, RpcLane>,
+    /// Serial `__call_reply__` delivery lanes for nodes that opted into
+    /// endpoint calls (see `rpc_dispatch::run`).
+    call_reply_lanes: DashMap<String, mpsc::Sender<CallReplyEnvelope>>,
+    /// Client-hosted endpoints (openspec: add-agent-harness-integration).
+    endpoints: Arc<EndpointRegistry>,
+    agent_backed: std::sync::atomic::AtomicBool,
     /// Monotonic sequence for injected packets (kept separate from the
     /// transport's own sequence to make out-of-band traffic identifiable).
     inject_seq: std::sync::atomic::AtomicU64,
@@ -727,6 +797,7 @@ impl SystemEventReceiver {
 
 impl SessionControl {
     pub fn new(session_id: impl Into<String>) -> Arc<Self> {
+        let session_id: String = session_id.into();
         let (close_tx, _) = broadcast::channel(1);
 
         // Honor the env-var opt-out for tests that want strict live-only semantics.
@@ -737,12 +808,15 @@ impl SessionControl {
         };
 
         Arc::new(Self {
-            session_id: session_id.into(),
+            session_id: session_id.clone(),
             office_observation: parking_lot::RwLock::new(None),
             taps: DashMap::new(),
             intercepts: DashMap::new(),
             input_tx: RwLock::new(None),
             rpc_inputs: DashMap::new(),
+            call_reply_lanes: DashMap::new(),
+            endpoints: EndpointRegistry::new(session_id.clone()),
+            agent_backed: std::sync::atomic::AtomicBool::new(false),
             inject_seq: std::sync::atomic::AtomicU64::new(0),
             close_tx,
             node_states: DashMap::new(),
@@ -843,6 +917,7 @@ impl SessionControl {
             phase: self.phase(),
             node_count: desc.as_ref().map(|d| d.nodes.len() as u32).unwrap_or(0),
             has_telemetry: self.telemetry.get().is_some(),
+            agent_backed: self.agent_backed(),
         }
     }
 
@@ -939,6 +1014,9 @@ impl SessionControl {
     /// Called once from `SessionRouter` just before its run-loop returns.
     /// Signals every attach to drain and exit. Idempotent.
     pub fn signal_close(&self, reason: CloseReason) {
+        // Pending endpoint calls are cancelled (callers get `cancelled`,
+        // hosts get `Cancelled { reason: session_closed }`).
+        self.endpoints.close();
         let _ = self.close_tx.send(reason);
     }
 
@@ -1064,10 +1142,273 @@ impl SessionControl {
         }
     }
 
-    pub(super) fn register_rpc(&self, node_id: &str) -> mpsc::Receiver<RpcInvocation> {
+    /// Register a node's native RPC lane. Returns the invocation receiver
+    /// and, when the node declares `__call_reply__`, the serial call-reply
+    /// receiver.
+    ///
+    /// A node whose only declared method is `__call_reply__` (e.g. Python
+    /// multiprocess nodes, which answer every other typed-RPC method through
+    /// their input path) gets a *call-reply-only* lane: every other
+    /// `<node>.in.<method>` RPC publish keeps the legacy input-path routing.
+    pub(super) fn register_rpc(
+        &self,
+        node_id: &str,
+        methods: &[remotemedia_traits::rpc::RpcMethod],
+    ) -> (
+        mpsc::Receiver<RpcInvocation>,
+        Option<mpsc::Receiver<CallReplyEnvelope>>,
+    ) {
         let (tx, rx) = mpsc::channel(32);
-        self.rpc_inputs.insert(node_id.to_string(), tx);
-        rx
+        let declares_reply = methods.iter().any(|m| m.name == CALL_REPLY_METHOD);
+        let call_reply_only = declares_reply && methods.iter().all(|m| m.name == CALL_REPLY_METHOD);
+        self.rpc_inputs.insert(
+            node_id.to_string(),
+            RpcLane {
+                tx,
+                call_reply_only,
+            },
+        );
+        let replies = declares_reply.then(|| {
+            let (tx, rx) = mpsc::channel(CALL_REPLY_LANE_CAPACITY);
+            self.call_reply_lanes.insert(node_id.to_string(), tx);
+            rx
+        });
+        (rx, replies)
+    }
+
+    /// Deliver one endpoint-call reply chunk to `node_id` through its serial
+    /// `__call_reply__` lane. Waits for lane capacity (bounded).
+    pub(crate) async fn deliver_call_reply(&self, node_id: &str, env: CallReplyEnvelope) -> bool {
+        let lane = self
+            .call_reply_lanes
+            .get(node_id)
+            .map(|l| l.value().clone());
+        match lane {
+            Some(tx) => tx.send(env).await.is_ok(),
+            None => false,
+        }
+    }
+
+    // ─── Client-hosted endpoints ───────────────────────────────────────────
+
+    /// Register `spec` as a client-hosted endpoint. Exclusive: fails with
+    /// `already_hosted` unless `takeover` is set, in which case the previous
+    /// host's pending calls fail with `responder_gone` and its
+    /// [`EndpointHost::next`] returns `None`. Dropping the returned handle
+    /// unregisters the endpoint.
+    pub fn host_endpoint(
+        &self,
+        spec: EndpointSpec,
+        takeover: bool,
+    ) -> std::result::Result<EndpointHost, EndpointError> {
+        if self.phase() == SessionPhase::Closing {
+            return Err(EndpointError::SessionClosed);
+        }
+        let host = self
+            .endpoints
+            .host(spec, takeover, |name| self.is_node_id(name))?;
+        self.sync_agent_backed();
+        Ok(host)
+    }
+
+    /// Whether `name` is a node of this session (descriptor nodes or a node
+    /// with a registered RPC lane).
+    fn is_node_id(&self, name: &str) -> bool {
+        if self.rpc_inputs.contains_key(name) {
+            return true;
+        }
+        self.descriptor
+            .read()
+            .as_ref()
+            .map(|d| d.nodes.iter().any(|n| n.id == name))
+            .unwrap_or(false)
+    }
+
+    /// Whether a client currently hosts endpoint `name`.
+    pub fn has_endpoint(&self, name: &str) -> bool {
+        self.endpoints.has(name)
+    }
+
+    /// Currently hosted endpoints.
+    pub fn endpoints(&self) -> Vec<EndpointInfo> {
+        self.endpoints.list()
+    }
+
+    /// Presence changes (`{name, hosted}`) from now on.
+    pub fn watch_endpoints(&self) -> broadcast::Receiver<EndpointPresence> {
+        self.endpoints.watch()
+    }
+
+    /// Call a method on a hosted endpoint on behalf of `caller_node`. Never
+    /// blocks; failures (`no_responder`, `overloaded`, …) arrive as the
+    /// stream's terminal chunk. A request with `cancel: true` cancels the
+    /// caller's in-flight call with the same `corr_id` and returns an empty
+    /// stream.
+    pub fn call_endpoint(&self, caller_node: &str, req: CallRequestEnvelope) -> EndpointCallStream {
+        let stream = self.endpoints.call(caller_node, req);
+        self.sync_agent_backed();
+        stream
+    }
+
+    /// Cancel `caller_node`'s in-flight call `corr_id` (host receives
+    /// `Cancelled { reason: caller }`; a later reply counts as late).
+    pub fn cancel_endpoint_call(&self, caller_node: &str, corr_id: &str) {
+        self.endpoints
+            .cancel_call(caller_node, corr_id, CancelReason::Caller);
+    }
+
+    /// Per-endpoint, per-method call telemetry. Latency percentiles are
+    /// included only when `histograms` is true.
+    pub fn endpoint_telemetry(&self, histograms: bool) -> Vec<crate::telemetry::EndpointTelemetry> {
+        self.endpoints.telemetry(histograms)
+    }
+
+    /// Whether this session's results depend on an agent (see
+    /// [`SessionSummary::agent_backed`]).
+    pub fn agent_backed(&self) -> bool {
+        self.agent_backed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Flag the session as agent-backed (e.g. a chat node targets an agent
+    /// gateway). Announces `Updated` the first time.
+    pub fn mark_agent_backed(&self) {
+        if self.agent_backed() {
+            return;
+        }
+        self.mutate_and_announce(|this| {
+            this.agent_backed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    fn sync_agent_backed(&self) {
+        if self.endpoints.agent_hit() && !self.agent_backed() {
+            self.mark_agent_backed();
+        }
+    }
+
+    /// An RPC-shaped publish (`{corr_id, …}` on `<endpoint>.in.<method>`)
+    /// to a hosted endpoint becomes an endpoint call (Hermes compatibility).
+    ///
+    /// * Caller identity: the payload's `node_id` (Hermes requests carry
+    ///   it), else the publishing control attachment.
+    /// * Arguments: `args`/`kwargs` when present (typed-RPC shape), else the
+    ///   remaining payload fields as kwargs (Hermes shape).
+    /// * Deadline: `deadline_ms`, else `timeout_ms`, else 30 s.
+    /// * Replies use the typed-RPC reply shape `{corr_id, kind, data}`
+    ///   (errors also carry the machine-readable `error` kind). They go to
+    ///   `<node_id>.out.__reply__` unwrapped when the payload names a
+    ///   `node_id` (what Hermes hosts publish today), else to
+    ///   `<endpoint>.out.__reply__` wrapped as a `__reply__` aux envelope
+    ///   (the typed-RPC client convention).
+    fn publish_rpc_to_endpoint(
+        &self,
+        endpoint: &str,
+        method: &str,
+        payload: &serde_json::Value,
+        caller: Option<RpcCaller>,
+    ) -> Result<()> {
+        let obj = payload
+            .as_object()
+            .ok_or_else(|| crate::Error::Execution("RPC payload must be an object".into()))?;
+        let corr_value = obj
+            .get("corr_id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let corr = match &corr_value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => {
+                return Err(crate::Error::Execution(
+                    "invalid RPC correlation: corr_id must be a string or integer".into(),
+                ))
+            }
+        };
+        let reply_node = obj
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let caller_key = match (&reply_node, &caller) {
+            (Some(node), _) => node.clone(),
+            (None, Some(c)) => format!("__control__#{}", c.id),
+            (None, None) => "__control__".to_string(),
+        };
+        if method.ends_with(".__cancel__") {
+            self.cancel_endpoint_call(&caller_key, &corr);
+            return Ok(());
+        }
+        let mut req = CallRequestEnvelope::new(endpoint, method, corr.clone());
+        let typed = obj.contains_key("args") || obj.contains_key("kwargs");
+        if typed {
+            if let Some(args) = obj.get("args").and_then(|a| a.as_array()) {
+                req.args = args.clone();
+            }
+            if let Some(kwargs) = obj.get("kwargs").and_then(|k| k.as_object()) {
+                req.kwargs = kwargs.clone();
+            }
+        } else {
+            req.kwargs = obj
+                .iter()
+                .filter(|(k, _)| k.as_str() != "corr_id")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        }
+        if let Some(ms) = obj
+            .get("deadline_ms")
+            .or_else(|| obj.get("timeout_ms"))
+            .and_then(|v| v.as_u64())
+        {
+            req.deadline_ms = ms;
+        }
+        req.hold_ms = obj.get("hold_ms").and_then(|v| v.as_u64());
+        req.route_hint = obj
+            .get("route_hint")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        req.adapter_hint = obj
+            .get("adapter_hint")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+
+        let (tap, wrap) = match &reply_node {
+            Some(node) => (self.tap_sender(node, Some("__reply__")), false),
+            None => (self.tap_sender(endpoint, Some("__reply__")), true),
+        };
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            crate::Error::Execution("endpoint call requires a tokio runtime".into())
+        })?;
+        let mut stream = self.call_endpoint(&caller_key, req);
+        let mut caller = caller;
+        handle.spawn(async move {
+            loop {
+                let env = tokio::select! {
+                    biased;
+                    _ = caller_scope_closed(&mut caller) => return,
+                    env = stream.recv() => env,
+                };
+                let Some(env) = env else { return };
+                let reply = typed_rpc_reply(&corr_value, &env);
+                let data = if wrap {
+                    wrap_aux_port("__reply__", RuntimeData::Json(reply))
+                } else {
+                    RuntimeData::Json(reply)
+                };
+                let _ = tap.send(data);
+                if env.is_terminal() {
+                    return;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn tap_sender(&self, node_id: &str, port: Option<&str>) -> broadcast::Sender<RuntimeData> {
+        let key: TapKey = (node_id.to_string(), port.map(|s| s.to_string()));
+        self.taps
+            .entry(key)
+            .or_insert_with(|| broadcast::channel(DEFAULT_TAP_CAPACITY).0)
+            .clone()
     }
 
     pub(super) fn publish_rpc_reply(&self, node_id: &str, data: RuntimeData) -> Result<()> {
@@ -1128,13 +1469,30 @@ impl SessionControl {
                 "publish requires Direction::In".into(),
             ));
         }
+        // RPC-shaped publishes to a client-hosted endpoint become endpoint
+        // calls (host-only delivery, presence, deadlines). Unhosted ids keep
+        // the legacy behavior below.
+        if let (Some(port), RuntimeData::Json(payload)) = (&addr.port, &data) {
+            if payload.get("corr_id").is_some() && self.endpoints.has(&addr.node_id) {
+                return self.publish_rpc_to_endpoint(&addr.node_id, port, payload, caller);
+            }
+        }
         // Dedicated native RPC bypasses the media/router ingress queues entirely.
         if let (Some(port), RuntimeData::Json(payload)) = (&addr.port, &data) {
             if payload.get("corr_id").is_some() {
-                let rpc = self
-                    .rpc_inputs
-                    .get(&addr.node_id)
-                    .map(|entry| entry.value().clone());
+                let rpc = self.rpc_inputs.get(&addr.node_id).and_then(|entry| {
+                    let lane = entry.value();
+                    let base = port.strip_suffix(".__cancel__").unwrap_or(port);
+                    // A call-reply-only lane carries nothing but runtime-
+                    // delivered `__call_reply__`; other methods keep the
+                    // input path the node's own dispatcher relies on.
+                    (!lane.call_reply_only || base == CALL_REPLY_METHOD).then(|| lane.tx.clone())
+                });
+                if rpc.is_some() && port == CALL_REPLY_METHOD {
+                    return Err(crate::Error::Execution(
+                        "__call_reply__ is reserved for runtime-delivered endpoint replies".into(),
+                    ));
+                }
                 if let Some(tx) = rpc {
                     serde_json::from_value::<remotemedia_traits::rpc::RpcId>(
                         payload["corr_id"].clone(),
@@ -1678,7 +2036,12 @@ impl SessionControlBus {
     /// Atomic snapshot + live lifecycle stream. Every session is reported
     /// exactly once: either in the snapshot or as a later `Created`. On
     /// `RecvError::Lagged` the caller should re-`list()`.
-    pub fn watch(&self) -> (Vec<SessionSummary>, broadcast::Receiver<SessionLifecycleEvent>) {
+    pub fn watch(
+        &self,
+    ) -> (
+        Vec<SessionSummary>,
+        broadcast::Receiver<SessionLifecycleEvent>,
+    ) {
         let _guard = self.lifecycle.lock.lock();
         let rx = self.lifecycle.tx.subscribe();
         (self.list(), rx)
@@ -2392,7 +2755,9 @@ mod discovery_tests {
 
         bus.unregister_with("a", Some("init failed: boom".into()));
         match rx.try_recv().unwrap() {
-            SessionLifecycleEvent::Closed { session_id, reason, .. } => {
+            SessionLifecycleEvent::Closed {
+                session_id, reason, ..
+            } => {
                 assert_eq!(session_id, "a");
                 assert_eq!(reason.as_deref(), Some("init failed: boom"));
             }
@@ -2443,10 +2808,8 @@ mod discovery_tests {
         for w in writers {
             w.join().unwrap();
         }
-        let mut seen: std::collections::HashMap<String, usize> = snapshot
-            .into_iter()
-            .map(|s| (s.session_id, 1))
-            .collect();
+        let mut seen: std::collections::HashMap<String, usize> =
+            snapshot.into_iter().map(|s| (s.session_id, 1)).collect();
         loop {
             match rx.try_recv() {
                 Ok(SessionLifecycleEvent::Created { session }) => {

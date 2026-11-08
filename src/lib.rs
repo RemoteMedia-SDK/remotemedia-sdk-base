@@ -41,6 +41,9 @@ extern crate self as remotemedia_sdk_base;
 
 // Core execution modules
 pub mod audio;
+// Audio device I/O on cpal (`MicInput`, `SpeakerOutput`, CLI audio commands).
+#[cfg(any(feature = "microphone", feature = "speaker"))]
+pub mod audio_io;
 pub mod capabilities;
 pub mod executor;
 pub mod ingestion;

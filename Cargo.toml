@@ -121,6 +121,14 @@ base64 = "0.22"
 
 # Video codec support (spec 012)
 ac-ffmpeg = { version = "0.19", optional = true }
+# `VideoScaler`: SIMD image resizing (pure Rust, no ffmpeg needed).
+fast_image_resize = "5"
+# Device nodes (`MicInput`, `SpeakerOutput`, `ScreenCapture`, `WebcamCapture`).
+cpal = { version = "0.15", optional = true }
+# `wgc`: Windows Graphics Capture (compositor capture) instead of GDI
+# PrintWindow, which makes GPU-rendered apps redraw for every frame.
+xcap = { version = "0.9", optional = true, features = ["wgc"] }
+nokhwa = { version = "0.10", optional = true, features = ["input-native"] }
 
 # llama.cpp + minijinja + encoding_rs all moved with the 4 llama.cpp
 # nodes to the llama-cpp plugin (RemoteMedia-SDK/llama-cpp@v0.1.0).
@@ -315,6 +323,16 @@ grpc-client = ["tonic", "prost", "prost-types"]
 docker = ["dep:bollard", "dep:chrono", "dep:bytes", "dep:hyper", "dep:http-body-util", "dep:glob", "dep:rusqlite"]
 # Video codec support (spec 012)
 video = ["dep:ac-ffmpeg"]
+# `MicInput` source node and `audio_io` (cpal). On Linux it needs ALSA dev
+# libraries.
+microphone = ["dep:cpal"]
+# `SpeakerOutput` sink node and the playback half of `audio_io` (cpal).
+speaker = ["dep:cpal"]
+# `ScreenCapture` source node: a monitor or an app window (xcap). On Linux
+# it needs the PipeWire / XCB development libraries.
+screen-capture = ["dep:xcap"]
+# `WebcamCapture` source node (nokhwa: Media Foundation, V4L2, AVFoundation).
+webcam = ["dep:nokhwa"]
 # `llama-cpp` + `llama-cpp-cuda` features removed — the 4 llama.cpp
 # inference nodes moved to standalone plugin
 # (RemoteMedia-SDK/llama-cpp@v0.1.0).

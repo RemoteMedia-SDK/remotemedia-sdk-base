@@ -362,7 +362,7 @@ pub trait DynamicCapabilityProvider {
     /// Resolve output capabilities to match target requirements.
     ///
     /// Called when we know what the downstream node needs. Used by
-    /// converter nodes like AudioResample that adapt their output.
+    /// converter nodes like FastResampleNode that adapt their output.
     ///
     /// # Arguments
     /// * `params` - The node's configuration parameters

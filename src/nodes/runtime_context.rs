@@ -216,6 +216,44 @@ impl NodeRuntimeContext {
         Self::for_session(session_id, node_id, control, Arc::new(()))
     }
 
+    /// Whether a control client currently hosts endpoint `name`
+    /// (openspec: add-agent-harness-integration).
+    pub fn has_endpoint(&self, name: &str) -> bool {
+        self.control.has_endpoint(name)
+    }
+
+    /// Call `method` on the client-hosted endpoint `endpoint` as this node.
+    ///
+    /// Never blocks: failures (`no_responder` when nobody hosts it and no
+    /// `hold_ms` is given, `overloaded`, `timeout`, `responder_gone`, …)
+    /// arrive as the stream's terminal error chunk. Dropping the stream
+    /// (including through barge-in cancellation of the node's in-flight
+    /// call) cancels the call at the host.
+    pub fn call_endpoint(
+        &self,
+        endpoint: &str,
+        method: &str,
+        args: Vec<serde_json::Value>,
+        kwargs: serde_json::Map<String, serde_json::Value>,
+        opts: crate::transport::endpoint::CallOptions,
+    ) -> crate::transport::endpoint::EndpointCallStream {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut req = remotemedia_traits::call::CallRequestEnvelope::new(
+            endpoint,
+            method,
+            format!("ctx-{n}"),
+        );
+        req.mode = opts.mode;
+        req.args = args;
+        req.kwargs = kwargs;
+        req.deadline_ms = opts.deadline_ms;
+        req.hold_ms = opts.hold_ms;
+        req.route_hint = opts.route_hint;
+        req.adapter_hint = opts.adapter_hint;
+        self.control.call_endpoint(self.node_id(), req)
+    }
+
     /// Read the latest published capability for `addr`, or `None` if no
     /// publisher has emitted yet.
     ///

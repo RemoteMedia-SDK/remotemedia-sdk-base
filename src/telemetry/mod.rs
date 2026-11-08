@@ -19,6 +19,8 @@
 //! (≈1 µs per record) only run while observed in [`TelemetryLevel::Auto`].
 
 pub mod descriptor;
+pub mod identity;
+pub mod node_logs;
 pub mod publisher;
 pub mod redact;
 pub mod size;
@@ -28,9 +30,10 @@ pub use descriptor::{
     EdgeDescriptor, EdgeKind, NodeDescriptor, PortDescriptor, QueueCapacity, SessionDescriptor,
     CLIENT_NODE_ID,
 };
+pub use identity::{file_digest, params_hash, ImplementationKind, NodeImplementation};
 pub use size::approx_payload_bytes;
 pub use snapshot::{
-    EdgeTelemetry, ErrorInfo, NodeStatus, NodeTelemetry, QueueDepth, TelemetrySnapshot,
+    EdgeTelemetry, EndpointAdapterTelemetry, EndpointTelemetry, ErrorInfo, NodeStatus, NodeTelemetry, QueueDepth, TelemetrySnapshot,
 };
 
 use crate::executor::StreamingScheduler;
@@ -169,6 +172,8 @@ pub struct NodeCell {
     pub(crate) bypassed: AtomicU64,
     pub(crate) discarded: AtomicU64,
     pub(crate) busy_us: AtomicU64,
+    /// Turns this node re-issued to an LLM fallback provider.
+    pub(crate) llm_fallbacks: AtomicU64,
     /// Microseconds since the telemetry epoch at which the in-flight
     /// dispatch started, **plus one** so that `0` means idle.
     pub(crate) in_flight_since_us: AtomicU64,
@@ -209,6 +214,7 @@ impl NodeCell {
             bypassed: AtomicU64::new(0),
             discarded: AtomicU64::new(0),
             busy_us: AtomicU64::new(0),
+            llm_fallbacks: AtomicU64::new(0),
             in_flight_since_us: AtomicU64::new(0),
             last_error_at_us: AtomicU64::new(0),
             alive: AtomicBool::new(false),
@@ -556,6 +562,13 @@ impl SessionTelemetry {
             }
         }
         out
+    }
+
+    /// Count one LLM fallback on `node_id` (unknown ids are ignored).
+    pub fn record_llm_fallback(&self, node_id: &str) {
+        if let Some(i) = self.node_index(node_id) {
+            self.nodes[i].llm_fallbacks.fetch_add(1, Relaxed);
+        }
     }
 
     pub(crate) fn last_error(&self, idx: usize) -> Option<ErrorInfo> {

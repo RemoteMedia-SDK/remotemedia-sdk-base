@@ -2586,7 +2586,10 @@ pub struct Empty {}
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlFrame {
-    #[prost(oneof = "control_frame::Op", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(
+        oneof = "control_frame::Op",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14"
+    )]
     pub op: ::core::option::Option<control_frame::Op>,
 }
 /// Nested message and enum types in `ControlFrame`.
@@ -2615,6 +2618,21 @@ pub mod control_frame {
         /// Change this session's telemetry level / snapshot interval.
         #[prost(message, tag = "10")]
         SetTelemetry(super::SetTelemetry),
+        /// ── Client-hosted endpoints (openspec: add-agent-harness-integration) ──
+        /// Register an endpoint hosted by this attach. Answered by
+        /// `EndpointHosted`. The registration ends when the attach closes.
+        #[prost(message, tag = "11")]
+        HostEndpoint(super::HostEndpoint),
+        /// Stop hosting an endpoint registered by this attach.
+        #[prost(message, tag = "12")]
+        UnhostEndpoint(super::UnhostEndpoint),
+        /// Reply chunk for an `EndpointCall`. Answered by `EndpointReplyAck`.
+        #[prost(message, tag = "13")]
+        EndpointReply(super::EndpointReply),
+        /// Stream endpoint presence changes (`EndpointPresenceEvent`), starting
+        /// with one `hosted = true` event per currently hosted endpoint.
+        #[prost(message, tag = "14")]
+        WatchEndpoints(super::WatchEndpoints),
     }
 }
 /// Identifies the session this attach is scoped to. MUST be the first frame.
@@ -2698,10 +2716,77 @@ pub struct SetTelemetry {
     #[prost(uint32, tag = "2")]
     pub interval_ms: u32,
 }
+/// One method an endpoint serves. `mode`: "reply" | "stream" | "ff".
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EndpointMethod {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub mode: ::prost::alloc::string::String,
+}
+/// Endpoint hosting is a control operation: when the server is configured
+/// with a bearer token the attach must carry it, and servers may disable
+/// hosting entirely (observe-only), in which case the result is `forbidden`.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HostEndpoint {
+    /// Endpoint id; must not equal a node id or a reserved virtual node.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Empty = accept any method (mode taken from the request).
+    #[prost(message, repeated, tag = "2")]
+    pub methods: ::prost::alloc::vec::Vec<EndpointMethod>,
+    /// "agent" | "service" (default "service").
+    #[prost(string, tag = "3")]
+    pub host_kind: ::prost::alloc::string::String,
+    /// Informational adapter name (agent hosts).
+    #[prost(string, tag = "4")]
+    pub adapter: ::prost::alloc::string::String,
+    /// Calls in flight at this host before new calls fail with `overloaded`.
+    /// 0 = server default (64).
+    #[prost(uint32, tag = "5")]
+    pub queue_capacity: u32,
+    /// Replace an existing host (its pending calls fail with `responder_gone`).
+    #[prost(bool, tag = "6")]
+    pub takeover: bool,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UnhostEndpoint {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EndpointReply {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// `call_id` from the `EndpointCall` event.
+    #[prost(string, tag = "2")]
+    pub call_id: ::prost::alloc::string::String,
+    /// "value" | "end" | "error".
+    #[prost(string, tag = "3")]
+    pub kind: ::prost::alloc::string::String,
+    /// JSON value for kind = "value".
+    #[prost(string, tag = "4")]
+    pub data_json: ::prost::alloc::string::String,
+    /// Error kind for kind = "error" ("unavailable", "error", ...).
+    #[prost(string, tag = "5")]
+    pub error: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub message: ::prost::alloc::string::String,
+    /// Optional JSON metadata (adapter, route, escalated).
+    #[prost(string, tag = "7")]
+    pub meta_json: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchEndpoints {}
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlEvent {
-    #[prost(oneof = "control_event::Event", tags = "1, 2, 3, 4, 5")]
+    #[prost(oneof = "control_event::Event", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub event: ::core::option::Option<control_event::Event>,
 }
 /// Nested message and enum types in `ControlEvent`.
@@ -2726,7 +2811,104 @@ pub mod control_event {
         /// Sent exactly once as the final frame when the session closes.
         #[prost(message, tag = "5")]
         SessionClosed(super::SessionClosed),
+        /// ── Client-hosted endpoints (openspec: add-agent-harness-integration) ──
+        /// Result of a `HostEndpoint` frame.
+        #[prost(message, tag = "6")]
+        EndpointHosted(super::EndpointHosted),
+        /// A call for an endpoint this attach hosts (delivered only to the host).
+        #[prost(message, tag = "7")]
+        EndpointCall(super::EndpointCall),
+        /// A delivered call was cancelled (deadline | caller | session_closed).
+        #[prost(message, tag = "8")]
+        EndpointCancelled(super::EndpointCancelled),
+        /// Presence change. Also sent to a host whose registration ended
+        /// (`reason`: "taken_over" | "session_closed" | "unhosted").
+        #[prost(message, tag = "9")]
+        EndpointPresence(super::EndpointPresenceEvent),
+        /// Result of an `EndpointReply` frame.
+        #[prost(message, tag = "10")]
+        EndpointReplyAck(super::EndpointReplyAck),
     }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EndpointHosted {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub ok: bool,
+    /// On failure: "already_hosted" | "name_conflict" | "forbidden" |
+    /// "session_closed" | "invalid".
+    #[prost(string, tag = "3")]
+    pub error: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub message: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EndpointCall {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Host-unique id ("\<caller_node>/\<corr_id>"); echo it in `EndpointReply`.
+    #[prost(string, tag = "2")]
+    pub call_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub caller_node: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub method: ::prost::alloc::string::String,
+    /// "reply" | "stream" | "ff".
+    #[prost(string, tag = "6")]
+    pub mode: ::prost::alloc::string::String,
+    /// JSON array.
+    #[prost(string, tag = "7")]
+    pub args_json: ::prost::alloc::string::String,
+    /// JSON object.
+    #[prost(string, tag = "8")]
+    pub kwargs_json: ::prost::alloc::string::String,
+    /// Deadline remaining at delivery.
+    #[prost(uint64, tag = "9")]
+    pub deadline_ms: u64,
+    #[prost(string, tag = "10")]
+    pub route_hint: ::prost::alloc::string::String,
+    #[prost(string, tag = "11")]
+    pub adapter_hint: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EndpointCancelled {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub call_id: ::prost::alloc::string::String,
+    /// "deadline" | "caller" | "session_closed".
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EndpointPresenceEvent {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub hosted: bool,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EndpointReplyAck {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub call_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub accepted: bool,
+    /// When not accepted: "late" | "cancelled" | "unknown_call" |
+    /// "responder_gone" | "invalid".
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2801,6 +2983,10 @@ pub struct SessionSummaryPb {
     /// Whether hot-path telemetry counters exist for this session.
     #[prost(bool, tag = "8")]
     pub has_telemetry: bool,
+    /// A call reached an agent-hosted endpoint, or the session was marked
+    /// agent-backed (openspec: add-agent-harness-integration).
+    #[prost(bool, tag = "9")]
+    pub agent_backed: bool,
 }
 #[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

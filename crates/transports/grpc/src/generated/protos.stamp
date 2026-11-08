@@ -4,5 +4,5 @@ ba8f86591d84f8bb  common.proto
 d9717df43a8af7b3  execution.proto
 2ae689d23917c984  streaming.proto
 3d77b6736af6a726  webrtc_signaling.proto
-deabbbd79bf75cc8  control.proto
+5c383af8fde50f39  control.proto
 6d8ecb207b86a8ed  deployment.proto

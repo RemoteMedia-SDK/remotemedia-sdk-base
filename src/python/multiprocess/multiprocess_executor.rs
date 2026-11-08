@@ -76,6 +76,13 @@ fn global_sessions(
 enum IpcCommand {
     /// Send data to the node's input channel (serialized Python wire bytes)
     SendData { bytes: Vec<u8> },
+    /// Publish to the node's input channel WITHOUT an `IpcResponse` ack.
+    ///
+    /// Used for out-of-band frames (endpoint-call `__call_reply__`
+    /// deliveries) that may be sent while a `process_runtime_data_streaming`
+    /// collector owns the shared response channel: an extra `SendComplete`
+    /// there would be misread as the ack for the collector's own input.
+    SendDataNoAck { bytes: Vec<u8> },
     /// Register a bounded callback channel for continuous output forwarding.
     ///
     /// The IPC thread uses `blocking_send` on this channel, so a full queue
@@ -912,6 +919,39 @@ impl MultiprocessExecutor {
                 )))
             }
         }
+    }
+
+    /// Fire-and-forget, out-of-band send to a node's Python process: the
+    /// frame is published on the node's input channel without an IPC ack and
+    /// without touching the executor's response channel, so it can be sent
+    /// while a `process()` call for the same node is in flight. The Python
+    /// side must not answer it with an `EndOfInput` sentinel.
+    ///
+    /// Used to deliver endpoint-call `__call_reply__` chunks
+    /// (openspec: add-agent-harness-integration).
+    #[cfg(feature = "multiprocess")]
+    pub async fn send_out_of_band(
+        session_id: &str,
+        node_id: &str,
+        data: crate::data::RuntimeData,
+    ) -> Result<()> {
+        let bytes = Self::to_ipc_runtime_data(&data, session_id);
+        let tx = {
+            let global_sessions = global_sessions();
+            let sessions = global_sessions.read().await;
+            sessions
+                .get(session_id)
+                .and_then(|s| s.get(node_id))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Execution(format!(
+                        "IPC thread not found for node {node_id} in session {session_id}"
+                    ))
+                })?
+        };
+        tx.send(IpcCommand::SendDataNoAck { bytes })
+            .await
+            .map_err(|e| Error::Execution(format!("Failed to send to IPC thread: {e}")))
     }
 
     /// Send data to a node's IPC thread without waiting for response (fire-and-forget)
@@ -1956,8 +1996,14 @@ sys.stdout.flush()
                         | super::process_manager::ProcessStatus::Stopped
                         | super::process_manager::ProcessStatus::Stopping)
                     {
+                        // The stderr reader may still be draining the last lines.
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        let cause = process
+                            .last_error_line()
+                            .map(|l| format!("; last stderr line: {l}"))
+                            .unwrap_or_default();
                         return Err(Error::Execution(format!(
-                            "Node {node_id_clone} exited before readiness: {status:?}"
+                            "Node {node_id_clone} exited before readiness: {status:?}{cause}"
                         )));
                     }
                     tracing::debug!(
@@ -2078,8 +2124,10 @@ sys.stdout.flush()
         let node_id_clone = node_id.to_string();
         let session_id_clone = session_id.to_string();
 
-        // Spawn dedicated OS thread
+        // Spawn dedicated OS thread (logging in the caller's node span).
+        let span = tracing::Span::current();
         let handle = std::thread::spawn(move || {
+            let _span = span.entered();
             tracing::debug!("IPC thread starting for node: {}", node_id_clone);
 
             // Create tokio runtime for this thread (needed for async create_publisher/subscriber)
@@ -2189,6 +2237,15 @@ sys.stdout.flush()
                         // Continue polling in the main loop - don't break out!
                         // The subscriber will be polled continuously even between commands
                         // to ensure we capture all output from streaming nodes
+                    }
+                    Ok(IpcCommand::SendDataNoAck { bytes }) => {
+                        if let Err(e) = publisher.send(&bytes) {
+                            tracing::warn!(
+                                "[IPC Thread] Node '{}': out-of-band publish failed: {}",
+                                node_id_clone,
+                                e
+                            );
+                        }
                     }
                     Ok(IpcCommand::RegisterOutputCallback { callback_tx }) => {
                         tracing::debug!(
@@ -2875,11 +2932,21 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                         .insert("PYTHONNOUSERSITE".to_string(), "1".to_string());
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    // Fail here rather than fall back to the system Python:
+                    // its remotemedia / iceoryx2 install rarely matches this
+                    // build, and the fallback then fails much later with an
+                    // opaque IPC error (`ServiceInCorruptedState`).
+                    tracing::error!(
                         error = %e,
                         node_id = %ctx.node_id,
-                        "Failed to provision managed Python environment, using system Python"
+                        "Failed to provision managed Python environment"
                     );
+                    return Err(Error::Execution(format!(
+                        "Node {} ({}): provisioning its managed Python environment failed: {e}. \
+                         Fix the dependency error, or set PYTHON_ENV_MODE=system \
+                         (--python-env system) to use the system Python as-is.",
+                        ctx.node_id, ctx.node_type
+                    )));
                 }
             }
         }
@@ -3014,9 +3081,18 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 )
                 .await?;
             if !ready {
+                let last = self
+                    .sessions
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .and_then(|s| s.node_processes.get(&ctx.node_id))
+                    .and_then(|p| p.last_error_line())
+                    .map(|l| format!("; last stderr line: {l}"))
+                    .unwrap_or_default();
                 return Err(Error::Execution(format!(
-                    "Node {} failed to signal ready within timeout",
-                    ctx.node_id
+                    "Node {} failed to signal ready within {}s{last}",
+                    ctx.node_id, self.config.init_timeout_secs
                 )));
             }
 
