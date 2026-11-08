@@ -37,6 +37,15 @@ pub enum CodecError {
 
     #[error(transparent)]
     CopyRejected(#[from] remotemedia_types::CopyRejected),
+
+    #[error(transparent)]
+    OutputAllocation(#[from] remotemedia_types::BufferAllocationError),
+
+    #[error("Invalid decoded output: {0}")]
+    OutputLayout(String),
+
+    #[error("Codec task failed: {0}")]
+    TaskFailed(String),
 }
 
 /// Video encoder backend trait
@@ -84,6 +93,18 @@ pub trait VideoDecoderBackend: Send + Sync {
     /// * `Ok(RuntimeData)` - Decoded raw frame with codec=None
     /// * `Err(CodecError)` - Decoding failure
     fn decode(&mut self, input: RuntimeData) -> Result<RuntimeData>;
+
+    /// Preserve caller copy authority and selected output storage, or reject.
+    fn decode_with_context(
+        &mut self,
+        _input: RuntimeData,
+        _copies: &remotemedia_types::CopyContext,
+        _allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<RuntimeData> {
+        Err(CodecError::NotAvailable(
+            "decoder does not support contextual output allocation".into(),
+        ))
+    }
 
     /// Get the codec this decoder handles
     fn codec(&self) -> VideoCodec;
@@ -351,6 +372,19 @@ impl FFmpegDecoder {
 #[cfg(feature = "video")]
 impl VideoDecoderBackend for FFmpegDecoder {
     fn decode(&mut self, input: RuntimeData) -> Result<RuntimeData> {
+        self.decode_with_context(
+            input,
+            remotemedia_types::CopyContext::legacy(),
+            &remotemedia_types::HeapOutputAllocator,
+        )
+    }
+
+    fn decode_with_context(
+        &mut self,
+        input: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+        allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<RuntimeData> {
         // Extract encoded video frame
         let (pixel_data, _width, _height, codec, frame_number, timestamp_us) = match input {
             RuntimeData::Video {
@@ -405,10 +439,9 @@ impl VideoDecoderBackend for FFmpegDecoder {
         let decoder = self.decoder.as_mut().unwrap();
 
         // Reuse a complete FFmpeg packet owner when available. Arbitrary bytes
-        // still require padded backend storage and explicit legacy attribution.
+        // still require padded backend storage under the caller's authority.
         use ac_ffmpeg::codec::Decoder;
-        let packet =
-            super::packets::decoder_packet(pixel_data, remotemedia_types::CopyContext::legacy())?;
+        let packet = super::packets::decoder_packet(pixel_data, copies)?;
 
         // Decode packet
         decoder.push(packet).map_err(|e| {
@@ -419,23 +452,15 @@ impl VideoDecoderBackend for FFmpegDecoder {
         if let Some(frame) = decoder.take().map_err(|e| {
             CodecError::DecodingFailed(format!("Failed to take frame from decoder: {}", e))
         })? {
-            // Copy frame planes to output buffer (YUV420P format)
-            let mut decoded_pixel_data = Vec::new();
-
-            let planes = frame.planes();
-            // Only access first 3 planes (Y, U, V for YUV420P)
-            // Planes index 3 may be uninitialized/invalid
-            for i in 0..3 {
-                if i < planes.len() {
-                    let plane_data = planes[i].data();
-                    if !plane_data.is_empty() {
-                        decoded_pixel_data.extend_from_slice(plane_data);
-                    }
-                }
-            }
+            let decoded_pixel_data = super::decoded_frames::decoder_frame(
+                &frame,
+                self.config.output_format,
+                copies,
+                allocator,
+            )?;
 
             Ok(RuntimeData::Video {
-                pixel_data: decoded_pixel_data.into(),
+                pixel_data: decoded_pixel_data,
                 width: frame.width() as u32,
                 height: frame.height() as u32,
                 format: self.config.output_format,

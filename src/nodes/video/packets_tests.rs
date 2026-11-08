@@ -214,7 +214,8 @@ fn codec_packets_real_h264_encoder_and_decoder_share_packet_storage() {
         .1
         .copied_bytes;
     assert_eq!(
-        before, after,
-        "owning codec chain must not stage packet ingress"
+        after - before,
+        32 * 32 * 3 / 2,
+        "owning codec chain transfers only visible decoded pixels, not packet ingress"
     );
 }

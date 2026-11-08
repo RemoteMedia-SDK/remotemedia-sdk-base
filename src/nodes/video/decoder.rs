@@ -100,7 +100,29 @@ impl VideoDecoderNode {
             dec.decode(input)
         })
         .await
-        .map_err(|e| CodecError::DecodingFailed(e.to_string()))?
+        .map_err(|e| CodecError::TaskFailed(e.to_string()))?
+    }
+    // Leniency handles corrupt bitstreams, never policy, allocation, layout or task failures.
+    fn finish_decode(&self, result: Result<RuntimeData, CodecError>) -> Result<RuntimeData, Error> {
+        match result {
+            Ok(frame) => Ok(frame),
+            Err(e @ CodecError::DecodingFailed(_)) if self.config.error_resilience == "lenient" => {
+                warn!("Dropped corrupted frame: {}", e);
+                Ok(RuntimeData::Video {
+                    pixel_data: Vec::new().into(),
+                    width: 0,
+                    height: 0,
+                    format: PixelFormat::Unspecified,
+                    codec: None,
+                    frame_number: 0,
+                    timestamp_us: 0,
+                    is_keyframe: false,
+                    stream_id: None,
+                    arrival_ts_us: None,
+                })
+            }
+            Err(e) => Err(Error::Execution(format!("Decoding failed: {}", e))),
+        }
     }
 }
 
@@ -108,6 +130,55 @@ impl VideoDecoderNode {
 impl AsyncStreamingNode for VideoDecoderNode {
     fn node_type(&self) -> &str {
         "VideoDecoder"
+    }
+
+    async fn process_with_ctx(
+        &self,
+        input: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let copies = ctx.copy_context().ok_or_else(|| {
+            Error::Execution("VideoDecoder requires context copy authority".into())
+        })?;
+        let allocator = ctx.output_allocator().ok_or_else(|| {
+            Error::Execution("VideoDecoder requires a selected output allocator".into())
+        })?;
+        let decoder = Arc::clone(&self.decoder);
+        let result = tokio::task::spawn_blocking(move || {
+            decoder
+                .lock()
+                .unwrap()
+                .decode_with_context(input, &copies, allocator.as_ref())
+        })
+        .await
+        .map_err(|e| Error::Execution(format!("Decoder task failed: {e}")))?;
+        self.finish_decode(result)
+    }
+
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: std::collections::HashMap<String, RuntimeData>,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let input = inputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Execution("No input data provided".into()))?
+            .1;
+        self.process_with_ctx(input, ctx).await
+    }
+
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        input: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+        mut callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        callback(self.process_with_ctx(input, ctx).await?)?;
+        Ok(1)
     }
 
     async fn process(&self, input: RuntimeData) -> Result<RuntimeData, Error> {
@@ -129,26 +200,7 @@ impl AsyncStreamingNode for VideoDecoderNode {
             }
         }
 
-        // Decode frame with error resilience
-        match self.decode_frame(input).await {
-            Ok(frame) => Ok(frame),
-            Err(e) if self.config.error_resilience == "lenient" => {
-                warn!("Dropped corrupted frame: {}", e);
-                Ok(RuntimeData::Video {
-                    pixel_data: Vec::new().into(),
-                    width: 0,
-                    height: 0,
-                    format: PixelFormat::Unspecified,
-                    codec: None,
-                    frame_number: 0,
-                    timestamp_us: 0,
-                    is_keyframe: false,
-                    stream_id: None,
-                    arrival_ts_us: None,
-                })
-            }
-            Err(e) => Err(Error::Execution(format!("Decoding failed: {}", e))),
-        }
+        self.finish_decode(self.decode_frame(input).await)
     }
 
     async fn process_multi(

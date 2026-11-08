@@ -7,6 +7,8 @@
 
 pub mod codec;
 #[cfg(feature = "video")]
+mod decoded_frames;
+#[cfg(feature = "video")]
 mod frames;
 #[cfg(feature = "video")]
 mod packets;
