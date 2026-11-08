@@ -355,17 +355,13 @@ impl ChannelRegistry {
         Ok(())
     }
 
-    /// Drain all pending messages from a channel's subscriber
-    /// Call this before destroying a channel to ensure no stale messages remain
+    /// Discard a new subscriber's pending samples without decoding payloads.
+    /// This releases this subscriber's borrows, not the publisher's history or
+    /// another subscriber's queue. Producers must be quiesced for a final drain.
     #[cfg(feature = "multiprocess")]
     pub async fn drain_channel(&self, channel_name: &str) -> Result<usize> {
         let subscriber = self.create_subscriber(channel_name).await?;
-        let mut count = 0;
-
-        // Drain all pending messages
-        while let Ok(Some(_)) = subscriber.receive() {
-            count += 1;
-        }
+        let count = subscriber.discard_pending()?;
 
         if count > 0 {
             tracing::info!(
@@ -447,17 +443,15 @@ impl ChannelRegistry {
 
     /// Create a subscriber and immediately drain any stale messages
     ///
-    /// This is useful when creating a new session to ensure we don't process
-    /// messages from a previous session that wasn't properly cleaned up.
+    /// Skips samples already available without parsing their wire format.
+    /// Publisher history delivered on a later connection refresh is not skipped.
+    /// Other subscriber queues and publisher history are unaffected. Producers
+    /// must be quiesced if the caller needs a stable boundary for fresh traffic.
     #[cfg(feature = "multiprocess")]
     pub async fn create_subscriber_fresh(&self, channel_name: &str) -> Result<Subscriber> {
         let subscriber = self.create_subscriber(channel_name).await?;
 
-        // Drain any stale messages from previous sessions
-        let mut stale_count = 0;
-        while let Ok(Some(_)) = subscriber.receive() {
-            stale_count += 1;
-        }
+        let stale_count = subscriber.discard_pending()?;
 
         if stale_count > 0 {
             tracing::warn!(
@@ -608,6 +602,22 @@ pub struct Subscriber {
 
 #[cfg(feature = "multiprocess")]
 impl Subscriber {
+    /// Release currently available native samples without reading their payloads.
+    /// Publisher history and other subscribers are unaffected. A temporarily
+    /// empty queue is not EOF: publishers may deliver history on a later refresh.
+    pub fn discard_pending(&self) -> Result<usize> {
+        let mut count = 0;
+        while self
+            .inner
+            .receive()
+            .map_err(|e| Error::IpcError(format!("Failed to discard pending samples: {e:?}")))?
+            .is_some()
+        {
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Receive data from the channel (synchronous - iceoryx2 is lock-free)
     pub fn receive(&self) -> Result<Option<RuntimeData>> {
         self.receive_with_copy_context(CopyContext::legacy())
