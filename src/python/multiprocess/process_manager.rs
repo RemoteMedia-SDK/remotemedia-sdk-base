@@ -133,9 +133,32 @@ pub struct ProcessHandle {
 
     /// Execution target (process or container)
     pub execution_target: Arc<Mutex<Option<ExecutionTarget>>>,
+
+    /// The last [`STDERR_TAIL_LINES`] lines the process wrote to stderr
+    /// (when output is captured), for error messages about early exits.
+    pub stderr_tail: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
+/// How many stderr lines a [`ProcessHandle`] keeps.
+pub const STDERR_TAIL_LINES: usize = 40;
+
 impl ProcessHandle {
+    /// The most informative recent stderr line: the last one that looks like
+    /// an exception or error (a traceback's final line), else the last line.
+    pub fn last_error_line(&self) -> Option<String> {
+        let tail = self.stderr_tail.lock().ok()?;
+        let looks_like_error = |l: &&String| {
+            let t = l.trim_start();
+            !t.starts_with("File ")
+                && (t.contains("Error:") || t.contains("Exception:") || t.contains("Error("))
+        };
+        tail.iter()
+            .rev()
+            .find(looks_like_error)
+            .or_else(|| tail.iter().rev().find(|l| !l.trim().is_empty()))
+            .map(|l| l.trim().to_string())
+    }
+
     /// Check if the process is still alive
     pub async fn is_alive(&self) -> bool {
         if let Some(ref mut child) = *self.inner.lock().await {
@@ -405,17 +428,36 @@ impl ProcessManager {
             None
         };
 
-        // Write params to stdin (avoids command-line length limits)
-        if !params.is_null() {
-            use std::io::Write;
-            if let Some(mut stdin) = child.stdin.take() {
+        // Drain stdout too: a piped stdout nobody reads fills its buffer
+        // (a few KB on Windows), and the worker then blocks in `print`.
+        if let Some(stdout) = child.stdout.take() {
+            let node_id = node_id.to_string();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let Ok(stdout) = tokio::process::ChildStdout::from_std(stdout) else {
+                    return;
+                };
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::info!("[Process {}] {} stdout: {}", pid, node_id, line);
+                }
+            });
+        }
+
+        // Write params to stdin (avoids command-line length limits), then
+        // close it. The runner (`--params-stdin`) reads stdin to EOF, so it
+        // must be closed even when there are no params: a node declared
+        // without `params` otherwise blocks in that read forever and never
+        // signals READY.
+        if let Some(mut stdin) = child.stdin.take() {
+            if !params.is_null() {
+                use std::io::Write;
                 let params_json = params.to_string();
                 stdin.write_all(params_json.as_bytes()).map_err(|e| {
                     Error::Execution(format!("Failed to write params to stdin: {}", e))
                 })?;
-                // Drop stdin to close the pipe
-                drop(stdin);
             }
+            drop(stdin);
         }
 
         // Create process handle
@@ -428,6 +470,7 @@ impl ProcessManager {
             started_at: Instant::now(),
             inner: Arc::new(Mutex::new(Some(child))),
             execution_target: Arc::new(Mutex::new(None)),
+            stderr_tail: Default::default(),
         };
 
         // Register process
@@ -511,6 +554,7 @@ impl ProcessManager {
         if let Some(stderr) = stderr {
             let node_id = process.node_id.clone();
             let pid = process.id;
+            let tail = process.stderr_tail.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let stderr = tokio::process::ChildStderr::from_std(stderr).unwrap();
@@ -518,6 +562,12 @@ impl ProcessManager {
 
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::warn!("[Process {}] {}: {}", pid, node_id, line);
+                    if let Ok(mut t) = tail.lock() {
+                        if t.len() == STDERR_TAIL_LINES {
+                            t.pop_front();
+                        }
+                        t.push_back(line);
+                    }
                 }
             });
         }
@@ -638,6 +688,7 @@ impl ProcessManager {
                 container_id: container_id.clone(),
                 docker_client: docker_support.docker_client().clone(),
             }))),
+            stderr_tail: Default::default(),
         };
 
         // Register process (using node_id hash as key since we don't have a PID)
@@ -681,6 +732,7 @@ mod tests {
             started_at: Instant::now(),
             inner: Arc::new(Mutex::new(None)),
             execution_target: Arc::new(Mutex::new(None)),
+            stderr_tail: Default::default(),
         };
 
         assert_eq!(handle.id, 1234);

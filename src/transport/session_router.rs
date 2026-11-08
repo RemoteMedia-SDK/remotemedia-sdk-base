@@ -450,6 +450,40 @@ struct NodeTelemetryHandle {
     input_weak: mpsc::WeakSender<RuntimeData>,
 }
 
+/// Publish a per-node loading event (`{kind: "loading", status, node,
+/// message, ts_ms}`) on the session's `__system__` tap.
+fn publish_node_loading(
+    control: Option<&Arc<SessionControl>>,
+    status: &str,
+    node_id: &str,
+    message: &str,
+) {
+    if let Some(ctrl) = control {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let event = RuntimeData::Json(serde_json::json!({
+            "kind": "loading",
+            "status": status,
+            "node": node_id,
+            "message": message,
+            "ts_ms": ts,
+        }));
+        ctrl.publish_tap("__system__", None, event);
+    }
+}
+
+/// The message of a caught panic payload (`&str` or `String`; anything else
+/// is reported generically).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
 impl SessionRouter {
     /// Create a new session router
     ///
@@ -806,6 +840,15 @@ impl SessionRouter {
         // Box<dyn StreamingNode>; for Python multiprocess nodes that
         // chains into ProcessManager::Drop and SIGKILLs the spawned
         // child, so we don't leak partially-initialised processes.
+        //
+        // A node whose initialize() panics (a device API asserting on an
+        // unsupported config, say) fails the session like any other init
+        // error. Uncaught, the panic unwinds the caller's task, so session
+        // creation never returns and the session stays "initializing".
+        //
+        // `node_ready` goes out as each node finishes, so an observer can
+        // tell which nodes are still loading while a slow one holds up the
+        // pipeline.
         let session_id = self.session_id.clone();
         let control = self.control.clone();
         let init_futures = created.into_iter().map(|(id, ty, node)| {
@@ -814,9 +857,28 @@ impl SessionRouter {
                 node_id: id.clone(),
                 control: control.clone(),
             };
+            let control = control.clone();
             async move {
-                match node.initialize(&init_ctx).await {
-                    Ok(()) => Ok((id, ty, node)),
+                use futures::FutureExt;
+                let result = std::panic::AssertUnwindSafe(node.initialize(&init_ctx))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|panic| {
+                        Err(Error::Execution(format!(
+                            "initialize panicked: {}",
+                            panic_message(panic.as_ref())
+                        )))
+                    });
+                match result {
+                    Ok(()) => {
+                        publish_node_loading(
+                            control.as_ref(),
+                            "node_ready",
+                            &id,
+                            &format!("Node '{}' ({}) ready", id, ty),
+                        );
+                        Ok((id, ty, node))
+                    }
                     Err(e) => Err((id, ty, e)),
                 }
             }
@@ -844,17 +906,11 @@ impl SessionRouter {
             }
         };
 
-        // Phase 4: stamp authoritative `node_ready` for each
-        // successfully initialised node, then move it into
-        // `cached_nodes`. The router emits `node_ready` itself so the
-        // frontend has a reliable transition signal even if a node
-        // doesn't bother calling `ctx.emit_progress("ready", …)`.
+        // Phase 4: move every initialised node into `cached_nodes`. The
+        // router emitted an authoritative `node_ready` for each as it
+        // finished (above), so the frontend has a reliable transition
+        // signal even if a node doesn't call `ctx.emit_progress("ready", …)`.
         for (id, ty, node) in initialised {
-            self.emit_node_loading_event(
-                "node_ready",
-                &id,
-                &format!("Node '{}' ({}) ready", id, ty),
-            );
             tracing::debug!(
                 "Session {}: Initialized node '{}' (type: {})",
                 self.session_id,
@@ -929,20 +985,7 @@ impl SessionRouter {
     ///                    itself called `ctx.emit_progress("ready", …)`)
     /// - `error`        — node init returned `Err`
     fn emit_node_loading_event(&self, status: &str, node_id: &str, message: &str) {
-        if let Some(ctrl) = &self.control {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let event = RuntimeData::Json(serde_json::json!({
-                "kind": "loading",
-                "status": status,
-                "node": node_id,
-                "message": message,
-                "ts_ms": ts,
-            }));
-            ctrl.publish_tap("__system__", None, event);
-        }
+        publish_node_loading(self.control.as_ref(), status, node_id, message);
     }
 
     /// Propagate capabilities from RuntimeDiscovered nodes after initialization (spec 025).
@@ -2747,6 +2790,81 @@ mod tests {
         .await
         .unwrap();
         SessionRouter::teardown_pipeline_tasks(pipeline, true).await;
+    }
+
+    /// A node whose `initialize` panics (cpal asserting on an unsupported
+    /// sample rate, say) or never returns.
+    struct InitNode {
+        panic: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::nodes::AsyncStreamingNode for InitNode {
+        fn node_type(&self) -> &str {
+            if self.panic {
+                "PanicInitNode"
+            } else {
+                "OkInitNode"
+            }
+        }
+        async fn initialize(
+            &self,
+            _ctx: &dyn crate::nodes::InitializeContextRead,
+        ) -> crate::Result<()> {
+            if self.panic {
+                panic!("sample rate out of range");
+            }
+            Ok(())
+        }
+        async fn process(&self, data: RuntimeData) -> crate::Result<RuntimeData> {
+            Ok(data)
+        }
+    }
+    struct InitNodeFactory(bool);
+    impl crate::nodes::StreamingNodeFactory for InitNodeFactory {
+        fn node_type(&self) -> &str {
+            if self.0 {
+                "PanicInitNode"
+            } else {
+                "OkInitNode"
+            }
+        }
+        fn create(
+            &self,
+            _node_id: String,
+            _params: &serde_json::Value,
+            _session_id: Option<String>,
+        ) -> crate::Result<Box<dyn StreamingNode>> {
+            Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(
+                InitNode { panic: self.0 },
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_initialize_fails_session_startup_instead_of_hanging() {
+        let mut registry = StreamingNodeRegistry::new();
+        registry.register(Arc::new(InitNodeFactory(false)));
+        registry.register(Arc::new(InitNodeFactory(true)));
+        let manifest = create_test_manifest(
+            vec![("ok", "OkInitNode"), ("mic", "PanicInitNode")],
+            vec![("ok", "mic")],
+        );
+        let (output, _rx) = ClientOutputRouter::new(8);
+        let (mut router, _) = SessionRouter::new(
+            "init-panic".into(),
+            Arc::new(manifest),
+            Arc::new(registry),
+            output,
+        )
+        .unwrap();
+        let err =
+            tokio::time::timeout(std::time::Duration::from_secs(5), router.initialize_nodes())
+                .await
+                .expect("initialize_nodes returned")
+                .expect_err("a panicking node fails initialisation");
+        let msg = err.to_string();
+        assert!(msg.contains("'mic' (PanicInitNode)"), "{msg}");
+        assert!(msg.contains("panicked: sample rate out of range"), "{msg}");
     }
 
     #[tokio::test]

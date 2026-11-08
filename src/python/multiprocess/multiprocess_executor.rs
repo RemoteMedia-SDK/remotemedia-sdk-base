@@ -1992,8 +1992,14 @@ sys.stdout.flush()
                         | super::process_manager::ProcessStatus::Stopped
                         | super::process_manager::ProcessStatus::Stopping)
                     {
+                        // The stderr reader may still be draining the last lines.
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        let cause = process
+                            .last_error_line()
+                            .map(|l| format!("; last stderr line: {l}"))
+                            .unwrap_or_default();
                         return Err(Error::Execution(format!(
-                            "Node {node_id_clone} exited before readiness: {status:?}"
+                            "Node {node_id_clone} exited before readiness: {status:?}{cause}"
                         )));
                     }
                     tracing::debug!(
@@ -2920,11 +2926,21 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                         .insert("PYTHONNOUSERSITE".to_string(), "1".to_string());
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    // Fail here rather than fall back to the system Python:
+                    // its remotemedia / iceoryx2 install rarely matches this
+                    // build, and the fallback then fails much later with an
+                    // opaque IPC error (`ServiceInCorruptedState`).
+                    tracing::error!(
                         error = %e,
                         node_id = %ctx.node_id,
-                        "Failed to provision managed Python environment, using system Python"
+                        "Failed to provision managed Python environment"
                     );
+                    return Err(Error::Execution(format!(
+                        "Node {} ({}): provisioning its managed Python environment failed: {e}. \
+                         Fix the dependency error, or set PYTHON_ENV_MODE=system \
+                         (--python-env system) to use the system Python as-is.",
+                        ctx.node_id, ctx.node_type
+                    )));
                 }
             }
         }
@@ -3059,9 +3075,18 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 )
                 .await?;
             if !ready {
+                let last = self
+                    .sessions
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .and_then(|s| s.node_processes.get(&ctx.node_id))
+                    .and_then(|p| p.last_error_line())
+                    .map(|l| format!("; last stderr line: {l}"))
+                    .unwrap_or_default();
                 return Err(Error::Execution(format!(
-                    "Node {} failed to signal ready within timeout",
-                    ctx.node_id
+                    "Node {} failed to signal ready within {}s{last}",
+                    ctx.node_id, self.config.init_timeout_secs
                 )));
             }
 
