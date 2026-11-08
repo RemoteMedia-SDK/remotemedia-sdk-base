@@ -1,7 +1,7 @@
 //! Owning conversion shared by envelope, raw compatibility and chunk ingress.
-//! Copy authority here covers reassembly and audio element conversion. The
-//! envelope decoder's legacy JSON/base64 fallback and native receive buffering
-//! remain separate boundaries; this is not full network strict enforcement.
+//! Copy authority covers legacy payload decoding, reassembly and audio element
+//! conversion. Native receive buffering remains a separate boundary; this is
+//! not full network strict enforcement.
 
 use bytes::Bytes;
 use prost::Message;
@@ -9,7 +9,7 @@ use remotemedia_core::data::RuntimeData;
 use remotemedia_types::CopyContext;
 use tracing::info;
 
-use crate::channels::{DataChannelMessage, DataChannelReassembler};
+use crate::channels::{DataChannelDecodeError, DataChannelMessage, DataChannelReassembler};
 use crate::generated::DataBuffer;
 
 pub(super) fn decode_pipeline_input(
@@ -17,7 +17,7 @@ pub(super) fn decode_pipeline_input(
     reassembler: &mut DataChannelReassembler,
     copies: &CopyContext,
 ) -> crate::Result<Option<RuntimeData>> {
-    let buffer = match DataChannelMessage::decode_owned(wire.clone()) {
+    let buffer = match DataChannelMessage::decode_owned_with_context(wire.clone(), copies) {
         Ok(DataChannelMessage::RuntimeData { data_buffer, .. }) => data_buffer,
         Ok(DataChannelMessage::Chunk { chunk, .. }) => {
             let Some(buffer) = reassembler
@@ -42,7 +42,14 @@ pub(super) fn decode_pipeline_input(
         }
         // Raw DataBuffer compatibility is decoded once, through the same owning
         // path as an envelope. Do not decode-and-discard merely to detect it.
-        Err(_) => wire,
+        Err(
+            DataChannelDecodeError::Protobuf(_)
+            | DataChannelDecodeError::InvalidKind(_)
+            | DataChannelDecodeError::MissingPayload(_),
+        ) => wire,
+        // Policy, accounting and recognized legacy payload errors are terminal.
+        // A raw-format retry must never turn a rejected operation into success.
+        Err(error) => return Err(anyhow::Error::from(error).into()),
     };
     let decoded = DataBuffer::decode(buffer)
         .map_err(|error| crate::Error::InvalidData(format!("DataBuffer decode: {error}")))?;

@@ -6,6 +6,59 @@ use remotemedia_types::{BufferBudget, CopyCounts, CopyPolicy, CopyReason};
 const BINARY: &[u8] = b"\x32\x06\x0a\x04abcd";
 
 #[test]
+fn legacy_ingress_preserves_policy_and_decode_failures_without_raw_retry() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let wire = serde_json::to_vec(&serde_json::json!({
+        "type": "RuntimeData", "payload": STANDARD.encode(BINARY)
+    }))
+    .unwrap();
+    let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "legacy-ingress-strict");
+    let error = decode_pipeline_input(
+        wire.clone().into(),
+        &mut DataChannelReassembler::new(),
+        &strict,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("legacy-ingress-strict"),
+        "{error}"
+    );
+    let allowed = CopyContext::new(CopyPolicy::AllowCopies, "legacy-ingress-compatible");
+    let RuntimeData::Binary(bytes) =
+        decode_pipeline_input(wire.into(), &mut DataChannelReassembler::new(), &allowed)
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("wrong payload kind")
+    };
+    assert_eq!(&*bytes, b"abcd");
+    for (context, copied, rejected) in [
+        (&allowed, BINARY.len() as u64, 0),
+        (&strict, 0, BINARY.len() as u64),
+    ] {
+        let report = context.report();
+        let counts = report
+            .entries
+            .iter()
+            .find(|(reason, _)| *reason == CopyReason::PortableDeserialization)
+            .unwrap()
+            .1;
+        assert_eq!(
+            (counts.copied_bytes, counts.rejected_bytes, counts.failed),
+            (copied, rejected, 0)
+        );
+    }
+    let malformed = Bytes::from_static(br#"{"type":"RuntimeData","payload":"!!!!"}"#);
+    let error =
+        decode_pipeline_input(malformed, &mut DataChannelReassembler::new(), &allowed).unwrap_err();
+    assert!(
+        error.to_string().contains("legacy base64 decode error"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("DataBuffer decode"));
+}
+
+#[test]
 fn raw_envelope_and_single_chunk_retain_wire_owner_through_pipeline_delivery() {
     let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "ingress");
     for encoded in [

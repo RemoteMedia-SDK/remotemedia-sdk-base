@@ -36,7 +36,7 @@ hyper = { version = "1", features = ["full"], optional = true }
 hyper-util = { version = "0.1", features = ["default"], optional = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_yaml = { workspace = true }
 base64 = "0.22"
 # from_owner retains immutable runtime owners in WebRTC samples.

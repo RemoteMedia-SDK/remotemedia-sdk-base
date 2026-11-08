@@ -31,7 +31,9 @@
 //!
 //! [`DataChannelMessage::decode_owned`] retains modern protobuf bulk fields as
 //! ranges of the incoming wire owner. Borrowed decoding and legacy JSON/base64
-//! decoding still allocate payload storage. Envelope encoding copies bulk bytes
+//! decoding still allocate payload storage. `decode_owned_with_context` authorizes
+//! legacy string/base64 materialization before allocation and records logical
+//! decoded bytes. Unescaped base64 tokens borrow the wire. Envelope encoding copies bulk bytes
 //! into the wire buffer; `encode_with_context` and `send_message_with_context`
 //! account for that copy or reject it under strict policy.
 //!
@@ -92,5 +94,6 @@ mod messages;
 pub use chunking::{DataChannelReassembler, DataChannelSplitter};
 pub use data_channel::{DataChannel, DataChannelState, DataChannelStats};
 pub use messages::{
-    ChunkInfo, ControlMessage, DataChannelMessage, MAX_CHUNK_SIZE, MAX_MESSAGE_SIZE,
+    ChunkInfo, ControlMessage, DataChannelDecodeError, DataChannelMessage, MAX_CHUNK_SIZE,
+    MAX_MESSAGE_SIZE,
 };

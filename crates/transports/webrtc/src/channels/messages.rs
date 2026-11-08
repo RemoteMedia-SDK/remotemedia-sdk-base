@@ -33,6 +33,9 @@ use crate::generated::webrtc::{
 #[path = "message_ownership_tests.rs"]
 mod ownership_tests;
 
+#[path = "message_legacy.rs"]
+mod legacy;
+
 /// Maximum message size for data channels (16 MB).
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
@@ -144,6 +147,15 @@ pub enum DataChannelEncodeError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataChannelDecodeError {
+    #[error(transparent)]
+    CopyRejected(#[from] CopyRejected),
+
+    #[error(transparent)]
+    CopyCompletion(#[from] remotemedia_types::CopyCompletionError),
+
+    #[error("legacy base64 decode error: {0}")]
+    Base64(#[from] base64::DecodeError),
+
     #[error("protobuf decode error: {0}")]
     Protobuf(#[from] prost::DecodeError),
 
@@ -353,107 +365,33 @@ impl DataChannelMessage {
 
     /// Deserialize message from binary protobuf envelope (with deprecated JSON fallback)
     pub fn decode(bytes: &[u8]) -> Result<Self, DataChannelDecodeError> {
-        Self::decode_buffer(bytes)
+        Self::decode_buffer(bytes, CopyContext::legacy())
     }
 
     /// Decode a protobuf envelope while retaining its bulk byte ranges. Metadata
-    /// and the legacy JSON/base64 fallback still allocate; this does not certify
-    /// the fallback or underlying transport as zero-copy.
+    /// still allocates; legacy payload decoding uses the unattributed ledger.
     pub fn decode_owned(bytes: Bytes) -> Result<Self, DataChannelDecodeError> {
-        Self::decode_buffer(bytes)
+        Self::decode_owned_with_context(bytes, CopyContext::legacy())
+    }
+
+    /// Retain modern bulk ranges and authorize legacy payload materializations
+    /// before they start. Metadata parsing and native/network buffers are separate.
+    pub fn decode_owned_with_context(
+        bytes: Bytes,
+        copies: &CopyContext,
+    ) -> Result<Self, DataChannelDecodeError> {
+        Self::decode_buffer(bytes, copies)
     }
 
     fn decode_buffer<B: Buf + AsRef<[u8]> + Clone>(
         bytes: B,
+        copies: &CopyContext,
     ) -> Result<Self, DataChannelDecodeError> {
         let envelope = match DataChannelEnvelope::decode(bytes.clone()) {
             Ok(env) => env,
             Err(pb_err) => {
-                // Fallback to legacy JSON/base64 decoding
-                #[derive(serde::Deserialize)]
-                #[serde(tag = "type", content = "payload")]
-                enum LegacyMessage {
-                    Json(serde_json::Value),
-                    Binary(String),
-                    Text(String),
-                    RuntimeData(String),
-                    Chunk(LegacyChunkInfo),
-                }
-
-                #[derive(serde::Deserialize)]
-                struct LegacyChunkInfo {
-                    stream_id: String,
-                    message_id: String,
-                    chunk_index: u32,
-                    total_chunks: Option<u32>,
-                    is_final: bool,
-                    content_type: Option<String>,
-                    data_type_hint: Option<String>,
-                    data: String,
-                }
-
-                if let Ok(legacy) = serde_json::from_slice::<LegacyMessage>(bytes.as_ref()) {
-                    tracing::warn!("Decoded legacy JSON/base64 DataChannelMessage (deprecated!)");
-                    use base64::{engine::general_purpose::STANDARD, Engine};
-                    match legacy {
-                        LegacyMessage::Json(json) => {
-                            let action = json
-                                .get("action")
-                                .and_then(|a| a.as_str())
-                                .unwrap_or("control")
-                                .to_string();
-                            return Ok(DataChannelMessage::Control {
-                                action,
-                                headers: Default::default(),
-                                json,
-                            });
-                        }
-                        LegacyMessage::Binary(b64) => {
-                            if let Ok(data) = STANDARD.decode(&b64) {
-                                return Ok(DataChannelMessage::Binary {
-                                    action: "binary".to_string(),
-                                    headers: Default::default(),
-                                    data: data.into(),
-                                });
-                            }
-                        }
-                        LegacyMessage::Text(text) => {
-                            return Ok(DataChannelMessage::Text {
-                                action: "text".to_string(),
-                                headers: Default::default(),
-                                text,
-                            });
-                        }
-                        LegacyMessage::RuntimeData(b64) => {
-                            if let Ok(data_buffer) = STANDARD.decode(&b64) {
-                                return Ok(DataChannelMessage::RuntimeData {
-                                    action: "node_output".to_string(),
-                                    headers: Default::default(),
-                                    data_buffer: data_buffer.into(),
-                                });
-                            }
-                        }
-                        LegacyMessage::Chunk(chunk) => {
-                            if let Ok(data) = STANDARD.decode(&chunk.data) {
-                                return Ok(DataChannelMessage::Chunk {
-                                    action: "runtime_data_chunk".to_string(),
-                                    headers: Default::default(),
-                                    chunk: ChunkInfo {
-                                        stream_id: chunk.stream_id,
-                                        message_id: chunk.message_id,
-                                        chunk_index: chunk.chunk_index,
-                                        total_chunks: chunk.total_chunks,
-                                        is_final: chunk.is_final,
-                                        content_type: chunk.content_type,
-                                        data_type_hint: chunk.data_type_hint,
-                                        data: data.into(),
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
-                return Err(DataChannelDecodeError::Protobuf(pb_err));
+                return legacy::decode(bytes.as_ref(), copies)?
+                    .ok_or(DataChannelDecodeError::Protobuf(pb_err));
             }
         };
 
