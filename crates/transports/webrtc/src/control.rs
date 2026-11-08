@@ -54,6 +54,15 @@ use webrtc::data_channel::data_channel_message::DataChannelMessage;
 #[cfg(feature = "grpc-signaling")]
 use webrtc::data_channel::RTCDataChannel;
 
+#[cfg(feature = "grpc-signaling")]
+mod output;
+#[cfg(feature = "grpc-signaling")]
+use output::Outbound;
+
+#[cfg(all(test, feature = "grpc-signaling"))]
+#[path = "control/policy_tests.rs"]
+mod policy_tests;
+
 /// Label the browser / native peer opens to reach the control bus.
 pub const CONTROL_CHANNEL_LABEL: &str = "remotemedia-control";
 
@@ -87,10 +96,10 @@ pub async fn attach_control_channel(
     //   - the forwarders installed by Subscribe/Intercept
     //   - the dispatch loop itself for error replies
     //   - the SessionClosed sender on shutdown
-    let (out_tx, out_rx) = mpsc::channel::<ControlEvent>(OUTBOUND_EVENT_CAPACITY);
+    let (out_tx, out_rx) = mpsc::channel::<Outbound>(OUTBOUND_EVENT_CAPACITY);
 
-    // Spawn the outbound serializer: reads ControlEvents, encodes as
-    // protobuf bytes, and writes to the data channel.
+    // Serialize owning events directly into their final protobuf allocation,
+    // then write it to the data channel.
     let dc_for_sender = Arc::clone(&data_channel);
     tokio::spawn(async move {
         run_outbound_loop(dc_for_sender, out_rx).await;
@@ -118,7 +127,7 @@ pub async fn attach_control_channel(
         let bus = Arc::clone(&bus_cb);
         let dc = Arc::clone(&dc_for_msg);
         Box::pin(async move {
-            let frame = match ControlFrame::decode(&msg.data[..]) {
+            let frame = match ControlFrame::decode(msg.data) {
                 Ok(f) => f,
                 Err(e) => {
                     let _ = out_tx
@@ -179,14 +188,18 @@ enum AttachState {
 }
 
 #[cfg(feature = "grpc-signaling")]
-async fn run_outbound_loop(dc: Arc<RTCDataChannel>, mut rx: mpsc::Receiver<ControlEvent>) {
+async fn run_outbound_loop(dc: Arc<RTCDataChannel>, mut rx: mpsc::Receiver<Outbound>) {
     while let Some(ev) = rx.recv().await {
-        let mut buf = Vec::with_capacity(128);
-        if let Err(e) = ev.encode(&mut buf) {
-            tracing::warn!("control: encode failed: {e}");
-            continue;
-        }
-        if let Err(e) = dc.send(&bytes::Bytes::from(buf)).await {
+        let buf = match ev.encode() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!("control: encode rejected: {error}");
+                error_event(ControlErrorCode::Internal, error.to_string(), None)
+                    .encode()
+                    .expect("metadata error event")
+            }
+        };
+        if let Err(e) = dc.send(&buf).await {
             tracing::warn!("control: data-channel send failed: {e}");
             break;
         }
@@ -200,7 +213,7 @@ async fn handle_inbound(
     frame: ControlFrame,
     state: &Arc<Mutex<AttachState>>,
     bus: &Arc<SessionControlBus>,
-    out_tx: &mpsc::Sender<ControlEvent>,
+    out_tx: &mpsc::Sender<Outbound>,
     forwarders: &Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     dc: &Arc<RTCDataChannel>,
 ) {
@@ -243,14 +256,14 @@ async fn handle_inbound(
 
             // Emit Attached and wire up the session-close watcher.
             let _ = out_tx
-                .send(ControlEvent {
+                .send(Outbound::Metadata(ControlEvent {
                     event: Some(PbEvent::Attached(Attached {
                         session_id: hello.session_id.clone(),
                         attach_id: hello.attach_id,
                         observer_schema_version:
                             remotemedia_core::telemetry::SCHEMA_VERSION as u32,
                     })),
-                })
+                }))
                 .await;
 
             let close_tx = out_tx.clone();
@@ -267,12 +280,12 @@ async fn handle_inbound(
                     ),
                 };
                 let _ = close_tx
-                    .send(ControlEvent {
+                    .send(Outbound::Metadata(ControlEvent {
                         event: Some(PbEvent::SessionClosed(SessionClosed {
                             reason: code,
                             detail,
                         })),
-                    })
+                    }))
                     .await;
                 let _ = dc_for_close.close().await;
             });
@@ -313,9 +326,9 @@ async fn handle_inbound(
     // Dispatch the frame.
     if let Err(err) = dispatch_frame(frame, &ctrl, out_tx, forwarders, &rpc_scope).await {
         let _ = out_tx
-            .send(ControlEvent {
+            .send(Outbound::Metadata(ControlEvent {
                 event: Some(PbEvent::Error(err)),
-            })
+            }))
             .await;
     }
 
@@ -327,52 +340,23 @@ async fn handle_inbound(
 async fn dispatch_frame(
     frame: ControlFrame,
     ctrl: &Arc<SessionControl>,
-    out_tx: &mpsc::Sender<ControlEvent>,
+    out_tx: &mpsc::Sender<Outbound>,
     forwarders: &Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     rpc_scope: &RpcCallScope,
 ) -> Result<(), ErrorEvent> {
     match frame.op {
         Some(PbOp::Subscribe(sub)) => {
             let core = pb_addr_to_core(sub.addr, Direction::Out)?;
-            let mut rx = ctrl.subscribe(&core).map_err(|e| {
+            let rx = ctrl.subscribe(&core).map_err(|e| {
                 error_inner(
                     ControlErrorCode::Internal,
                     e.to_string(),
                     Some(core.clone()),
                 )
             })?;
-            let pb_addr = core_addr_to_pb(&core);
-            let tx = out_tx.clone();
-            let task = tokio::spawn(async move {
-                loop {
-                    let data = match rx.recv().await {
-                        Ok(data) => data,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count))
-                            if core.port.as_deref() == Some("__reply__") =>
-                        {
-                            let event = ControlEvent {
-                                event: Some(PbEvent::Error(error_inner(
-                                    ControlErrorCode::Internal,
-                                    format!("RPC reply subscription lagged by {count} frames"),
-                                    Some(core.clone()),
-                                ))),
-                            };
-                            let _ = tx.send(event).await;
-                            break;
-                        }
-                        Err(_) => break,
-                    };
-                    let buf = crate::adapters::runtime_data_to_data_buffer(&data);
-                    let _ = tx
-                        .send(ControlEvent {
-                            event: Some(PbEvent::Tap(TapEvent {
-                                addr: Some(pb_addr.clone()),
-                                data: Some(buf),
-                            })),
-                        })
-                        .await;
-                }
-            });
+            let task = tokio::spawn(output::forward_taps(
+                rx, out_tx.clone(), core, ctrl.transport_copy_context(),
+            ));
             forwarders.lock().await.push(task);
             Ok(())
         }
@@ -388,7 +372,7 @@ async fn dispatch_frame(
                     Some(core.clone()),
                 )
             })?;
-            let rt = pb_to_runtime_data(data)
+            let rt = pb_to_runtime_data(data, &ctrl.transport_copy_context())
                 .map_err(|e| error_inner(ControlErrorCode::Internal, e, Some(core.clone())))?;
             ctrl.publish_scoped(&core, rt, rpc_scope)
                 .await
@@ -409,36 +393,16 @@ async fn dispatch_frame(
             } else {
                 None
             };
-            let mut events = ctrl.intercept(&core, deadline).map_err(|e| {
+            let events = ctrl.intercept(&core, deadline).map_err(|e| {
                 error_inner(
                     ControlErrorCode::Internal,
                     e.to_string(),
                     Some(core.clone()),
                 )
             })?;
-            let pb_addr = core_addr_to_pb(&core);
-            let tx = out_tx.clone();
-            let task = tokio::spawn(async move {
-                while let Some(ev) = events.recv().await {
-                    if let CoreEvent::InterceptRequest {
-                        correlation_id,
-                        data,
-                        ..
-                    } = ev
-                    {
-                        let buf = crate::adapters::runtime_data_to_data_buffer(&data);
-                        let _ = tx
-                            .send(ControlEvent {
-                                event: Some(PbEvent::InterceptRequest(PbInterceptRequest {
-                                    addr: Some(pb_addr.clone()),
-                                    correlation_id,
-                                    data: Some(buf),
-                                })),
-                            })
-                            .await;
-                    }
-                }
-            });
+            let task = tokio::spawn(output::forward_intercepts(
+                events, out_tx.clone(), core_addr_to_pb(&core), ctrl.transport_copy_context(),
+            ));
             forwarders.lock().await.push(task);
             Ok(())
         }
@@ -450,7 +414,7 @@ async fn dispatch_frame(
         }
 
         Some(PbOp::InterceptReply(reply)) => {
-            let decision = pb_decision_to_core(reply.decision)?;
+            let decision = pb_decision_to_core(reply.decision, &ctrl.transport_copy_context())?;
             ctrl.complete_intercept(reply.correlation_id, decision)
                 .map_err(|e| error_inner(ControlErrorCode::Internal, e.to_string(), None))
         }
@@ -567,6 +531,7 @@ fn core_addr_to_pb(addr: &CoreAddress) -> PbAddress {
 #[cfg(feature = "grpc-signaling")]
 fn pb_decision_to_core(
     decision: Option<crate::generated::InterceptDecision>,
+    copies: &remotemedia_types::CopyContext,
 ) -> Result<CoreDecision, ErrorEvent> {
     let decision = decision.ok_or_else(|| {
         error_inner(
@@ -579,7 +544,7 @@ fn pb_decision_to_core(
         Some(PbDecision::Pass(_)) => Ok(CoreDecision::Pass),
         Some(PbDecision::Drop(_)) => Ok(CoreDecision::Drop),
         Some(PbDecision::Replace(data)) => {
-            let rt = pb_to_runtime_data(data)
+            let rt = pb_to_runtime_data(data, copies)
                 .map_err(|e| error_inner(ControlErrorCode::Internal, e, None))?;
             Ok(CoreDecision::Replace(rt))
         }
@@ -602,12 +567,16 @@ fn pb_node_state_to_core(value: i32) -> Result<NodeState, String> {
 }
 
 #[cfg(feature = "grpc-signaling")]
-fn pb_to_runtime_data(data: crate::generated::DataBuffer) -> Result<RuntimeData, String> {
-    crate::adapters::data_buffer_into_runtime_data(data)
+fn pb_to_runtime_data(
+    data: crate::generated::DataBuffer,
+    copies: &remotemedia_types::CopyContext,
+) -> Result<RuntimeData, String> {
+    crate::adapters::data_buffer_into_runtime_data_with_context(data, copies)
+        .map_err(|e| e.to_string())?
         .ok_or_else(|| "unsupported or unset DataBuffer variant".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "grpc-signaling"))]
 mod buffer_owner_tests {
     use super::*;
 
@@ -624,7 +593,7 @@ mod buffer_owner_tests {
             )),
             ..Default::default()
         };
-        let RuntimeData::Binary(owner) = pb_to_runtime_data(buffer).unwrap() else {
+        let RuntimeData::Binary(owner) = pb_to_runtime_data(buffer, remotemedia_types::CopyContext::legacy()).unwrap() else {
             unreachable!()
         };
         assert_eq!(owner.as_ptr(), pointer);
@@ -637,10 +606,11 @@ fn error_event(
     code: ControlErrorCode,
     message: impl Into<String>,
     addr: Option<CoreAddress>,
-) -> ControlEvent {
+) -> Outbound {
     ControlEvent {
         event: Some(PbEvent::Error(error_inner(code, message, addr))),
     }
+    .into()
 }
 
 #[cfg(feature = "grpc-signaling")]

@@ -142,3 +142,6 @@ mod tests {
         assert!(!ver.is_empty());
     }
 }
+
+#[cfg(test)]
+mod test_support;

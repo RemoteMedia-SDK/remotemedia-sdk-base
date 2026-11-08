@@ -1,28 +1,12 @@
 use super::*;
 use crate::media::audio::AudioEncoderConfig;
-use remotemedia_core::manifest::NodeManifest;
-use remotemedia_core::transport::{ExecutorConfig, PipelineExecutor};
 use remotemedia_types::{BufferBudget, CopyContext, CopyPolicy, CopyReason};
 use std::time::Duration;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 async fn session_with_policy(policy: CopyPolicy) -> (Arc<SharedPipelineSession>, CopyContext) {
-    let executor = PipelineExecutor::with_config(ExecutorConfig {
-        transport_materialization_policy: policy,
-        ..Default::default()
-    })
-    .unwrap();
-    let manifest = Arc::new(Manifest {
-        nodes: vec![NodeManifest {
-            id: "calc".into(),
-            node_type: "CalculatorNode".into(),
-            params: serde_json::json!({}),
-            ..Default::default()
-        }],
-        ..Default::default()
-    });
-    let handle = executor.create_session(manifest).await.unwrap();
+    let (_executor, handle, _control) = crate::test_support::core_session(policy).await;
     let copies = handle.transport_copy_context();
     let core = CoreSharedPipelineSession::new("audio-dispatch", handle).unwrap();
     let shared = SharedPipelineSession::new(core, None, false).await.unwrap();

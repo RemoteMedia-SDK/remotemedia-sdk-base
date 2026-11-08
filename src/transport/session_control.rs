@@ -554,6 +554,7 @@ struct ControlIngress {
 /// handed to the router via `attach_control`.
 pub struct SessionControl {
     session_id: String,
+    transport_copies: remotemedia_types::CopyContext,
     /// Latest office observation, read at the start of an LLM turn. This is
     /// replaceable state, not a queued input that could stall the media router.
     office_observation: parking_lot::RwLock<Option<serde_json::Value>>,
@@ -732,6 +733,16 @@ impl SystemEventReceiver {
 
 impl SessionControl {
     pub fn new(session_id: impl Into<String>) -> Arc<Self> {
+        Self::with_transport_copy_context(
+            session_id, remotemedia_types::CopyContext::legacy().clone(),
+        )
+    }
+
+    /// Bind control transports to the same immutable authority as session media.
+    pub fn with_transport_copy_context(
+        session_id: impl Into<String>,
+        transport_copies: remotemedia_types::CopyContext,
+    ) -> Arc<Self> {
         let (close_tx, _) = broadcast::channel(1);
 
         // Honor the env-var opt-out for tests that want strict live-only semantics.
@@ -743,6 +754,7 @@ impl SessionControl {
 
         Arc::new(Self {
             session_id: session_id.into(),
+            transport_copies,
             office_observation: parking_lot::RwLock::new(None),
             taps: DashMap::new(),
             intercepts: DashMap::new(),
@@ -771,6 +783,11 @@ impl SessionControl {
     }
 
     // ─── Discovery / telemetry ─────────────────────────────────────────────
+
+    /// Retained transport authority remains valid after the session closes.
+    pub fn transport_copy_context(&self) -> remotemedia_types::CopyContext {
+        self.transport_copies.clone()
+    }
 
     /// Wall-clock creation time (ms since epoch).
     pub fn created_at_ms(&self) -> u64 {

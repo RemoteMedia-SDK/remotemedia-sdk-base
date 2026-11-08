@@ -1440,7 +1440,9 @@ impl PipelineExecutor {
 
         // Create and attach the per-session control bus. Must happen before
         // `start()` consumes the router's input_tx.
-        let control = SessionControl::new(session_id.clone());
+        let control = SessionControl::with_transport_copy_context(
+            session_id.clone(), transport_copies.clone(),
+        );
         router.attach_control(control.clone()).await;
         self.control_bus.register(control.clone());
 

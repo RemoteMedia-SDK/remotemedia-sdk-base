@@ -1,22 +1,8 @@
 use super::*;
+use crate::test_support::{negotiate, peer};
 use remotemedia_types::{BufferBudget, CopyCounts, CopyPolicy, RuntimeData};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use webrtc::api::{setting_engine::SettingEngine, APIBuilder};
-use webrtc::ice::network_type::NetworkType;
-
-async fn peer() -> RTCPeerConnection {
-    let mut settings = SettingEngine::default();
-    settings.set_network_types(vec![NetworkType::Udp4]);
-    settings.set_include_loopback_candidate(true);
-    settings.set_ip_filter(Box::new(|ip| ip.is_loopback()));
-    APIBuilder::new()
-        .with_setting_engine(settings)
-        .build()
-        .new_peer_connection(Default::default())
-        .await
-        .unwrap()
-}
 
 fn counts(copies: &CopyContext, reason: CopyReason) -> CopyCounts {
     copies
@@ -137,29 +123,6 @@ async fn channel_owners_send_validation_and_copy_rejection_precede_native_send()
     assert_eq!(channel.messages_sent().await, 0);
     channel.close().await.unwrap();
     peer.close().await.unwrap();
-}
-
-async fn negotiate(offer: &RTCPeerConnection, answer: &RTCPeerConnection) {
-    let mut gathered = offer.gathering_complete_promise().await;
-    offer
-        .set_local_description(offer.create_offer(None).await.unwrap())
-        .await
-        .unwrap();
-    gathered.recv().await;
-    answer
-        .set_remote_description(offer.local_description().await.unwrap())
-        .await
-        .unwrap();
-    let mut gathered = answer.gathering_complete_promise().await;
-    answer
-        .set_local_description(answer.create_answer(None).await.unwrap())
-        .await
-        .unwrap();
-    gathered.recv().await;
-    offer
-        .set_remote_description(answer.local_description().await.unwrap())
-        .await
-        .unwrap();
 }
 
 #[tokio::test]

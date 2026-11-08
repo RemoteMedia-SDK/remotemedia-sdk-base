@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::Guarded;
 use remotemedia_types::{CopyCounts, CopyPolicy, SharedBuffer};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -72,20 +73,6 @@ fn wire_output_bulk_variants_match_generated_encoder_and_count_once() {
             16
         );
         assert_eq!(counts(&strict).copied_bytes, 0);
-    }
-}
-
-struct Guarded<T> {
-    values: Vec<T>,
-    deny: Arc<AtomicBool>,
-}
-impl<T> AsRef<[T]> for Guarded<T> {
-    fn as_ref(&self) -> &[T] {
-        assert!(
-            !self.deny.load(Ordering::SeqCst),
-            "payload accessed before authorization"
-        );
-        &self.values
     }
 }
 
