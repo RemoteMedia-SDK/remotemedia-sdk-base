@@ -786,6 +786,31 @@ impl PipelineExecutor {
         &self.registry
     }
 
+    /// Validate `manifest` with capability resolution against this
+    /// executor's registry, after loading the plugins the manifest declares
+    /// (so their node types are recognized). A plugin that fails to load is
+    /// reported as a `plugin_load_failed` error instead of failing the call.
+    /// `extra_node_types` are treated as known (see
+    /// [`crate::capabilities::validate_manifest_report`]).
+    pub async fn validate_manifest_report(
+        &self,
+        manifest: &Manifest,
+        extra_node_types: &[String],
+    ) -> crate::capabilities::ManifestReport {
+        let plugin_error = self.ensure_plugins_loaded(manifest).await.err();
+        let registry = self.registry.read().await;
+        let mut report =
+            crate::capabilities::validate_manifest_report(manifest, &registry, extra_node_types);
+        if let Some(e) = plugin_error {
+            report.push_error(crate::capabilities::ReportIssue {
+                code: crate::capabilities::report::codes::PLUGIN_LOAD_FAILED.to_string(),
+                message: e.to_string(),
+                ..Default::default()
+            });
+        }
+        report
+    }
+
     /// Generate a session ID unique across processes:
     /// `{prefix}_{instance tag}_{n}` (see `instance_tag`).
     pub fn generate_session_id(&self) -> String {
