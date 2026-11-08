@@ -136,6 +136,8 @@ bundled-uv-embedded = ["bundled-uv", "remotemedia-core/bundled-uv-embedded"]
 # inside the spawned Python subprocess (pure Python, no Rust feature
 # required).
 napi = ["dep:napi", "dep:napi-derive", "dep:napi-build", "bundled-uv-embedded"]
+# Select per-session shared mappings for producer allocations (Windows/Linux).
+mapped-buffers = ["remotemedia-core/native-worker"]
 # WebRTC core (shared types and signaling service wrapper)
 # Includes gRPC signaling server dependencies for embedded mode
 webrtc = [

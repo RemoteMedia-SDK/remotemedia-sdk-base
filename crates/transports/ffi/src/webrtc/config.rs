@@ -151,7 +151,14 @@ pub struct PipelineBufferConfig {
     pub policy: CopyPolicy,
     pub node_retention_owners: u64,
     pub node_retention_bytes: u64,
+    /// Optional per-session mapped storage for producer output loans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped_pool: Option<MappedPoolConfig>,
 }
+
+#[path = "mapped_pool_config.rs"]
+mod mapped_pool_config;
+pub use mapped_pool_config::{MappedPoolConfig, MappedSizeClass};
 
 fn default_max_peers() -> u32 {
     10
@@ -193,10 +200,17 @@ mod transport_policy_tests;
 #[path = "pipeline_policy_tests.rs"]
 mod pipeline_policy_tests;
 
+#[cfg(test)]
+#[path = "mapped_pool_tests.rs"]
+mod mapped_pool_tests;
+
 impl WebRtcServerConfig {
     /// Preserve independent or unified policy for either FFI frontend.
-    pub fn to_executor_config(&self) -> remotemedia_core::transport::ExecutorConfig {
-        remotemedia_core::transport::ExecutorConfig {
+    pub fn to_executor_config(
+        &self,
+    ) -> Result<remotemedia_core::transport::ExecutorConfig, ConfigValidationError> {
+        self.validate_buffers()?;
+        Ok(remotemedia_core::transport::ExecutorConfig {
             pipeline_copy_policy: self.pipeline_buffers.as_ref().map(|config| config.policy),
             buffer_preflight: self.pipeline_buffers.as_ref().map(|config| {
                 remotemedia_core::transport::buffer_preflight::BufferPreflightConfig {
@@ -208,12 +222,31 @@ impl WebRtcServerConfig {
                 }
             }),
             transport_materialization_policy: self.transport_materialization_policy,
+            #[cfg(all(feature = "mapped-buffers", any(windows, target_os = "linux")))]
+            mapped_pool: self
+                .pipeline_buffers
+                .as_ref()
+                .and_then(|config| config.mapped_pool.as_ref())
+                .map(MappedPoolConfig::to_pool_config)
+                .transpose()?,
             ..Default::default()
+        })
+    }
+
+    fn validate_buffers(&self) -> Result<(), ConfigValidationError> {
+        if let Some(pool) = self
+            .pipeline_buffers
+            .as_ref()
+            .and_then(|config| config.mapped_pool.as_ref())
+        {
+            pool.validate()?;
         }
+        Ok(())
     }
 
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        self.validate_buffers()?;
         // Check mutual exclusivity of port and signaling_url
         match (&self.port, &self.signaling_url) {
             (None, None) => {
@@ -328,6 +361,8 @@ impl WebRtcServerConfig {
 /// Configuration validation errors
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ConfigValidationError {
+    #[error("Invalid pipeline mapped pool: {0}")]
+    InvalidMappedPool(String),
     #[error("Either port (embedded) or signaling_url (external) must be specified")]
     MissingSignalingConfig,
 

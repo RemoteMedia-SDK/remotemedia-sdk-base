@@ -44,7 +44,7 @@ async fn transport_policy_server_config_reaches_real_session_authority() {
             transport_materialization_policy: policy,
             ..Default::default()
         };
-        let executor = PipelineExecutor::with_config(config.to_executor_config()).unwrap();
+        let executor = PipelineExecutor::with_config(config.to_executor_config().unwrap()).unwrap();
         let mut session = executor
             .create_session(std::sync::Arc::new(Manifest {
                 nodes: vec![NodeManifest {
@@ -109,7 +109,10 @@ fn transport_policy_python_constructor_and_mutation_validate() {
                 .to_core_config()
                 .unwrap();
             assert_eq!(
-                config.to_executor_config().transport_materialization_policy,
+                config
+                    .to_executor_config()
+                    .unwrap()
+                    .transport_materialization_policy,
                 expected
             );
             assert_eq!(
@@ -172,6 +175,7 @@ fn transport_policy_node_conversion_validates_and_preserves_selection() {
                 .to_core_config()
                 .unwrap()
                 .to_executor_config()
+                .unwrap()
                 .transport_materialization_policy,
             expected
         );

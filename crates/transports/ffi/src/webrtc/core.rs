@@ -178,9 +178,16 @@ impl WebRtcServerCore {
         let manifest = Arc::new(manifest);
 
         // Create PipelineExecutor
-        let runner = Arc::new(PipelineExecutor::with_config(self.config.to_executor_config()).map_err(|e| {
-            WebRtcError::Internal(format!("Failed to create PipelineExecutor: {}", e))
-        })?);
+        let runner = Arc::new(
+            PipelineExecutor::with_config(
+                self.config
+                    .to_executor_config()
+                    .map_err(|e| WebRtcError::config(e.to_string()))?,
+            )
+            .map_err(|e| {
+                WebRtcError::Internal(format!("Failed to create PipelineExecutor: {}", e))
+            })?,
+        );
 
         // Build WebRTC transport configuration using the conversion helper
         let transport_config = Arc::new(self.config.to_webrtc_config());

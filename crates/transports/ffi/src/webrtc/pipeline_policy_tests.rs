@@ -5,6 +5,7 @@ fn buffers(policy: CopyPolicy) -> PipelineBufferConfig {
         policy,
         node_retention_owners: 64,
         node_retention_bytes: 4194304,
+        mapped_pool: None,
     }
 }
 
@@ -18,7 +19,7 @@ fn pipeline_policy_serde_requires_explicit_complete_budgets() {
     for policy in [CopyPolicy::AllowCopies, CopyPolicy::RequireZeroCopy] {
         value["pipeline_buffers"] = serde_json::to_value(buffers(policy)).unwrap();
         let config: WebRtcServerConfig = serde_json::from_value(value.clone()).unwrap();
-        let executor = config.to_executor_config();
+        let executor = config.to_executor_config().unwrap();
         assert_eq!(executor.pipeline_copy_policy, Some(policy));
         let preflight = executor.buffer_preflight.unwrap();
         assert_eq!(preflight.policy, policy);
@@ -72,7 +73,7 @@ async fn pipeline_policy_controls_real_session_preflight_and_both_authorities() 
             },
             ..Default::default()
         };
-        let executor = PipelineExecutor::with_config(config.to_executor_config()).unwrap();
+        let executor = PipelineExecutor::with_config(config.to_executor_config().unwrap()).unwrap();
         let mut session = executor
             .create_session(manifest("PassThrough", serde_json::json!({})))
             .await
@@ -123,10 +124,11 @@ async fn pipeline_policy_enforces_the_supplied_retention_budget() {
             policy: CopyPolicy::RequireZeroCopy,
             node_retention_owners: 1,
             node_retention_bytes: 8,
+            mapped_pool: None,
         }),
         ..Default::default()
     };
-    let executor = PipelineExecutor::with_config(config.to_executor_config()).unwrap();
+    let executor = PipelineExecutor::with_config(config.to_executor_config().unwrap()).unwrap();
     let graph = manifest(
         "PassThrough",
         serde_json::json!({"passthrough_layouts":["binary"], "buffer_limits": {
@@ -180,7 +182,7 @@ fn pipeline_policy_python_nested_config_and_replacement() {
                 .to_core_config()
                 .unwrap();
             assert_eq!(
-                core.to_executor_config().pipeline_copy_policy,
+                core.to_executor_config().unwrap().pipeline_copy_policy,
                 Some(parse_copy_policy(policy, "policy").unwrap())
             );
         }
@@ -251,12 +253,14 @@ fn pipeline_policy_node_nested_config_validates_safe_integer_budgets() {
             policy: policy.into(),
             node_retention_owners: 64.0,
             node_retention_bytes: 4194304.0,
+            mapped_pool: None,
         });
         assert_eq!(
             config
                 .to_core_config()
                 .unwrap()
                 .to_executor_config()
+                .unwrap()
                 .pipeline_copy_policy,
             Some(parse_copy_policy(policy, "policy").unwrap())
         );

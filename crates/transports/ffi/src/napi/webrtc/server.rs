@@ -278,9 +278,14 @@ impl WebRtcServer {
         let manifest = Arc::new(manifest);
 
         // Create PipelineExecutor
-        let runner = Arc::new(PipelineExecutor::with_config(config.to_executor_config()).map_err(|e| {
-            Error::from_reason(format!("Failed to create PipelineExecutor: {}", e))
-        })?);
+        let runner = Arc::new(
+            PipelineExecutor::with_config(
+                config
+                    .to_executor_config()
+                    .map_err(|e| Error::from_reason(e.to_string()))?,
+            )
+            .map_err(|e| Error::from_reason(format!("Failed to create PipelineExecutor: {}", e)))?,
+        );
 
         // Build WebRTC transport configuration
         let transport_config = Arc::new(config.to_webrtc_config());

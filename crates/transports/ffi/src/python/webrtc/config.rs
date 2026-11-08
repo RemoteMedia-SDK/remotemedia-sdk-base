@@ -48,6 +48,31 @@ impl From<&TurnServer> for crate::webrtc::config::TurnServerConfig {
     }
 }
 
+pub use crate::webrtc::config::{MappedPoolConfig, MappedSizeClass};
+
+#[pymethods]
+impl MappedSizeClass {
+    #[new]
+    fn new(bytes: u64, slots: u64) -> Self {
+        Self { bytes, slots }
+    }
+}
+
+#[pymethods]
+impl MappedPoolConfig {
+    #[new]
+    fn new(classes: Vec<MappedSizeClass>, max_bytes: u64, max_leases: u64) -> PyResult<Self> {
+        let pool = Self {
+            classes,
+            max_bytes,
+            max_leases,
+        };
+        pool.validate()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(pool)
+    }
+}
+
 /// WebRTC server configuration for Python
 #[pyclass(get_all, frozen)]
 #[derive(Clone, Debug)]
@@ -55,18 +80,26 @@ pub struct PipelineBufferConfig {
     pub policy: String,
     pub node_retention_owners: u64,
     pub node_retention_bytes: u64,
+    pub mapped_pool: Option<MappedPoolConfig>,
 }
 
 #[pymethods]
 impl PipelineBufferConfig {
     #[new]
-    fn new(policy: &str, node_retention_owners: u64, node_retention_bytes: u64) -> PyResult<Self> {
+    #[pyo3(signature = (policy, node_retention_owners, node_retention_bytes, *, mapped_pool=None))]
+    fn new(
+        policy: &str,
+        node_retention_owners: u64,
+        node_retention_bytes: u64,
+        mapped_pool: Option<MappedPoolConfig>,
+    ) -> PyResult<Self> {
         crate::webrtc::config::parse_copy_policy(policy, "pipeline_buffers.policy")
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok(Self {
             policy: policy.to_owned(),
             node_retention_owners,
             node_retention_bytes,
+            mapped_pool,
         })
     }
 }
@@ -81,6 +114,7 @@ impl PipelineBufferConfig {
             .map_err(pyo3::exceptions::PyValueError::new_err)?,
             node_retention_owners: self.node_retention_owners,
             node_retention_bytes: self.node_retention_bytes,
+            mapped_pool: self.mapped_pool.clone(),
         })
     }
 }

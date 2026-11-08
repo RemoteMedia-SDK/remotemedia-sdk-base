@@ -308,11 +308,21 @@ export interface TurnServer {
   credential: string;
 }
 
+/** Positive safe-integer slot geometry. */
+export interface MappedSizeClass { bytes: number; slots: number; }
+/** Per-session pool; requires mapped-buffers on Windows/Linux. All limits are safe integers. */
+export interface MappedPoolConfig {
+  classes: MappedSizeClass[];
+  maxBytes: number;
+  maxLeases: number;
+}
+
 /** Unified core policy; budgets must be nonnegative safe integers. */
 export interface PipelineBufferConfig {
   policy: 'allow_copies' | 'require_zero_copy';
   nodeRetentionOwners: number;
   nodeRetentionBytes: number;
+  mappedPool?: MappedPoolConfig;
 }
 
 /** WebRTC server configuration */
