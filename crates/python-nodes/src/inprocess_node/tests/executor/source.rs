@@ -1,32 +1,6 @@
 use super::*;
 use remotemedia_traits::streaming::{PacingNature, Tick};
 
-// A foreign context may expose identity without an allocator. The concrete host
-// context always supplies a provider, including its for_test constructor.
-struct UnboundContext;
-
-impl NodeRuntimeContextRead for UnboundContext {
-    fn session_id(&self) -> &str {
-        "session"
-    }
-    fn node_id(&self) -> &str {
-        "python"
-    }
-    fn capability(&self, _: &str) -> Option<remotemedia_traits::capabilities::MediaCapabilities> {
-        None
-    }
-    fn insert_capability(&self, _: &str, _: remotemedia_traits::capabilities::MediaCapabilities) {}
-    fn snapshot_any(&self, _: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        None
-    }
-    fn state_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        None
-    }
-    fn try_state_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        None
-    }
-}
-
 fn source_config() -> PythonNodeConfig {
     PythonNodeConfig::new("SourceNode")
         .with_python_class("inprocess_runtime_fixture.SourceNode")

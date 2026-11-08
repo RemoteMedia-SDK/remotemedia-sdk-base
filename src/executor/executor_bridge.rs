@@ -309,12 +309,49 @@ impl InProcessExecutorBridge {
 
     /// Legacy Python conversions are not certified by a strict call context.
     pub fn validate_legacy_context(ctx: &dyn crate::nodes::NodeRuntimeContextRead) -> Result<()> {
+        Self::legacy_copy_context(ctx).map(|_| ())
+    }
+
+    /// Retain the exact caller ledger, rather than validating then discarding it.
+    pub fn legacy_copy_context(
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+    ) -> Result<remotemedia_types::CopyContext> {
         match ctx.copy_context() {
-            Some(context) if context.policy() == remotemedia_types::CopyPolicy::AllowCopies => Ok(()),
+            Some(context) if context.policy() == remotemedia_types::CopyPolicy::AllowCopies => Ok(context),
             _ => Err(Error::Execution(
                 "Legacy in-process Python requires allow_copies; select shared-buffer execution for strict calls".into(),
             )),
         }
+    }
+
+    /// Preserve the legacy Python data format without a redundant in-process
+    /// portable wire roundtrip. Python conversions retain the caller's ledger.
+    pub async fn execute_legacy(
+        &self,
+        node_id: &str,
+        input: &RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<RuntimeData> {
+        self.loaded_node(node_id)
+            .await?
+            .process_with_copy_context(input, copies)
+            .map_err(|e| Error::Execution(format!("Python node process failed: {e}")))
+    }
+
+    /// Legacy generators still collect outputs, with per-output copy accounting.
+    /// Use execute_streaming_shared for incremental owning output delivery.
+    pub async fn execute_streaming_legacy(
+        &self,
+        node_id: &str,
+        input: &RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<Box<dyn futures::Stream<Item = Result<RuntimeData>> + Send + Unpin>> {
+        let outputs = self
+            .loaded_node(node_id)
+            .await?
+            .process_streaming_with_copy_context(input, copies)
+            .map_err(|e| Error::Execution(format!("Python node streaming failed: {e}")))?;
+        Ok(Box::new(futures::stream::iter(outputs.into_iter().map(Ok))))
     }
 }
 

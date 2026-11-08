@@ -78,7 +78,7 @@ async fn executor(contract: BufferContract) -> PipelineExecutor {
     executor
 }
 
-async fn receive(
+pub(super) async fn receive(
     rx: &mut tokio::sync::mpsc::Receiver<RuntimeData>,
     session: &mut SessionHandle,
 ) -> RuntimeData {

@@ -10,8 +10,8 @@ mod tests;
 
 use remotemedia_core::data::RuntimeData;
 use remotemedia_core::nodes::{AsyncStreamingNode, InitializeContextRead, NodeRuntimeContextRead};
-use remotemedia_core::python::multiprocess::data_transfer;
 use remotemedia_core::Error;
+use remotemedia_types::CopyContext;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -99,7 +99,10 @@ impl InProcessPythonNode {
             .map_err(|_| Error::Execution("Python executor unavailable".into()))
     }
 
-    fn validate_call(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<(), Error> {
+    fn validate_call(
+        &self,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<Option<CopyContext>, Error> {
         if ctx.node_id() != self.node_id
             || self
                 .session_id
@@ -116,10 +119,40 @@ impl InProcessPythonNode {
                     "Shared in-process Python requires an output allocator".into(),
                 ));
             }
-            Ok(())
+            Ok(None)
         } else {
-            InProcessExecutorBridge::validate_legacy_context(ctx)
+            InProcessExecutorBridge::legacy_copy_context(ctx).map(Some)
         }
+    }
+
+    async fn process_legacy(
+        &self,
+        data: RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<RuntimeData, Error> {
+        let executor = self.initialized_executor().await?;
+        executor.execute_legacy(&self.node_id, &data, copies).await
+    }
+
+    async fn stream_legacy<F>(
+        &self,
+        data: RuntimeData,
+        copies: &CopyContext,
+        mut callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        let executor = self.initialized_executor().await?;
+        let mut stream = executor
+            .execute_streaming_legacy(&self.node_id, &data, copies)
+            .await?;
+        let mut count = 0;
+        while let Some(output) = futures::StreamExt::next(&mut stream).await {
+            callback(output?)?;
+            count += 1;
+        }
+        Ok(count)
     }
 }
 
@@ -187,29 +220,7 @@ impl AsyncStreamingNode for InProcessPythonNode {
                 "Shared in-process Python requires a runtime context".into(),
             ));
         }
-        self.ensure_initialized().await?;
-
-        let executor_guard = self.executor.lock().await;
-        let Some(executor) = executor_guard.as_ref() else {
-            return Err(Error::Execution(
-                "InProcessExecutorBridge not initialized".into(),
-            ));
-        };
-
-        // Serialize input data for the bridge
-        let input_bytes = data_transfer::to_bytes(&data)
-            .map_err(|e| Error::Execution(format!("Failed to serialize input: {}", e)))?;
-
-        // Execute via the bridge
-        let output_bytes = executor
-            .execute_node(&self.node_id, &self.node_type, input_bytes, &self.params)
-            .await?;
-
-        // Deserialize output
-        let output = data_transfer::from_bytes(&output_bytes)
-            .map_err(|e| Error::Execution(format!("Failed to deserialize output: {}", e)))?;
-
-        Ok(output)
+        self.process_legacy(data, CopyContext::legacy()).await
     }
 
     async fn process_with_ctx(
@@ -217,9 +228,8 @@ impl AsyncStreamingNode for InProcessPythonNode {
         data: RuntimeData,
         ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
-        self.validate_call(ctx)?;
-        if !self.shared_buffers {
-            return self.process(data).await;
+        if let Some(copies) = self.validate_call(ctx)? {
+            return self.process_legacy(data, &copies).await;
         }
         let executor = self.initialized_executor().await?;
         executor.execute_shared(&self.node_id, data, ctx).await
@@ -234,11 +244,8 @@ impl AsyncStreamingNode for InProcessPythonNode {
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
-        self.validate_call(ctx)?;
-        if !self.shared_buffers {
-            return self
-                .process_streaming(data, Some(ctx.session_id().to_owned()), callback)
-                .await;
+        if let Some(copies) = self.validate_call(ctx)? {
+            return self.stream_legacy(data, &copies, callback).await;
         }
         if !self.multi_output {
             callback(self.process_with_ctx(data, ctx).await?)?;
@@ -250,11 +257,24 @@ impl AsyncStreamingNode for InProcessPythonNode {
             .await
     }
 
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: std::collections::HashMap<String, RuntimeData>,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        // Preserve the trait's first-input fallback, but never discard authority.
+        let (_, data) = inputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Execution("No input data provided".into()))?;
+        self.process_with_ctx(data, ctx).await
+    }
+
     async fn process_streaming<F>(
         &self,
         data: RuntimeData,
         _session_id: Option<String>,
-        mut callback: F,
+        callback: F,
     ) -> Result<usize, Error>
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
@@ -264,35 +284,8 @@ impl AsyncStreamingNode for InProcessPythonNode {
                 "Shared in-process Python requires a runtime context".into(),
             ));
         }
-        self.ensure_initialized().await?;
-
-        let executor_guard = self.executor.lock().await;
-        let Some(executor) = executor_guard.as_ref() else {
-            return Err(Error::Execution(
-                "InProcessExecutorBridge not initialized".into(),
-            ));
-        };
-
-        // Serialize input data for the bridge
-        let input_bytes = data_transfer::to_bytes(&data)
-            .map_err(|e| Error::Execution(format!("Failed to serialize input: {}", e)))?;
-
-        // Get streaming output
-        let mut stream = executor
-            .execute_node_streaming(&self.node_id, &self.node_type, input_bytes, &self.params)
-            .await?;
-
-        let mut count = 0;
-        while let Some(result) = futures::StreamExt::next(&mut stream).await {
-            match result {
-                Ok(output) => {
-                    callback(output)?;
-                    count += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(count)
+        self.stream_legacy(data, CopyContext::legacy(), callback)
+            .await
     }
 }
 

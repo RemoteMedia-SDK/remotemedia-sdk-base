@@ -8,28 +8,51 @@ use remotemedia_types::{CopyContext, CopyPolicy};
 mod contracts;
 mod executor;
 mod guards;
+mod legacy;
 mod router;
+
+// A foreign context may expose identity without an allocator. The concrete host
+// context always supplies a provider, including its for_test constructor.
+struct UnboundContext;
+
+impl NodeRuntimeContextRead for UnboundContext {
+    fn session_id(&self) -> &str {
+        "session"
+    }
+    fn node_id(&self) -> &str {
+        "python"
+    }
+    fn capability(&self, _: &str) -> Option<remotemedia_traits::capabilities::MediaCapabilities> {
+        None
+    }
+    fn insert_capability(&self, _: &str, _: remotemedia_traits::capabilities::MediaCapabilities) {}
+    fn snapshot_any(&self, _: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+    fn state_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+    fn try_state_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+}
+
+fn install_fixture(source: &str, name: &std::ffi::CStr) {
+    Python::attach(|py| {
+        let code = std::ffi::CString::new(source).unwrap();
+        let module = PyModule::from_code(py, &code, name, name).unwrap();
+        py.import("sys")
+            .unwrap()
+            .getattr("modules")
+            .unwrap()
+            .set_item(name.to_str().unwrap(), module)
+            .unwrap();
+    });
+}
 
 fn node(mode: &str) -> Box<dyn StreamingNode> {
     static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        Python::attach(|py| {
-            let code = std::ffi::CString::new(include_str!("fixture.py")).unwrap();
-            let module = PyModule::from_code(
-                py,
-                &code,
-                c"inprocess_runtime_fixture.py",
-                c"inprocess_runtime_fixture",
-            )
-            .unwrap();
-            py.import("sys")
-                .unwrap()
-                .getattr("modules")
-                .unwrap()
-                .set_item("inprocess_runtime_fixture", module)
-                .unwrap();
-        })
-    });
+    INSTALL.call_once(|| install_fixture(include_str!("fixture.py"), c"inprocess_runtime_fixture"));
     DynamicInProcessPythonNodeFactory::new(
         PythonNodeConfig::new("SharedFixture")
             .with_python_class("inprocess_runtime_fixture.SharedNode")
