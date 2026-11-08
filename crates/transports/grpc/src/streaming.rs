@@ -70,6 +70,25 @@ const CACHE_CLEANUP_INTERVAL_SECS: u64 = 60; // 1 minute
 /// Frequency of metrics updates (every N chunks)
 const METRICS_UPDATE_INTERVAL: u64 = 10;
 
+/// Optional `StreamPipeline` request header naming who opened the session
+/// (for example `agent:claude-code`). It is recorded as the session's
+/// discovery origin (`SessionSummary.origin`) so observers can tell agent-
+/// created sessions apart. Values are trimmed, must be printable ASCII and at
+/// most [`MAX_STREAM_ORIGIN_LEN`] bytes; anything else is ignored.
+pub const STREAM_ORIGIN_HEADER: &str = "x-remotemedia-origin";
+
+/// Upper bound on an accepted [`STREAM_ORIGIN_HEADER`] value.
+pub const MAX_STREAM_ORIGIN_LEN: usize = 128;
+
+/// The accepted origin label from a `StreamPipeline` request's metadata.
+pub fn stream_origin(metadata: &tonic::metadata::MetadataMap) -> Option<String> {
+    let v = metadata.get(STREAM_ORIGIN_HEADER)?.to_str().ok()?.trim();
+    (!v.is_empty()
+        && v.len() <= MAX_STREAM_ORIGIN_LEN
+        && v.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+    .then(|| v.to_string())
+}
+
 /// Node cache entry with timestamp for TTL management
 struct CachedNode {
     node: Arc<Box<dyn StreamingNode>>,
@@ -487,6 +506,7 @@ impl crate::StreamingPipelineService for StreamingServiceImpl {
             info!("Preview features requested (validation skipped)");
         }
 
+        let origin = stream_origin(request.metadata());
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut stream = request.into_inner();
         let sessions = self.sessions.clone();
@@ -509,6 +529,7 @@ impl crate::StreamingPipelineService for StreamingServiceImpl {
                 executor,
                 plugin_policy,
                 global_node_cache,
+                origin,
                 multiprocess_executor,
             )
             .await;
@@ -522,6 +543,7 @@ impl crate::StreamingPipelineService for StreamingServiceImpl {
                 executor,
                 plugin_policy,
                 global_node_cache,
+                origin,
             )
             .await;
 
@@ -547,6 +569,32 @@ impl crate::StreamingPipelineService for StreamingServiceImpl {
     }
 }
 
+/// Forward the session control bus's injected packets into a gRPC
+/// [`SessionRouter`]'s input. Ends when the router input closes or the
+/// control (and its sender) is dropped.
+async fn attach_control_input(
+    control: &Arc<SessionControl>,
+    router_input: tokio::sync::mpsc::Sender<DataPacket>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<remotemedia_core::transport::DataPacket>(64);
+    control.attach_input_sender(tx).await;
+    tokio::spawn(async move {
+        while let Some(p) = rx.recv().await {
+            let packet = DataPacket {
+                data: p.data,
+                from_node: p.from_node,
+                to_node: p.to_node,
+                session_id: p.session_id,
+                sequence: p.sequence,
+                sub_sequence: p.sub_sequence,
+            };
+            if router_input.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
 /// Handle bidirectional stream (runs in async task)
 ///
 /// Note: Audio chunks are now processed through the session router like data chunks,
@@ -560,294 +608,307 @@ async fn handle_stream(
     executor: Arc<PipelineExecutor>,
     plugin_policy: PluginPolicy,
     global_node_cache: Arc<RwLock<HashMap<String, CachedNode>>>,
+    origin: Option<String>,
     #[cfg(feature = "multiprocess")] multiprocess_executor: Option<Arc<MultiprocessExecutor>>,
 ) -> Result<(), ServiceError> {
     let mut session: Option<Arc<Mutex<StreamSession>>> = None;
     let mut session_id = String::new();
 
-    // Main stream loop
-    while let Some(request_result) = stream
-        .message()
-        .await
-        .map_err(|e| ServiceError::Internal(format!("Stream receive error: {}", e)))?
-    {
-        match request_result.request {
-            Some(StreamRequestType::Init(init)) => {
-                // Handle StreamInit (must be first message)
-                if session.is_some() {
-                    return Err(ServiceError::Validation(
-                        "StreamInit already received".to_string(),
-                    ));
-                }
+    // Main stream loop. Its errors (including a client that vanishes
+    // mid-stream) still run the cleanup below, so the session never
+    // outlives its stream on the control bus.
+    let result: Result<(), ServiceError> = async {
+        while let Some(request_result) = stream
+            .message()
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Stream receive error: {}", e)))?
+        {
+            match request_result.request {
+                Some(StreamRequestType::Init(init)) => {
+                    // Handle StreamInit (must be first message)
+                    if session.is_some() {
+                        return Err(ServiceError::Validation(
+                            "StreamInit already received".to_string(),
+                        ));
+                    }
 
-                debug!("Processing StreamInit");
-                let output_taps = validate_output_taps(&init.output_taps)?;
-                let (new_session_id, ready) =
-                    handle_stream_init(init, &sessions, &executor, &plugin_policy).await?;
-                session_id = new_session_id.clone();
-                session = Some(sessions.read().await.get(&session_id).unwrap().clone());
+                    debug!("Processing StreamInit");
+                    let output_taps = validate_output_taps(&init.output_taps)?;
+                    let (new_session_id, ready) =
+                        handle_stream_init(init, &sessions, &executor, &plugin_policy).await?;
+                    session_id = new_session_id.clone();
+                    session = Some(sessions.read().await.get(&session_id).unwrap().clone());
 
-                // Manifest-declared plugins are resolved before taking the
-                // per-session registry snapshot used by SessionRouter.
-                let streaming_registry = {
-                    let registry = executor.registry();
-                    let guard = registry.read().await;
-                    Arc::new(guard.clone())
-                };
+                    // Manifest-declared plugins are resolved before taking the
+                    // per-session registry snapshot used by SessionRouter.
+                    let streaming_registry = {
+                        let registry = executor.registry();
+                        let guard = registry.read().await;
+                        Arc::new(guard.clone())
+                    };
 
-                // Create and start the SessionRouter for this session
-                let sess = session.as_ref().unwrap();
+                    // Create and start the SessionRouter for this session
+                    let sess = session.as_ref().unwrap();
 
-                // Create the session router with graph validation (spec 021)
-                // This validates the pipeline graph (cycles, missing nodes) before streaming starts
-                let (mut router, shutdown_tx) = SessionRouter::new(
-                    session_id.clone(),
-                    streaming_registry.clone(),
-                    sess.clone(),
-                    tx.clone(),
-                )
-                .await
-                .map_err(|e| {
-                    error!("Failed to create session router: {}", e);
-                    ServiceError::Validation(format!("Pipeline graph validation failed: {}", e))
-                })?;
-
-                // Set multiprocess executor if available
-                #[cfg(feature = "multiprocess")]
-                if let Some(ref mp_executor) = multiprocess_executor {
-                    router.set_multiprocess_executor(mp_executor.clone());
-                }
-
-                // This streaming path constructs SessionRouter directly rather
-                // than through PipelineExecutor::cold_build_session, so it must
-                // install the per-session control bus itself. Do this before
-                // node initialization: source-Python nodes can publish blips
-                // and progress while initialize() is still running, and output
-                // taps must be attachable as soon as StreamReady is emitted.
-                let control = SessionControl::new(session_id.clone());
-                router.attach_control(control.clone());
-                // Discovery metadata (openspec: add-live-pipeline-observer);
-                // the router attached its descriptor + telemetry above.
-                control.set_transport_info("grpc", None);
-                executor.control_bus().register(control.clone());
-
-                // 🔥 Pre-initialize all nodes before streaming starts
-                // CRITICAL: Do this WITHOUT holding the session lock to avoid deadlock
-                // (get_or_create_node needs to acquire the lock)
-                info!("🔥 Pre-initializing nodes for session '{}'", session_id);
-                router.pre_initialize_all_nodes().await.map_err(|e| {
-                    executor
-                        .control_bus()
-                        .unregister_with(&session_id, Some(e.to_string()));
-                    error!("Failed to pre-initialize nodes: {}", e);
-                    ServiceError::Internal(format!("Node pre-initialization failed: {}", e))
-                })?;
-                control.set_phase(remotemedia_core::transport::session_control::SessionPhase::Active);
-                info!("✅ All nodes ready, starting router");
-
-                // Get the input sender before starting
-                let input_sender = router.get_input_sender();
-
-                // Start the router task
-                let task = router.start();
-
-                // Now acquire lock to store router state
-                {
-                    let mut sess_guard = sess.lock().await;
-                    sess_guard.router_task = Some(task);
-
-                    // Store the input sender for feeding chunks
-                    sess_guard.router_input = Some(input_sender);
-
-                    // Store the shutdown sender for cleanup
-                    sess_guard.router_shutdown = Some(shutdown_tx);
-
-                    info!("🚀 SessionRouter started for session '{}'", session_id);
-                }
-
-                // Record metrics
-                metrics.record_stream_start();
-
-                // Send StreamReady response
-                let response = StreamResponse {
-                    response: Some(StreamResponseType::Ready(ready)),
-                };
-                tx.send(Ok(response)).await.map_err(|_| {
-                    ServiceError::Internal("Failed to send StreamReady".to_string())
-                })?;
-
-                if !output_taps.is_empty() {
-                    let control = executor.control_bus().get(&session_id).ok_or_else(|| {
-                        ServiceError::Internal(format!(
-                            "session control unavailable for '{}'",
-                            session_id
-                        ))
+                    // Create the session router with graph validation (spec 021)
+                    // This validates the pipeline graph (cycles, missing nodes) before streaming starts
+                    let (mut router, shutdown_tx) = SessionRouter::new(
+                        session_id.clone(),
+                        streaming_registry.clone(),
+                        sess.clone(),
+                        tx.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to create session router: {}", e);
+                        ServiceError::Validation(format!("Pipeline graph validation failed: {}", e))
                     })?;
-                    for tap in output_taps {
-                        let tap_tx = tx.clone();
-                        let output_key = format!("__tap__.{tap}");
-                        if tap == "__system__" {
-                            let mut receiver = control.subscribe_system();
-                            tokio::spawn(async move {
-                                while let Some(data) = receiver.recv().await {
-                                    if send_tap_result(&tap_tx, &output_key, data).await.is_err() {
-                                        break;
+
+                    // Set multiprocess executor if available
+                    #[cfg(feature = "multiprocess")]
+                    if let Some(ref mp_executor) = multiprocess_executor {
+                        router.set_multiprocess_executor(mp_executor.clone());
+                    }
+
+                    // This streaming path constructs SessionRouter directly rather
+                    // than through PipelineExecutor::cold_build_session, so it must
+                    // install the per-session control bus itself. Do this before
+                    // node initialization: source-Python nodes can publish blips
+                    // and progress while initialize() is still running, and output
+                    // taps must be attachable as soon as StreamReady is emitted.
+                    let control = SessionControl::new(session_id.clone());
+                    router.attach_control(control.clone());
+                    // Discovery metadata (openspec: add-live-pipeline-observer);
+                    // the router attached its descriptor + telemetry above.
+                    // [`STREAM_ORIGIN_HEADER`] labels who opened it (e.g. an agent).
+                    control.set_transport_info("grpc", origin.clone());
+                    // Control-plane injection (`publish` to `<node>.in[.<port>]`,
+                    // typed RPC to nodes without a dedicated lane) reaches this
+                    // router through a bridge: the bus speaks core `DataPacket`s,
+                    // this router its own.
+                    attach_control_input(&control, router.get_input_sender()).await;
+                    executor.control_bus().register(control.clone());
+
+                    // 🔥 Pre-initialize all nodes before streaming starts
+                    // CRITICAL: Do this WITHOUT holding the session lock to avoid deadlock
+                    // (get_or_create_node needs to acquire the lock)
+                    info!("🔥 Pre-initializing nodes for session '{}'", session_id);
+                    router.pre_initialize_all_nodes().await.map_err(|e| {
+                        executor
+                            .control_bus()
+                            .unregister_with(&session_id, Some(e.to_string()));
+                        error!("Failed to pre-initialize nodes: {}", e);
+                        ServiceError::Internal(format!("Node pre-initialization failed: {}", e))
+                    })?;
+                    control.set_phase(remotemedia_core::transport::session_control::SessionPhase::Active);
+                    info!("✅ All nodes ready, starting router");
+
+                    // Get the input sender before starting
+                    let input_sender = router.get_input_sender();
+
+                    // Start the router task
+                    let task = router.start();
+
+                    // Now acquire lock to store router state
+                    {
+                        let mut sess_guard = sess.lock().await;
+                        sess_guard.router_task = Some(task);
+
+                        // Store the input sender for feeding chunks
+                        sess_guard.router_input = Some(input_sender);
+
+                        // Store the shutdown sender for cleanup
+                        sess_guard.router_shutdown = Some(shutdown_tx);
+
+                        info!("🚀 SessionRouter started for session '{}'", session_id);
+                    }
+
+                    // Record metrics
+                    metrics.record_stream_start();
+
+                    // Send StreamReady response
+                    let response = StreamResponse {
+                        response: Some(StreamResponseType::Ready(ready)),
+                    };
+                    tx.send(Ok(response)).await.map_err(|_| {
+                        ServiceError::Internal("Failed to send StreamReady".to_string())
+                    })?;
+
+                    if !output_taps.is_empty() {
+                        let control = executor.control_bus().get(&session_id).ok_or_else(|| {
+                            ServiceError::Internal(format!(
+                                "session control unavailable for '{}'",
+                                session_id
+                            ))
+                        })?;
+                        for tap in output_taps {
+                            let tap_tx = tx.clone();
+                            let output_key = format!("__tap__.{tap}");
+                            if tap == "__system__" {
+                                let mut receiver = control.subscribe_system();
+                                tokio::spawn(async move {
+                                    while let Some(data) = receiver.recv().await {
+                                        if send_tap_result(&tap_tx, &output_key, data).await.is_err() {
+                                            break;
+                                        }
                                     }
-                                }
-                            });
-                        } else {
-                            let mut receiver = control
-                                .subscribe(&ControlAddress::node_out(tap.clone()))
-                                .map_err(|error| {
-                                    ServiceError::Validation(format!(
-                                        "could not subscribe output tap '{tap}': {error}"
-                                    ))
-                                })?;
-                            tokio::spawn(async move {
-                                loop {
-                                    match receiver.recv().await {
-                                        Ok(data) => {
-                                            if send_tap_result(&tap_tx, &output_key, data)
-                                                .await
-                                                .is_err()
-                                            {
-                                                break;
+                                });
+                            } else {
+                                let mut receiver = control
+                                    .subscribe(&ControlAddress::node_out(tap.clone()))
+                                    .map_err(|error| {
+                                        ServiceError::Validation(format!(
+                                            "could not subscribe output tap '{tap}': {error}"
+                                        ))
+                                    })?;
+                                tokio::spawn(async move {
+                                    loop {
+                                        match receiver.recv().await {
+                                            Ok(data) => {
+                                                if send_tap_result(&tap_tx, &output_key, data)
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                                count,
+                                            )) => {
+                                                warn!(tap = %output_key, dropped = count, "gRPC output tap lagged");
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                                break
                                             }
                                         }
-                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
-                                            count,
-                                        )) => {
-                                            warn!(tap = %output_key, dropped = count, "gRPC output tap lagged");
-                                        }
-                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                            break
-                                        }
                                     }
-                                }
-                            });
+                                });
+                            }
                         }
                     }
                 }
-            }
 
-            Some(StreamRequestType::DataChunk(data_chunk)) => {
-                // Handle DataChunk (generic streaming)
-                let sess = session.as_ref().ok_or_else(|| {
-                    ServiceError::Validation("StreamInit required before DataChunk".to_string())
-                })?;
-
-                let chunk_start = Instant::now();
-                debug!(sequence = data_chunk.sequence, "Processing DataChunk");
-
-                // Feed the chunk to the session router. Clone the sender and
-                // release the session lock before the (bounded, awaited) send:
-                // the router takes this lock to lazily create node tasks, so
-                // holding it across a full-queue send deadlocks the session.
-                let router_input = sess.lock().await.router_input.clone();
-                if let Some(router_input) = router_input {
-                    // Convert DataBuffer to RuntimeData with arrival timestamp (spec 026)
-                    use crate::adapters::{data_buffer_to_runtime_data_with_arrival, now_micros};
-                    let arrival_ts = Some(now_micros());
-
-                    let runtime_data = if let Some(buffer) = data_chunk.buffer {
-                        data_buffer_to_runtime_data_with_arrival(&buffer, arrival_ts).ok_or_else(
-                            || ServiceError::Validation("Data conversion failed".to_string()),
-                        )?
-                    } else if !data_chunk.named_buffers.is_empty() {
-                        // For multi-input, just use the first buffer for now
-                        let (_, buffer) =
-                            data_chunk.named_buffers.into_iter().next().ok_or_else(|| {
-                                ServiceError::Validation("No input data provided".to_string())
-                            })?;
-                        data_buffer_to_runtime_data_with_arrival(&buffer, arrival_ts).ok_or_else(
-                            || ServiceError::Validation("Data conversion failed".to_string()),
-                        )?
-                    } else {
-                        return Err(ServiceError::Validation(
-                            "DataChunk must have buffer or named_buffers".to_string(),
-                        ));
-                    };
-
-                    // Create DataPacket - the data should be sent TO the node specified in data_chunk.node_id
-                    // not FROM it. We use "client" as the source since this is input from the client.
-                    let packet = DataPacket {
-                        data: runtime_data,
-                        from_node: "client".to_string(), // Data comes from client
-                        to_node: Some(data_chunk.node_id.clone()), // Send TO this node for processing
-                        session_id: session_id.clone(),
-                        sequence: data_chunk.sequence,
-                        sub_sequence: 0,
-                    };
-
-                    // Bounded router-input: .await applies real backpressure.
-                    router_input.send(packet).await.map_err(|e| {
-                        ServiceError::Internal(format!("Failed to send to router: {}", e))
+                Some(StreamRequestType::DataChunk(data_chunk)) => {
+                    // Handle DataChunk (generic streaming)
+                    let sess = session.as_ref().ok_or_else(|| {
+                        ServiceError::Validation("StreamInit required before DataChunk".to_string())
                     })?;
 
-                    sess.lock().await.chunks_processed += 1;
+                    let chunk_start = Instant::now();
+                    debug!(sequence = data_chunk.sequence, "Processing DataChunk");
 
-                    let latency = chunk_start.elapsed().as_secs_f64();
-                    metrics.record_chunk_processed(&session_id, latency);
+                    // Feed the chunk to the session router. Clone the sender and
+                    // release the session lock before the (bounded, awaited) send:
+                    // the router takes this lock to lazily create node tasks, so
+                    // holding it across a full-queue send deadlocks the session.
+                    let router_input = sess.lock().await.router_input.clone();
+                    if let Some(router_input) = router_input {
+                        // Convert DataBuffer to RuntimeData with arrival timestamp (spec 026)
+                        use crate::adapters::{data_buffer_to_runtime_data_with_arrival, now_micros};
+                        let arrival_ts = Some(now_micros());
 
-                    debug!("Fed DataChunk to session router");
-
-                    // Send periodic metrics
-                    let sess_lock = sess.lock().await;
-                    if sess_lock.chunks_processed % METRICS_UPDATE_INTERVAL == 0 {
-                        let cached_nodes_count = global_node_cache.read().await.len() as u64;
-                        let stream_metrics = sess_lock.create_metrics(cached_nodes_count);
-                        drop(sess_lock);
-
-                        let metrics_response = StreamResponse {
-                            response: Some(StreamResponseType::Metrics(stream_metrics)),
+                        let runtime_data = if let Some(buffer) = data_chunk.buffer {
+                            data_buffer_to_runtime_data_with_arrival(&buffer, arrival_ts).ok_or_else(
+                                || ServiceError::Validation("Data conversion failed".to_string()),
+                            )?
+                        } else if !data_chunk.named_buffers.is_empty() {
+                            // For multi-input, just use the first buffer for now
+                            let (_, buffer) =
+                                data_chunk.named_buffers.into_iter().next().ok_or_else(|| {
+                                    ServiceError::Validation("No input data provided".to_string())
+                                })?;
+                            data_buffer_to_runtime_data_with_arrival(&buffer, arrival_ts).ok_or_else(
+                                || ServiceError::Validation("Data conversion failed".to_string()),
+                            )?
+                        } else {
+                            return Err(ServiceError::Validation(
+                                "DataChunk must have buffer or named_buffers".to_string(),
+                            ));
                         };
-                        tx.send(Ok(metrics_response)).await.map_err(|_| {
-                            ServiceError::Internal("Failed to send StreamMetrics".to_string())
+
+                        // Create DataPacket - the data should be sent TO the node specified in data_chunk.node_id
+                        // not FROM it. We use "client" as the source since this is input from the client.
+                        let packet = DataPacket {
+                            data: runtime_data,
+                            from_node: "client".to_string(), // Data comes from client
+                            to_node: Some(data_chunk.node_id.clone()), // Send TO this node for processing
+                            session_id: session_id.clone(),
+                            sequence: data_chunk.sequence,
+                            sub_sequence: 0,
+                        };
+
+                        // Bounded router-input: .await applies real backpressure.
+                        router_input.send(packet).await.map_err(|e| {
+                            ServiceError::Internal(format!("Failed to send to router: {}", e))
                         })?;
+
+                        sess.lock().await.chunks_processed += 1;
+
+                        let latency = chunk_start.elapsed().as_secs_f64();
+                        metrics.record_chunk_processed(&session_id, latency);
+
+                        debug!("Fed DataChunk to session router");
+
+                        // Send periodic metrics
+                        let sess_lock = sess.lock().await;
+                        if sess_lock.chunks_processed % METRICS_UPDATE_INTERVAL == 0 {
+                            let cached_nodes_count = global_node_cache.read().await.len() as u64;
+                            let stream_metrics = sess_lock.create_metrics(cached_nodes_count);
+                            drop(sess_lock);
+
+                            let metrics_response = StreamResponse {
+                                response: Some(StreamResponseType::Metrics(stream_metrics)),
+                            };
+                            tx.send(Ok(metrics_response)).await.map_err(|_| {
+                                ServiceError::Internal("Failed to send StreamMetrics".to_string())
+                            })?;
+                        }
+                    } else {
+                        return Err(ServiceError::Internal(
+                            "Session router not initialized".to_string(),
+                        ));
                     }
-                } else {
-                    return Err(ServiceError::Internal(
-                        "Session router not initialized".to_string(),
-                    ));
                 }
-            }
 
-            Some(StreamRequestType::Control(control)) => {
-                // Handle StreamControl (CLOSE or CANCEL)
-                let sess = session.as_ref().ok_or_else(|| {
-                    ServiceError::Validation("StreamInit required before StreamControl".to_string())
-                })?;
+                Some(StreamRequestType::Control(control)) => {
+                    // Handle StreamControl (CLOSE or CANCEL)
+                    let sess = session.as_ref().ok_or_else(|| {
+                        ServiceError::Validation("StreamInit required before StreamControl".to_string())
+                    })?;
 
-                debug!(command = control.command, "Processing StreamControl");
-                let closed = handle_stream_control(control, sess.clone()).await?;
+                    debug!(command = control.command, "Processing StreamControl");
+                    let closed = handle_stream_control(control, sess.clone()).await?;
 
-                // Send StreamClosed response
-                let response = StreamResponse {
-                    response: Some(StreamResponseType::Closed(closed)),
-                };
-                tx.send(Ok(response)).await.map_err(|_| {
-                    ServiceError::Internal("Failed to send StreamClosed".to_string())
-                })?;
+                    // Send StreamClosed response
+                    let response = StreamResponse {
+                        response: Some(StreamResponseType::Closed(closed)),
+                    };
+                    tx.send(Ok(response)).await.map_err(|_| {
+                        ServiceError::Internal("Failed to send StreamClosed".to_string())
+                    })?;
 
-                // Cleanup session and metrics
-                if let Some(session_arc) = sessions.write().await.remove(&session_id) {
-                    // Shutdown router and all node processing
-                    let mut sess_guard = session_arc.lock().await;
-                    sess_guard.shutdown_router().await;
-                    sess_guard.clear_node_cache();
+                    // Cleanup session and metrics
+                    if let Some(session_arc) = sessions.write().await.remove(&session_id) {
+                        // Shutdown router and all node processing
+                        let mut sess_guard = session_arc.lock().await;
+                        sess_guard.shutdown_router().await;
+                        sess_guard.clear_node_cache();
+                    }
+                    metrics.record_stream_end();
+                    info!(session_id = %session_id, "Session closed");
+                    break; // Exit stream loop
                 }
-                metrics.record_stream_end();
-                info!(session_id = %session_id, "Session closed");
-                break; // Exit stream loop
-            }
 
-            None => {
-                warn!("Received empty StreamRequest");
+                None => {
+                    warn!("Received empty StreamRequest");
+                }
             }
         }
+        Ok(())
     }
+    .await;
 
-    // If we exit loop without explicit close, cleanup
+    // If we exit loop without explicit close (or on error), cleanup
     if !session_id.is_empty() {
         if let Some(session_arc) = sessions.write().await.remove(&session_id) {
             // Shutdown router and all node processing
@@ -855,12 +916,14 @@ async fn handle_stream(
             sess_guard.shutdown_router().await;
             sess_guard.clear_node_cache();
         }
-        executor.control_bus().unregister(&session_id);
+        executor
+            .control_bus()
+            .unregister_with(&session_id, result.as_ref().err().map(|e| e.to_string()));
         metrics.record_stream_end();
         info!(session_id = %session_id, "Session disconnected");
     }
 
-    Ok(())
+    result
 }
 
 fn validate_output_taps(taps: &[String]) -> Result<Vec<String>, ServiceError> {
@@ -1467,4 +1530,22 @@ async fn handle_stream_control(
     );
 
     Ok(closed)
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    #[test]
+    fn stream_origin_header_is_sanitised() {
+        let mut md = tonic::metadata::MetadataMap::new();
+        assert_eq!(stream_origin(&md), None);
+        md.insert(STREAM_ORIGIN_HEADER, "  agent:claude-code ".parse().unwrap());
+        assert_eq!(stream_origin(&md).as_deref(), Some("agent:claude-code"));
+        md.insert(STREAM_ORIGIN_HEADER, "".parse().unwrap());
+        assert_eq!(stream_origin(&md), None);
+        let long = "a".repeat(MAX_STREAM_ORIGIN_LEN + 1);
+        md.insert(STREAM_ORIGIN_HEADER, long.parse().unwrap());
+        assert_eq!(stream_origin(&md), None);
+    }
 }
