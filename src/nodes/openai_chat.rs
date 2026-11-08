@@ -155,6 +155,20 @@ pub struct OpenAIChatConfig {
     /// any visible output. Never used once output has started.
     #[serde(default)]
     pub fallback: Option<LlmFallbackConfig>,
+
+    // ── Turn handling ───────────────────────────────────────────────
+    /// Latest input wins: cancel the in-flight completion as soon as a
+    /// newer input (e.g. the next transcribed utterance) reaches this
+    /// node, instead of queueing it behind the running request.
+    ///
+    /// Without this, a user who speaks twice in quick succession gets a
+    /// reply to the first utterance spoken before the second is even
+    /// handled. The cancelled turn's user message stays in history, so
+    /// the model sees both utterances. Non-cancelable tool calls
+    /// (`ToolSpec::cancelable = false`) are still protected.
+    /// Default: `false`.
+    #[serde(default, alias = "supersedeOnNewInput")]
+    pub supersede_on_new_input: bool,
 }
 
 impl Default for OpenAIChatConfig {
@@ -179,6 +193,7 @@ impl Default for OpenAIChatConfig {
             provider: ProviderKind::default(),
             first_output_deadline_ms: None,
             fallback: None,
+            supersede_on_new_input: false,
         }
     }
 }
@@ -354,6 +369,10 @@ impl OpenAIChatNode {
 impl AsyncStreamingNode for OpenAIChatNode {
     fn node_type(&self) -> &str {
         "OpenAIChatNode"
+    }
+
+    fn supersede_on_new_input(&self) -> bool {
+        self.config.supersede_on_new_input
     }
 
     async fn process_control_message(
@@ -657,6 +676,27 @@ mod tests {
         assert_eq!(config.max_tokens, Some(1024));
         assert_eq!(config.history_turns, 20);
         assert!(config.streaming);
+    }
+
+    #[test]
+    fn test_supersede_on_new_input_is_opt_in() {
+        // Off by default: inputs are processed strictly in order.
+        let node = OpenAIChatNode::with_config(OpenAIChatConfig::default());
+        assert!(!node.supersede_on_new_input());
+        let wrapped = crate::nodes::AsyncNodeWrapper(Arc::new(node));
+        assert!(!crate::nodes::StreamingNode::supersede_on_new_input(&wrapped));
+
+        // Both key spellings enable it, and the flag reaches the wrapper
+        // the session router queries.
+        for params in [
+            serde_json::json!({ "supersede_on_new_input": true }),
+            serde_json::json!({ "supersedeOnNewInput": true }),
+        ] {
+            let config: OpenAIChatConfig = serde_json::from_value(params).unwrap();
+            assert!(config.supersede_on_new_input);
+            let node = crate::nodes::AsyncNodeWrapper(Arc::new(OpenAIChatNode::with_config(config)));
+            assert!(crate::nodes::StreamingNode::supersede_on_new_input(&node));
+        }
     }
 
     #[test]

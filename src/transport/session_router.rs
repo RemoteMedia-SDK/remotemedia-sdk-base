@@ -1520,6 +1520,9 @@ impl SessionRouter {
         let span = node_span(&session_id, &node_id);
         // Endpoint-call opt-in (openspec: add-agent-harness-integration).
         let rpc_methods = node.rpc_methods();
+        // Latest-input-wins opt-in (e.g. `OpenAIChatNode.supersede_on_new_input`):
+        // a newer data input cancels the node's in-flight call.
+        let supersede_on_new_input = node.supersede_on_new_input();
         let call_mode = super::call_routing::call_mode(&rpc_methods, control.is_some());
         let envelope_calls: super::call_routing::EnvelopeCalls = Default::default();
         let NodeTelemetryHandle {
@@ -1785,6 +1788,27 @@ impl SessionRouter {
                     // Other aux ports fall through — node-side aux
                     // handlers (e.g. `_handle_aux_port` in Python
                     // nodes) still receive them.
+                } else if supersede_on_new_input {
+                    // Latest input wins. A plain data input (aux envelopes
+                    // are excluded above) preempts the in-flight call
+                    // instead of queueing behind it. Unlike barge_in this
+                    // does NOT bump `input_generation`: the new input must
+                    // still run. `try_cancel` honours ProtectGuard, and is
+                    // a no-op when nothing is in flight.
+                    if filter_cancel.try_cancel() {
+                        tracing::info!(
+                            session_id = %filter_session_id,
+                            node_id = %filter_node_id,
+                            "Runtime: newer input arrived — superseding any in-flight call"
+                        );
+                    } else {
+                        tracing::info!(
+                            session_id = %filter_session_id,
+                            node_id = %filter_node_id,
+                            "Runtime: newer input arrived but supersede suppressed by \
+                             active ProtectGuard (non-cancelable tool call in progress)"
+                        );
+                    }
                 }
                 let generation = filter_generation.load(std::sync::atomic::Ordering::Acquire);
                 if filt_tx.send((generation, input)).await.is_err() {
