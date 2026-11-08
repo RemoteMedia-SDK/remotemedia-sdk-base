@@ -54,6 +54,10 @@ pub struct ExecutorConfig {
     /// Policy for explicit materializations in host Rust node contexts. Separate
     /// from mapped worker ingress; this alone is not graph-wide certification.
     pub node_materialization_policy: remotemedia_types::CopyPolicy,
+    /// Policy for instrumented transport materializations, separate from node
+    /// and worker ledgers. Adapters must use the session's transport context;
+    /// this is not certification of uninstrumented codec/network internals.
+    pub transport_materialization_policy: remotemedia_types::CopyPolicy,
     /// Scheduler configuration
     pub scheduler_config: SchedulerConfig,
     /// Drift metrics thresholds
@@ -103,6 +107,7 @@ impl Default for ExecutorConfig {
             buffer_preflight: None,
             ingress_retention: None,
             node_materialization_policy: remotemedia_types::CopyPolicy::AllowCopies,
+            transport_materialization_policy: remotemedia_types::CopyPolicy::AllowCopies,
             scheduler_config: SchedulerConfig::default(),
             drift_thresholds: DriftThresholds::default(),
             enable_drift_metrics: true,
@@ -135,6 +140,7 @@ impl Default for ExecutorConfig {
 pub struct SessionHandle {
     buffer_preflight: Option<super::buffer_preflight::BufferPreflightReport>,
     node_materialization_copies: super::NodeMaterializationCopies,
+    transport_copies: remotemedia_types::CopyContext,
     /// Unique session identifier
     pub session_id: String,
     output_allocator: Arc<dyn remotemedia_types::OutputAllocator>,
@@ -184,6 +190,12 @@ impl SessionHandle {
     /// Retain per-node explicit materialization ledgers through joined shutdown.
     pub fn node_materialization_copies(&self) -> super::NodeMaterializationCopies {
         self.node_materialization_copies.clone()
+    }
+
+    /// Retain this session's transport policy and ledger through joined shutdown.
+    /// Clones share authority; reports cover only explicitly instrumented paths.
+    pub fn transport_copy_context(&self) -> remotemedia_types::CopyContext {
+        self.transport_copies.clone()
     }
 
     /// Allocate ingress media directly in the storage used by this session's
@@ -1411,6 +1423,10 @@ impl PipelineExecutor {
         }
         let node_materialization_copies =
             router.set_node_materialization_policy(self.config.node_materialization_policy);
+        let transport_copies = remotemedia_types::CopyContext::new(
+            self.config.transport_materialization_policy,
+            format!("session/{session_id}/transport/materialization"),
+        );
 
         let inserted: std::collections::HashSet<String> = manifest
             .nodes
@@ -1518,6 +1534,7 @@ impl PipelineExecutor {
             input_control: control,
             buffer_preflight,
             node_materialization_copies,
+            transport_copies,
             session_id,
             output_allocator,
             #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]

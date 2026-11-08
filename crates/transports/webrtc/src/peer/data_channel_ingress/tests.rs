@@ -108,8 +108,7 @@ fn fragmented_ingress_counts_only_contiguous_assembly_and_rejects_strict() {
     }
 }
 
-#[test]
-fn audio_ingress_authorizes_only_the_aligned_element_conversion() {
+fn audio_wire() -> Bytes {
     use crate::generated::{data_buffer::DataType, AudioBuffer, AudioFormat};
     let buffer = DataBuffer {
         data_type: Some(DataType::Audio(AudioBuffer {
@@ -122,7 +121,12 @@ fn audio_ingress_authorizes_only_the_aligned_element_conversion() {
         })),
         ..Default::default()
     };
-    let wire = Bytes::from(buffer.encode_to_vec());
+    Bytes::from(buffer.encode_to_vec())
+}
+
+#[test]
+fn audio_ingress_authorizes_only_the_aligned_element_conversion() {
+    let wire = audio_wire();
     let mut pending = DataChannelReassembler::new();
     let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "audio-ingress-strict");
     assert!(decode_pipeline_input(wire.clone(), &mut pending, &strict).is_err());
@@ -152,6 +156,61 @@ fn audio_ingress_authorizes_only_the_aligned_element_conversion() {
             (c.copied_bytes, c.rejected_bytes, c.failed),
             (copied, rejected, 0)
         );
+    }
+}
+
+#[tokio::test]
+async fn session_policy_reaches_audio_ingress_and_survives_join() {
+    use remotemedia_core::manifest::{Manifest, NodeManifest};
+    use remotemedia_core::transport::{ExecutorConfig, PipelineExecutor};
+    use std::sync::Arc;
+    for policy in [CopyPolicy::AllowCopies, CopyPolicy::RequireZeroCopy] {
+        let executor = PipelineExecutor::with_config(ExecutorConfig {
+            transport_materialization_policy: policy,
+            ..Default::default()
+        })
+        .unwrap();
+        let manifest = Arc::new(Manifest {
+            nodes: vec![NodeManifest {
+                id: "calc".into(),
+                node_type: "CalculatorNode".into(),
+                params: serde_json::json!({}),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut session = executor.create_session(manifest).await.unwrap();
+        let copies = session.transport_copy_context();
+        let result =
+            decode_pipeline_input(audio_wire(), &mut DataChannelReassembler::new(), &copies);
+        session.close().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), session.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.is_ok(), policy == CopyPolicy::AllowCopies);
+        if policy == CopyPolicy::AllowCopies {
+            let RuntimeData::Audio { samples, .. } = result.unwrap().unwrap() else {
+                panic!("audio ingress returned the wrong payload kind");
+            };
+            assert_eq!(samples.as_slice(), &[0.25, -0.5]);
+        }
+        let report = copies.report();
+        let counts = report
+            .entries
+            .iter()
+            .find(|(reason, _)| *reason == CopyReason::PortableDeserialization)
+            .unwrap()
+            .1;
+        assert_eq!(
+            (counts.copied_bytes, counts.rejected_bytes),
+            if policy == CopyPolicy::AllowCopies {
+                (8, 0)
+            } else {
+                (0, 8)
+            }
+        );
+        assert_eq!((counts.failed, counts.in_flight), (0, 0));
     }
 }
 

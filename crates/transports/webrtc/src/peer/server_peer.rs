@@ -961,6 +961,7 @@ impl ServerPeer {
         // Clone dc_input_tx before moving into closures
         let dc_input_tx_for_dc = dc_input_tx.clone();
         let dc_input_tx_for_track = dc_input_tx.clone();
+        let copies_for_dc = shared_session.core.transport_copy_context().await;
 
         // Clone event_tx for closures (FFI event forwarding)
         #[cfg(feature = "ws-signaling")]
@@ -986,6 +987,7 @@ impl ServerPeer {
             .on_data_channel(Box::new(move |data_channel| {
                 let peer_id = peer_id_for_dc.clone();
                 let dc_input_tx = dc_input_tx_for_dc.clone();
+                let copies = copies_for_dc.clone();
                 let data_channel_ref = Arc::clone(&data_channel_ref_for_dc);
                 #[cfg(feature = "ws-signaling")]
                 let event_tx = event_tx_for_dc_clone.clone();
@@ -1030,6 +1032,7 @@ impl ServerPeer {
                     dc_for_handler.on_message(Box::new(move |msg| {
                         let peer_id = peer_id.clone();
                         let dc_input_tx = dc_input_tx.clone();
+                        let copies = copies.clone();
                         #[cfg(feature = "ws-signaling")]
                         let event_tx = event_tx_for_msg.clone();
                         let reassembler = Arc::clone(&reassembler);
@@ -1056,7 +1059,7 @@ impl ServerPeer {
                                 super::data_channel_ingress::decode_pipeline_input(
                                     msg.data,
                                     &mut pending,
-                                    remotemedia_types::CopyContext::legacy(),
+                                    &copies,
                                 )
                             };
                             match decoded {
