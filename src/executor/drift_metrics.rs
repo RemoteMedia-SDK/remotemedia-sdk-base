@@ -27,7 +27,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use remotemedia_core::executor::drift_metrics::{DriftMetrics, DriftThresholds};
+//! use remotemedia_sdk_base::executor::drift_metrics::{DriftMetrics, DriftThresholds};
 //!
 //! let thresholds = DriftThresholds::default();
 //! let mut metrics = DriftMetrics::new("stream_1".to_string(), thresholds);

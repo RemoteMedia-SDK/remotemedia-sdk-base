@@ -50,11 +50,9 @@ thiserror = { workspace = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv"] }
-remotemedia-core-multiprocess = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["multiprocess"], optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["bundled-uv"] }
-remotemedia-core-multiprocess = { package = "remotemedia-sdk-base", path = "../../..", default-features = false, features = ["multiprocess"], optional = true }
 
 [dev-dependencies]
 remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk" }
@@ -64,11 +62,16 @@ reqwest = { workspace = true }
 tokio-tungstenite = "0.21"
 
 [build-dependencies]
-tonic-prost-build = { workspace = true }
-protobuf-src = { workspace = true }
+# Only for regenerating the committed bindings in src/generated/ (see build.rs).
+tonic-prost-build = { workspace = true, optional = true }
+protobuf-src = { workspace = true, optional = true }
 
 [features]
 default = ["grpc-signaling"]
+# Regenerate (REMOTEMEDIA_REGEN_PROTOS=1) or check the committed protobuf
+# bindings in src/generated/ against proto/*.proto. Builds protoc from source
+# via protobuf-src. Not needed for normal builds; see build.rs.
+regen-protos = ["dep:tonic-prost-build", "dep:protobuf-src"]
 codecs = ["dep:media-codec-vpx"]
 h264 = ["dep:openh264"]
 # Video codec support (spec 012). Enables `remotemedia_core::nodes::video`
@@ -96,7 +99,8 @@ avatar-live2d = ["avatar-core"]
 avatar-cc = ["avatar-core"]
 avatar = ["avatar-core"]
 full = ["codecs", "h264", "grpc-signaling", "ws-signaling"]
-multiprocess = ["dep:remotemedia-core-multiprocess"]
+# Python streaming nodes (PythonNodeFactory) via the multiprocess executor.
+multiprocess = ["remotemedia-core/multiprocess"]
 
 [[test]]
 name = "video_integration_test"

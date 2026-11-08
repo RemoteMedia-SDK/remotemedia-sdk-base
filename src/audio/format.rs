@@ -9,7 +9,7 @@
 ///
 /// # Example
 /// ```
-/// use remotemedia_core::audio::format::i16_to_f32;
+/// use remotemedia_sdk_base::audio::format::i16_to_f32;
 ///
 /// let i16_samples = vec![0, 16384, 32767, -16384, -32768];
 /// let f32_samples = i16_to_f32(&i16_samples);
@@ -28,7 +28,7 @@ pub fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
 ///
 /// # Example
 /// ```
-/// use remotemedia_core::audio::format::f32_to_i16;
+/// use remotemedia_sdk_base::audio::format::f32_to_i16;
 ///
 /// let f32_samples = vec![0.0, 0.5, 1.0, -0.5, -1.0];
 /// let i16_samples = f32_to_i16(&f32_samples);
@@ -55,7 +55,7 @@ pub fn f32_to_i16(samples: &[f32]) -> Vec<i16> {
 ///
 /// # Example
 /// ```
-/// use remotemedia_core::audio::format::i32_to_f32;
+/// use remotemedia_sdk_base::audio::format::i32_to_f32;
 ///
 /// let i32_samples = vec![0, 1073741824, 2147483647, -1073741824, -2147483648];
 /// let f32_samples = i32_to_f32(&i32_samples);
@@ -74,7 +74,7 @@ pub fn i32_to_f32(samples: &[i32]) -> Vec<f32> {
 ///
 /// # Example
 /// ```
-/// use remotemedia_core::audio::format::f32_to_i32;
+/// use remotemedia_sdk_base::audio::format::f32_to_i32;
 ///
 /// let f32_samples = vec![0.0, 0.5, 1.0, -0.5, -1.0];
 /// let i32_samples = f32_to_i32(&f32_samples);
@@ -103,12 +103,15 @@ pub fn f32_to_i32(samples: &[f32]) -> Vec<i32> {
 ///
 /// # Example
 /// ```
-/// use remotemedia_core::audio::format::transmute_u8_to_f32;
+/// use remotemedia_sdk_base::audio::format::{transmute_f32_to_u8, transmute_u8_to_f32};
 ///
-/// let bytes: Vec<u8> = vec![0, 0, 0, 0, 0, 0, 128, 63]; // [0.0, 1.0] in LE
-/// let f32_slice = transmute_u8_to_f32(&bytes);
+/// // Bytes borrowed from f32s are aligned for f32, which a `Vec<u8>` need not be.
+/// let samples = [0.0_f32, 1.0];
+/// let bytes = transmute_f32_to_u8(&samples);
 ///
-/// assert!(f32_slice.is_some());
+/// assert_eq!(transmute_u8_to_f32(bytes), Some(&samples[..]));
+/// assert_eq!(transmute_u8_to_f32(&bytes[..3]), None); // length not a multiple of 4
+/// assert_eq!(transmute_u8_to_f32(&bytes[1..5]), None); // misaligned
 /// ```
 pub fn transmute_u8_to_f32(bytes: &[u8]) -> Option<&[f32]> {
     // Check length alignment
@@ -131,7 +134,7 @@ pub fn transmute_u8_to_f32(bytes: &[u8]) -> Option<&[f32]> {
 ///
 /// # Example
 /// ```
-/// use remotemedia_core::audio::format::transmute_f32_to_u8;
+/// use remotemedia_sdk_base::audio::format::transmute_f32_to_u8;
 ///
 /// let samples = vec![0.0_f32, 1.0];
 /// let bytes = transmute_f32_to_u8(&samples);

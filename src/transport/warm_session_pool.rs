@@ -15,7 +15,7 @@
 //!
 //! ```ignore
 //! use std::sync::Arc;
-//! use remotemedia_core::transport::{PipelineExecutor, WarmSessionPool};
+//! use remotemedia_sdk_base::transport::{PipelineExecutor, WarmSessionPool};
 //!
 //! let executor = Arc::new(PipelineExecutor::with_config(cfg)?);
 //! let manifest = Arc::new(build_manifest()?);

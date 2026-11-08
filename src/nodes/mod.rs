@@ -299,8 +299,8 @@ use crate::data::RuntimeData;
 /// # Example
 ///
 /// ```ignore
-/// use remotemedia_core::data::RuntimeData;
-/// use remotemedia_core::nodes::{process_sync, SyncStreamingNode};
+/// use remotemedia_sdk_base::data::RuntimeData;
+/// use remotemedia_sdk_base::nodes::{process_sync, SyncStreamingNode};
 ///
 /// extern "C" fn hal_io_proc(
 ///     _device: AudioDeviceID,

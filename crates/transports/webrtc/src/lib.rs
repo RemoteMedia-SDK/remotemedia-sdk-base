@@ -142,3 +142,24 @@ mod tests {
         assert!(!ver.is_empty());
     }
 }
+
+/// Guards the committed protobuf bindings in `src/generated/`: fails when a
+/// `.proto` input changed without regenerating them (see `build.rs`). Cheap:
+/// hashes the `.proto` files, does not run protoc.
+#[cfg(test)]
+mod proto_stamp_tests {
+    include!("../../../../proto/codegen_support.rs");
+
+    #[test]
+    fn committed_bindings_match_proto_files() {
+        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let protos: Vec<&str> = env!("REMOTEMEDIA_PROTO_INPUTS").split(';').collect();
+        if let Some(problem) =
+            proto_codegen::stamp_mismatch(crate_dir, &crate_dir.join("src/generated"), &protos)
+        {
+            panic!(
+                "{problem}\nregenerate: REMOTEMEDIA_REGEN_PROTOS=1 cargo check -p remotemedia-webrtc --features regen-protos"
+            );
+        }
+    }
+}

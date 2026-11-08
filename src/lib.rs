@@ -19,9 +19,9 @@
 //! # Example
 //!
 //! ```
-//! use remotemedia_core::transport::PipelineExecutor;
-//! use remotemedia_core::transport::TransportData;
-//! use remotemedia_core::data::RuntimeData;
+//! use remotemedia_sdk_base::transport::PipelineExecutor;
+//! use remotemedia_sdk_base::transport::TransportData;
+//! use remotemedia_sdk_base::data::RuntimeData;
 //!
 //! // Create the pipeline executor
 //! let executor = PipelineExecutor::new().unwrap();
@@ -93,7 +93,7 @@ pub mod data {
     //! [`TensorBuffer`], [`AudioFormat`], [`DataTypeHint`],
     //! plus the text-channel helpers) are defined in the skinny
     //! `remotemedia-types` crate and re-exported here so existing
-    //! `use remotemedia_core::data::RuntimeData` call sites keep
+    //! `use remotemedia_sdk_base::data::RuntimeData` call sites keep
     //! compiling.
     //!
     //! Execution machinery (`AudioBufferPool`, `BufferingPolicy`,
@@ -191,28 +191,28 @@ pub fn init() -> Result<()> {
 
 /// Backward compatibility: Core execution types remain in core
 ///
-/// **Migration Note**: Continue using from `remotemedia_core::executor`
+/// **Migration Note**: Continue using from `remotemedia_sdk_base::executor`
 pub mod executor_compat {
     pub use crate::executor::*;
 }
 
 /// Backward compatibility: Data types remain in core
 ///
-/// **Migration Note**: Continue using from `remotemedia_core::data`
+/// **Migration Note**: Continue using from `remotemedia_sdk_base::data`
 pub mod data_compat {
     pub use crate::data::*;
 }
 
 /// Backward compatibility: Manifest types remain in core
 ///
-/// **Migration Note**: Continue using from `remotemedia_core::manifest`
+/// **Migration Note**: Continue using from `remotemedia_sdk_base::manifest`
 pub mod manifest_compat {
     pub use crate::manifest::*;
 }
 
 /// Backward compatibility: Node types remain in core
 ///
-/// **Migration Note**: Continue using from `remotemedia_core::nodes`
+/// **Migration Note**: Continue using from `remotemedia_sdk_base::nodes`
 pub mod nodes_compat {
     pub use crate::nodes::*;
 }

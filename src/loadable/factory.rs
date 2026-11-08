@@ -4,8 +4,8 @@
 //!
 //! ```no_run
 //! use std::path::Path;
-//! use remotemedia_core::loadable::factory::LoadableNodeBundle;
-//! use remotemedia_core::nodes::StreamingNodeRegistry;
+//! use remotemedia_sdk_base::loadable::factory::LoadableNodeBundle;
+//! use remotemedia_sdk_base::nodes::StreamingNodeRegistry;
 //!
 //! let bundle = LoadableNodeBundle::load(Path::new("./my_plugin.so")).unwrap();
 //! let mut registry = StreamingNodeRegistry::new();
@@ -215,7 +215,7 @@ fn load_node_plugin(path: &Path) -> Result<NodePluginRef, Error> {
 /// step entirely.
 ///
 /// ```ignore
-/// use remotemedia_core::loadable::factory::wrap_ffi_factory;
+/// use remotemedia_sdk_base::loadable::factory::wrap_ffi_factory;
 /// use silero_vad_loadable_plugin::SileroVADNodeFactory;
 ///
 /// executor

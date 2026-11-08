@@ -21,7 +21,7 @@ static GLOBAL_REGISTRY: OnceLock<IngestRegistry> = OnceLock::new();
 /// # Example
 ///
 /// ```ignore
-/// use remotemedia_core::ingestion::{global_ingest_registry, IngestConfig};
+/// use remotemedia_sdk_base::ingestion::{global_ingest_registry, IngestConfig};
 ///
 /// let registry = global_ingest_registry();
 /// let schemes = registry.list_schemes();
@@ -90,7 +90,7 @@ impl IngestRegistry {
     ///
     /// ```ignore
     /// use std::sync::Arc;
-    /// use remotemedia_core::ingestion::IngestRegistry;
+    /// use remotemedia_sdk_base::ingestion::IngestRegistry;
     ///
     /// let registry = IngestRegistry::new();
     /// registry.register(Arc::new(MyPlugin))?;

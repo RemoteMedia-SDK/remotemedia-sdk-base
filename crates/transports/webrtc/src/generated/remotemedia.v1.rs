@@ -12,6 +12,7 @@
 /// DataBuffer json_buf = {
 /// json: { json_payload: "{"operation": "add"}", ... }
 /// };
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DataBuffer {
     /// Optional metadata for extensibility
@@ -29,6 +30,7 @@ pub struct DataBuffer {
 /// Nested message and enum types in `DataBuffer`.
 pub mod data_buffer {
     /// Data type discriminator (exactly one must be set)
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum DataType {
         #[prost(message, tag = "1")]
@@ -60,6 +62,7 @@ pub mod data_buffer {
 /// For stereo: \[L0, R0, L1, R1, L2, R2, ...\]
 ///
 /// This type is unchanged from Feature 003 to maintain backward compatibility.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AudioBuffer {
     /// Raw audio samples (interleaved, little-endian)
@@ -94,6 +97,7 @@ pub struct AudioBuffer {
 /// Validation:
 /// Raw: pixel_data.len() == width * height * format.bytes_per_pixel()
 /// Encoded: pixel_data.len() is variable (codec-dependent)
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VideoFrame {
     /// Raw pixel data or encoded bitstream
@@ -139,6 +143,7 @@ pub struct VideoFrame {
 /// shape: \[512\],
 /// dtype: TENSOR_DTYPE_F32
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TensorBuffer {
     /// Raw tensor data (row-major layout by default)
@@ -173,6 +178,7 @@ pub struct TensorBuffer {
 /// c_contiguous: true,
 /// f_contiguous: false
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NumpyBuffer {
     /// Raw array data (bytes)
@@ -207,6 +213,7 @@ pub struct NumpyBuffer {
 /// json_payload: "{"operation": "add", "operands": \[10, 20\]}",
 /// schema_type: "CalculatorRequest"
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct JsonData {
     /// JSON payload as string (required, must be valid JSON)
@@ -228,6 +235,7 @@ pub struct JsonData {
 /// encoding: "utf-8",
 /// language: "en"
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TextBuffer {
     /// Text data as UTF-8 encoded bytes
@@ -261,6 +269,7 @@ pub struct TextBuffer {
 /// data: <PNG file bytes>,
 /// mime_type: "image/png"
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BinaryBuffer {
     /// Raw binary data
@@ -297,6 +306,7 @@ pub struct BinaryBuffer {
 /// offset: 1048576,  // 1 MB offset
 /// length: 65536     // 64 KB chunk
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileBuffer {
     /// File path (required, UTF-8)
@@ -349,6 +359,7 @@ pub struct FileBuffer {
 /// segment_id: "seg_abc123",
 /// timestamp_ms: 1500
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ControlMessage {
     /// Optional target segment ID for cancellation
@@ -368,6 +379,7 @@ pub struct ControlMessage {
 /// Nested message and enum types in `ControlMessage`.
 pub mod control_message {
     /// Control message type (exactly one must be set)
+    #[allow(clippy::all)]
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum MessageType {
         #[prost(message, tag = "1")]
@@ -379,6 +391,7 @@ pub mod control_message {
     }
 }
 /// Cancel a speculative segment (retroactive cancellation)
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelSpeculation {
     /// Start timestamp of segment to cancel (sample index or microseconds)
@@ -389,6 +402,7 @@ pub struct CancelSpeculation {
     pub to_timestamp: u64,
 }
 /// Hint to increase batch size for throughput
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BatchHint {
     /// Suggested batch size for downstream nodes
@@ -396,6 +410,7 @@ pub struct BatchHint {
     pub suggested_batch_size: u32,
 }
 /// Soft deadline approaching (not a hard timeout)
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeadlineWarning {
     /// Deadline in microseconds from now
@@ -405,6 +420,7 @@ pub struct DeadlineWarning {
 /// Performance metrics for pipeline execution
 ///
 /// UPDATED: Added serialization_time_ms and data_type_breakdown
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecutionMetrics {
     /// Wall-clock time from request receipt to response ready (milliseconds)
@@ -444,6 +460,7 @@ pub struct ExecutionMetrics {
     >,
 }
 /// Performance metrics for a single node execution
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NodeMetrics {
     /// Time spent executing this node's process() method (milliseconds)
@@ -464,6 +481,7 @@ pub struct NodeMetrics {
 /// Structured error information for debugging and diagnostics
 ///
 /// UPDATED: Added ERROR_TYPE_TYPE_VALIDATION for generic type errors
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ErrorResponse {
     /// Error category for programmatic handling
@@ -486,6 +504,7 @@ pub struct ErrorResponse {
 /// Service version and protocol compatibility information
 ///
 /// Returned by GetVersion() RPC to enable client compatibility checks.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VersionInfo {
     /// Current protocol version (e.g., "v1")
@@ -511,6 +530,7 @@ pub struct VersionInfo {
 ///
 /// Clients can request custom limits within service-defined maximums.
 /// Service applies defaults if not specified.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResourceLimits {
     /// Maximum memory allocation (bytes)
@@ -528,6 +548,7 @@ pub struct ResourceLimits {
     pub max_audio_samples: u64,
 }
 /// Execution details for a single node
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NodeResult {
     /// Node ID from manifest
@@ -545,6 +566,7 @@ pub struct NodeResult {
     pub output_metadata: ::prost::alloc::string::String,
 }
 /// Audio sample encoding format
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum AudioFormat {
@@ -584,6 +606,7 @@ impl AudioFormat {
     }
 }
 /// Pixel format enumeration
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum PixelFormat {
@@ -639,6 +662,7 @@ impl PixelFormat {
     }
 }
 /// Video codec enumeration (Spec 012: Video Codec Support)
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum VideoCodec {
@@ -677,6 +701,7 @@ impl VideoCodec {
     }
 }
 /// Tensor data type enumeration
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TensorDtype {
@@ -736,6 +761,7 @@ impl TensorDtype {
 /// input_types: \[DATA_TYPE_HINT_AUDIO\],
 /// output_types: \[DATA_TYPE_HINT_JSON\]
 /// }
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum DataTypeHint {
@@ -789,6 +815,7 @@ impl DataTypeHint {
 /// Error category enumeration
 ///
 /// UPDATED: Added ERROR_TYPE_TYPE_VALIDATION
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ErrorType {
@@ -849,6 +876,7 @@ impl ErrorType {
     }
 }
 /// Overall pipeline execution status
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ExecutionStatus {
@@ -886,6 +914,7 @@ impl ExecutionStatus {
     }
 }
 /// Execution status for a single node
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum NodeStatus {
@@ -922,6 +951,7 @@ impl NodeStatus {
     }
 }
 /// A point within the session's pipeline. Mirrors `ControlAddress` in Rust.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ControlAddress {
     #[prost(string, tag = "1")]
@@ -933,6 +963,7 @@ pub struct ControlAddress {
     pub direction: i32,
 }
 /// Decision the client returns for an `InterceptRequest`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InterceptDecision {
     #[prost(oneof = "intercept_decision::Decision", tags = "1, 2, 3")]
@@ -940,6 +971,7 @@ pub struct InterceptDecision {
 }
 /// Nested message and enum types in `InterceptDecision`.
 pub mod intercept_decision {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Decision {
         /// Forward the frame unchanged.
@@ -954,8 +986,10 @@ pub mod intercept_decision {
     }
 }
 /// Empty placeholder (protobuf oneof can't have bare tag variants).
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Empty {}
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlFrame {
     #[prost(
@@ -966,6 +1000,7 @@ pub struct ControlFrame {
 }
 /// Nested message and enum types in `ControlFrame`.
 pub mod control_frame {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Op {
         #[prost(message, tag = "1")]
@@ -1007,6 +1042,7 @@ pub mod control_frame {
     }
 }
 /// Identifies the session this attach is scoped to. MUST be the first frame.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Hello {
     #[prost(string, tag = "1")]
@@ -1016,16 +1052,19 @@ pub struct Hello {
     #[prost(string, tag = "2")]
     pub attach_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Subscribe {
     #[prost(message, optional, tag = "1")]
     pub addr: ::core::option::Option<ControlAddress>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Unsubscribe {
     #[prost(message, optional, tag = "1")]
     pub addr: ::core::option::Option<ControlAddress>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Publish {
     #[prost(message, optional, tag = "1")]
@@ -1033,11 +1072,13 @@ pub struct Publish {
     #[prost(message, optional, tag = "2")]
     pub data: ::core::option::Option<DataBuffer>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveIntercept {
     #[prost(message, optional, tag = "1")]
     pub addr: ::core::option::Option<ControlAddress>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Intercept {
     #[prost(message, optional, tag = "1")]
@@ -1047,6 +1088,7 @@ pub struct Intercept {
     #[prost(uint32, tag = "2")]
     pub deadline_ms: u32,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InterceptReply {
     /// Matches the `correlation_id` on the inbound `InterceptRequest` event.
@@ -1055,6 +1097,7 @@ pub struct InterceptReply {
     #[prost(message, optional, tag = "2")]
     pub decision: ::core::option::Option<InterceptDecision>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SetNodeState {
     #[prost(string, tag = "1")]
@@ -1062,6 +1105,7 @@ pub struct SetNodeState {
     #[prost(enumeration = "NodeState", tag = "2")]
     pub state: i32,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClearNodeState {
     #[prost(string, tag = "1")]
@@ -1070,6 +1114,7 @@ pub struct ClearNodeState {
 /// Telemetry level for the attached session: "off" | "counters" | "auto" |
 /// "full". Empty = unchanged. `interval_ms` 0 = unchanged (else clamped to
 /// 250–5000).
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SetTelemetry {
     #[prost(string, tag = "1")]
@@ -1078,6 +1123,7 @@ pub struct SetTelemetry {
     pub interval_ms: u32,
 }
 /// One method an endpoint serves. `mode`: "reply" | "stream" | "ff".
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EndpointMethod {
     #[prost(string, tag = "1")]
@@ -1088,6 +1134,7 @@ pub struct EndpointMethod {
 /// Endpoint hosting is a control operation: when the server is configured
 /// with a bearer token the attach must carry it, and servers may disable
 /// hosting entirely (observe-only), in which case the result is `forbidden`.
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HostEndpoint {
     /// Endpoint id; must not equal a node id or a reserved virtual node.
@@ -1110,11 +1157,13 @@ pub struct HostEndpoint {
     #[prost(bool, tag = "6")]
     pub takeover: bool,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnhostEndpoint {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EndpointReply {
     #[prost(string, tag = "1")]
@@ -1137,8 +1186,10 @@ pub struct EndpointReply {
     #[prost(string, tag = "7")]
     pub meta_json: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchEndpoints {}
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlEvent {
     #[prost(oneof = "control_event::Event", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
@@ -1146,6 +1197,7 @@ pub struct ControlEvent {
 }
 /// Nested message and enum types in `ControlEvent`.
 pub mod control_event {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Event {
         /// Attach was accepted. Sent exactly once, in response to Hello.
@@ -1184,6 +1236,7 @@ pub mod control_event {
         EndpointReplyAck(super::EndpointReplyAck),
     }
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EndpointHosted {
     #[prost(string, tag = "1")]
@@ -1197,6 +1250,7 @@ pub struct EndpointHosted {
     #[prost(string, tag = "4")]
     pub message: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EndpointCall {
     #[prost(string, tag = "1")]
@@ -1227,6 +1281,7 @@ pub struct EndpointCall {
     #[prost(string, tag = "11")]
     pub adapter_hint: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EndpointCancelled {
     #[prost(string, tag = "1")]
@@ -1237,6 +1292,7 @@ pub struct EndpointCancelled {
     #[prost(string, tag = "3")]
     pub reason: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EndpointPresenceEvent {
     #[prost(string, tag = "1")]
@@ -1246,6 +1302,7 @@ pub struct EndpointPresenceEvent {
     #[prost(string, tag = "3")]
     pub reason: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct EndpointReplyAck {
     #[prost(string, tag = "1")]
@@ -1259,6 +1316,7 @@ pub struct EndpointReplyAck {
     #[prost(string, tag = "4")]
     pub reason: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Attached {
     #[prost(string, tag = "1")]
@@ -1270,6 +1328,7 @@ pub struct Attached {
     #[prost(uint32, tag = "3")]
     pub observer_schema_version: u32,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TapEvent {
     #[prost(message, optional, tag = "1")]
@@ -1277,6 +1336,7 @@ pub struct TapEvent {
     #[prost(message, optional, tag = "2")]
     pub data: ::core::option::Option<DataBuffer>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InterceptRequest {
     #[prost(message, optional, tag = "1")]
@@ -1286,6 +1346,7 @@ pub struct InterceptRequest {
     #[prost(message, optional, tag = "3")]
     pub data: ::core::option::Option<DataBuffer>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ErrorEvent {
     #[prost(enumeration = "ControlErrorCode", tag = "1")]
@@ -1296,6 +1357,7 @@ pub struct ErrorEvent {
     #[prost(message, optional, tag = "3")]
     pub addr: ::core::option::Option<ControlAddress>,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionClosed {
     #[prost(enumeration = "CloseReasonCode", tag = "1")]
@@ -1304,6 +1366,7 @@ pub struct SessionClosed {
     #[prost(string, tag = "2")]
     pub detail: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionSummaryPb {
     #[prost(string, tag = "1")]
@@ -1331,8 +1394,10 @@ pub struct SessionSummaryPb {
     #[prost(bool, tag = "9")]
     pub agent_backed: bool,
 }
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListSessionsRequest {}
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListSessionsResponse {
     #[prost(message, repeated, tag = "1")]
@@ -1342,11 +1407,13 @@ pub struct ListSessionsResponse {
     #[prost(string, tag = "3")]
     pub server_version: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DescribeSessionRequest {
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DescribeSessionResponse {
     /// `SessionDescriptor` serialized as JSON (the Rust serde type is the
@@ -1356,8 +1423,10 @@ pub struct DescribeSessionResponse {
     #[prost(uint32, tag = "2")]
     pub schema_version: u32,
 }
+#[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchSessionsRequest {}
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionClosedInfo {
     #[prost(string, tag = "1")]
@@ -1367,6 +1436,7 @@ pub struct SessionClosedInfo {
     #[prost(uint64, tag = "3")]
     pub ts_ms: u64,
 }
+#[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionLifecycle {
     #[prost(oneof = "session_lifecycle::Event", tags = "1, 2, 3, 4, 5")]
@@ -1374,6 +1444,7 @@ pub struct SessionLifecycle {
 }
 /// Nested message and enum types in `SessionLifecycle`.
 pub mod session_lifecycle {
+    #[allow(clippy::all)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Event {
         /// First message on every WatchSessions stream.
@@ -1392,6 +1463,7 @@ pub mod session_lifecycle {
     }
 }
 /// Which side of a node the client is talking to.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ControlDirection {
@@ -1424,6 +1496,7 @@ impl ControlDirection {
     }
 }
 /// Runtime execution state for a single node. Mirrors Rust `NodeState`.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum NodeState {
@@ -1457,6 +1530,7 @@ impl NodeState {
     }
 }
 /// Structured error codes. Granular for client-side pattern-matching.
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ControlErrorCode {
@@ -1499,6 +1573,7 @@ impl ControlErrorCode {
         }
     }
 }
+#[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum CloseReasonCode {
