@@ -16,7 +16,7 @@
 //! - `RuntimeData::Audio` / `RuntimeData::Video` → RTP media tracks
 //! - All other variants → WebRTC Data Channel (this module)
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use prost::Message;
 use remotemedia_types::{CopyContext, CopyReason, CopyRejected};
 use serde::{Deserialize, Serialize};
@@ -33,8 +33,15 @@ use crate::generated::webrtc::{
 #[path = "message_ownership_tests.rs"]
 mod ownership_tests;
 
+#[cfg(test)]
+#[path = "message_borrowed_tests.rs"]
+mod borrowed_tests;
+
 #[path = "message_legacy.rs"]
 mod legacy;
+
+#[path = "message_borrowed.rs"]
+mod borrowed;
 
 /// Maximum message size for data channels (16 MB).
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
@@ -375,7 +382,17 @@ impl DataChannelMessage {
 
     /// Deserialize message from binary protobuf envelope (with deprecated JSON fallback)
     pub fn decode(bytes: &[u8]) -> Result<Self, DataChannelDecodeError> {
-        Self::decode_buffer(bytes, CopyContext::legacy())
+        Self::decode_with_context(bytes, CopyContext::legacy())
+    }
+
+    /// Decode borrowed wire, authorizing a snapshot of the final bulk field.
+    /// Prefer `decode_owned_with_context` to retain the original wire instead.
+    /// Metadata and overwritten bulk fields do not incur payload copy charges.
+    pub fn decode_with_context(
+        bytes: &[u8],
+        copies: &CopyContext,
+    ) -> Result<Self, DataChannelDecodeError> {
+        borrowed::decode(bytes, copies)
     }
 
     /// Decode a protobuf envelope while retaining its bulk byte ranges. Metadata
@@ -390,13 +407,6 @@ impl DataChannelMessage {
         bytes: Bytes,
         copies: &CopyContext,
     ) -> Result<Self, DataChannelDecodeError> {
-        Self::decode_buffer(bytes, copies)
-    }
-
-    fn decode_buffer<B: Buf + AsRef<[u8]> + Clone>(
-        bytes: B,
-        copies: &CopyContext,
-    ) -> Result<Self, DataChannelDecodeError> {
         let envelope = match DataChannelEnvelope::decode(bytes.clone()) {
             Ok(env) => env,
             Err(pb_err) => {
@@ -405,6 +415,10 @@ impl DataChannelMessage {
             }
         };
 
+        Self::from_envelope(envelope)
+    }
+
+    fn from_envelope(envelope: DataChannelEnvelope) -> Result<Self, DataChannelDecodeError> {
         let kind = FrameKind::try_from(envelope.kind)
             .map_err(|_| DataChannelDecodeError::InvalidKind(envelope.kind))?;
 
