@@ -54,16 +54,15 @@ impl NodeProvider for CoreNodesProvider {
 
         // Video processing nodes
         registry.register(Arc::new(VideoFlipNodeFactory));
+        registry.register(Arc::new(super::streaming_registry::VideoScalerNodeFactory));
 
         #[cfg(feature = "video")]
         {
             use super::streaming_registry::{
                 VideoDecoderNodeFactory, VideoEncoderNodeFactory, VideoFormatConverterNodeFactory,
-                VideoScalerNodeFactory,
             };
             registry.register(Arc::new(VideoEncoderNodeFactory));
             registry.register(Arc::new(VideoDecoderNodeFactory));
-            registry.register(Arc::new(VideoScalerNodeFactory));
             registry.register(Arc::new(VideoFormatConverterNodeFactory));
         }
 
@@ -181,6 +180,8 @@ impl NodeProvider for CoreNodesProvider {
         // Capture sources: microphone, screen / app window and webcam.
         #[cfg(feature = "microphone")]
         registry.register(Arc::new(super::capture::MicInputNodeFactory));
+        #[cfg(feature = "speaker")]
+        registry.register(Arc::new(super::playback::SpeakerOutputNodeFactory));
         #[cfg(feature = "screen-capture")]
         registry.register(Arc::new(super::capture::ScreenCaptureNodeFactory));
         #[cfg(feature = "webcam")]

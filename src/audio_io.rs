@@ -1,11 +1,13 @@
-//! Audio device I/O on cpal (feature `microphone`): device selection, stream
-//! config picking that never panics on an unsupported format, and live
-//! capture. Used by the `MicInput` node and the CLI's audio commands.
+//! Audio device I/O on cpal (features `microphone` / `speaker`): device
+//! selection, stream config picking that never panics on an unsupported
+//! format, channel mapping for speakers with another layout, live capture
+//! and playback. Used by `MicInput`, `SpeakerOutput` and the CLI's audio
+//! commands.
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Host, SupportedStreamConfig};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::broadcast;
 
 /// Which audio device to open: parsed from a `device` param or CLI argument
@@ -346,6 +348,299 @@ impl AudioCapture {
 
     /// Get the capture configuration
     pub fn config(&self) -> &CaptureConfig {
+        &self.config
+    }
+}
+
+/// Like [`pick_stream_config`] for an output device, but when it has no
+/// config with `channels` channels (a sound card set to 7.1 offers only 8 in
+/// shared mode), open it with the fewest channels above `channels` (else the
+/// most) and let the caller map channels: see [`map_frame`]. Returns the
+/// config and the device's channel count.
+pub fn pick_output_config(
+    ranges: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
+    device_name: &str,
+    channels: u16,
+    sample_rate: u32,
+) -> Result<(SupportedStreamConfig, u16)> {
+    let all: Vec<_> = ranges.collect();
+    if all.iter().any(|r| r.channels() == channels) {
+        let c = pick_stream_config(all.into_iter(), device_name, channels, sample_rate, "")?;
+        return Ok((c, channels));
+    }
+    let counts: std::collections::BTreeSet<u16> = all.iter().map(|r| r.channels()).collect();
+    let device_channels = counts
+        .iter()
+        .copied()
+        .find(|&c| c > channels)
+        .or_else(|| counts.iter().next_back().copied())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Device '{device_name}' reports no supported stream configs.")
+        })?;
+    let c = pick_stream_config(
+        all.into_iter(),
+        device_name,
+        device_channels,
+        sample_rate,
+        "",
+    )?;
+    tracing::info!(
+        "Device '{device_name}' has no {channels}-channel output; playing on its {device_channels} channels"
+    );
+    Ok((c, device_channels))
+}
+
+/// Write one interleaved input frame (`input.len()` channels) to an output
+/// frame with a different channel count: mono goes to the first two (front
+/// left/right) channels, otherwise channels are copied in order and the rest
+/// stay silent.
+pub fn map_frame(input: &[f32], output: &mut [f32]) {
+    let mono = input.len() == 1;
+    for (d, out) in output.iter_mut().enumerate() {
+        *out = if mono {
+            if d < 2 {
+                input[0]
+            } else {
+                0.0
+            }
+        } else {
+            input.get(d).copied().unwrap_or(0.0)
+        };
+    }
+}
+
+/// Find an output device by selector
+pub fn find_output_device(selector: &DeviceSelector, host_name: Option<&str>) -> Result<Device> {
+    let host = get_host(host_name)?;
+
+    match selector {
+        DeviceSelector::Default => host
+            .default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("No default output device available")),
+        DeviceSelector::Name(name) => {
+            for device in host.output_devices()? {
+                if let Ok(device_name) = device.name() {
+                    if device_name.eq_ignore_ascii_case(name) || device_name.contains(name) {
+                        return Ok(device);
+                    }
+                }
+            }
+            anyhow::bail!("Output device '{}' not found", name)
+        }
+        DeviceSelector::Index(idx) => host
+            .output_devices()?
+            .nth(*idx)
+            .ok_or_else(|| anyhow::anyhow!("Output device index {} out of range", idx)),
+        DeviceSelector::AlsaHw { card, device } => {
+            let pattern = format!("hw:{},{}", card, device);
+            let alt_pattern = format!("card {}", card);
+
+            for dev in host.output_devices()? {
+                if let Ok(name) = dev.name() {
+                    if name.contains(&pattern) || name.contains(&alt_pattern) {
+                        return Ok(dev);
+                    }
+                }
+            }
+            anyhow::bail!("ALSA output device hw:{},{} not found", card, device)
+        }
+    }
+}
+
+/// Audio playback configuration
+#[derive(Debug, Clone)]
+pub struct PlaybackConfig {
+    /// Device selector (name, index, or default)
+    pub device: Option<DeviceSelector>,
+    /// Audio host/backend name (platform-specific)
+    pub host: Option<String>,
+    /// Sample rate in Hz
+    pub sample_rate: u32,
+    /// Number of channels
+    pub channels: u16,
+}
+
+impl Default for PlaybackConfig {
+    fn default() -> Self {
+        Self {
+            device: None,
+            host: None,
+            sample_rate: 48000,
+            channels: 1,
+        }
+    }
+}
+
+/// Audio playback handle (Send + Sync safe)
+///
+/// The actual cpal::Stream runs on a dedicated thread, and this handle
+/// communicates via channels. This makes it safe to use in async contexts.
+pub struct AudioPlayback {
+    /// Shared buffer for samples to play
+    buffer: Arc<Mutex<Vec<f32>>>,
+    /// Current playback position
+    position: Arc<Mutex<usize>>,
+    /// Device name for logging
+    device_name: String,
+    /// Original config
+    config: PlaybackConfig,
+    /// Handle to stop the playback thread
+    _stop_tx: std::sync::mpsc::Sender<()>,
+}
+
+// Ensure AudioPlayback is Send + Sync
+unsafe impl Send for AudioPlayback {}
+unsafe impl Sync for AudioPlayback {}
+
+impl AudioPlayback {
+    /// Start playback on the specified or default output device
+    pub fn start(config: PlaybackConfig) -> Result<Self> {
+        let device = Self::get_device(&config)?;
+        let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+
+        tracing::info!(
+            "Starting audio playback on '{}' ({}Hz, {} ch)",
+            device_name,
+            config.sample_rate,
+            config.channels
+        );
+
+        // The buffer holds `config.channels`-channel frames; the device may
+        // only offer another count (see `pick_output_config`).
+        let (supported_config, device_channels) = pick_output_config(
+            device.supported_output_configs()?,
+            &device_name,
+            config.channels,
+            config.sample_rate,
+        )?;
+        let in_channels = config.channels.max(1) as usize;
+        let out_channels = device_channels.max(1) as usize;
+
+        let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let position = Arc::new(Mutex::new(0usize));
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+
+        let buffer_clone = buffer.clone();
+        let position_clone = position.clone();
+        let device_name_clone = device_name.clone();
+
+        // Spawn a dedicated thread to own the cpal::Stream (which is !Send)
+        std::thread::spawn(move || {
+            let mut frame = vec![0.0f32; in_channels];
+            let stream = match device.build_output_stream(
+                &supported_config.into(),
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let buf = buffer_clone.lock().unwrap();
+                    let mut pos = position_clone.lock().unwrap();
+
+                    if in_channels == out_channels {
+                        for sample in data.iter_mut() {
+                            if *pos < buf.len() {
+                                *sample = buf[*pos];
+                                *pos += 1;
+                            } else {
+                                *sample = 0.0;
+                            }
+                        }
+                        return;
+                    }
+                    for out in data.chunks_mut(out_channels) {
+                        for s in frame.iter_mut() {
+                            *s = if *pos < buf.len() {
+                                *pos += 1;
+                                buf[*pos - 1]
+                            } else {
+                                0.0
+                            };
+                        }
+                        map_frame(&frame, out);
+                    }
+                },
+                |err| {
+                    tracing::error!("Audio playback error: {}", err);
+                },
+                None,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to build output stream: {}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = stream.play() {
+                tracing::error!("Failed to start stream: {}", e);
+                return;
+            }
+
+            tracing::debug!("Audio playback thread started for '{}'", device_name_clone);
+
+            // Keep the thread alive until stop signal
+            let _ = stop_rx.recv();
+
+            tracing::debug!("Audio playback thread stopping for '{}'", device_name_clone);
+            // Stream is dropped here, stopping playback
+        });
+
+        Ok(Self {
+            buffer,
+            position,
+            device_name,
+            config,
+            _stop_tx: stop_tx,
+        })
+    }
+
+    /// Get the device based on configuration
+    fn get_device(config: &PlaybackConfig) -> Result<Device> {
+        match &config.device {
+            Some(selector) => find_output_device(selector, config.host.as_deref()),
+            None => {
+                let host = get_host(config.host.as_deref())?;
+                host.default_output_device()
+                    .ok_or_else(|| anyhow::anyhow!("No default output device available"))
+            }
+        }
+    }
+
+    /// Queue audio samples for playback
+    pub fn queue(&self, samples: &[f32]) {
+        let mut buffer = self.buffer.lock().unwrap();
+        buffer.extend_from_slice(samples);
+    }
+
+    /// Clear the playback buffer
+    pub fn clear(&self) {
+        let mut buffer = self.buffer.lock().unwrap();
+        let mut position = self.position.lock().unwrap();
+        buffer.clear();
+        *position = 0;
+    }
+
+    /// Check if playback is complete
+    pub fn is_complete(&self) -> bool {
+        let buffer = self.buffer.lock().unwrap();
+        let position = self.position.lock().unwrap();
+        *position >= buffer.len()
+    }
+
+    /// Get current playback position in samples
+    pub fn position(&self) -> usize {
+        *self.position.lock().unwrap()
+    }
+
+    /// Get total samples queued
+    pub fn total_samples(&self) -> usize {
+        self.buffer.lock().unwrap().len()
+    }
+
+    /// Get the device name being used
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    /// Get the playback configuration
+    pub fn config(&self) -> &PlaybackConfig {
         &self.config
     }
 }
