@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use crate::{Error, Result};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -95,7 +96,7 @@ impl MediaClockPublisher {
 #[derive(Clone)]
 struct AudioFrame {
     /// Encoded Opus data
-    data: Vec<u8>,
+    data: bytes::Bytes,
     /// Number of samples this frame represents (for timestamp calculation)
     sample_count: u32,
     /// Frame duration
@@ -104,13 +105,10 @@ struct AudioFrame {
 
 /// Ring buffer for audio frames
 struct AudioRingBuffer {
-    /// Circular buffer of frames
-    buffer: Vec<Option<AudioFrame>>,
-    /// Write position
-    write_pos: AtomicU32,
-    /// Read position
-    read_pos: AtomicU32,
-    /// Buffer capacity
+    /// A single lock serializes publication, pop, flush and shutdown. Moving
+    /// these owners never moves their encoded payload allocation.
+    buffer: parking_lot::Mutex<VecDeque<AudioFrame>>,
+    /// Usable capacity, preserving the previous capacity-minus-one convention.
     capacity: usize,
     /// Wakes any task awaiting space in the buffer. Notified on every
     /// successful pop (one slot freed) and on `clear()` (all slots
@@ -126,13 +124,11 @@ struct AudioRingBuffer {
 impl AudioRingBuffer {
     /// Create a new ring buffer with given capacity
     fn new(capacity: usize) -> Self {
-        let mut buffer = Vec::with_capacity(capacity);
-        buffer.resize_with(capacity, || None);
-
+        // Degenerate configurations still admit one frame instead of dividing
+        // by zero or leaving every producer permanently backpressured.
+        let capacity = capacity.max(2) - 1;
         Self {
-            buffer,
-            write_pos: AtomicU32::new(0),
-            read_pos: AtomicU32::new(0),
+            buffer: parking_lot::Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
             space_available: Notify::new(),
             shutdown: AtomicBool::new(false),
@@ -152,11 +148,6 @@ impl AudioRingBuffer {
     async fn push(&self, frame: AudioFrame) -> Result<()> {
         let mut frame = Some(frame);
         loop {
-            if self.shutdown.load(Ordering::Acquire) {
-                return Err(Error::MediaTrackError(
-                    "audio sender shutdown — refusing to enqueue frame".to_string(),
-                ));
-            }
             // Register interest BEFORE the try_push attempt. If the
             // consumer drains a slot between try_push() and notified()
             // the permit is held by the Notify and the next
@@ -166,6 +157,11 @@ impl AudioRingBuffer {
             // Enable the waiter so it captures any notifications that
             // arrive between this point and the next .await.
             waiter.as_mut().enable();
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(Error::MediaTrackError(
+                    "audio sender shutdown — refusing to enqueue frame".to_string(),
+                ));
+            }
 
             match self.try_push_internal(frame.take().expect("frame consumed only on success")) {
                 Ok(()) => return Ok(()),
@@ -194,43 +190,18 @@ impl AudioRingBuffer {
     /// the async `push` can retry without cloning. `Err(frame)` =
     /// "buffer was full, here's your frame back."
     fn try_push_internal(&self, frame: AudioFrame) -> std::result::Result<(), AudioFrame> {
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-        let read_pos = self.read_pos.load(Ordering::Acquire);
-
-        let next_write = (write_pos + 1) % self.capacity as u32;
-        if next_write == read_pos {
+        let mut buffer = self.buffer.lock();
+        if self.shutdown.load(Ordering::Acquire) || buffer.len() == self.capacity {
             return Err(frame);
         }
-
-        // SAFETY: position is in bounds and won't overlap the reader.
-        unsafe {
-            let slot = self.buffer.as_ptr().add(write_pos as usize) as *mut Option<AudioFrame>;
-            *slot = Some(frame);
-        }
-        self.write_pos.store(next_write, Ordering::Release);
+        buffer.push_back(frame);
         Ok(())
     }
 
     /// Try to pop a frame from the buffer
     /// Returns None if buffer is empty
     fn try_pop(&self) -> Option<AudioFrame> {
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-        let read_pos = self.read_pos.load(Ordering::Acquire);
-
-        // Check if buffer is empty
-        if read_pos == write_pos {
-            return None;
-        }
-
-        // SAFETY: We've verified there's data to read
-        let frame = unsafe {
-            let slot = self.buffer.as_ptr().add(read_pos as usize) as *mut Option<AudioFrame>;
-            (*slot).take()
-        };
-
-        // Update read position
-        let next_read = (read_pos + 1) % self.capacity as u32;
-        self.read_pos.store(next_read, Ordering::Release);
+        let frame = self.buffer.lock().pop_front()?;
 
         // Wake any producer parked on `push().await` waiting for
         // space. Notify is `Send + Sync` and `notify_one` is callable
@@ -239,51 +210,24 @@ impl AudioRingBuffer {
         // queued and the next `push()` consumes it without waiting.
         self.space_available.notify_one();
 
-        frame
+        Some(frame)
     }
 
     /// Get the number of frames currently in the buffer
     fn len(&self) -> usize {
-        let write_pos = self.write_pos.load(Ordering::Acquire) as usize;
-        let read_pos = self.read_pos.load(Ordering::Acquire) as usize;
-
-        if write_pos >= read_pos {
-            write_pos - read_pos
-        } else {
-            self.capacity - read_pos + write_pos
-        }
+        self.buffer.lock().len()
     }
 
     /// Drain the ring buffer without stopping the sender thread.
     ///
-    /// Called on barge-in: the user started speaking while the
-    /// assistant was still playing queued TTS audio. Advancing
-    /// `read_pos` to `write_pos` discards all queued frames so the
-    /// next frames the thread pops are the fresh ones. The `Option`
-    /// slots are left as-is — the thread's `try_pop` tolerates both
-    /// None and stale Some readings (it checks read_pos==write_pos
-    /// first, and any stale Some is overwritten on the next push).
+    /// Called on barge-in. An already-popped frame remains owned by the sender;
+    /// queued owners are released atomically with respect to push and pop.
     fn clear(&self) -> usize {
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-        let old_read_pos = self.read_pos.swap(write_pos, Ordering::AcqRel);
-        let dropped = if write_pos >= old_read_pos {
-            (write_pos - old_read_pos) as usize
-        } else {
-            self.capacity - old_read_pos as usize + write_pos as usize
-        };
-        // Proactively clear the Option slots we just skipped over so
-        // we don't hold onto AudioFrame allocations until the next
-        // wrap-around.
-        let mut cursor = old_read_pos as usize;
-        while cursor != write_pos as usize {
-            // SAFETY: same reasoning as try_pop — positions are in
-            // bounds and we just claimed this range by moving read_pos.
-            unsafe {
-                let slot = self.buffer.as_ptr().add(cursor) as *mut Option<AudioFrame>;
-                *slot = None;
-            }
-            cursor = (cursor + 1) % self.capacity;
-        }
+        let mut buffer = self.buffer.lock();
+        let dropped = buffer.len();
+        let discarded = std::mem::take(&mut *buffer);
+        drop(buffer);
+        drop(discarded);
         // Wake every parked producer — clearing freed every slot at
         // once. A single `notify_one` would only wake one of them and
         // leave the rest sleeping despite the buffer being empty.
@@ -294,7 +238,11 @@ impl AudioRingBuffer {
     /// Mark the ring buffer as shutting down and wake every parked
     /// producer so they observe the flag and return promptly.
     fn signal_shutdown(&self) {
+        let mut buffer = self.buffer.lock();
         self.shutdown.store(true, Ordering::Release);
+        let discarded = std::mem::take(&mut *buffer);
+        drop(buffer);
+        drop(discarded);
         self.space_available.notify_waiters();
     }
 }
@@ -317,6 +265,26 @@ pub struct AudioSender {
     /// `parking_lot::RwLock` because it's set once at construction and
     /// otherwise only read by the transmission thread.
     media_clock: Arc<parking_lot::RwLock<Option<MediaClockPublisher>>>,
+    /// Only sender handles own this guard; the transmission thread must not.
+    lifetime: Arc<SenderLifetime>,
+}
+
+/// Arc's final release, rather than a racy strong-count snapshot, requests stop
+/// when the last sender handle is dropped. Explicit shutdown additionally joins.
+struct SenderLifetime {
+    buffer: Arc<AudioRingBuffer>,
+    shutdown: Arc<AtomicBool>,
+    media_clock: Arc<parking_lot::RwLock<Option<MediaClockPublisher>>>,
+}
+
+impl Drop for SenderLifetime {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.buffer.signal_shutdown();
+        if let Some(publisher) = self.media_clock.write().take() {
+            publisher.stop();
+        }
+    }
 }
 
 impl AudioSender {
@@ -343,6 +311,11 @@ impl AudioSender {
             timestamp: Arc::clone(&timestamp),
             thread_handle: Arc::new(Mutex::new(None)),
             media_clock: Arc::clone(&media_clock),
+            lifetime: Arc::new(SenderLifetime {
+                buffer: buffer.clone(),
+                shutdown: shutdown.clone(),
+                media_clock: media_clock.clone(),
+            }),
         };
 
         // Start the transmission thread
@@ -365,11 +338,12 @@ impl AudioSender {
             })
             .expect("Failed to spawn audio sender thread");
 
-        // Store the thread handle
-        let sender_clone = sender.clone();
-        tokio::spawn(async move {
-            *sender_clone.thread_handle.lock().await = Some(handle);
-        });
+        // Publish before returning: immediate shutdown must always see the
+        // thread it must join, even before the caller's runtime yields.
+        *sender
+            .thread_handle
+            .try_lock()
+            .expect("new sender handle lock") = Some(handle);
 
         use tracing::info;
         info!(
@@ -455,7 +429,7 @@ impl AudioSender {
 
                 // Create WebRTC sample
                 let sample = Sample {
-                    data: frame.data.into(),
+                    data: frame.data,
                     duration: frame.duration,
                     timestamp: std::time::SystemTime::now(),
                     ..Default::default()
@@ -555,8 +529,34 @@ impl AudioSender {
         sample_count: u32,
         duration: Duration,
     ) -> Result<()> {
+        self.enqueue_packet(encoded_data.into(), sample_count, duration)
+            .await
+    }
+
+    /// Retain a runtime buffer owner and its receipts until transmission, flush,
+    /// cancellation or shutdown releases the final view. No payload copy.
+    pub async fn enqueue_owned_frame(
+        &self,
+        encoded_data: remotemedia_types::SharedBytes,
+        sample_count: u32,
+        duration: Duration,
+    ) -> Result<()> {
+        self.enqueue_packet(
+            bytes::Bytes::from_owner(encoded_data),
+            sample_count,
+            duration,
+        )
+        .await
+    }
+
+    async fn enqueue_packet(
+        &self,
+        data: bytes::Bytes,
+        sample_count: u32,
+        duration: Duration,
+    ) -> Result<()> {
         let frame = AudioFrame {
-            data: encoded_data,
+            data,
             sample_count,
             duration,
         };
@@ -639,14 +639,14 @@ impl Clone for AudioSender {
             timestamp: Arc::clone(&self.timestamp),
             thread_handle: Arc::clone(&self.thread_handle),
             media_clock: Arc::clone(&self.media_clock),
+            lifetime: Arc::clone(&self.lifetime),
         }
     }
 }
 
-// NOTE: We do NOT implement Drop to set shutdown=true because AudioSender
-// is cloned internally (for storing thread handle), and dropping the clone
-// would kill the thread prematurely. Instead, shutdown must be called explicitly
-// or the AudioTrack that owns this sender will clean up when it's dropped.
+#[cfg(test)]
+#[path = "audio_sender_owner_tests.rs"]
+mod owner_tests;
 
 #[cfg(test)]
 mod tests {
@@ -658,7 +658,7 @@ mod tests {
 
         // Push some frames
         let frame = AudioFrame {
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
             sample_count: 480,
             duration: Duration::from_millis(20),
         };
@@ -677,7 +677,7 @@ mod tests {
         let buffer = AudioRingBuffer::new(3);
 
         let frame = AudioFrame {
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
             sample_count: 480,
             duration: Duration::from_millis(20),
         };
@@ -695,7 +695,7 @@ mod tests {
         let buffer = AudioRingBuffer::new(4);
 
         let frame = AudioFrame {
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
             sample_count: 480,
             duration: Duration::from_millis(20),
         };
