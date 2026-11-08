@@ -3,6 +3,7 @@
 //! Handles encoding/decoding and media track management.
 
 pub mod audio;
+mod audio_packetizer;
 pub mod audio_sender;
 pub mod frame_router;
 pub mod track_registry;

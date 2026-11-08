@@ -5,6 +5,8 @@
 // Phase 4 (US2) media track infrastructure
 #![allow(dead_code)]
 
+use super::audio_packetizer::AudioPcmPacketizer;
+use remotemedia_types::{CopyContext, SharedBuffer};
 use super::audio::{AudioEncoder, AudioEncoderConfig};
 use super::audio_sender::{AudioSender, MediaClockPublisher};
 use super::video::{VideoFormat, VideoFrame};
@@ -72,47 +74,9 @@ use tokio::sync::RwLock as AsyncRwLock;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-/// Codec-frame assembly across arbitrary PCM callback boundaries. Padding is
-/// reserved for an explicit utterance end, never an input chunk boundary.
-struct AudioPcmPacketizer {
-    frame_size: usize,
-    pending: std::collections::VecDeque<f32>,
-}
-
-impl AudioPcmPacketizer {
-    fn new(frame_size: usize) -> Self {
-        assert!(frame_size > 0);
-        Self {
-            frame_size,
-            pending: std::collections::VecDeque::new(),
-        }
-    }
-
-    fn append(&mut self, samples: &[f32]) {
-        self.pending.extend(samples.iter().copied());
-    }
-
-    fn next_frame(&mut self) -> Option<Vec<f32>> {
-        (self.pending.len() >= self.frame_size)
-            .then(|| self.pending.drain(..self.frame_size).collect())
-    }
-
-    #[cfg(test)]
-    fn push(&mut self, samples: &[f32]) -> Vec<(Vec<f32>, usize)> {
-        self.append(samples);
-        std::iter::from_fn(|| self.next_frame().map(|pcm| (pcm, self.frame_size))).collect()
-    }
-
-    fn finish(&mut self) -> Option<(Vec<f32>, usize)> {
-        if self.pending.is_empty() { return None; }
-        let real = self.pending.len();
-        let mut pcm: Vec<f32> = self.pending.drain(..).collect();
-        pcm.resize(self.frame_size, 0.0);
-        Some((pcm, real))
-    }
-
-    fn clear(&mut self) { self.pending.clear(); }
-}
+#[cfg(test)]
+#[path = "audio_track_owner_tests.rs"]
+mod audio_owner_tests;
 
 /// Audio track for WebRTC
 ///
@@ -169,7 +133,7 @@ impl AudioTrack {
             // Async RwLock: see field doc — guard held across await.
             sender: Arc::new(AsyncRwLock::new(Some(sender))),
             packetizer: tokio::sync::Mutex::new(AudioPcmPacketizer::new(
-                (config.sample_rate as usize * 20) / 1000,
+                (config.sample_rate as usize * 20) / 1000 * config.channels as usize,
             )),
             timestamp: Arc::new(RwLock::new(0)),
         })
@@ -195,6 +159,14 @@ impl AudioTrack {
     /// - Transmission (dedicated thread): Dequeue frames and send at real-time pace (20ms intervals)
     /// - This decouples TTS generation speed from playback speed, preventing interruptions
     pub async fn send_audio(&self, samples: Arc<Vec<f32>>, sample_rate: u32) -> Result<()> {
+        self.send_audio_with_context(samples.into(), sample_rate, CopyContext::legacy()).await
+    }
+
+    /// Send owning samples without PCM staging when a codec frame can borrow a
+    /// contiguous range. Required assembly uses each retained input's authority.
+    pub async fn send_audio_with_context(
+        &self, samples: SharedBuffer<f32>, sample_rate: u32, copies: &CopyContext,
+    ) -> Result<()> {
         use tracing::{info, trace};
 
         // Phase B2: encoder / decoder / sender / timestamp locks
@@ -208,7 +180,10 @@ impl AudioTrack {
         // Serialize assembly through enqueue across concurrent producers and cancellation.
         let mut packetizer = self.packetizer.lock().await;
         let frame_duration = Duration::from_millis(20);
-        let old_rate = self.encoder.read().config.sample_rate;
+        let (old_rate, channels) = {
+            let encoder = self.encoder.read();
+            (encoder.config.sample_rate, encoder.config.channels as usize)
+        };
         let replacement = if old_rate != sample_rate {
             let encoder = self.encoder.read();
             let config = crate::media::audio::AudioEncoderConfig {
@@ -222,14 +197,14 @@ impl AudioTrack {
         } else {
             None
         };
-        let frame_size = (sample_rate as usize * 20) / 1000; // 20ms Opus frame
+        let frame_size = (sample_rate as usize * 20) / 1000 * channels; // interleaved 20ms frame
 
         trace!(
             "AudioTrack: Enqueuing {} samples as {}sample frames @ {}Hz (duration: {:.2}s)",
             samples.len(),
             frame_size,
             sample_rate,
-            samples.len() as f64 / sample_rate as f64
+            samples.len() as f64 / sample_rate as f64 / channels as f64
         );
 
         // `sender` is `tokio::sync::RwLock` — the read-guard needs to
@@ -243,9 +218,9 @@ impl AudioTrack {
 
         if let Some(replacement) = replacement {
             // End the previous format once, before replacing its encoder.
-            if let Some((pcm, _real)) = packetizer.finish() {
+            while let Some((pcm, _real)) = packetizer.finish()? {
                 let encoded = self.encoder.write().encode(&pcm)?;
-                sender.enqueue_frame(encoded, pcm.len() as u32, frame_duration).await?;
+                sender.enqueue_frame(encoded, (pcm.len() / channels) as u32, frame_duration).await?;
             }
             *self.encoder.write() = replacement;
             *packetizer = AudioPcmPacketizer::new(frame_size);
@@ -253,10 +228,10 @@ impl AudioTrack {
         }
 
         let mut frames_enqueued = 0;
-        packetizer.append(&samples);
-        while let Some(pcm) = packetizer.next_frame() {
+        packetizer.append(samples, copies)?;
+        while let Some(pcm) = packetizer.next_frame()? {
             let encoded = self.encoder.write().encode(&pcm)?;
-            sender.enqueue_frame(encoded, pcm.len() as u32, frame_duration).await?;
+            sender.enqueue_frame(encoded, (pcm.len() / channels) as u32, frame_duration).await?;
             frames_enqueued += 1;
         }
 
@@ -272,12 +247,13 @@ impl AudioTrack {
     /// Encode the final partial frame once at an explicit speech boundary.
     pub async fn finish_audio(&self) -> Result<()> {
         let mut packetizer = self.packetizer.lock().await;
-        if let Some((pcm, _real)) = packetizer.finish() {
+        while let Some((pcm, _real)) = packetizer.finish()? {
             let sender_guard = self.sender.read().await;
             let sender = sender_guard.as_ref().ok_or_else(||
                 Error::MediaTrackError("AudioSender not initialized".to_string()))?;
             let encoded = self.encoder.write().encode(&pcm)?;
-            sender.enqueue_frame(encoded, pcm.len() as u32, Duration::from_millis(20)).await?;
+            let channels = self.encoder.read().config.channels as usize;
+            sender.enqueue_frame(encoded, (pcm.len() / channels) as u32, Duration::from_millis(20)).await?;
         }
         Ok(())
     }
@@ -348,7 +324,11 @@ impl AudioTrack {
     pub async fn shutdown(&self) -> Result<()> {
         // Take the sender under the async write-lock, then await the
         // actual shutdown (the `.take()` returns owned).
-        let taken = self.sender.write().await.take();
+        let taken = {
+            let mut packetizer = self.packetizer.lock().await;
+            packetizer.clear();
+            self.sender.write().await.take()
+        };
         if let Some(sender) = taken {
             sender.shutdown().await?;
         }
@@ -775,7 +755,7 @@ mod tests {
         let contiguous = whole.push(&pcm);
         let mut stream = AudioPcmPacketizer::new(960);
         let per_tick: Vec<_> = pcm.chunks(1_600).flat_map(|chunk| stream.push(chunk)).collect();
-        let stats = |frames: &Vec<(Vec<f32>, usize)>| {
+        let stats = |frames: &Vec<(SharedBuffer<f32>, usize)>| {
             (
                 frames.len(),
                 frames.iter().map(|(pcm, _)| pcm.len()).sum::<usize>(),
@@ -820,12 +800,12 @@ mod tests {
     fn packetizer_pads_only_at_explicit_end_and_discards_on_cancel() {
         let mut stream = AudioPcmPacketizer::new(960);
         assert!(stream.push(&vec![0.25; 1_600]).len() == 1);
-        assert_eq!(stream.finish().map(|(_, real)| real), Some(640));
-        assert!(stream.finish().is_none());
+        assert_eq!(stream.finish().unwrap().map(|(_, real)| real), Some(640));
+        assert!(stream.finish().unwrap().is_none());
         assert!(stream.push(&vec![0.5; 500]).is_empty());
         stream.clear();
         assert!(stream.push(&vec![0.75; 460]).is_empty());
-        assert!(stream.finish().is_some_and(|(f, real)| real == 460 && f[0] == 0.75));
+        assert!(stream.finish().unwrap().is_some_and(|(f, real)| real == 460 && f[0] == 0.75));
     }
 
     #[tokio::test]

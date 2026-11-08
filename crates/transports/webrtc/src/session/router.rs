@@ -466,6 +466,7 @@ impl SessionMetrics {
 /// Note: This router does NOT run the pipeline directly - it's a routing
 /// layer between WebRTC peers and the application (which uses PipelineTransport).
 pub struct SessionRouter {
+    copies: remotemedia_types::CopyContext,
     /// Session ID
     session_id: SessionId,
 
@@ -516,6 +517,12 @@ pub struct SessionRouter {
 }
 
 impl SessionRouter {
+    /// Bind audio materialization to the owning pipeline's transport authority.
+    pub fn with_copy_context(mut self, copies: remotemedia_types::CopyContext) -> Self {
+        self.copies = copies;
+        self
+    }
+
     /// Create a new session router
     ///
     /// # Arguments
@@ -534,6 +541,7 @@ impl SessionRouter {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         Ok(Self {
+            copies: remotemedia_types::CopyContext::legacy().clone(),
             session_id,
             session,
             peer_manager,
@@ -669,6 +677,7 @@ impl SessionRouter {
     ///
     /// * `data` - RuntimeData to send
     async fn route_outgoing(&self, data: RuntimeData) -> Result<()> {
+        let data = data.into_shared();
         debug!("Routing outgoing data (session: {})", self.session_id);
 
         // Get all peers in this session
@@ -706,12 +715,8 @@ impl SessionRouter {
                     Error::MediaTrackError("No audio track configured".to_string())
                 })?;
 
-                // Send audio directly (handles encoding + RTP transmission).
-                // Use sample rate from RuntimeData. `send_audio` takes
-                // `Arc<Vec<f32>>`; materialize via `to_vec` — same cost
-                // as the previous `samples.clone()` on a `Vec<f32>`.
                 audio_track
-                    .send_audio(Arc::new(samples.to_vec()), *sample_rate)
+                    .send_audio_with_context(samples.clone().into_shared(), *sample_rate, &self.copies)
                     .await?;
 
                 // Record outgoing audio metrics
@@ -1194,6 +1199,7 @@ impl SessionRouter {
         output_id: &str,
         data: RuntimeData,
     ) -> Result<Vec<String>> {
+        let data = data.into_shared();
         let policy = *self.routing_policy.read().await;
         let mut sent_to = Vec::new();
 

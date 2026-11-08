@@ -75,6 +75,7 @@ fn participant_metadata(
 /// Json/Text envelopes still go through the data channel inline because
 /// they're low-rate and don't have parallelism to extract.
 struct PerTrackDispatcher {
+    copies: remotemedia_types::CopyContext,
     audio_txs: TokioMutex<HashMap<String, mpsc::Sender<TransportData>>>,
     video_txs: TokioMutex<HashMap<String, mpsc::Sender<TransportData>>>,
     track_registry: Arc<TrackRegistry<AudioTrack, VideoTrack>>,
@@ -107,8 +108,10 @@ impl PerTrackDispatcher {
         track_registry: Arc<TrackRegistry<AudioTrack, VideoTrack>>,
         data_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
         peer_id: String,
+        copies: remotemedia_types::CopyContext,
     ) -> Arc<Self> {
         Arc::new(Self {
+            copies,
             audio_txs: TokioMutex::new(HashMap::new()),
             video_txs: TokioMutex::new(HashMap::new()),
             track_registry,
@@ -259,6 +262,7 @@ impl PerTrackDispatcher {
         let stream = stream_id.to_string();
         let registry = self.track_registry.clone();
         let peer = self.peer_id.clone();
+        let copies = self.copies.clone();
         tokio::spawn(async move {
             let mut first = true;
             let mut chunk_idx: u64 = 0;
@@ -307,7 +311,7 @@ impl PerTrackDispatcher {
                     first = false;
                 }
                 let res = track
-                    .send_audio(Arc::new(samples.to_vec()), sample_rate)
+                    .send_audio_with_context(samples.into_shared(), sample_rate, &copies)
                     .await;
                 let send_ms = send_start.elapsed().as_millis();
                 if let Err(e) = res {
@@ -477,7 +481,8 @@ impl SharedPipelineSession {
         data_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
         #[cfg(feature = "ws-signaling")] event_tx: Option<mpsc::Sender<WebRtcEventBridge>>,
     ) {
-        let dispatcher = PerTrackDispatcher::new(track_registry, data_channel, peer_id.clone());
+        let copies = self.core.transport_copy_context().await;
+        let dispatcher = PerTrackDispatcher::new(track_registry, data_channel, peer_id.clone(), copies);
         self.output_targets.write().await.insert(
             peer_id,
             PeerOutputTarget {
@@ -1329,7 +1334,7 @@ impl ServerPeer {
         transport_data: TransportData,
     ) -> Result<()> {
         // Get RuntimeData and extract stream_id
-        let runtime_data = transport_data.data;
+        let runtime_data = transport_data.data.into_shared();
         let stream_id = extract_stream_id(&runtime_data).unwrap_or(DEFAULT_STREAM_ID);
 
         match &runtime_data {
@@ -1350,11 +1355,8 @@ impl ServerPeer {
                 // Get the audio track from registry
                 if let Some(audio_track) = track_registry.get_audio_track(stream_id).await {
                     // Send audio samples through the track with dynamic sample rate.
-                    // `send_audio` takes `Arc<Vec<f32>>`; copy via `to_vec`
-                    // regardless of `AudioSamples` variant (Vec path is a
-                    // full clone, same as before this refactor).
                     audio_track
-                        .send_audio(Arc::new(samples.to_vec()), *sample_rate)
+                        .send_audio_with_context(samples.clone().into_shared(), *sample_rate, remotemedia_types::CopyContext::legacy())
                         .await?;
 
                     // Record frame for activity tracking
@@ -1538,6 +1540,10 @@ impl Drop for ServerPeer {
         debug!("ServerPeer {} dropped", self.peer_id);
     }
 }
+
+#[cfg(test)]
+#[path = "audio_dispatch_tests.rs"]
+mod audio_dispatch_tests;
 
 #[cfg(test)]
 mod tests {
