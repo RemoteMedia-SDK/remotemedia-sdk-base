@@ -8,9 +8,10 @@ use crate::codec::{decode_g711, encode_g711, CodecMap, OpusCodec};
 use crate::jitter::{JitterBuffer, JitterDecision};
 use crate::session::{apply_frame_metadata, CallId, CallLegId, ParticipantRole};
 use crate::{AudioCodec, Error, Result};
+use remotemedia_core::audio::pcm_frames::AudioPcmPacketizer;
 use remotemedia_core::data::{AudioSamples, RuntimeData};
 use remotemedia_core::transport::TransportData;
-use remotemedia_types::{CopyContext, CopyReason, SharedBytes};
+use remotemedia_types::{CopyContext, CopyReason, SharedBuffer, SharedBytes};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -457,6 +458,7 @@ pub struct RtpOutboundMediaSession {
     packetizer: RtpPacketizer,
     opus: Option<OpusCodec>,
     expected_samples_per_frame: usize,
+    pcm: AudioPcmPacketizer,
 }
 
 impl RtpOutboundMediaSession {
@@ -471,6 +473,11 @@ impl RtpOutboundMediaSession {
     ) -> Result<Self> {
         let sample_rate = codec.clock_rate_hz();
         let samples_per_frame = (sample_rate / 1000) * u32::from(frame_duration_ms);
+        if samples_per_frame == 0 {
+            return Err(Error::InvalidConfig(
+                "RTP frame duration must be positive".into(),
+            ));
+        }
         Ok(Self {
             copies: CopyContext::legacy().clone(),
             codec,
@@ -487,6 +494,7 @@ impl RtpOutboundMediaSession {
                 None
             },
             expected_samples_per_frame: samples_per_frame as usize,
+            pcm: AudioPcmPacketizer::new(samples_per_frame as usize),
         })
     }
 
@@ -522,6 +530,100 @@ impl RtpOutboundMediaSession {
         self.packetize_audio_frame(samples)?
             .write_with_context(&self.copies)
     }
+
+    /// Queue an owning input. Matching mono PCM retains its original storage.
+    /// Channel mixing computes directly into the resampled output; mono rate
+    /// conversion copies selected elements and is governed by the session policy.
+    pub fn queue_audio(
+        &mut self,
+        samples: SharedBuffer<f32>,
+        sample_rate: u32,
+        channels: u32,
+    ) -> Result<()> {
+        let samples = prepare_pcm(
+            samples,
+            sample_rate,
+            channels,
+            self.codec.clock_rate_hz(),
+            &self.copies,
+        )?;
+        self.pcm
+            .append(samples, &self.copies)
+            .map_err(|error| Error::Rtp(error.to_string()))
+    }
+
+    /// Encode the next complete frame. Fragment assembly rejection retains the
+    /// queued owners; clear the queue when abandoning the failed stream.
+    pub fn next_audio_packet(&mut self) -> Result<Option<RtpPacket>> {
+        let frame = self
+            .pcm
+            .next_frame()
+            .map_err(|error| Error::Rtp(error.to_string()))?;
+        frame
+            .map(|frame| self.packetize_audio_frame(&frame))
+            .transpose()
+    }
+
+    /// Encode and serialize the next complete frame under the session policy.
+    pub fn next_audio_datagram(&mut self) -> Result<Option<Vec<u8>>> {
+        self.next_audio_packet()?
+            .map(|packet| packet.write_with_context(&self.copies))
+            .transpose()
+    }
+
+    /// Discard incomplete or rejected audio and release its retained owners.
+    pub fn clear_pending_audio(&mut self) {
+        self.pcm.clear();
+    }
+}
+
+fn prepare_pcm(
+    samples: SharedBuffer<f32>,
+    source_rate: u32,
+    channels: u32,
+    target_rate: u32,
+    copies: &CopyContext,
+) -> Result<SharedBuffer<f32>> {
+    let channels =
+        usize::try_from(channels).map_err(|_| Error::Rtp("PCM channel count overflow".into()))?;
+    if source_rate == 0 || target_rate == 0 || channels == 0 || samples.len() % channels != 0 {
+        return Err(Error::Rtp(
+            "invalid PCM rate, channel count or interleaved length".into(),
+        ));
+    }
+    if channels == 1 && source_rate == target_rate {
+        return Ok(samples);
+    }
+    let frames = samples.len() / channels;
+    let output_len =
+        usize::try_from((frames as u128 * u128::from(target_rate)) / u128::from(source_rate))
+            .map_err(|_| Error::Rtp("resampled PCM length overflow".into()))?;
+    let generate = || {
+        (0..output_len)
+            .map(|index| {
+                let frame =
+                    ((index as u128 * u128::from(source_rate)) / u128::from(target_rate)) as usize;
+                let start = frame * channels;
+                if channels == 1 {
+                    samples[start]
+                } else {
+                    samples[start..start + channels].iter().sum::<f32>() / channels as f32
+                }
+            })
+            .collect::<Vec<f32>>()
+    };
+    let output = if channels == 1 {
+        let bytes = u64::try_from(output_len)
+            .ok()
+            .and_then(|len| len.checked_mul(4))
+            .ok_or_else(|| Error::Rtp("resampled PCM byte length overflow".into()))?;
+        copies
+            .materialize(CopyReason::VecMaterialization, bytes, generate)
+            .map_err(|error| Error::Rtp(error.to_string()))?
+    } else {
+        generate()
+    };
+    Ok(output.into())
 }
 
 impl RtpPortLease {

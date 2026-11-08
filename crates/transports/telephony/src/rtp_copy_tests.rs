@@ -164,3 +164,169 @@ async fn rtp_copy_udp_owned_ingress_computes_g711_and_opus_under_strict_policy()
         );
     }
 }
+
+#[test]
+fn pcm_owned_frames_match_all_codecs_and_retain_credit_without_staging() {
+    for (codec, rate) in [
+        (AudioCodec::Pcmu, 8000),
+        (AudioCodec::Pcma, 8000),
+        (AudioCodec::Opus, 48000),
+    ] {
+        let copies = CopyContext::new(CopyPolicy::RequireZeroCopy, "pcm-owned");
+        let size = rate as usize / 50;
+        let values: Vec<f32> = (0..size * 2)
+            .map(|i| (i as f32 * 0.01).sin() * 0.25)
+            .collect();
+        let pointer = values.as_ptr();
+        let budget = BufferBudget::new(1, (size * 8) as u64);
+        let RuntimeData::Audio { samples, .. } = budget
+            .admit(RuntimeData::Audio {
+                samples: values.into(),
+                sample_rate: rate,
+                channels: 1,
+                stream_id: None,
+                timestamp_us: None,
+                arrival_ts_us: None,
+                metadata: None,
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let source = samples.into_shared();
+        let mut session = RtpOutboundMediaSession::new(codec, 0, 1, 1, 0, 20)
+            .unwrap()
+            .with_copy_context(copies.clone());
+        let mut reference = RtpOutboundMediaSession::new(codec, 0, 1, 1, 0, 20).unwrap();
+        session
+            .queue_audio(source.slice(0..17).unwrap(), rate, 1)
+            .unwrap();
+        session
+            .queue_audio(source.slice(17..size * 2).unwrap(), rate, 1)
+            .unwrap();
+        let first = session.pcm.next_frame().unwrap().unwrap();
+        assert_eq!(first.as_ptr(), pointer);
+        assert_eq!(
+            session.packetize_audio_frame(&first).unwrap(),
+            reference.packetize_audio_frame(&source[..size]).unwrap()
+        );
+        assert_eq!(
+            session.next_audio_packet().unwrap().unwrap(),
+            reference.packetize_audio_frame(&source[size..]).unwrap()
+        );
+        drop(source);
+        assert_eq!(budget.usage().owners, 1);
+        drop(first);
+        assert_eq!(budget.usage().owners, 0);
+        assert!(session.next_audio_packet().unwrap().is_none());
+        assert!(copies
+            .report()
+            .entries
+            .iter()
+            .all(|(_, count)| count.copied_bytes == 0 && count.rejected_bytes == 0));
+    }
+}
+
+#[test]
+fn pcm_fragment_assembly_is_counted_and_strict_failure_keeps_queue_until_clear() {
+    for policy in [CopyPolicy::AllowCopies, CopyPolicy::RequireZeroCopy] {
+        let copies = CopyContext::new(policy, "pcm-fragments");
+        let mut session = RtpOutboundMediaSession::new(AudioCodec::Pcmu, 0, 1, 1, 0, 20)
+            .unwrap()
+            .with_copy_context(copies.clone());
+        let budget = BufferBudget::new(2, 640);
+        for value in [0.1, 0.2] {
+            let RuntimeData::Audio { samples, .. } = budget
+                .admit(RuntimeData::Audio {
+                    samples: vec![value; 80].into(),
+                    sample_rate: 8000,
+                    channels: 1,
+                    stream_id: None,
+                    timestamp_us: None,
+                    arrival_ts_us: None,
+                    metadata: None,
+                })
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            session.queue_audio(samples.into_shared(), 8000, 1).unwrap();
+        }
+        if policy == CopyPolicy::AllowCopies {
+            let wire = session.next_audio_datagram().unwrap().unwrap();
+            assert_eq!(wire.len(), 172);
+            assert_eq!(
+                counts(&copies, CopyReason::VecMaterialization).copied_bytes,
+                640
+            );
+            assert_eq!(
+                counts(&copies, CopyReason::PortableSerialization).copied_bytes,
+                160
+            );
+            assert_eq!(budget.usage().owners, 0);
+        } else {
+            assert!(session
+                .next_audio_packet()
+                .unwrap_err()
+                .to_string()
+                .contains("pcm-fragments"));
+            assert_eq!(session.pcm.queued_samples(), 160);
+            assert_eq!(budget.usage().owners, 2);
+            assert_eq!(
+                counts(&copies, CopyReason::VecMaterialization).copied_bytes,
+                0
+            );
+            session.clear_pending_audio();
+            assert_eq!(budget.usage().owners, 0);
+        }
+    }
+}
+
+#[test]
+fn pcm_conversion_averages_channels_and_accounts_mono_resampling() {
+    let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "pcm-convert");
+    let stereo: SharedBuffer<f32> = vec![1., 3., 2., 4., 5., 7., 6., 8.].into();
+    assert_eq!(
+        &*prepare_pcm(stereo.clone(), 8000, 2, 8000, &strict).unwrap(),
+        &[2., 3., 6., 7.]
+    );
+    assert_eq!(
+        &*prepare_pcm(stereo, 16000, 2, 8000, &strict).unwrap(),
+        &[2., 6.]
+    );
+    let mono: SharedBuffer<f32> = vec![1., 2., 3., 4.].into();
+    assert!(prepare_pcm(mono.clone(), 16000, 1, 8000, &strict).is_err());
+    assert_eq!(
+        counts(&strict, CopyReason::VecMaterialization).rejected_bytes,
+        8
+    );
+    let allow = CopyContext::new(CopyPolicy::AllowCopies, "pcm-resample");
+    assert_eq!(
+        &*prepare_pcm(mono.clone(), 16000, 1, 8000, &allow).unwrap(),
+        &[1., 3.]
+    );
+    assert_eq!(
+        &*prepare_pcm(mono, 4000, 1, 8000, &allow).unwrap(),
+        &[1., 1., 2., 2., 3., 3., 4., 4.]
+    );
+    assert_eq!(
+        counts(&allow, CopyReason::VecMaterialization).copied_bytes,
+        40
+    );
+}
+
+#[test]
+fn pcm_invalid_input_preserves_queue_and_incomplete_tail_can_be_discarded() {
+    assert!(RtpOutboundMediaSession::new(AudioCodec::Pcmu, 0, 1, 1, 0, 0).is_err());
+    let mut session = RtpOutboundMediaSession::new(AudioCodec::Pcmu, 0, 1, 1, 0, 20).unwrap();
+    session.queue_audio(vec![0.; 80].into(), 8000, 1).unwrap();
+    for (rate, channels) in [(0, 1), (8000, 0), (8000, 2)] {
+        assert!(session
+            .queue_audio(vec![0.; 3].into(), rate, channels)
+            .is_err());
+        assert_eq!(session.pcm.queued_samples(), 80);
+    }
+    assert!(session.next_audio_packet().unwrap().is_none());
+    session.clear_pending_audio();
+    assert_eq!(session.pcm.queued_samples(), 0);
+}

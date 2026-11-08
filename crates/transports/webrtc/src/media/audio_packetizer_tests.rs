@@ -103,7 +103,7 @@ fn audio_owners_strict_fragment_rejects_before_any_copy_and_clear_releases() {
             .unwrap_err()
             .to_string()
             .contains("strict-fragment"));
-        assert_eq!(packetizer.remaining, 4);
+        assert_eq!(packetizer.queued_samples(), 4);
         assert_eq!(budget.usage().owners, 2);
         assert!(allow
             .report()

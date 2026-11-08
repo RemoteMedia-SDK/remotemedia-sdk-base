@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 use super::audio_packetizer::AudioPcmPacketizer;
+#[cfg(test)]
+use super::audio_packetizer::PcmFixtureExt;
 use remotemedia_types::{CopyContext, SharedBuffer};
 use super::audio::{AudioEncoder, AudioEncoderConfig};
 use super::audio_sender::{AudioSender, MediaClockPublisher};
