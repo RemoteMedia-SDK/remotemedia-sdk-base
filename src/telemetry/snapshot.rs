@@ -137,6 +137,8 @@ pub struct NodeTelemetry {
     pub first_output_latency_us: Option<LatencyPercentiles>,
     pub circuit_open: bool,
     pub last_error: Option<ErrorInfo>,
+    /// Turns re-issued to an LLM fallback provider (cumulative).
+    pub llm_fallbacks: u64,
 }
 
 impl Default for NodeTelemetry {
@@ -157,6 +159,7 @@ impl Default for NodeTelemetry {
             first_output_latency_us: None,
             circuit_open: false,
             last_error: None,
+            llm_fallbacks: 0,
         }
     }
 }

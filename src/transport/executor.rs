@@ -716,6 +716,22 @@ impl PipelineExecutor {
                 plugin_toml.plugin.name
             ))
         })?;
+        let implementation = crate::telemetry::NodeImplementation {
+            kind: crate::telemetry::ImplementationKind::Python,
+            plugin_name: Some(plugin_toml.plugin.name.clone()),
+            plugin_version: Some(plugin_toml.plugin.version.clone()),
+            digest: Some(if hash.starts_with("sha256:") {
+                hash.clone()
+            } else {
+                format!("sha256:{hash}")
+            }),
+            loaded_at_ms: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            ),
+        };
         let mut registry = self.registry.write().await;
         for node_type in &py.node_types {
             let plugin = crate::loadable::source_python::SourcePythonPlugin {
@@ -728,7 +744,7 @@ impl PipelineExecutor {
             let factory = std::sync::Arc::new(
                 crate::loadable::source_python::SourcePythonFactory::new(plugin),
             );
-            registry.register(factory);
+            registry.register_with_implementation(factory, implementation.clone());
         }
         Ok(())
     }
@@ -768,6 +784,31 @@ impl PipelineExecutor {
     /// Get the node registry reference (wrapped in RwLock)
     pub fn registry(&self) -> &Arc<RwLock<StreamingNodeRegistry>> {
         &self.registry
+    }
+
+    /// Validate `manifest` with capability resolution against this
+    /// executor's registry, after loading the plugins the manifest declares
+    /// (so their node types are recognized). A plugin that fails to load is
+    /// reported as a `plugin_load_failed` error instead of failing the call.
+    /// `extra_node_types` are treated as known (see
+    /// [`crate::capabilities::validate_manifest_report`]).
+    pub async fn validate_manifest_report(
+        &self,
+        manifest: &Manifest,
+        extra_node_types: &[String],
+    ) -> crate::capabilities::ManifestReport {
+        let plugin_error = self.ensure_plugins_loaded(manifest).await.err();
+        let registry = self.registry.read().await;
+        let mut report =
+            crate::capabilities::validate_manifest_report(manifest, &registry, extra_node_types);
+        if let Some(e) = plugin_error {
+            report.push_error(crate::capabilities::ReportIssue {
+                code: crate::capabilities::report::codes::PLUGIN_LOAD_FAILED.to_string(),
+                message: e.to_string(),
+                ..Default::default()
+            });
+        }
+        report
     }
 
     /// Generate a session ID unique across processes:

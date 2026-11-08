@@ -59,6 +59,9 @@ pub mod resolver;
 // Manifest-level negotiation entry point (ties registry + negotiation together)
 pub mod manifest_negotiation;
 
+// Agent-facing validation report (add-agent-harness-integration)
+pub mod report;
+
 // Re-export main types for convenience
 pub use constraints::{
     AudioConstraints, AudioSampleFormat, ConstraintValue, FileConstraints, JsonConstraints,
@@ -83,4 +86,9 @@ pub use resolver::{CapabilityHints, CapabilityResolver, NodeHints};
 
 pub use manifest_negotiation::{
     negotiate_manifest, strict_capabilities_enabled, NegotiationOutcome,
+};
+
+pub use report::{
+    validate_manifest_report, ConnectionReport, ManifestReport, MismatchReport, ReportIssue,
+    ResolvedConnection,
 };
