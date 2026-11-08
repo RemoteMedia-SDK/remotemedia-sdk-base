@@ -505,6 +505,27 @@ pub fn map_frame(input: &[f32], output: &mut [f32]) {
     }
 }
 
+/// An output device's name and the formats it offers, as
+/// `(channels, min_rate, max_rate)` ranges, without opening a stream.
+/// `selector` `None` is the host's default output device.
+pub fn output_device_formats(
+    selector: Option<&DeviceSelector>,
+    host_name: Option<&str>,
+) -> Result<(String, Vec<(u16, u32, u32)>)> {
+    let device = match selector {
+        Some(s) => find_output_device(s, host_name)?,
+        None => get_host(host_name)?
+            .default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("No default output device available"))?,
+    };
+    let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+    let formats = device
+        .supported_output_configs()?
+        .map(|r| (r.channels(), r.min_sample_rate().0, r.max_sample_rate().0))
+        .collect();
+    Ok((name, formats))
+}
+
 /// Find an output device by selector
 pub fn find_output_device(selector: &DeviceSelector, host_name: Option<&str>) -> Result<Device> {
     let host = get_host(host_name)?;

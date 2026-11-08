@@ -36,7 +36,7 @@
 //! router.send_input(input_data).await?;
 //! ```
 
-use crate::capabilities::{CapabilityBehavior, CapabilityResolver, ResolutionContext};
+use crate::capabilities::ResolutionContext;
 use crate::data::RuntimeData;
 use crate::executor::{
     DriftMetrics, DriftThresholds, NodeStats, PipelineGraph, SchedulerConfig, StreamingScheduler,
@@ -1051,12 +1051,12 @@ impl SessionRouter {
             ctrl.set_descriptor(Arc::new(self.descriptor.clone()));
         }
 
+        // Settle each connection's format from what the nodes discovered
+        // (spec 025 handshake) before declaring the pipeline ready.
+        self.propagate_runtime_capabilities().await?;
+
         // Pipeline-level "ready": every node is up.
         self.emit_loading_event("ready", Some("Pipeline ready".to_string()));
-
-        // Spec 025: After initialization, propagate actual capabilities from
-        // RuntimeDiscovered nodes to downstream Adaptive/Passthrough nodes
-        self.propagate_runtime_capabilities().await?;
 
         Ok(())
     }
@@ -1096,77 +1096,49 @@ impl SessionRouter {
         publish_node_loading(self.control.as_ref(), status, node_id, message);
     }
 
-    /// Propagate capabilities from RuntimeDiscovered nodes after initialization (spec 025).
-    ///
-    /// This method is called after all nodes are initialized. For each node with
-    /// `RuntimeDiscovered` behavior that reports actual capabilities, we:
-    /// 1. Call `revalidate_and_propagate()` to update resolution context
-    /// 2. Apply pending updates to downstream nodes via `configure_from_upstream()`
+    /// Runtime capability handshake after initialization (spec 025): see
+    /// [`super::caps_handshake`]. Sources' discovered outputs flow forward,
+    /// sinks' discovered inputs flow back to the nearest Adaptive node
+    /// (a resampler takes its target from the speaker after it), each node
+    /// keeps its upstream format where the next one accepts it, and every
+    /// connection is checked. Mismatches involving a discovered (device)
+    /// format fail startup, all of them in one error.
     async fn propagate_runtime_capabilities(&mut self) -> Result<()> {
-        // Build resolution context from manifest if not already present
-        if self.resolution_ctx.is_none() {
-            let mut ctx = ResolutionContext::new();
-
-            // Add node types and connections from manifest
-            for node_spec in &self.manifest.nodes {
-                ctx.node_types
-                    .insert(node_spec.id.clone(), node_spec.node_type.clone());
-            }
-            for conn in &self.manifest.connections {
-                ctx.add_connection(&conn.from, &conn.to);
-            }
-
-            // Set behaviors from cached nodes
-            for (node_id, node) in &self.cached_nodes {
-                ctx.set_behavior(node_id, node.capability_behavior());
-            }
-
-            self.resolution_ctx = Some(ctx);
+        let outcome = super::caps_handshake::negotiate(
+            &self.session_id,
+            &self.manifest,
+            &self.cached_nodes,
+        );
+        for w in &outcome.warnings {
+            tracing::warn!(session_id = %self.session_id, "capability handshake: {w}");
         }
-
-        let ctx = self.resolution_ctx.as_mut().unwrap();
-        let resolver = CapabilityResolver::new(&self.registry);
-
-        // Find RuntimeDiscovered nodes that have actual capabilities
-        let runtime_discovered_nodes: Vec<String> = self
-            .cached_nodes
-            .iter()
-            .filter(|(_, node)| {
-                matches!(
-                    node.capability_behavior(),
-                    CapabilityBehavior::RuntimeDiscovered
-                )
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for node_id in runtime_discovered_nodes {
-            if let Some(node) = self.cached_nodes.get(&node_id) {
-                // Get actual capabilities from the node after initialization
-                if let Some(actual_caps) = node.actual_capabilities() {
-                    tracing::info!(
-                        "Session {}: Node '{}' reported actual capabilities, propagating to downstream nodes",
-                        self.session_id,
-                        node_id
-                    );
-
-                    // Update resolution context with actual capabilities and create pending updates
-                    if let Err(e) = resolver.revalidate_and_propagate(ctx, &node_id, actual_caps) {
-                        tracing::warn!(
-                            "Session {}: Failed to propagate capabilities from '{}': {}",
-                            self.session_id,
-                            node_id,
-                            e
-                        );
-                    }
-                }
-            }
+        for (node, f) in &outcome.formats {
+            tracing::debug!(
+                session_id = %self.session_id,
+                node_id = %node,
+                sample_rate = ?f.sample_rate,
+                channels = ?f.channels,
+                "negotiated output format"
+            );
         }
-
-        // Apply pending updates to downstream nodes
-        self.apply_pending_updates().await?;
-
-        Ok(())
+        if outcome.errors.is_empty() {
+            return Ok(());
+        }
+        for e in &outcome.errors {
+            tracing::error!(session_id = %self.session_id, "capability handshake: {e}");
+        }
+        self.emit_loading_event("error", Some(outcome.errors.join("; ")));
+        Err(Error::Execution(if outcome.errors.len() == 1 {
+            format!("Pipeline formats do not fit: {}", outcome.errors[0])
+        } else {
+            format!(
+                "Pipeline formats do not fit ({} problems):
+- {}",
+                outcome.errors.len(),
+                outcome.errors.join("
+- ")
+            )
+        }))
     }
 
     /// Apply pending capability updates to downstream nodes (spec 025).
