@@ -2120,8 +2120,10 @@ sys.stdout.flush()
         let node_id_clone = node_id.to_string();
         let session_id_clone = session_id.to_string();
 
-        // Spawn dedicated OS thread
+        // Spawn dedicated OS thread (logging in the caller's node span).
+        let span = tracing::Span::current();
         let handle = std::thread::spawn(move || {
+            let _span = span.entered();
             tracing::debug!("IPC thread starting for node: {}", node_id_clone);
 
             // Create tokio runtime for this thread (needed for async create_publisher/subscriber)

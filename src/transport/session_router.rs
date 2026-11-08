@@ -43,6 +43,7 @@ use crate::executor::{
 };
 use crate::manifest::Manifest;
 use crate::nodes::{InitializeContext, StreamingNode, StreamingNodeRegistry};
+use crate::telemetry::node_logs::node_span;
 use crate::telemetry::{approx_payload_bytes, QueueCapacity, SessionDescriptor, SessionTelemetry};
 use crate::transport::perf_aggregator::PerfAggregator;
 use crate::transport::session_control::{aux_port_of, CloseReason, SessionControl, BARGE_IN_PORT};
@@ -53,6 +54,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 /// Default capacity for the router's internal input channel.
 ///
@@ -807,12 +809,14 @@ impl SessionRouter {
                     }
                 }
             }
-            let node = self.registry.create_node(
-                &node_spec.node_type,
-                node_spec.id.clone(),
-                &params,
-                Some(self.session_id.clone()),
-            )?;
+            let node = node_span(&self.session_id, &node_spec.id).in_scope(|| {
+                self.registry.create_node(
+                    &node_spec.node_type,
+                    node_spec.id.clone(),
+                    &params,
+                    Some(self.session_id.clone()),
+                )
+            })?;
             created.push((node_spec.id.clone(), node_spec.node_type.clone(), node));
         }
 
@@ -858,6 +862,7 @@ impl SessionRouter {
                 control: control.clone(),
             };
             let control = control.clone();
+            let span = node_span(&session_id, &id);
             async move {
                 use futures::FutureExt;
                 let result = std::panic::AssertUnwindSafe(node.initialize(&init_ctx))
@@ -882,6 +887,7 @@ impl SessionRouter {
                     Err(e) => Err((id, ty, e)),
                 }
             }
+            .instrument(span)
         });
 
         let initialised = match try_join_all(init_futures).await {
@@ -1510,6 +1516,8 @@ impl SessionRouter {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> (JoinHandle<()>, JoinHandle<()>) {
         let (fan_tx, mut fan_rx) = mpsc::channel::<RuntimeData>(NODE_FANOUT_CAPACITY);
+        // Every task of this node logs inside its span (`rm_node_logs`).
+        let span = node_span(&session_id, &node_id);
         // Endpoint-call opt-in (openspec: add-agent-harness-integration).
         let rpc_methods = node.rpc_methods();
         let call_mode = super::call_routing::call_mode(&rpc_methods, control.is_some());
@@ -1529,7 +1537,7 @@ impl SessionRouter {
         let fan_tel = tel.clone();
         let mut fan_shutdown = shutdown.clone();
         let fan_envelope_calls = envelope_calls.clone();
-        let fan_handle = tokio::spawn(async move {
+        let fan_task = async move {
             let forward = async move {
                 let tel = fan_tel;
                 // Dropped with this task: aborts reply forwarders, which
@@ -1673,7 +1681,8 @@ impl SessionRouter {
                 _ = fan_shutdown.changed() => {},
                 _ = forward => {},
             }
-        });
+        };
+        let fan_handle = tokio::spawn(fan_task.instrument(span.clone()));
 
         // ── Aux-port filter task ───────────────────────────────────────
         //
@@ -1725,7 +1734,7 @@ impl SessionRouter {
         let filter_cancel = Arc::clone(&cancel);
         let filter_node_id = node_id.clone();
         let filter_session_id = session_id.clone();
-        let filter_handle = tokio::spawn(async move {
+        let filter_task = async move {
             while let Some(input) = input_rx.recv().await {
                 if let Some(port) = aux_port_of(&input) {
                     if port == BARGE_IN_PORT {
@@ -1782,14 +1791,15 @@ impl SessionRouter {
                     break;
                 }
             }
-        });
+        };
+        let filter_handle = tokio::spawn(filter_task.instrument(span.clone()));
 
         // ── Main node task ─────────────────────────────────────────────
         let main_node_id = node_id.clone();
         let main_session_id = session_id.clone();
         let main_cancel = Arc::clone(&cancel);
         let main_tel = tel;
-        let main_handle = tokio::spawn(async move {
+        let main_task = async move {
             let tel = main_tel;
             let cell = tel.node(node_idx);
             tel.set_alive(node_idx, true);
@@ -1836,13 +1846,16 @@ impl SessionRouter {
             .with_cancel_gate(Arc::clone(&cancel));
 
             let rpc_handle = rpc_rx.map(|(rx, call_replies)| {
-                super::rpc_dispatch::RpcTask(tokio::spawn(super::rpc_dispatch::run(
-                    node.clone(),
-                    bound_ctx.clone(),
-                    rx,
-                    call_replies,
-                    shutdown.clone(),
-                )))
+                super::rpc_dispatch::RpcTask(tokio::spawn(
+                    super::rpc_dispatch::run(
+                        node.clone(),
+                        bound_ctx.clone(),
+                        rx,
+                        call_replies,
+                        shutdown.clone(),
+                    )
+                    .in_current_span(),
+                ))
             });
 
             // Capability transient channel: subscribe to every address the
@@ -1866,7 +1879,7 @@ impl SessionRouter {
                 let cap_node = Arc::clone(&node);
                 let cap_ctx = bound_ctx.clone();
                 let cap_addr = addr.clone();
-                cap_tasks.push(tokio::spawn(async move {
+                let cap_task = async move {
                     loop {
                         match rx.recv().await {
                             Ok(caps) => {
@@ -1889,7 +1902,8 @@ impl SessionRouter {
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                }));
+                };
+                cap_tasks.push(tokio::spawn(cap_task.in_current_span()));
             }
 
             // Pacer wiring: delegate to `crate::transport::pacer`.
@@ -2377,7 +2391,8 @@ impl SessionRouter {
                 tracing::error!(node = %main_node_id, %error, "node shutdown failed");
             }
             tel.set_alive(node_idx, false);
-        });
+        };
+        let main_handle = tokio::spawn(main_task.instrument(span));
 
         (main_handle, fan_handle)
     }

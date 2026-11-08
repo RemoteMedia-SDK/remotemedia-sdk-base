@@ -20,6 +20,7 @@
 
 pub mod descriptor;
 pub mod identity;
+pub mod node_logs;
 pub mod publisher;
 pub mod redact;
 pub mod size;

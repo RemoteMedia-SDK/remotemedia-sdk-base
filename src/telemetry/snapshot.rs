@@ -139,6 +139,10 @@ pub struct NodeTelemetry {
     pub last_error: Option<ErrorInfo>,
     /// Turns re-issued to an LLM fallback provider (cumulative).
     pub llm_fallbacks: u64,
+    /// Log records the node produced, per level (when the host captures
+    /// node logs; see `telemetry::node_logs`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<super::node_logs::LogCounts>,
 }
 
 impl Default for NodeTelemetry {
@@ -160,6 +164,7 @@ impl Default for NodeTelemetry {
             circuit_open: false,
             last_error: None,
             llm_fallbacks: 0,
+            logs: None,
         }
     }
 }

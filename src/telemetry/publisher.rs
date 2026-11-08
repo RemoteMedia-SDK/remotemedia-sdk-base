@@ -247,6 +247,7 @@ pub(crate) fn build_snapshot(
                 circuit_open,
                 last_error: tel.last_error(idx),
                 llm_fallbacks: cell.llm_fallbacks.load(Relaxed),
+                logs: super::node_logs::NodeLogStore::global().counts(tel.session_id(), id),
             }
         })
         .collect();

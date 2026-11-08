@@ -432,7 +432,9 @@ impl ProcessManager {
         // (a few KB on Windows), and the worker then blocks in `print`.
         if let Some(stdout) = child.stdout.take() {
             let node_id = node_id.to_string();
+            let session_id = session_id.to_string();
             tokio::spawn(async move {
+                use crate::telemetry::node_logs::{LogLevel, LogSource, NodeLogStore};
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let Ok(stdout) = tokio::process::ChildStdout::from_std(stdout) else {
                     return;
@@ -440,6 +442,14 @@ impl ProcessManager {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::info!("[Process {}] {} stdout: {}", pid, node_id, line);
+                    NodeLogStore::global().push(
+                        &session_id,
+                        &node_id,
+                        LogLevel::Info,
+                        LogSource::Stdout,
+                        "python",
+                        &line,
+                    );
                 }
             });
         }
@@ -553,15 +563,28 @@ impl ProcessManager {
         // Spawn task to capture stderr output
         if let Some(stderr) = stderr {
             let node_id = process.node_id.clone();
+            let session_id = process.session_id.clone();
             let pid = process.id;
             let tail = process.stderr_tail.clone();
             tokio::spawn(async move {
+                use crate::telemetry::node_logs::{parse_python_line, LogSource, NodeLogStore};
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let stderr = tokio::process::ChildStderr::from_std(stderr).unwrap();
                 let mut lines = BufReader::new(stderr).lines();
+                let mut prev = None;
 
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::warn!("[Process {}] {}: {}", pid, node_id, line);
+                    let level = parse_python_line(&line, prev);
+                    prev = Some(level);
+                    NodeLogStore::global().push(
+                        &session_id,
+                        &node_id,
+                        level,
+                        LogSource::Stderr,
+                        "python",
+                        &line,
+                    );
                     if let Ok(mut t) = tail.lock() {
                         if t.len() == STDERR_TAIL_LINES {
                             t.pop_front();
