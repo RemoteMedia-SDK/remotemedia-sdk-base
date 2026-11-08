@@ -77,8 +77,8 @@ impl Plugin {
     /// unrecoverable iceoryx2 error). `handler` is called once per
     /// input message and returns a single response.
     ///
-    /// Errors returned by `handler` are logged to stderr and the
-    /// message is dropped — the loop continues. iceoryx2 errors abort
+    /// With host reporting, errors are acknowledged by the host and stop the loop.
+    /// Standalone errors returned by `handler` are logged and the message is dropped — the loop continues. iceoryx2 errors abort
     /// the loop.
     ///
     /// # Output
@@ -95,6 +95,12 @@ impl Plugin {
 
         let (publisher, subscriber) = open_channels(&out_name, &in_name)?;
 
+        if let Some(mut worker) =
+            super::native_copy_reporting::Worker::from_env(&self.node_id, &self.session_id)
+                .map_err(|error| error.to_string())?
+        {
+            return run_reported(&publisher, &subscriber, &mut worker, &mut handler);
+        }
         eprintln!("[plugin] READY");
 
         loop {
@@ -129,6 +135,46 @@ impl Plugin {
                 }
             }
         }
+    }
+}
+
+/// One host grant covers decode, processing and publication. A reply is not
+/// successful until the host has acknowledged all accounting and its terminal.
+fn run_reported<F>(
+    publisher: &NativePublisher,
+    subscriber: &NativeSubscriber,
+    worker: &mut super::native_copy_reporting::Worker,
+    handler: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(RuntimeData) -> Result<RuntimeData, String>,
+{
+    loop {
+        let call = worker.next().map_err(|error| error.to_string())?;
+        let result = (|| {
+            let input = loop {
+                match subscriber
+                    .receive()
+                    .map_err(|error| format!("subscriber receive: {error:?}"))?
+                {
+                    Some(sample) => {
+                        break super::data_transfer::from_bytes_with_copy_context(
+                            sample.payload(),
+                            &call.copies,
+                        )?
+                    }
+                    None => std::thread::yield_now(),
+                }
+            };
+            call.check().map_err(|error| error.to_string())?;
+            let output = handler(input)?;
+            call.check().map_err(|error| error.to_string())?;
+            publish_runtime_data(publisher, &output, &call.copies)?;
+            call.check().map_err(|error| error.to_string())
+        })();
+        call.finish(result.clone())
+            .map_err(|error| error.to_string())?;
+        result?;
     }
 }
 

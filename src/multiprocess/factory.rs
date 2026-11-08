@@ -20,16 +20,16 @@
 //!
 //! # Limitations of this prototype
 //!
-//! - The plugin is assumed ready ~500 ms after spawn. Production
-//!   would handshake on a control channel (READY pattern from the
-//!   Python multiprocess executor).
-//! - A nonresponding/crashed plugin can leave a call pending until node drop.
-//!   Dropping the node cancels the receive loop and kills/reaps its child.
-//! - Strict contexts reject this copying protocol. Compatibility host copies
-//!   use the caller ledger; worker copies still use the worker legacy ledger.
+//! - The worker must negotiate copy reporting v1; rebuild older plugin binaries.
+//! - A hung handler can leave a call pending until node drop; crashes and
+//!   reporting failures terminate the command lane and reap the child.
+//! - Strict contexts reject this copying protocol. Compatibility framework
+//!   copies on both sides use the caller ledger. Handler-internal copies are
+//!   outside this runner's instrumentation.
 //! - One outstanding request per node — the IPC thread handles them
 //!   serially. Concurrent calls queue on the mpsc command channel.
 
+use super::native_copy_reporting::{Host, PROTOCOL_ENV};
 use crate::data::RuntimeData;
 use crate::nodes::{
     AsyncNodeWrapper, AsyncStreamingNode, InitializeContextRead, NodeRuntimeContextRead,
@@ -44,6 +44,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -87,6 +88,7 @@ pub struct MultiprocessNativeNode {
     node_id: String,
     session_id: String,
     stopping: Arc<AtomicBool>,
+    reporter: Arc<Host>,
     cmd_tx: mpsc::Sender<IpcCommand>,
     /// Held so the child is killed on drop.
     child: Arc<Mutex<Child>>,
@@ -119,24 +121,34 @@ impl MultiprocessNativeNode {
         let in_channel = format!("{session_id}_{node_id}_input");
         let out_channel = format!("{session_id}_{node_id}_output");
 
-        let mut child = command
+        let reporter = Host::start(node_id, session_id)
+            .map_err(|error| Error::IpcError(format!("native copy reporter: {error}")))?;
+        let child = command
             .env("RM_SESSION_ID", session_id)
             .env("RM_NODE_ID", node_id)
+            .env(PROTOCOL_ENV, "1")
+            .stdin(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| Error::Execution(format!("spawn native compatibility plugin: {e}")))?;
 
-        // Plugin needs a moment to attach to iceoryx2 services. A
-        // production implementation would wait on a control channel
-        // READY signal instead of sleeping.
-        std::thread::sleep(Duration::from_millis(500));
-
+        let child = Arc::new(Mutex::new(child));
         let stopping = Arc::new(AtomicBool::new(false));
-        let cmd_tx = match spawn_ipc_thread(in_channel, out_channel, stopping.clone()) {
+        let setup = (|| {
+            negotiate_reporting(&reporter, &child)?;
+            spawn_ipc_thread(
+                in_channel,
+                out_channel,
+                stopping.clone(),
+                reporter.clone(),
+                child.clone(),
+            )
+        })();
+        let cmd_tx = match setup {
             Ok(sender) => sender,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                reporter.close();
+                reap_child(&child);
                 return Err(error);
             }
         };
@@ -146,8 +158,9 @@ impl MultiprocessNativeNode {
             node_id: node_id.to_string(),
             session_id: session_id.to_string(),
             stopping,
+            reporter,
             cmd_tx,
-            child: Arc::new(Mutex::new(child)),
+            child,
         })
     }
     fn call_authority(
@@ -194,14 +207,37 @@ impl MultiprocessNativeNode {
 impl Drop for MultiprocessNativeNode {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        // Closing the cmd_tx makes the IPC thread's blocking_recv()
-        // return None and the thread exits cleanly.
-        // Kill the child explicitly — the plugin runs an infinite
-        // loop so it won't notice the channel close on its own.
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.reporter.close();
+        reap_child(&self.child);
+    }
+}
+
+fn negotiate_reporting(reporter: &Host, child: &Mutex<Child>) -> Result<(), Error> {
+    let mut stdin = child
+        .lock()
+        .unwrap()
+        .stdin
+        .take()
+        .ok_or_else(|| Error::IpcError("native copy bootstrap stdin missing".into()))?;
+    reporter
+        .bootstrap(&mut stdin)
+        .map_err(|error| Error::IpcError(error.to_string()))?;
+    drop(stdin);
+    reporter
+        .wait_ready(|| {
+            child
+                .lock()
+                .unwrap()
+                .try_wait()
+                .map(|status| status.is_none())
+        })
+        .map_err(|error| Error::IpcError(error.to_string()))
+}
+
+fn reap_child(child: &Mutex<Child>) {
+    if let Ok(mut child) = child.lock() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -269,6 +305,8 @@ fn spawn_ipc_thread(
     in_channel: String,
     out_channel: String,
     stopping: Arc<AtomicBool>,
+    reporter: Arc<Host>,
+    child: Arc<Mutex<Child>>,
 ) -> Result<mpsc::Sender<IpcCommand>, Error> {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<IpcCommand>(64);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -288,24 +326,32 @@ fn spawn_ipc_thread(
                     }
                 };
 
-            while let Some(cmd) = cmd_rx.blocking_recv() {
-                match cmd {
-                    IpcCommand::Round {
-                        data,
-                        copies,
-                        reply,
-                    } => {
-                        if reply.is_closed() {
-                            continue;
-                        }
-                        let result = round_trip(&publisher, &subscriber, &data, &copies, &stopping);
-                        let failed = result.is_err();
-                        let _ = reply.send(result);
-                        // A late response must never be mistaken for the next request.
-                        if failed {
-                            break;
-                        }
-                    }
+            while let Some(IpcCommand::Round {
+                data,
+                copies,
+                reply,
+            }) = cmd_rx.blocking_recv()
+            {
+                if reply.is_closed() {
+                    continue;
+                }
+                let result = round_trip(
+                    &publisher,
+                    &subscriber,
+                    &data,
+                    &copies,
+                    &stopping,
+                    &reporter,
+                );
+                let failed = result.is_err();
+                if failed {
+                    reporter.close();
+                    reap_child(&child);
+                }
+                let _ = reply.send(result);
+                // A late response must never be mistaken for the next request.
+                if failed {
+                    break;
                 }
             }
         })
@@ -325,17 +371,28 @@ fn round_trip<P: PublishApi, S: ReceiveApi>(
     data: &RuntimeData,
     copies: &CopyContext,
     stopping: &AtomicBool,
+    reporter: &Host,
 ) -> Result<RuntimeData, String> {
     if stopping.load(Ordering::Acquire) {
         return Err("native compatibility IPC stopped".into());
     }
+    let call = reporter
+        .begin(copies.clone())
+        .map_err(|error| error.to_string())?;
     publisher.publish_data(data, copies)?;
+    let mut output = None;
     loop {
         if stopping.load(Ordering::Acquire) {
             return Err("native compatibility IPC stopped".into());
         }
-        if let Some(data) = subscriber.receive_data(copies)? {
-            return Ok(data);
+        let finished = reporter.status(call).map_err(|error| error.to_string())?;
+        if output.is_none() {
+            output = subscriber.receive_data(copies)?;
+        }
+        if finished {
+            if let Some(data) = output.take() {
+                return Ok(data);
+            }
         }
         std::thread::yield_now();
     }

@@ -1,9 +1,14 @@
 //! Bounded, acknowledged metadata-only reporting to one retained host authority.
 //! The private capability is delivered over the child's stdin, never argv/logs.
+#[cfg(test)]
+use crate::multiprocess::control_frames::MAX_FRAME;
+use crate::multiprocess::control_frames::{invalid, read_frame, write_frame};
 use remotemedia_types::{CopyContext, CopyOperation, CopyReason};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::io::Write;
 use std::{
-    io::{self, Read, Write},
+    io,
     net::{Shutdown, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -12,8 +17,6 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-
-const MAX_FRAME: usize = 4096;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -262,31 +265,6 @@ fn serve(stream: &mut TcpStream, copies: CopyContext) -> io::Result<()> {
             return Ok(());
         }
     }
-}
-
-fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> io::Result<T> {
-    let mut header = [0; 4];
-    stream.read_exact(&mut header)?;
-    let size = u32::from_be_bytes(header) as usize;
-    if size == 0 || size > MAX_FRAME {
-        return Err(invalid("invalid copy frame size"));
-    }
-    let mut bytes = vec![0; size];
-    stream.read_exact(&mut bytes)?;
-    serde_json::from_slice(&bytes).map_err(|_| invalid("invalid copy report schema"))
-}
-
-fn write_frame(stream: &mut TcpStream, value: &impl Serialize) -> io::Result<()> {
-    let bytes = serde_json::to_vec(value).map_err(|_| invalid("invalid copy reply"))?;
-    if bytes.len() > MAX_FRAME {
-        return Err(invalid("copy reply too large"));
-    }
-    stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
-    stream.write_all(&bytes)
-}
-
-fn invalid(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 #[cfg(test)]

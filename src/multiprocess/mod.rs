@@ -33,6 +33,10 @@
 //! whichever attaches first creates the service.
 
 pub mod data_transfer;
+#[cfg(feature = "multiprocess")]
+pub(crate) mod control_frames;
+#[cfg(feature = "multiprocess")]
+mod native_copy_reporting;
 mod python_wire;
 
 /// Typed mapped runner for existing node traits and direct output allocation.

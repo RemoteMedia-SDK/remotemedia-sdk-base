@@ -15,6 +15,14 @@ fn native_compat_echo_fixture() {
                 std::thread::sleep(Duration::from_secs(30));
                 Ok(RuntimeData::Text(text))
             }
+            RuntimeData::Text(text) if text == "handler-error" => {
+                Err("fixture handler rejected input".into())
+            }
+            RuntimeData::Text(text) if text == "exit" => std::process::exit(29),
+            RuntimeData::Text(text) if text == "delay" => {
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(RuntimeData::Binary(vec![4; 16].into()))
+            }
             other => Ok(other),
         })
         .unwrap();
@@ -140,15 +148,15 @@ async fn native_compat_real_worker_attributes_each_call_and_drops_wire_snapshot(
     for (copies, calls) in [(&a, 1), (&b, 2)] {
         assert_eq!(
             counts(copies, CopyReason::PortableSerialization).copied_bytes,
-            64 * calls
+            128 * calls
         );
         assert_eq!(
             counts(copies, CopyReason::PortableDeserialization).copied_bytes,
-            64 * calls
+            128 * calls
         );
         assert_eq!(
             counts(copies, CopyReason::PrivateIpcIngress).copied_bytes,
-            wire_len * calls
+            2 * wire_len * calls
         );
         assert_eq!(
             counts(copies, CopyReason::VecMaterialization).copied_bytes,
@@ -160,8 +168,7 @@ async fn native_compat_real_worker_attributes_each_call_and_drops_wire_snapshot(
             .iter()
             .all(|(_, c)| c.failed == 0 && c.in_flight == 0));
     }
-    // Query the fixture's process-local ledger. This is test evidence, not the
-    // production host-report negotiation still required for session attribution.
+    // Framework work must no longer escape into the worker legacy ledger.
     let report_context = context(
         &node,
         CopyContext::new(CopyPolicy::AllowCopies, "report-query"),
@@ -176,9 +183,9 @@ async fn native_compat_real_worker_attributes_each_call_and_drops_wire_snapshot(
         panic!("expected worker report")
     };
     for (reason, expected) in [
-        ("portable_serialization", 192),
-        ("portable_deserialization", 192),
-        ("private_ipc_ingress", wire_len * 3),
+        ("portable_serialization", 0),
+        ("portable_deserialization", 0),
+        ("private_ipc_ingress", 0),
     ] {
         let entry = report["entries"]
             .as_array()
@@ -220,7 +227,8 @@ fn native_compat_stopped_round_does_not_access_input_or_transport() {
         &Never,
         &RuntimeData::Binary(vec![1; 8].into()),
         CopyContext::legacy(),
-        &AtomicBool::new(true)
+        &AtomicBool::new(true),
+        &Host::start("stopped", "test").unwrap()
     )
     .is_err());
 }
@@ -244,4 +252,187 @@ async fn native_compat_drop_stops_pending_round_and_reaps_worker() {
         .await
         .unwrap();
     assert!(child.lock().unwrap().try_wait().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn native_compat_worker_failure_closes_lane_and_reaps_child() {
+    for message in ["handler-error", "exit"] {
+        let node = fixture();
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "failed-call");
+        let ctx = context(&node, copies.clone());
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            node.process_with_ctx(RuntimeData::Text(message.into()), &ctx),
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+        if message == "handler-error" {
+            assert!(error.contains("fixture handler rejected input"), "{error}");
+        }
+        assert!(node.child.lock().unwrap().try_wait().unwrap().is_some());
+        assert!(node
+            .process_with_ctx(RuntimeData::Text("after-error".into()), &ctx)
+            .await
+            .is_err());
+        assert!(copies
+            .report()
+            .entries
+            .iter()
+            .all(|(_, c)| c.in_flight == 0));
+    }
+}
+
+#[tokio::test]
+async fn native_compat_abandoned_call_drains_before_next_authority() {
+    let node = fixture();
+    let abandoned = CopyContext::new(CopyPolicy::AllowCopies, "abandoned");
+    let next = CopyContext::new(CopyPolicy::AllowCopies, "next");
+    let a = context(&node, abandoned.clone());
+    let b = context(&node, next.clone());
+    assert!(tokio::time::timeout(
+        Duration::from_millis(50),
+        node.process_with_ctx(RuntimeData::Text("delay".into()), &a)
+    )
+    .await
+    .is_err());
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        node.process_with_ctx(RuntimeData::Binary(vec![9; 32].into()), &b),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let RuntimeData::Binary(bytes) = output else {
+        panic!("expected binary");
+    };
+    assert_eq!(bytes.as_slice(), &[9; 32]);
+    assert_eq!(
+        counts(&abandoned, CopyReason::PortableSerialization).copied_bytes,
+        16
+    );
+    assert_eq!(
+        counts(&abandoned, CopyReason::PortableDeserialization).copied_bytes,
+        16
+    );
+    assert_eq!(
+        counts(&next, CopyReason::PortableSerialization).copied_bytes,
+        64
+    );
+    assert_eq!(
+        counts(&next, CopyReason::PortableDeserialization).copied_bytes,
+        64
+    );
+}
+
+#[test]
+fn native_compat_exited_worker_cannot_silently_skip_negotiation() {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.arg("--list"); // Exits without reading the private bootstrap.
+    let start = std::time::Instant::now();
+    let result = MultiprocessNativeNode::spawn_command(command, "Old", "old", "missing_reporting");
+    assert!(result.is_err());
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn native_compat_all_bulk_variants_report_both_sides_before_return() {
+    use remotemedia_types::{ImageFormat, PixelFormat};
+    let node = fixture();
+    let inputs = [
+        (
+            RuntimeData::Audio {
+                samples: vec![0.1, 0.2, 0.3].into(),
+                sample_rate: 16000,
+                channels: 1,
+                stream_id: None,
+                timestamp_us: None,
+                arrival_ts_us: None,
+                metadata: None,
+            },
+            12,
+        ),
+        (RuntimeData::Binary(vec![1; 7].into()), 7),
+        (
+            RuntimeData::Video {
+                pixel_data: vec![2; 12].into(),
+                width: 2,
+                height: 2,
+                format: PixelFormat::Rgb24,
+                codec: None,
+                frame_number: 1,
+                timestamp_us: 8,
+                is_keyframe: true,
+                stream_id: None,
+                arrival_ts_us: None,
+            },
+            12,
+        ),
+        (
+            RuntimeData::Image {
+                data: vec![3; 16].into(),
+                format: ImageFormat::Raw {
+                    pixel_format: PixelFormat::Rgba32,
+                },
+                width: 2,
+                height: 2,
+                timestamp_us: None,
+                stream_id: None,
+                metadata: None,
+            },
+            16,
+        ),
+        (
+            RuntimeData::Tensor {
+                data: vec![4; 8].into(),
+                shape: vec![8],
+                dtype: 0,
+                metadata: None,
+            },
+            8,
+        ),
+        (
+            RuntimeData::Numpy {
+                data: vec![0; 32].into(),
+                shape: vec![4, 2],
+                dtype: "float32".into(),
+                strides: vec![8, 4],
+                c_contiguous: true,
+                f_contiguous: false,
+            },
+            32,
+        ),
+    ];
+    for (input, payload_bytes) in inputs {
+        let wire = super::super::data_transfer::to_bytes(&input).unwrap();
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, input.data_type());
+        let ctx = context(&node, copies.clone());
+        let output =
+            tokio::time::timeout(Duration::from_secs(5), node.process_with_ctx(input, &ctx))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            super::super::data_transfer::to_bytes(&output).unwrap(),
+            wire
+        );
+        assert_eq!(
+            counts(&copies, CopyReason::PortableSerialization).copied_bytes,
+            2 * payload_bytes
+        );
+        assert_eq!(
+            counts(&copies, CopyReason::PortableDeserialization).copied_bytes,
+            2 * payload_bytes
+        );
+        assert_eq!(
+            counts(&copies, CopyReason::PrivateIpcIngress).copied_bytes,
+            2 * wire.len() as u64
+        );
+        assert!(copies
+            .report()
+            .entries
+            .iter()
+            .all(|(_, c)| c.failed == 0 && c.in_flight == 0));
+    }
 }
