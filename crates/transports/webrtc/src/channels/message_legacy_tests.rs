@@ -1,5 +1,7 @@
 use super::*;
-use remotemedia_types::{CopyCounts, CopyPolicy};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use bytes::Bytes;
+use remotemedia_types::{CopyCounts, CopyPolicy, CopyReason};
 
 fn wire(kind: &str, encoded: &str, payload_first: bool) -> Vec<u8> {
     let payload = if kind == "Chunk" {

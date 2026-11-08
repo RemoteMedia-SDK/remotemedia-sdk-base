@@ -47,18 +47,36 @@
 //! - `audio.in.context`      — `context` aux port of node `audio`
 //! - `vad.out`               — main output of node `vad`
 
+use super::control_wire::{coerce_payload, encode_event};
 use super::handler::SharedState;
-use remotemedia_core::data::{split_text_str, RuntimeData};
+use remotemedia_core::data::RuntimeData;
 use remotemedia_core::transport::session_control::{
     ControlAddress, Direction, NodeState, SessionControl,
 };
+use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
+
+fn event_or_error(
+    topic: &str,
+    data: &RuntimeData,
+    include_audio: bool,
+    copies: &remotemedia_types::CopyContext,
+) -> String {
+    encode_event(topic, data, include_audio, copies).unwrap_or_else(|message| {
+        let mut error = crate::signaling::protocol::JsonRpcError::new(
+            crate::signaling::protocol::error_codes::INTERNAL_ERROR,
+            message,
+            Value::Null,
+        );
+        error.error.data = Some(json!({"topic": topic}));
+        error.to_json().expect("metadata control error")
+    })
+}
 
 /// Per-connection state for in-flight control-bus subscriptions. One map
 /// per WebSocket — lifetime bound to the connection.
@@ -162,13 +180,21 @@ async fn resolve_session_control(
 /// the method is not a control.* method (caller falls through).
 pub async fn handle_control_method(
     method: &str,
-    params: &Value,
+    params: &RawValue,
     request_id: &Value,
     state: &Arc<SharedState>,
     peer_id: &str,
     tx: &mpsc::Sender<String>,
     control_state: &Arc<ControlSessionState>,
 ) -> Option<Result<String, String>> {
+    if method == "control.publish" {
+        return Some(handle_publish(params, request_id, state, peer_id).await);
+    }
+    let parsed: Value = match serde_json::from_str(params.get()) {
+        Ok(value) => value,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    let params = &parsed;
     match method {
         "control.subscribe" => Some(
             handle_subscribe(params, request_id, state, peer_id, tx, control_state)
@@ -177,11 +203,6 @@ pub async fn handle_control_method(
         ),
         "control.unsubscribe" => Some(
             handle_unsubscribe(params, request_id, control_state)
-                .await
-                .map_err(|e| e.to_string()),
-        ),
-        "control.publish" => Some(
-            handle_publish(params, request_id, state, peer_id)
                 .await
                 .map_err(|e| e.to_string()),
         ),
@@ -264,26 +285,17 @@ async fn handle_subscribe(
 
     let tx_out = tx.clone();
     let topic_for_task = topic.clone();
+    let copies = ctrl.transport_copy_context();
     let handle = if is_system {
         let mut rx = ctrl.subscribe_system();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Some(data) => {
-                        let params =
-                            runtime_data_to_event_params(&topic_for_task, &data, include_audio);
-                        let notif = json!({
-                            "jsonrpc": "2.0",
-                            "method": "control.event",
-                            "params": params,
-                        });
-                        if let Ok(msg) = serde_json::to_string(&notif) {
-                            if tx_out.send(msg).await.is_err() {
-                                debug!(
-                                    "control.event forwarder: ws tx closed for {topic_for_task:?}"
-                                );
-                                break;
-                            }
+                        let msg = event_or_error(&topic_for_task, &data, include_audio, &copies);
+                        if tx_out.send(msg).await.is_err() {
+                            debug!("control.event forwarder: ws tx closed for {topic_for_task:?}");
+                            break;
                         }
                     }
                     None => {
@@ -299,20 +311,10 @@ async fn handle_subscribe(
             loop {
                 match rx.recv().await {
                     Ok(data) => {
-                        let params =
-                            runtime_data_to_event_params(&topic_for_task, &data, include_audio);
-                        let notif = json!({
-                            "jsonrpc": "2.0",
-                            "method": "control.event",
-                            "params": params,
-                        });
-                        if let Ok(msg) = serde_json::to_string(&notif) {
-                            if tx_out.send(msg).await.is_err() {
-                                debug!(
-                                    "control.event forwarder: ws tx closed for {topic_for_task:?}"
-                                );
-                                break;
-                            }
+                        let msg = event_or_error(&topic_for_task, &data, include_audio, &copies);
+                        if tx_out.send(msg).await.is_err() {
+                            debug!("control.event forwarder: ws tx closed for {topic_for_task:?}");
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -368,37 +370,34 @@ async fn handle_unsubscribe(
 }
 
 async fn handle_publish(
-    params: &Value,
+    params: &RawValue,
     request_id: &Value,
     state: &Arc<SharedState>,
     peer_id: &str,
 ) -> Result<String, String> {
-    let topic = params
-        .get("topic")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "control.publish: missing 'topic' string param".to_string())?;
+    #[derive(serde::Deserialize)]
+    struct Params<'a> {
+        topic: String,
+        #[serde(borrow)]
+        payload: &'a RawValue,
+    }
+    let params: Params<'_> = serde_json::from_str(params.get()).map_err(|e| e.to_string())?;
+    let topic = &params.topic;
     let parsed = parse_topic(topic)?;
     if parsed.direction != Direction::In {
         return Err(format!(
             "control.publish: topic {topic:?} must be an .in address"
         ));
     }
-
-    let payload = params
-        .get("payload")
-        .ok_or_else(|| "control.publish: missing 'payload'".to_string())?;
-    let data = coerce_payload_to_runtime_data(payload)?;
-
     let ctrl = resolve_session_control(state, peer_id).await?;
-    let addr = parsed.as_address();
-    ctrl.publish(&addr, data).await.map_err(|e| e.to_string())?;
-
-    Ok(json!({
-        "jsonrpc": "2.0",
-        "result": { "published": true, "topic": topic },
-        "id": request_id,
-    })
-    .to_string())
+    let data = coerce_payload(params.payload, &ctrl.transport_copy_context())?;
+    ctrl.publish(&parsed.as_address(), data)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(
+        json!({"jsonrpc":"2.0", "result":{"published":true,"topic":topic}, "id":request_id})
+            .to_string(),
+    )
 }
 
 async fn handle_set_node_state(
@@ -432,112 +431,4 @@ async fn handle_set_node_state(
         "id": request_id,
     })
     .to_string())
-}
-
-// ─── Payload coercion ───────────────────────────────────────────────────
-
-fn coerce_payload_to_runtime_data(payload: &Value) -> Result<RuntimeData, String> {
-    // Three accepted shapes:
-    //   { "text": "..." }      -> RuntimeData::Text
-    //   { "json": { ... } }    -> RuntimeData::Json
-    //   { "binary_b64": "..." } -> RuntimeData::Binary
-    if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
-        return Ok(RuntimeData::Text(t.to_string()));
-    }
-    if let Some(j) = payload.get("json") {
-        return Ok(RuntimeData::Json(j.clone()));
-    }
-    if let Some(b64) = payload.get("binary_b64").and_then(|v| v.as_str()) {
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .map_err(|e| format!("bad base64 in binary_b64: {e}"))?;
-        return Ok(RuntimeData::Binary(bytes.into()));
-    }
-    // Fall through: if the payload is itself a bare string treat it as text,
-    // and a bare object as JSON. Keeps the wire comfortable for simple cases.
-    if let Some(t) = payload.as_str() {
-        return Ok(RuntimeData::Text(t.to_string()));
-    }
-    if payload.is_object() || payload.is_array() {
-        return Ok(RuntimeData::Json(payload.clone()));
-    }
-    Err("control.publish payload: expected {text|json|binary_b64} object".to_string())
-}
-
-fn runtime_data_to_event_params(topic: &str, data: &RuntimeData, include_audio: bool) -> Value {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    match data {
-        RuntimeData::Text(s) => {
-            // Strip the `\x00<len><channel>` routing header. The
-            // browser sees only clean content, plus an explicit
-            // `channel` field so it can decide where to render
-            // (transcript line, markdown pane, etc).
-            let (channel, content) = split_text_str(s);
-            json!({
-                "topic": topic,
-                "kind": "text",
-                "payload": content,
-                "channel": channel,
-                "ts": ts,
-            })
-        }
-        RuntimeData::Json(v) => json!({
-            "topic": topic,
-            "kind": "json",
-            "payload": v,
-            "ts": ts,
-        }),
-        RuntimeData::Binary(b) => {
-            use base64::Engine as _;
-            json!({
-                "topic": topic,
-                "kind": "binary",
-                "payload": {
-                    "size": b.len(),
-                    "b64": base64::engine::general_purpose::STANDARD.encode(b),
-                },
-                "ts": ts,
-            })
-        }
-        RuntimeData::Audio {
-            samples,
-            sample_rate,
-            channels,
-            ..
-        } => {
-            // Audio for the browser rides the WebRTC audio track. We
-            // surface a liveness envelope here (size + sample rate) so
-            // UIs can still draw "audio active" meters without paying
-            // to re-encode PCM as base64 every frame. Clients that
-            // really want the samples pass `include_audio: true`.
-            let mut payload = json!({
-                "size": samples.len(),
-                "sample_rate": sample_rate,
-                "channels": channels,
-            });
-            if include_audio {
-                use base64::Engine as _;
-                // samples are f32 LE; encode the raw bytes.
-                let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-                payload["samples_b64"] =
-                    json!(base64::engine::general_purpose::STANDARD.encode(&bytes));
-            }
-            json!({
-                "topic": topic,
-                "kind": "audio",
-                "payload": payload,
-                "ts": ts,
-            })
-        }
-        other => json!({
-            "topic": topic,
-            "kind": "other",
-            "payload": { "debug": format!("{:?}", std::mem::discriminant(other)) },
-            "ts": ts,
-        }),
-    }
 }

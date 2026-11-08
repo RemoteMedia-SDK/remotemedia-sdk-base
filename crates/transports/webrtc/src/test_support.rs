@@ -69,26 +69,63 @@ pub(crate) async fn core_session(
     remotemedia_core::transport::SessionHandle,
     Arc<SessionControl>,
 ) {
+    let manifest = Arc::new(Manifest {
+        nodes: vec![NodeManifest {
+            id: "calc".into(),
+            node_type: "CalculatorNode".into(),
+            params: serde_json::json!({}),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    core_session_with_manifest(policy, manifest).await
+}
+
+pub(crate) async fn core_session_with_manifest(
+    policy: CopyPolicy,
+    manifest: Arc<Manifest>,
+) -> (
+    PipelineExecutor,
+    remotemedia_core::transport::SessionHandle,
+    Arc<SessionControl>,
+) {
     let executor = PipelineExecutor::with_config(ExecutorConfig {
         transport_materialization_policy: policy,
         ..Default::default()
     })
     .unwrap();
-    let session = executor
-        .create_session(Arc::new(Manifest {
-            nodes: vec![NodeManifest {
-                id: "calc".into(),
-                node_type: "CalculatorNode".into(),
-                params: serde_json::json!({}),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
+    let session = executor.create_session(manifest).await.unwrap();
     let control = executor.control_bus().get(&session.session_id).unwrap();
     assert!(control
         .transport_copy_context()
         .same_authority(&session.transport_copy_context()));
     (executor, session, control)
+}
+
+/// Identical external storage barriers for byte and native-sample boundaries.
+pub(crate) fn guarded_payloads() -> (
+    remotemedia_types::RuntimeData,
+    remotemedia_types::RuntimeData,
+    Arc<AtomicBool>,
+) {
+    use remotemedia_types::{RuntimeData, SharedBuffer};
+    let deny = Arc::new(AtomicBool::new(false));
+    let binary = RuntimeData::Binary(SharedBuffer::from_owner(Guarded {
+        values: vec![42u8; 16],
+        deny: deny.clone(),
+    }));
+    let audio = RuntimeData::Audio {
+        samples: SharedBuffer::from_owner(Guarded {
+            values: vec![0.5f32; 4],
+            deny: deny.clone(),
+        })
+        .into(),
+        sample_rate: 48000,
+        channels: 2,
+        stream_id: None,
+        timestamp_us: None,
+        arrival_ts_us: None,
+        metadata: None,
+    };
+    (binary, audio, deny)
 }

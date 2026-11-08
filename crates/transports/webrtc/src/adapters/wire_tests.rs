@@ -1,10 +1,6 @@
 use super::*;
-use crate::test_support::Guarded;
-use remotemedia_types::{CopyCounts, CopyPolicy, SharedBuffer};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use remotemedia_types::{CopyCounts, CopyPolicy};
+use std::sync::atomic::Ordering;
 
 fn audio(samples: Vec<f32>) -> RuntimeData {
     RuntimeData::Audio {
@@ -78,22 +74,7 @@ fn wire_output_bulk_variants_match_generated_encoder_and_count_once() {
 
 #[test]
 fn wire_output_strict_rejects_before_accessing_external_payload_storage() {
-    let deny = Arc::new(AtomicBool::new(false));
-    let samples = SharedBuffer::from_owner(Guarded {
-        values: vec![0.25f32; 4],
-        deny: deny.clone(),
-    });
-    let mut runtime_audio = audio(Vec::new());
-    if let RuntimeData::Audio {
-        samples: target, ..
-    } = &mut runtime_audio
-    {
-        *target = samples.into();
-    }
-    let binary = RuntimeData::Binary(SharedBuffer::from_owner(Guarded {
-        values: vec![42u8; 16],
-        deny: deny.clone(),
-    }));
+    let (binary, runtime_audio, deny) = crate::test_support::guarded_payloads();
     deny.store(true, Ordering::SeqCst);
     for runtime in [runtime_audio, binary] {
         let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "read-barrier");

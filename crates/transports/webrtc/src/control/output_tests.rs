@@ -1,7 +1,6 @@
 use super::*;
-use crate::test_support::Guarded;
-use remotemedia_types::{BufferBudget, CopyCounts, CopyPolicy, CopyReason, SharedBuffer};
-use std::sync::atomic::{AtomicBool, Ordering};
+use remotemedia_types::{BufferBudget, CopyCounts, CopyPolicy, CopyReason};
+use std::sync::atomic::Ordering;
 
 fn address() -> PbAddress {
     PbAddress {
@@ -118,19 +117,7 @@ fn queued_payload_retains_owner_budget_and_authority_until_drop() {
 
 #[test]
 fn strict_control_rejects_before_reading_queued_external_owners() {
-    let deny = Arc::new(AtomicBool::new(false));
-    let binary = RuntimeData::Binary(SharedBuffer::from_owner(Guarded {
-        values: vec![7u8; 16],
-        deny: deny.clone(),
-    }));
-    let mut audio = audio(Vec::new());
-    if let RuntimeData::Audio { samples, .. } = &mut audio {
-        *samples = SharedBuffer::from_owner(Guarded {
-            values: vec![0.5f32; 4],
-            deny: deny.clone(),
-        })
-        .into();
-    }
+    let (binary, audio, deny) = crate::test_support::guarded_payloads();
     deny.store(true, Ordering::SeqCst);
     let copies = CopyContext::new(CopyPolicy::RequireZeroCopy, "strict-control");
     for data in [binary, audio] {

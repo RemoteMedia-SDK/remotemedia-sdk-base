@@ -39,6 +39,8 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_yaml = { workspace = true }
 base64 = "0.22"
+# Borrow little-endian PCM bytes without a staging allocation.
+bytemuck = { workspace = true }
 # from_owner retains immutable runtime owners in WebRTC samples.
 bytes = "1.11"
 remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3" }
