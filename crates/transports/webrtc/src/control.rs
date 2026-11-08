@@ -618,7 +618,7 @@ mod buffer_owner_tests {
         let buffer = crate::generated::DataBuffer {
             data_type: Some(crate::generated::data_buffer::DataType::Binary(
                 crate::generated::BinaryBuffer {
-                    data: bytes,
+                    data: bytes.into(),
                     ..Default::default()
                 },
             )),

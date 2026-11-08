@@ -1,5 +1,5 @@
-//! Adopt already decoded protobuf byte storage. Wire decoding itself is outside
-//! this handoff; native f32 audio still needs an aligned element conversion.
+//! Retain decoded protobuf Bytes owners in runtime buffers. Owning protobuf
+//! decode preserves wire ranges; native f32 audio still needs aligned conversion.
 use super::*;
 
 pub fn data_buffer_into_runtime_data(buffer: DataBuffer) -> Option<RuntimeData> {
@@ -28,7 +28,7 @@ pub fn data_buffer_into_runtime_data_with_context(
 pub(super) fn decode_bytes(data: DataType, arrival_ts_us: Option<u64>) -> Option<RuntimeData> {
     match data {
         DataType::Video(video) => Some(RuntimeData::Video {
-            pixel_data: video.pixel_data.into(),
+            pixel_data: remotemedia_types::SharedBytes::from_owner(video.pixel_data),
             width: video.width,
             height: video.height,
             format: proto_to_pixel_format(video.format),
@@ -40,7 +40,7 @@ pub(super) fn decode_bytes(data: DataType, arrival_ts_us: Option<u64>) -> Option
             arrival_ts_us,
         }),
         DataType::Tensor(tensor) => Some(RuntimeData::Tensor {
-            data: tensor.data.into(),
+            data: remotemedia_types::SharedBytes::from_owner(tensor.data),
             shape: tensor
                 .shape
                 .into_iter()
@@ -50,9 +50,11 @@ pub(super) fn decode_bytes(data: DataType, arrival_ts_us: Option<u64>) -> Option
             dtype: tensor.dtype,
             metadata: None,
         }),
-        DataType::Binary(binary) => Some(RuntimeData::Binary(binary.data.into())),
+        DataType::Binary(binary) => Some(RuntimeData::Binary(
+            remotemedia_types::SharedBytes::from_owner(binary.data),
+        )),
         DataType::Numpy(numpy) => Some(RuntimeData::Numpy {
-            data: numpy.data.into(),
+            data: remotemedia_types::SharedBytes::from_owner(numpy.data),
             shape: numpy
                 .shape
                 .into_iter()

@@ -45,9 +45,12 @@
 //! struct literals can use `.into()`. Callers requiring mutable storage must
 //! explicitly materialize it, for example with `.to_vec()`.
 //!
-//! These guarantees cover wrapper and envelope ownership. WebRTC receive
-//! buffering, SCTP/DTLS, inner DataBuffer decoding and network/device transfers
-//! remain separate boundaries and do not have an end-to-end zero-copy guarantee.
+//! The server also decodes inner DataBuffer bulk fields from owning ranges and
+//! retains byte-backed fields through runtime conversion. Native-f32 audio still
+//! requires an aligned element conversion. Borrowed wire decoding allocates;
+//! runtime-to-protobuf fields retain owners, but protobuf wire encoding copies.
+//! WebRTC receive buffering, SCTP/DTLS, session policy binding and network/device
+//! transfers remain separate boundaries without an end-to-end zero-copy guarantee.
 //!
 //! # RTP vs Data Channel
 //!

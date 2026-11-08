@@ -79,15 +79,19 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
         .expect("legacy policy permits protobuf materialization")
 }
 
-/// Owned protobuf fields materialize bulk bytes. Reject before conversion in
-/// strict mode; count logical payload bytes separately from metadata/framing.
+/// Byte-backed protobuf fields retain runtime owners. Audio requires native-f32
+/// to little-endian byte conversion, authorized here. Encoding the resulting
+/// DataBuffer to wire bytes is a separate serialization boundary.
 pub fn runtime_data_to_data_buffer_with_context(
     data: &RuntimeData,
     context: &CopyContext,
 ) -> Result<DataBuffer, CopyRejected> {
     context.materialize(
         CopyReason::PortableSerialization,
-        data.bulk_payload_bytes() as u64,
+        match data {
+            RuntimeData::Audio { samples, .. } => (samples.len() * 4) as u64,
+            _ => 0,
+        },
         || encode_data_buffer(data),
     )
 }
@@ -124,7 +128,7 @@ fn encode_data_buffer(data: &RuntimeData) -> DataBuffer {
             stream_id: _,     // stream_id not included in protobuf (yet)
             arrival_ts_us: _, // spec 026: not included in protobuf
         } => DataType::Video(VideoFrame {
-            pixel_data: pixel_data.to_vec(),
+            pixel_data: bytes::Bytes::from_owner(pixel_data.clone()),
             width: *width,
             height: *height,
             format: pixel_format_to_proto(*format),
@@ -137,7 +141,7 @@ fn encode_data_buffer(data: &RuntimeData) -> DataBuffer {
             data, shape, dtype, ..
         } => {
             DataType::Tensor(TensorBuffer {
-                data: data.to_vec(),
+                data: bytes::Bytes::from_owner(data.clone()),
                 shape: shape.iter().map(|&s| s as u64).collect(),
                 dtype: *dtype,
                 layout: String::new(), // Empty layout - nodes document expected layout
@@ -161,14 +165,14 @@ fn encode_data_buffer(data: &RuntimeData) -> DataBuffer {
             })
         }
         RuntimeData::Binary(bytes) => DataType::Binary(BinaryBuffer {
-            data: bytes.to_vec(),
+            data: bytes::Bytes::from_owner(bytes.clone()),
             mime_type: "application/octet-stream".to_string(),
         }),
         // Image-over-WebRTC fallback: ship as Binary with a mime-type
         // hint. A first-class `ImageBuffer` proto entry is a follow-up
         // spec; vision-LLM pipelines today run image input in-process.
         RuntimeData::Image { data, format, .. } => DataType::Binary(BinaryBuffer {
-            data: data.to_vec(),
+            data: bytes::Bytes::from_owner(data.clone()),
             mime_type: format
                 .mime_type()
                 .unwrap_or("application/octet-stream")
@@ -182,7 +186,7 @@ fn encode_data_buffer(data: &RuntimeData) -> DataBuffer {
             c_contiguous,
             f_contiguous,
         } => DataType::Numpy(NumpyBuffer {
-            data: data.to_vec(),
+            data: bytes::Bytes::from_owner(data.clone()),
             shape: shape.iter().map(|&s| s as u64).collect(),
             dtype: dtype.clone(),
             strides: strides.iter().map(|&s| s as i64).collect(),
@@ -267,8 +271,9 @@ pub fn data_buffer_to_runtime_data(buffer: &DataBuffer) -> Option<RuntimeData> {
         .expect("legacy policy permits protobuf materialization")
 }
 
-/// Borrowed protobuf fields require their own runtime allocation. Malformed f32
-/// byte lengths reject instead of silently discarding trailing sample bytes.
+/// Byte-backed protobuf fields retain immutable owners even when borrowed.
+/// Audio requires an aligned f32 allocation; malformed byte lengths reject
+/// instead of silently discarding trailing sample bytes.
 pub fn data_buffer_to_runtime_data_with_context(
     buffer: &DataBuffer,
     context: &CopyContext,
@@ -280,10 +285,6 @@ pub fn data_buffer_to_runtime_data_with_context(
             }
             audio.samples.len()
         }
-        Some(DataType::Video(frame)) => frame.pixel_data.len(),
-        Some(DataType::Tensor(tensor)) => tensor.data.len(),
-        Some(DataType::Binary(binary)) => binary.data.len(),
-        Some(DataType::Numpy(numpy)) => numpy.data.len(),
         _ => 0,
     };
     context.materialize(CopyReason::PortableDeserialization, bytes as u64, || {

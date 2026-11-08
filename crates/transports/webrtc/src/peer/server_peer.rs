@@ -1050,99 +1050,32 @@ impl ServerPeer {
                                 }
                             }
 
-                            // Try to decode message as our binary DataChannelMessage envelope
-                            use crate::channels::DataChannelMessage;
-                            let parsed_msg = match DataChannelMessage::decode_owned(msg.data.clone()) {
-                                Ok(m) => Some(m),
-                                Err(e) => {
-                                    // Fallback to legacy raw DataBuffer decode for old clients
-                                    match crate::generated::DataBuffer::decode(&msg.data[..]) {
-                                        Ok(_) => {
-                                            info!("Decoded legacy raw DataBuffer from data channel (peer {})", peer_id);
-                                            Some(DataChannelMessage::runtime_data(msg.data.clone()))
-                                        }
-                                        Err(_) => {
-                                            error!("Failed to decode DataChannelMessage envelope or raw DataBuffer: {}", e);
-                                            None
-                                        }
-                                    }
-                                }
+                            // Drop the reassembly lock before awaiting pipeline backpressure.
+                            let decoded = {
+                                let mut pending = reassembler.lock().await;
+                                super::data_channel_ingress::decode_pipeline_input(
+                                    msg.data,
+                                    &mut pending,
+                                    remotemedia_types::CopyContext::legacy(),
+                                )
                             };
-
-                            if let Some(parsed) = parsed_msg {
-                                match parsed {
-                                    DataChannelMessage::RuntimeData { data_buffer, .. } => {
-                                        // Deserialize Protobuf DataBuffer
-                                        match crate::generated::DataBuffer::decode(&data_buffer[..]) {
-                                            Ok(data_buffer) => {
-                                                // Convert Protobuf DataBuffer → RuntimeData
-                                                if let Some(runtime_data) = crate::adapters::data_buffer_into_runtime_data(data_buffer) {
-                                                    info!("Decoded RuntimeData from data channel: type={}", runtime_data.data_type());
-
-                                                    let transport_data = remotemedia_core::transport::TransportData {
-                                                        data: runtime_data,
-                                                        sequence: None,
-                                                        metadata: participant_metadata(
-                                                            &peer_id,
-                                                            format!("{}:data", peer_id),
-                                                            participant::modality::CONTROL,
-                                                        ),
-                                                    };
-
-                                                    if let Err(e) = dc_input_tx.send(transport_data).await {
-                                                        error!("Failed to forward data channel message to pipeline: {}", e);
-                                                    }
-                                                } else {
-                                                    error!("Failed to convert DataBuffer to RuntimeData: invalid data type");
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to decode Protobuf DataBuffer from RuntimeData payload: {}", e);
-                                            }
-                                        }
-                                    }
-                                    DataChannelMessage::Chunk { chunk, .. } => {
-                                        let mut r = reassembler.lock().await;
-                                        if let Some(reassembled_bytes) = r.feed_chunk(&chunk) {
-                                            // Deserialize Protobuf DataBuffer from reassembled chunks
-                                            match crate::generated::DataBuffer::decode(&reassembled_bytes[..]) {
-                                                Ok(data_buffer) => {
-                                                    if let Some(runtime_data) = crate::adapters::data_buffer_into_runtime_data(data_buffer) {
-                                                        info!("Reassembled and decoded RuntimeData from chunks: type={}", runtime_data.data_type());
-
-                                                        let transport_data = remotemedia_core::transport::TransportData {
-                                                            data: runtime_data,
-                                                            sequence: None,
-                                                            metadata: participant_metadata(
-                                                                &peer_id,
-                                                                format!("{}:data", peer_id),
-                                                                participant::modality::CONTROL,
-                                                            ),
-                                                        };
-
-                                                        if let Err(e) = dc_input_tx.send(transport_data).await {
-                                                            error!("Failed to forward reassembled data to pipeline: {}", e);
-                                                        }
-                                                    } else {
-                                                        error!("Failed to convert reassembled DataBuffer to RuntimeData: invalid data type");
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("Failed to decode Protobuf DataBuffer from reassembled payload: {}", e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    DataChannelMessage::Control { action, json, .. } => {
-                                        info!("Received control message on data-plane channel: action={}, json={}", action, json);
-                                    }
-                                    DataChannelMessage::Text { action, text, .. } => {
-                                        info!("Received text message on data-plane channel: action={}, text={}", action, text);
-                                    }
-                                    DataChannelMessage::Binary { action, data, .. } => {
-                                        info!("Received binary message on data-plane channel: action={}, bytes={}", action, data.len());
+                            match decoded {
+                                Ok(Some(runtime_data)) => {
+                                    let transport_data = remotemedia_core::transport::TransportData {
+                                        data: runtime_data,
+                                        sequence: None,
+                                        metadata: participant_metadata(
+                                            &peer_id,
+                                            format!("{}:data", peer_id),
+                                            participant::modality::CONTROL,
+                                        ),
+                                    };
+                                    if let Err(e) = dc_input_tx.send(transport_data).await {
+                                        error!("Failed to forward data channel message to pipeline: {}", e);
                                     }
                                 }
+                                Ok(None) => {}
+                                Err(e) => error!("Failed to decode pipeline data from peer {}: {}", peer_id, e),
                             }
                         })
                     }));

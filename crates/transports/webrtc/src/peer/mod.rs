@@ -8,6 +8,9 @@ pub mod manager;
 pub mod scanner;
 
 #[cfg(any(feature = "grpc-signaling", feature = "ws-signaling"))]
+mod data_channel_ingress;
+
+#[cfg(any(feature = "grpc-signaling", feature = "ws-signaling"))]
 pub mod server_peer;
 
 pub use connection::{ConnectionState, PeerConnection};

@@ -64,8 +64,8 @@ pub mod data_buffer {
 pub struct AudioBuffer {
     /// Raw audio samples (interleaved, little-endian)
     /// Size = num_samples * channels * format.bytes_per_sample()
-    #[prost(bytes = "vec", tag = "1")]
-    pub samples: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub samples: ::prost::bytes::Bytes,
     /// Sample rate in Hz (e.g., 8000, 16000, 44100, 48000)
     #[prost(uint32, tag = "2")]
     pub sample_rate: u32,
@@ -98,8 +98,8 @@ pub struct AudioBuffer {
 pub struct VideoFrame {
     /// Raw pixel data or encoded bitstream
     /// Layout determined by PixelFormat (raw) or VideoCodec (encoded)
-    #[prost(bytes = "vec", tag = "1")]
-    pub pixel_data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub pixel_data: ::prost::bytes::Bytes,
     /// Frame width in pixels (must be > 0)
     #[prost(uint32, tag = "2")]
     pub width: u32,
@@ -143,8 +143,8 @@ pub struct VideoFrame {
 pub struct TensorBuffer {
     /// Raw tensor data (row-major layout by default)
     /// Must match calculated size from shape and dtype
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub data: ::prost::bytes::Bytes,
     /// Shape array (e.g., \[1, 3, 224, 224\] for batch=1, channels=3, 224x224 image)
     /// Empty shape = scalar, \[N\] = vector, \[N, M\] = matrix
     #[prost(uint64, repeated, tag = "2")]
@@ -176,8 +176,8 @@ pub struct TensorBuffer {
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NumpyBuffer {
     /// Raw array data (bytes)
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub data: ::prost::bytes::Bytes,
     /// Array shape (dimensions)
     /// Example: \[960\] for 1D, \[960, 2\] for stereo audio
     #[prost(uint64, repeated, tag = "2")]
@@ -264,8 +264,8 @@ pub struct TextBuffer {
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BinaryBuffer {
     /// Raw binary data
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub data: ::prost::bytes::Bytes,
     /// MIME type hint
     /// Examples: "application/octet-stream", "image/png", "application/protobuf"
     /// Not validated by protocol (client responsibility)
