@@ -977,6 +977,7 @@ impl ServerPeer {
         let dc_input_tx_for_dc = dc_input_tx.clone();
         let dc_input_tx_for_track = dc_input_tx.clone();
         let copies_for_dc = shared_session.core.transport_copy_context().await;
+        let allocator_for_track = shared_session.core.output_allocator().await;
 
         // Clone event_tx for closures (FFI event forwarding)
         #[cfg(feature = "ws-signaling")]
@@ -1109,6 +1110,7 @@ impl ServerPeer {
                 let peer_id = peer_id_for_track.clone();
                 let dc_input_tx = dc_input_tx_for_track.clone();
                 let peer_connection = Arc::clone(&peer_connection_for_track);
+                let output_allocator = allocator_for_track.clone();
 
                 Box::pin(async move {
                     info!("Remote track added for peer {}: kind={}", peer_id, track.kind());
@@ -1184,7 +1186,9 @@ impl ServerPeer {
                             };
 
                             // Decode Opus payload to audio samples
-                            match audio_track.on_rtp_packet(&rtp_packet.payload).await {
+                            match audio_track.on_rtp_packet_with_allocator(
+                                &rtp_packet.payload, output_allocator.as_ref(),
+                            ).await {
                                 Ok(samples) => {
                                     // Diagnostic: every ~50 packets (~1s at 50Hz),
                                     // log RMS + peak so we can confirm whether mic
@@ -1200,7 +1204,7 @@ impl ServerPeer {
                                         let len = samples.len();
                                         let mut peak: f32 = 0.0;
                                         let mut sumsq: f64 = 0.0;
-                                        for s in &samples {
+                                        for s in samples.as_slice() {
                                             let a = s.abs();
                                             if a > peak { peak = a; }
                                             sumsq += (*s as f64) * (*s as f64);

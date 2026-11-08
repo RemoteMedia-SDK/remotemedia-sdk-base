@@ -6,7 +6,6 @@
 #![allow(dead_code)]
 
 mod wire_output;
-use crate::media::tracks::rtp_to_runtime_data;
 use crate::peer::PeerManager;
 use crate::session::{Session, SessionId};
 use crate::sync::RtpHeader;
@@ -660,7 +659,9 @@ impl SessionRouter {
                 let audio_track = peer.audio_track().await.ok_or_else(|| {
                     Error::MediaTrackError("No audio track configured".to_string())
                 })?;
-                rtp_to_runtime_data(payload, true, Some(&audio_track), None).await?
+                crate::media::tracks::audio_rtp_to_runtime_data(
+                    payload, &audio_track, self.output_allocator.as_ref(),
+                ).await?
             } else {
                 let video_track = peer.video_track().await.ok_or_else(|| {
                     Error::MediaTrackError("No video track configured".to_string())

@@ -167,6 +167,35 @@ unsafe impl Send for AudioDecoder {}
 unsafe impl Sync for AudioDecoder {}
 
 impl AudioDecoder {
+    /// Decode directly into the selected final owner. Allocation failure occurs
+    /// before decoding advances codec state; there is no heap fallback.
+    pub fn decode_with_allocator(
+        &mut self,
+        payload: &[u8],
+        allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<remotemedia_types::SharedBuffer<f32>> {
+        // Empty packets request loss concealment. Keep the legacy 120 ms window
+        // at 48 kHz, scaled to the decoder rate at other supported rates.
+        let frames = if payload.is_empty() {
+            self.config.sample_rate as usize * 120 / 1000
+        } else {
+            self.decoder
+                .get_nb_samples(payload)
+                .map_err(|e| Error::EncodingError(format!("Invalid Opus packet: {e}")))?
+        };
+        let mut output = allocator
+            .allocate_audio(frames * usize::from(self.config.channels))
+            .map_err(|e| Error::EncodingError(format!("Opus output allocation failed: {e}")))?;
+        let frames_written = self
+            .decoder
+            .decode_float(payload, output.as_mut_slice(), false)
+            .map_err(|e| Error::EncodingError(format!("Opus decoding failed: {e}")))?;
+        output
+            .freeze()
+            .slice(0..frames_written * usize::from(self.config.channels))
+            .map_err(|e| Error::EncodingError(format!("Invalid Opus output length: {e}")))
+    }
+
     /// Create a new audio decoder
     pub fn new(config: AudioEncoderConfig) -> Result<Self> {
         // Validate configuration
@@ -222,6 +251,10 @@ impl AudioDecoder {
         Ok(output)
     }
 }
+
+#[cfg(test)]
+#[path = "audio_decode_tests.rs"]
+mod audio_decode_tests;
 
 #[cfg(test)]
 mod tests {

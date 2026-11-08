@@ -345,6 +345,15 @@ impl AudioTrack {
         Ok(samples)
     }
 
+    /// Decode PCM into the session-selected owner, retaining its allocation credit.
+    pub async fn on_rtp_packet_with_allocator(
+        &self,
+        payload: &[u8],
+        allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<SharedBuffer<f32>> {
+        self.decoder.write().decode_with_allocator(payload, allocator)
+    }
+
     /// Drain queued TTS packets and discard any incomplete PCM frame
     /// without stopping the sender thread.
     ///
@@ -1019,6 +1028,25 @@ fn now_micros() -> u64 {
         .as_micros() as u64
 }
 
+/// Decode a complete Opus payload into the selected ingress owner.
+pub(crate) async fn audio_rtp_to_runtime_data(
+    payload: &[u8],
+    track: &AudioTrack,
+    allocator: &dyn remotemedia_types::OutputAllocator,
+) -> Result<RuntimeData> {
+    let arrival_ts_us = Some(now_micros());
+    let samples = track.on_rtp_packet_with_allocator(payload, allocator).await?;
+    Ok(RuntimeData::Audio {
+        samples: samples.into(),
+        sample_rate: 48000,
+        channels: 1,
+        stream_id: None,
+        timestamp_us: None,
+        arrival_ts_us,
+        metadata: None,
+    })
+}
+
 /// Convert RTP payload to RuntimeData (T073)
 ///
 /// # Arguments
@@ -1050,18 +1078,7 @@ pub async fn rtp_to_runtime_data(
             Error::MediaTrackError("No audio track available for decoding".to_string())
         })?;
 
-        // Decode Opus to f32 samples
-        let samples = audio_track.on_rtp_packet(payload).await?;
-
-        Ok(RuntimeData::Audio {
-            samples: samples.into(),
-            sample_rate: 48000, // Opus always decodes to 48kHz
-            channels: 1,        // Assuming mono for now
-            stream_id: None,
-            timestamp_us: None,
-            arrival_ts_us,
-            metadata: None,
-        })
+        audio_rtp_to_runtime_data(payload, audio_track, &remotemedia_types::HeapOutputAllocator).await
     } else {
         let video_track = video_track.ok_or_else(|| {
             Error::MediaTrackError("No video track available for decoding".to_string())
