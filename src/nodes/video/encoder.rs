@@ -150,11 +150,22 @@ impl VideoEncoderNode {
     /// - Encoding operation fails (codec error, buffer issues, etc.)
     /// - Task cannot be spawned on the blocking thread pool
     pub async fn encode_frame(&self, input: RuntimeData) -> Result<RuntimeData, CodecError> {
+        self.encode_frame_with_copy_context(input, remotemedia_types::CopyContext::legacy())
+            .await
+    }
+
+    /// Encode using the caller's authority for transfers into backend storage.
+    pub async fn encode_frame_with_copy_context(
+        &self,
+        input: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<RuntimeData, CodecError> {
         let encoder = Arc::clone(&self.encoder);
+        let copies = copies.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut enc = encoder.lock().unwrap();
-            enc.encode(input)
+            enc.encode_with_copy_context(input, &copies)
         })
         .await
         .map_err(|e| CodecError::EncodingFailed(e.to_string()))?
@@ -202,16 +213,9 @@ impl AsyncStreamingNode for VideoEncoderNode {
         let copies = ctx.copy_context().ok_or_else(|| {
             Error::Execution("VideoEncoder requires context copy authority".into())
         })?;
-        let encoder = Arc::clone(&self.encoder);
-        tokio::task::spawn_blocking(move || {
-            encoder
-                .lock()
-                .unwrap()
-                .encode_with_copy_context(input, &copies)
-        })
-        .await
-        .map_err(|e| Error::Execution(format!("Encoder task failed: {e}")))?
-        .map_err(|e| Error::Execution(format!("Encoding failed: {e}")))
+        self.encode_frame_with_copy_context(input, &copies)
+            .await
+            .map_err(|e| Error::Execution(format!("Encoding failed: {e}")))
     }
 
     async fn process_multi_with_ctx(

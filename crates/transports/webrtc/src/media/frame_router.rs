@@ -188,7 +188,7 @@ impl FrameRouter {
 
         // Send video through the track
         track
-            .send_video_runtime_data(data)
+            .send_video_runtime_data_with_context(data, &self.copies)
             .await
             .map_err(|e| Error::MediaTrackError(format!("Failed to send video: {}", e)))?;
 

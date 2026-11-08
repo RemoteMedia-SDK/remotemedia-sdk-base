@@ -38,7 +38,15 @@ impl VideoEncoderNode {
     pub fn new(_config: VideoEncoderConfig) -> Result<Self> {
         Ok(Self)
     }
-    pub async fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
+    pub async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
+        self.encode_frame_with_copy_context(data, CopyContext::legacy())
+            .await
+    }
+    pub async fn encode_frame_with_copy_context(
+        &self,
+        _data: RuntimeData,
+        _copies: &CopyContext,
+    ) -> Result<RuntimeData> {
         Err(crate::Error::EncodingError(
             "Video support is disabled".to_string(),
         ))
@@ -77,6 +85,25 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 #[cfg(test)]
 #[path = "audio_track_owner_tests.rs"]
 mod audio_owner_tests;
+
+#[cfg(all(test, not(feature = "video")))]
+#[tokio::test]
+async fn video_copy_disabled_backend_keeps_explicit_error_without_materialization() {
+    let encoder = VideoEncoderNode;
+    let copies = CopyContext::new(remotemedia_types::CopyPolicy::RequireZeroCopy, "disabled-video");
+    let error = encoder
+        .encode_frame_with_copy_context(RuntimeData::Binary(vec![1].into()), &copies)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Video support is disabled"));
+    assert!(encoder.process(RuntimeData::Binary(vec![1].into())).await.is_err());
+    assert!(copies.report().entries.iter()
+        .all(|(_, c)| c.copied_bytes == 0 && c.rejected == 0));
+}
+
+#[cfg(all(test, feature = "video"))]
+#[path = "video_copy_tests.rs"]
+pub(crate) mod video_copy_tests;
 
 /// Audio track for WebRTC
 ///
@@ -495,12 +522,21 @@ impl VideoTrack {
     ///
     /// Phase 5 T067, T078: RTP transmission with 90kHz timestamp mapping
     pub async fn send_video_runtime_data(&self, runtime_data: RuntimeData) -> Result<()> {
-        use remotemedia_core::nodes::streaming_node::AsyncStreamingNode;
+        self.send_video_runtime_data_with_context(runtime_data, CopyContext::legacy())
+            .await
+    }
 
+    /// Encode with caller-owned copy authority, then retain the encoded owner
+    /// through RTP sample submission. Backend/network-internal copies are separate.
+    pub async fn send_video_runtime_data_with_context(
+        &self,
+        runtime_data: RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<()> {
         // Encode raw frame using core VideoEncoderNode
         let encoded = self
             .encoder
-            .process(runtime_data)
+            .encode_frame_with_copy_context(runtime_data, copies)
             .await
             .map_err(|e| Error::EncodingError(format!("Video encoding failed: {}", e)))?;
 

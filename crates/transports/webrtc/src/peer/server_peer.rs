@@ -344,6 +344,7 @@ impl PerTrackDispatcher {
         let stream = stream_id.to_string();
         let registry = self.track_registry.clone();
         let peer = self.peer_id.clone();
+        let copies = self.copies.clone();
         tokio::spawn(async move {
             while let Some(td) = rx.recv().await {
                 let Some(track) = registry.get_video_track(&stream).await else {
@@ -353,7 +354,7 @@ impl PerTrackDispatcher {
                     );
                     continue;
                 };
-                if let Err(e) = track.send_video_runtime_data(td.data).await {
+                if let Err(e) = track.send_video_runtime_data_with_context(td.data, &copies).await {
                     warn!(
                         "video send failed for stream '{}' (peer {}): {}",
                         stream, peer, e
@@ -1545,6 +1546,10 @@ impl Drop for ServerPeer {
 #[cfg(test)]
 #[path = "audio_dispatch_tests.rs"]
 mod audio_dispatch_tests;
+
+#[cfg(all(test, feature = "video"))]
+#[path = "video_dispatch_tests.rs"]
+mod video_dispatch_tests;
 
 #[cfg(test)]
 mod tests {

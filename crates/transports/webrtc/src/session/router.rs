@@ -517,7 +517,7 @@ pub struct SessionRouter {
 }
 
 impl SessionRouter {
-    /// Bind audio materialization to the owning pipeline's transport authority.
+    /// Bind media and wire materialization to the pipeline's transport authority.
     pub fn with_copy_context(mut self, copies: remotemedia_types::CopyContext) -> Self {
         self.copies = copies;
         self
@@ -761,7 +761,9 @@ impl SessionRouter {
                 };
 
                 // Send video directly (handles encoding + RTP transmission)
-                video_track.send_video(&frame).await?;
+                video_track
+                    .send_video_runtime_data_with_context(frame.as_runtime_data(), &self.copies)
+                    .await?;
 
                 // Record outgoing video metrics
                 self.metrics
@@ -1308,6 +1310,10 @@ impl SessionRouter {
 #[cfg(test)]
 #[path = "router_wire_tests.rs"]
 mod wire_tests;
+
+#[cfg(all(test, feature = "video"))]
+#[path = "router_video_copy_tests.rs"]
+mod video_copy_tests;
 
 #[cfg(test)]
 mod tests {
