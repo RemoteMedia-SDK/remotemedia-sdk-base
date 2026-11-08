@@ -1,7 +1,8 @@
 //! Multiprocess executor for Python nodes
 //!
 //! Implements NodeExecutor trait to manage Python nodes running in separate processes
-//! with iceoryx2 shared memory IPC for zero-copy data transfer.
+//! with legacy iceoryx2 wire IPC. Native staging is counted compatibility work;
+//! mapped descriptor workers provide strict zero-copy bulk transport.
 
 use crate::executor::node_executor::{
     NodeContext as ExecutorNodeContext, NodeExecutor as ExecutorNodeExecutor,
@@ -22,6 +23,8 @@ use super::health_monitor::{HealthMonitor, ProcessEvent};
 use super::ipc_channel::{ChannelHandle, ChannelRegistry};
 #[cfg(feature = "multiprocess")]
 use super::process_manager::{ExitReason, ProcessHandle, ProcessManager};
+#[cfg(feature = "multiprocess")]
+use remotemedia_types::{CopyContext, SharedBytes};
 
 #[cfg(feature = "docker")]
 use super::docker_support::DockerSupport;
@@ -75,14 +78,15 @@ fn global_sessions(
 #[cfg(feature = "multiprocess")]
 enum IpcCommand {
     /// Send data to the node's input channel (serialized Python wire bytes)
-    SendData { bytes: Vec<u8> },
+    SendData { bytes: Vec<u8>, copies: CopyContext },
     /// Register a bounded callback channel for continuous output forwarding.
     ///
     /// The IPC thread uses `blocking_send` on this channel, so a full queue
     /// will back-pressure the iceoryx2 subscriber loop — which in turn back-
     /// pressures the Python process via iceoryx2's own publisher limits.
     RegisterOutputCallback {
-        callback_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        callback_tx: tokio::sync::mpsc::Sender<SharedBytes>,
+        copies: CopyContext,
     },
     /// Request graceful shutdown of the IPC thread
     Shutdown,
@@ -92,11 +96,28 @@ enum IpcCommand {
 #[cfg(feature = "multiprocess")]
 enum IpcResponse {
     /// Data received from the node's output channel (serialized Python wire bytes)
-    OutputData(Vec<u8>),
+    OutputData(SharedBytes),
     /// Acknowledgment that data was sent successfully
     SendComplete,
     /// Error occurred during IPC operation
     Error(String),
+}
+
+/// Retain one wire owner in each bounded delivery lane. Preserve callback-first
+/// blocking/backpressure and response delivery even when the callback closes.
+#[cfg(feature = "multiprocess")]
+fn deliver_ipc_output(
+    output: SharedBytes,
+    callback: &mut Option<tokio::sync::mpsc::Sender<SharedBytes>>,
+    response: &tokio::sync::mpsc::Sender<IpcResponse>,
+) {
+    if let Some(sender) = callback {
+        if sender.blocking_send(output.clone()).is_err() {
+            tracing::debug!("Legacy IPC output callback closed");
+            *callback = None;
+        }
+    }
+    let _ = response.blocking_send(IpcResponse::OutputData(output));
 }
 
 /// Handle a single runtime control message read from a Python node's
@@ -691,7 +712,10 @@ impl MultiprocessExecutor {
             ctx.node_id
         );
         ipc_thread_cmd_tx
-            .send(IpcCommand::SendData { bytes: ipc_data })
+            .send(IpcCommand::SendData {
+                bytes: ipc_data,
+                copies: copies.clone(),
+            })
             .await
             .map_err(|e| Error::Execution(format!("Failed to send to IPC thread: {}", e)))?;
 
@@ -821,6 +845,8 @@ impl MultiprocessExecutor {
     /// from a node's IPC thread. The callback will receive ALL outputs from
     /// the node, independent of any input processing.
     ///
+    /// Callback messages retain a SharedBytes wire owner. Consumers needing a
+    /// mutable Vec must explicitly materialize it under their copy policy.
     /// The sender is bounded — the caller chooses the capacity. The IPC
     /// thread uses `blocking_send`, so a full receiver applies real
     /// backpressure all the way back to the Python process.
@@ -829,8 +855,33 @@ impl MultiprocessExecutor {
         &self,
         node_id: &str,
         session_id: &str,
-        callback_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        callback_tx: tokio::sync::mpsc::Sender<SharedBytes>,
     ) -> Result<()> {
+        self.register_output_callback_with_copy_context(
+            node_id,
+            session_id,
+            callback_tx,
+            CopyContext::legacy(),
+        )
+        .await
+    }
+
+    /// Bind continuously produced output to this session/node authority. This
+    /// context is not replaced by later input requests. Registration applies to
+    /// subsequent native receives, not frames already copied before it arrives.
+    #[cfg(feature = "multiprocess")]
+    pub async fn register_output_callback_with_copy_context(
+        &self,
+        node_id: &str,
+        session_id: &str,
+        callback_tx: tokio::sync::mpsc::Sender<SharedBytes>,
+        copies: &CopyContext,
+    ) -> Result<()> {
+        if copies.policy() != remotemedia_types::CopyPolicy::AllowCopies {
+            return Err(Error::Execution(
+                "Legacy Python output requires allow_copies; use mapped execution".into(),
+            ));
+        }
         // Get the IPC thread from global sessions storage
         let global_sessions = global_sessions();
         let sessions = global_sessions.read().await;
@@ -848,7 +899,10 @@ impl MultiprocessExecutor {
 
         // Send register command to IPC thread
         ipc_thread_cmd_tx
-            .send(IpcCommand::RegisterOutputCallback { callback_tx })
+            .send(IpcCommand::RegisterOutputCallback {
+                callback_tx,
+                copies: copies.clone(),
+            })
             .await
             .map_err(|e| {
                 Error::Execution(format!(
@@ -874,74 +928,21 @@ impl MultiprocessExecutor {
         session_id: &str,
         input: crate::data::RuntimeData,
     ) -> Result<()> {
-        tracing::info!(
-            "[send_data_to_node] START: node_id='{}', session_id='{}'",
-            node_id,
-            session_id
-        );
-
-        // Convert input to Python IPC wire bytes
-        let ipc_data = Self::to_ipc_runtime_data(&input, session_id)?;
-
-        tracing::info!(
-            "[send_data_to_node] Converted RuntimeData to IPC wire: {} bytes",
-            ipc_data.len()
-        );
-
-        // Get the IPC thread from global sessions storage
-        let global_sessions = global_sessions();
-        let sessions = global_sessions.read().await;
-
-        let session = sessions.get(session_id).ok_or_else(|| {
-            let available: Vec<_> = sessions.keys().collect();
-            Error::Execution(format!(
-                "Session {} not found. Available: {:?}",
-                session_id, available
-            ))
-        })?;
-
-        let ipc_thread_cmd_tx = session
-            .get(node_id)
-            .ok_or_else(|| {
-                let available: Vec<_> = session.keys().collect();
-                Error::Execution(format!(
-                    "IPC thread not found for node {}. Available: {:?}",
-                    node_id, available
-                ))
-            })?
-            .clone();
-
-        drop(sessions);
-
-        // Send data to IPC thread (no waiting for outputs)
-        tracing::info!(
-            "[send_data_to_node] Queuing data to IPC thread for node '{}'",
-            node_id
-        );
-
-        match ipc_thread_cmd_tx
-            .send(IpcCommand::SendData { bytes: ipc_data })
+        self.send_to_node_async_with_copy_context(node_id, session_id, input, CopyContext::legacy())
             .await
-        {
-            Ok(_) => {
-                tracing::info!(
-                    "[send_data_to_node] Successfully queued data to IPC thread for node '{}'",
-                    node_id
-                );
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!(
-                    "[send_data_to_node] Failed to send to IPC thread for node '{}': {}",
-                    node_id,
-                    e
-                );
-                Err(Error::Execution(format!(
-                    "Failed to send to IPC thread for node {}: {}",
-                    node_id, e
-                )))
-            }
-        }
+    }
+
+    /// Queue input with explicit authority retained through native publication.
+    #[cfg(feature = "multiprocess")]
+    pub async fn send_data_to_node_with_copy_context(
+        &self,
+        node_id: &str,
+        session_id: &str,
+        input: crate::data::RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<()> {
+        self.send_to_node_async_with_copy_context(node_id, session_id, input, copies)
+            .await
     }
 
     /// Send data to a node's IPC thread without waiting for response (fire-and-forget)
@@ -953,8 +954,30 @@ impl MultiprocessExecutor {
         session_id: &str,
         data: crate::data::RuntimeData,
     ) -> Result<()> {
+        self.send_to_node_async_with_copy_context(node_id, session_id, data, CopyContext::legacy())
+            .await
+    }
+
+    /// Legacy asynchronous ingress requires allow_copies even for metadata: a
+    /// Python invocation may emit bulk data. Success means queued, not sent.
+    #[cfg(feature = "multiprocess")]
+    pub async fn send_to_node_async_with_copy_context(
+        &self,
+        node_id: &str,
+        session_id: &str,
+        data: crate::data::RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<()> {
+        if copies.policy() != remotemedia_types::CopyPolicy::AllowCopies {
+            return Err(Error::Execution(
+                "Legacy Python execution requires allow_copies; use mapped execution".into(),
+            ));
+        }
         // Convert to Python IPC wire bytes
-        let ipc_data = Self::to_ipc_runtime_data(&data, session_id)?;
+        let ipc_data = crate::multiprocess::data_transfer::to_python_wire_with_copy_context(
+            &data, session_id, copies,
+        )
+        .map_err(Error::Execution)?;
 
         // Get the IPC thread from global sessions storage
         let global_sessions = global_sessions();
@@ -988,7 +1011,10 @@ impl MultiprocessExecutor {
             session_id
         );
         ipc_thread_cmd_tx
-            .send(IpcCommand::SendData { bytes: ipc_data })
+            .send(IpcCommand::SendData {
+                bytes: ipc_data,
+                copies: copies.clone(),
+            })
             .await
             .map_err(|e| {
                 Error::Execution(format!(
@@ -1011,10 +1037,21 @@ impl MultiprocessExecutor {
 
     /// Convert Python IPC wire bytes back to main RuntimeData
     #[cfg(feature = "multiprocess")]
-    pub fn from_ipc_runtime_data(bytes: Vec<u8>) -> Result<crate::data::RuntimeData> {
+    pub fn from_ipc_runtime_data(
+        bytes: impl Into<SharedBytes>,
+    ) -> Result<crate::data::RuntimeData> {
+        Self::from_ipc_runtime_data_with_copy_context(bytes, CopyContext::legacy())
+    }
+
+    /// Retain an owned wire frame; charge required decoding to the given ledger.
+    #[cfg(feature = "multiprocess")]
+    pub fn from_ipc_runtime_data_with_copy_context(
+        bytes: impl Into<SharedBytes>,
+        copies: &CopyContext,
+    ) -> Result<crate::data::RuntimeData> {
         crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(
             bytes.into(),
-            remotemedia_types::CopyContext::legacy(),
+            copies,
         )
         .map_err(|e| Error::Execution(format!("Invalid IPC wire data: {e}")))
     }
@@ -2186,13 +2223,16 @@ sys.stdout.flush()
             // Optional bounded callback for continuous output forwarding.
             // Uses blocking_send from this sync OS thread so a full queue
             // naturally stalls the iceoryx2 subscriber loop below.
-            let mut output_callback: Option<tokio::sync::mpsc::Sender<Vec<u8>>> = None;
+            let mut output_callback: Option<tokio::sync::mpsc::Sender<SharedBytes>> = None;
+            // Independent of request SendData authority: sources may emit between
+            // calls. A registered consumer supplies the stable session/node scope.
+            let mut output_copies = CopyContext::legacy().clone();
 
             // Main loop: process commands using persistent publishers/subscribers
             loop {
                 // Check for commands (non-blocking poll)
                 match cmd_rx.try_recv() {
-                    Ok(IpcCommand::SendData { bytes }) => {
+                    Ok(IpcCommand::SendData { bytes, copies }) => {
                         // Per-frame hot path: keep tracing at trace!/debug! to avoid
                         // allocating a format-args record per audio frame. Use
                         // `RUST_LOG=remotemedia_core::python::multiprocess=trace` to
@@ -2203,7 +2243,7 @@ sys.stdout.flush()
                             bytes.len()
                         );
 
-                        match publisher.send(&bytes) {
+                        match publisher.send_with_copy_context(&bytes, &copies) {
                             Ok(_) => {
                                 tracing::trace!(
                                     "[IPC Thread] Node '{}': Successfully published data to iceoryx2",
@@ -2231,12 +2271,16 @@ sys.stdout.flush()
                         // The subscriber will be polled continuously even between commands
                         // to ensure we capture all output from streaming nodes
                     }
-                    Ok(IpcCommand::RegisterOutputCallback { callback_tx }) => {
+                    Ok(IpcCommand::RegisterOutputCallback {
+                        callback_tx,
+                        copies,
+                    }) => {
                         tracing::debug!(
                             "IPC thread registered output callback for node: {}",
                             node_id_clone
                         );
                         output_callback = Some(callback_tx);
+                        output_copies = copies;
                     }
                     Ok(IpcCommand::Shutdown) => {
                         tracing::debug!("IPC thread shutting down for node: {}", node_id_clone);
@@ -2273,26 +2317,9 @@ sys.stdout.flush()
 
                         // No command, poll subscriber for incoming data
                         // Use receive_bytes() for Python IPC — the wire format is not bincode
-                        match subscriber.receive_bytes() {
+                        match subscriber.receive_shared_bytes_with_copy_context(&output_copies) {
                             Ok(Some(output_data)) => {
-                                // If we have a registered callback, use it (for continuous forwarding).
-                                // blocking_send applies backpressure: when the downstream
-                                // consumer is slow the send blocks this IPC thread, which
-                                // stalls `subscriber.receive()` below, which back-pressures
-                                // the Python publisher via iceoryx2.
-                                if let Some(ref cb) = output_callback {
-                                    if let Err(e) = cb.blocking_send(output_data.clone()) {
-                                        tracing::error!(
-                                            "Failed to send output via callback for node {}: {}",
-                                            node_id_clone,
-                                            e
-                                        );
-                                        // Callback channel closed, clear it
-                                        output_callback = None;
-                                    }
-                                }
-                                // Also send via response channel (for backwards compat)
-                                let _ = resp_tx.blocking_send(IpcResponse::OutputData(output_data));
+                                deliver_ipc_output(output_data, &mut output_callback, &resp_tx);
                             }
                             Ok(None) => {
                                 // No data, yield to scheduler (avoids 100% CPU but minimal latency)
@@ -3432,3 +3459,7 @@ except Exception as e:
         );
     }
 }
+
+#[cfg(all(test, feature = "multiprocess"))]
+#[path = "legacy_ipc_tests.rs"]
+mod legacy_ipc_tests;

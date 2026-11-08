@@ -27,10 +27,10 @@ use remotemedia_core::data::RuntimeData;
 use remotemedia_core::executor::PipelineGraph;
 use remotemedia_core::metrics::RtProbeSet;
 use remotemedia_core::nodes::{StreamingNode, StreamingNodeRegistry};
+use remotemedia_core::telemetry::publisher::record_node_error;
 use remotemedia_core::telemetry::{
     approx_payload_bytes, NoQueue, QueueCapacity, SessionDescriptor, SessionTelemetry,
 };
-use remotemedia_core::telemetry::publisher::record_node_error;
 use remotemedia_core::transport::perf_aggregator::PerfAggregator;
 use remotemedia_core::transport::session_control::{NodeState, SessionControl};
 use std::collections::HashMap;
@@ -883,7 +883,12 @@ impl SessionRouter {
 
                     // Register callback with IPC thread
                     if let Err(e) = executor
-                        .register_output_callback(&node_id_clone, &session_id, output_tx)
+                        .register_output_callback_with_copy_context(
+                            &node_id_clone,
+                            &session_id,
+                            output_tx,
+                            &runtime_ctx.materialization,
+                        )
                         .await
                     {
                         error!(
@@ -900,6 +905,7 @@ impl SessionRouter {
                         let router_tx_for_drain = router_tx.clone();
                         let node_id_for_drain = node_id_clone.clone();
                         let session_id_for_drain = session_id.clone();
+                        let output_copies = runtime_ctx.materialization.clone();
 
                         tokio::spawn(async move {
                             let mut sub_sequence = 0;
@@ -914,7 +920,10 @@ impl SessionRouter {
                                 sub_sequence += 1;
 
                                 // Convert IPC wire bytes to RuntimeData
-                                match MultiprocessExecutor::from_ipc_runtime_data(ipc_output) {
+                                match MultiprocessExecutor::from_ipc_runtime_data_with_copy_context(
+                                    ipc_output,
+                                    &output_copies,
+                                ) {
                                     Ok(output_data) => {
                                         let output_packet = DataPacket {
                                             data: output_data,
@@ -1078,7 +1087,13 @@ impl SessionRouter {
                             debug!("✅ Node '{}' produced {} outputs", node_id_clone, count);
                         }
                         Err(e) => {
-                            record_node_error(&tel, node_idx, node_control.as_deref(), &node_id_clone, &e.to_string());
+                            record_node_error(
+                                &tel,
+                                node_idx,
+                                node_control.as_deref(),
+                                &node_id_clone,
+                                &e.to_string(),
+                            );
                             error!("Streaming node '{}' failed: {}", node_id_clone, e);
                         }
                     }
@@ -1111,7 +1126,13 @@ impl SessionRouter {
                             }
                         }
                         Err(e) => {
-                            record_node_error(&tel, node_idx, node_control.as_deref(), &node_id_clone, &e.to_string());
+                            record_node_error(
+                                &tel,
+                                node_idx,
+                                node_control.as_deref(),
+                                &node_id_clone,
+                                &e.to_string(),
+                            );
                             error!("Node '{}' failed: {}", node_id_clone, e);
                         }
                     }

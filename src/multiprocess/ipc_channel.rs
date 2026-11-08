@@ -1,7 +1,8 @@
 //! IPC channel management using iceoryx2
 //!
-//! Provides zero-copy shared memory channels for inter-process communication
-//! between Python nodes using the iceoryx2 publish-subscribe pattern.
+//! Legacy compatibility channels over iceoryx2 shared memory. Serialized wire
+//! transfers still copy into/out of loans; mapped descriptor workers provide
+//! strict zero-copy bulk forwarding.
 
 use crate::{Error, Result};
 #[cfg(feature = "multiprocess")]
@@ -15,6 +16,8 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
 use remotemedia_types::RuntimeData;
+#[cfg(feature = "multiprocess")]
+use remotemedia_types::{CopyContext, CopyReason, SharedBytes};
 
 /// Global shared channel registry instance
 /// All MultiprocessExecutor instances will use this single registry to ensure
@@ -516,52 +519,18 @@ pub struct Publisher<'a> {
 impl<'a> Publisher<'a> {
     /// Publish data to the channel (synchronous - iceoryx2 is lock-free)
     pub fn publish(&self, data: &RuntimeData) -> Result<()> {
-        // Serialize RuntimeData to bytes via msgpack
-        let bytes = super::data_transfer::to_bytes(data)
-            .map_err(|e| Error::IpcError(format!("Failed to serialize: {}", e)))?;
+        self.publish_with_copy_context(data, CopyContext::legacy())
+    }
 
-        tracing::debug!(
-            "[IPC Publisher] Channel '{}' publishing {} bytes (type: {})",
-            self.channel_name,
-            bytes.len(),
-            data.data_type()
-        );
-
-        if bytes.len() > MAX_SLICE_LEN {
-            return Err(Error::IpcError(format!(
-                "Message too large: {} bytes (max: {})",
-                bytes.len(),
-                MAX_SLICE_LEN
-            )));
-        }
-
-        // Loan uninitialized memory
-        let sample = self
-            .inner
-            .loan_slice_uninit(bytes.len())
-            .map_err(|e| Error::IpcError(format!("Failed to loan memory: {:?}", e)))?;
-
-        // Write payload and send
-        let sample = sample.write_from_slice(&bytes);
-        sample
-            .send()
-            .map_err(|e| Error::IpcError(format!("Failed to send sample: {:?}", e)))?;
-
-        tracing::debug!(
-            "[IPC Publisher] Channel '{}' successfully sent {} bytes",
-            self.channel_name,
-            bytes.len()
-        );
-
-        // Update stats (use try_write to avoid blocking in async contexts)
-        if let Ok(mut stats) = self.stats.try_write() {
-            stats.messages_sent += 1;
-            stats.bytes_transferred += bytes.len() as u64;
-            stats.last_activity = Some(std::time::Instant::now());
-        }
-        // If lock is contended, skip stats update (non-critical)
-
-        Ok(())
+    /// Authorize codec materialization and the final native wire transfer.
+    pub fn publish_with_copy_context(
+        &self,
+        data: &RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<()> {
+        let bytes = super::data_transfer::to_bytes_with_copy_context(data, copies)
+            .map_err(|e| Error::IpcError(format!("Failed to serialize: {e}")))?;
+        self.send_with_copy_context(&bytes, copies)
     }
 
     /// Try to publish without blocking (returns false if would block)
@@ -573,6 +542,13 @@ impl<'a> Publisher<'a> {
 
     /// Send raw bytes directly (like READY signal) - bypasses RuntimeData serialization
     pub fn send(&self, bytes: &[u8]) -> Result<()> {
+        self.send_with_copy_context(bytes, CopyContext::legacy())
+    }
+
+    /// Count the complete borrowed wire slice copied into the native loan.
+    /// Includes framing/metadata, unlike logical portable-codec counters.
+    /// A later send failure does not undo a transfer already performed.
+    pub fn send_with_copy_context(&self, bytes: &[u8], copies: &CopyContext) -> Result<()> {
         tracing::debug!(
             "[IPC Publisher] Channel '{}' sending raw {} bytes",
             self.channel_name,
@@ -587,6 +563,10 @@ impl<'a> Publisher<'a> {
             )));
         }
 
+        let transfer = copies
+            .begin(CopyReason::BorrowedInput, bytes.len() as u64)
+            .map_err(|e| Error::IpcError(e.to_string()))?;
+
         // Loan uninitialized memory
         let sample = self
             .inner
@@ -595,6 +575,7 @@ impl<'a> Publisher<'a> {
 
         // Write payload and send
         let sample = sample.write_from_slice(bytes);
+        transfer.complete();
         sample
             .send()
             .map_err(|e| Error::IpcError(format!("Failed to send sample: {:?}", e)))?;
@@ -629,6 +610,11 @@ pub struct Subscriber {
 impl Subscriber {
     /// Receive data from the channel (synchronous - iceoryx2 is lock-free)
     pub fn receive(&self) -> Result<Option<RuntimeData>> {
+        self.receive_with_copy_context(CopyContext::legacy())
+    }
+
+    /// Decode native MessagePack directly from the loan under caller authority.
+    pub fn receive_with_copy_context(&self, copies: &CopyContext) -> Result<Option<RuntimeData>> {
         // Try to receive a sample
         match self.inner.receive() {
             Ok(Some(sample)) => {
@@ -641,7 +627,7 @@ impl Subscriber {
                 );
 
                 // Deserialize RuntimeData from bytes via msgpack
-                let data = super::data_transfer::from_bytes(bytes)
+                let data = super::data_transfer::from_bytes_with_copy_context(bytes, copies)
                     .map_err(|e| Error::IpcError(format!("Failed to deserialize: {}", e)))?;
 
                 // Update stats (use try_write to avoid blocking in async contexts)
@@ -661,9 +647,20 @@ impl Subscriber {
     /// Receive raw bytes without deserialization.
     /// Used by the Python IPC path where the wire format differs from the native msgpack encoding.
     pub fn receive_bytes(&self) -> Result<Option<Vec<u8>>> {
+        self.receive_bytes_with_copy_context(CopyContext::legacy())
+    }
+
+    /// Snapshot a native loan once under explicit authority. Strict rejection
+    /// consumes/releases the sample, but allocates no wire snapshot.
+    /// Counts include the entire wire slice, including metadata and framing.
+    pub fn receive_bytes_with_copy_context(&self, copies: &CopyContext) -> Result<Option<Vec<u8>>> {
         match self.inner.receive() {
             Ok(Some(sample)) => {
+                let transfer = copies
+                    .begin(CopyReason::PrivateIpcIngress, sample.payload().len() as u64)
+                    .map_err(|e| Error::IpcError(e.to_string()))?;
                 let bytes = sample.payload().to_vec();
+                transfer.complete();
 
                 tracing::trace!(
                     "[IPC Subscriber] Channel '{}' received {} raw bytes",
@@ -683,6 +680,14 @@ impl Subscriber {
             Ok(None) => Ok(None),
             Err(e) => Err(Error::IpcError(format!("Failed to receive: {:?}", e))),
         }
+    }
+    /// Move the one snapshot into a shareable owner; clones retain its payload.
+    pub fn receive_shared_bytes_with_copy_context(
+        &self,
+        copies: &CopyContext,
+    ) -> Result<Option<SharedBytes>> {
+        self.receive_bytes_with_copy_context(copies)
+            .map(|value| value.map(SharedBytes::from))
     }
 }
 #[cfg(test)]
