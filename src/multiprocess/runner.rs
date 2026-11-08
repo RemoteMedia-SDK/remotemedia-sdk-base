@@ -33,7 +33,7 @@
 //! the standard `{session}_{node}_input/output` iceoryx2 services.
 
 use iceoryx2::prelude::*;
-use remotemedia_types::RuntimeData;
+use remotemedia_types::{CopyContext, CopyReason, RuntimeData};
 
 /// Matches the global iceoryx2 config the channel registry uses.
 const MAX_SLICE_LEN: usize = 1024 * 1024;
@@ -93,37 +93,7 @@ impl Plugin {
         let out_name = self.output_channel();
         eprintln!("[plugin] in={in_name}  out={out_name}");
 
-        let node = NodeBuilder::new()
-            .create::<ipc::Service>()
-            .map_err(|e| format!("iceoryx2 node create: {e:?}"))?;
-
-        let in_service = node
-            .service_builder(&service_name(&in_name)?)
-            .publish_subscribe::<[u8]>()
-            .max_publishers(2)
-            .max_subscribers(2)
-            .subscriber_max_buffer_size(64)
-            .open_or_create()
-            .map_err(|e| format!("input service open_or_create: {e:?}"))?;
-
-        let out_service = node
-            .service_builder(&service_name(&out_name)?)
-            .publish_subscribe::<[u8]>()
-            .max_publishers(2)
-            .max_subscribers(2)
-            .subscriber_max_buffer_size(64)
-            .open_or_create()
-            .map_err(|e| format!("output service open_or_create: {e:?}"))?;
-
-        let subscriber = in_service
-            .subscriber_builder()
-            .create()
-            .map_err(|e| format!("subscriber create: {e:?}"))?;
-        let publisher = out_service
-            .publisher_builder()
-            .initial_max_slice_len(MAX_SLICE_LEN)
-            .create()
-            .map_err(|e| format!("publisher create: {e:?}"))?;
+        let (publisher, subscriber) = open_channels(&out_name, &in_name)?;
 
         eprintln!("[plugin] READY");
 
@@ -150,15 +120,7 @@ impl Plugin {
                         }
                     };
 
-                    let out_bytes = super::data_transfer::to_bytes(&output)
-                        .map_err(|e| format!("msgpack serialize: {e}"))?;
-                    let sample = publisher
-                        .loan_slice_uninit(out_bytes.len())
-                        .map_err(|e| format!("loan_slice_uninit: {e:?}"))?;
-                    let sample = sample.write_from_slice(&out_bytes);
-                    sample
-                        .send()
-                        .map_err(|e| format!("publisher send: {e:?}"))?;
+                    publish_runtime_data(&publisher, &output, CopyContext::legacy())?;
                 }
                 None => {
                     // Hot-poll: matches the latency tuning in the
@@ -172,4 +134,63 @@ impl Plugin {
 
 fn service_name(name: &str) -> Result<ServiceName, String> {
     ServiceName::new(name).map_err(|e| format!("invalid service name '{name}': {e:?}"))
+}
+
+/// Native endpoints shared by both sides of the copying compatibility protocol.
+pub(super) type NativePublisher = iceoryx2::port::publisher::Publisher<ipc::Service, [u8], ()>;
+pub(super) type NativeSubscriber = iceoryx2::port::subscriber::Subscriber<ipc::Service, [u8], ()>;
+
+pub(super) fn open_channels(
+    publish_name: &str,
+    subscribe_name: &str,
+) -> Result<(NativePublisher, NativeSubscriber), String> {
+    let node = NodeBuilder::new()
+        .create::<ipc::Service>()
+        .map_err(|e| format!("iceoryx2 node create: {e:?}"))?;
+    let publish_service = node
+        .service_builder(&service_name(publish_name)?)
+        .publish_subscribe::<[u8]>()
+        .max_publishers(2)
+        .max_subscribers(2)
+        .subscriber_max_buffer_size(64)
+        .open_or_create()
+        .map_err(|e| format!("publish service: {e:?}"))?;
+    let subscribe_service = node
+        .service_builder(&service_name(subscribe_name)?)
+        .publish_subscribe::<[u8]>()
+        .max_publishers(2)
+        .max_subscribers(2)
+        .subscriber_max_buffer_size(64)
+        .open_or_create()
+        .map_err(|e| format!("subscribe service: {e:?}"))?;
+    let publisher = publish_service
+        .publisher_builder()
+        .initial_max_slice_len(MAX_SLICE_LEN)
+        .create()
+        .map_err(|e| format!("publisher create: {e:?}"))?;
+    let subscriber = subscribe_service
+        .subscriber_builder()
+        .create()
+        .map_err(|e| format!("subscriber create: {e:?}"))?;
+    Ok((publisher, subscriber))
+}
+
+/// Serialize once, then account the separate transfer into the native loan.
+/// Completion describes copied bytes even if subsequent publication fails.
+pub(super) fn publish_runtime_data(
+    publisher: &NativePublisher,
+    data: &RuntimeData,
+    copies: &CopyContext,
+) -> Result<(), String> {
+    let bytes = super::data_transfer::to_bytes_with_copy_context(data, copies)?;
+    let sample = copies
+        .materialize_result(CopyReason::PrivateIpcIngress, bytes.len() as u64, || {
+            let sample = publisher
+                .loan_slice_uninit(bytes.len())
+                .map_err(|e| format!("loan: {e:?}"))?;
+            Ok::<_, String>(sample.write_from_slice(&bytes))
+        })
+        .map_err(|error| error.to_string())??;
+    sample.send().map_err(|error| format!("send: {error:?}"))?;
+    Ok(())
 }

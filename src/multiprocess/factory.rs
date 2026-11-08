@@ -23,25 +23,29 @@
 //! - The plugin is assumed ready ~500 ms after spawn. Production
 //!   would handshake on a control channel (READY pattern from the
 //!   Python multiprocess executor).
-//! - Crash of the plugin process surfaces as an iceoryx2 receive
-//!   error on the next call but is otherwise unrecovered. A real
-//!   integration would respawn / mark the node failed.
+//! - A nonresponding/crashed plugin can leave a call pending until node drop.
+//!   Dropping the node cancels the receive loop and kills/reaps its child.
+//! - Strict contexts reject this copying protocol. Compatibility host copies
+//!   use the caller ledger; worker copies still use the worker legacy ledger.
 //! - One outstanding request per node — the IPC thread handles them
 //!   serially. Concurrent calls queue on the mpsc command channel.
 
 use crate::data::RuntimeData;
-use crate::nodes::{AsyncNodeWrapper, AsyncStreamingNode, StreamingNode, StreamingNodeFactory};
+use crate::nodes::{
+    AsyncNodeWrapper, AsyncStreamingNode, InitializeContextRead, NodeRuntimeContextRead,
+    StreamingNode, StreamingNodeFactory,
+};
 use crate::Error;
 use async_trait::async_trait;
-use iceoryx2::prelude::*;
+use remotemedia_types::{CopyContext, CopyPolicy};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-
-const MAX_SLICE_LEN: usize = 1024 * 1024;
 
 /// Spawns a native binary plugin per `create()`.
 ///
@@ -80,6 +84,9 @@ impl StreamingNodeFactory for MultiprocessNativeFactory {
 /// the !Send iceoryx2 publisher/subscriber.
 pub struct MultiprocessNativeNode {
     node_type: String,
+    node_id: String,
+    session_id: String,
+    stopping: Arc<AtomicBool>,
     cmd_tx: mpsc::Sender<IpcCommand>,
     /// Held so the child is killed on drop.
     child: Arc<Mutex<Child>>,
@@ -87,8 +94,9 @@ pub struct MultiprocessNativeNode {
 
 enum IpcCommand {
     Round {
-        req_bytes: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+        data: RuntimeData,
+        copies: CopyContext,
+        reply: oneshot::Sender<Result<RuntimeData, String>>,
     },
 }
 
@@ -99,35 +107,93 @@ impl MultiprocessNativeNode {
         node_id: &str,
         session_id: &str,
     ) -> Result<Self, Error> {
+        Self::spawn_command(Command::new(binary_path), node_type, node_id, session_id)
+    }
+
+    fn spawn_command(
+        mut command: Command,
+        node_type: &str,
+        node_id: &str,
+        session_id: &str,
+    ) -> Result<Self, Error> {
         let in_channel = format!("{session_id}_{node_id}_input");
         let out_channel = format!("{session_id}_{node_id}_output");
 
-        let child = Command::new(binary_path)
+        let mut child = command
             .env("RM_SESSION_ID", session_id)
             .env("RM_NODE_ID", node_id)
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| {
-                Error::Execution(format!("spawn plugin {}: {e}", binary_path.display()))
-            })?;
+            .map_err(|e| Error::Execution(format!("spawn native compatibility plugin: {e}")))?;
 
         // Plugin needs a moment to attach to iceoryx2 services. A
         // production implementation would wait on a control channel
         // READY signal instead of sleeping.
         std::thread::sleep(Duration::from_millis(500));
 
-        let cmd_tx = spawn_ipc_thread(in_channel, out_channel)?;
+        let stopping = Arc::new(AtomicBool::new(false));
+        let cmd_tx = match spawn_ipc_thread(in_channel, out_channel, stopping.clone()) {
+            Ok(sender) => sender,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             node_type: node_type.to_string(),
+            node_id: node_id.to_string(),
+            session_id: session_id.to_string(),
+            stopping,
             cmd_tx,
             child: Arc::new(Mutex::new(child)),
         })
+    }
+    fn call_authority(
+        &self,
+        node: &str,
+        session: &str,
+        copies: Option<CopyContext>,
+    ) -> Result<CopyContext, Error> {
+        if node != self.node_id || session != self.session_id {
+            return Err(Error::Execution(
+                "Native compatibility call identity mismatch".into(),
+            ));
+        }
+        let copies = copies.ok_or_else(|| {
+            Error::Execution("Native compatibility calls require copy authority".into())
+        })?;
+        if copies.policy() != CopyPolicy::AllowCopies {
+            return Err(Error::Execution("Native MessagePack compatibility requires allow_copies; use the mapped native-worker protocol for strict calls".into()));
+        }
+        Ok(copies)
+    }
+
+    async fn process_with_copies(
+        &self,
+        data: RuntimeData,
+        copies: CopyContext,
+    ) -> Result<RuntimeData, Error> {
+        let (reply, response) = oneshot::channel();
+        self.cmd_tx
+            .send(IpcCommand::Round {
+                data,
+                copies,
+                reply,
+            })
+            .await
+            .map_err(|error| Error::IpcError(format!("ipc cmd send: {error}")))?;
+        response
+            .await
+            .map_err(|error| Error::IpcError(format!("ipc reply recv: {error}")))?
+            .map_err(Error::IpcError)
     }
 }
 
 impl Drop for MultiprocessNativeNode {
     fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         // Closing the cmd_tx makes the IPC thread's blocking_recv()
         // return None and the thread exits cleanly.
         // Kill the child explicitly — the plugin runs an infinite
@@ -145,27 +211,50 @@ impl AsyncStreamingNode for MultiprocessNativeNode {
         &self.node_type
     }
 
+    async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
+        self.call_authority(ctx.node_id(), ctx.session_id(), ctx.copy_context())?;
+        Ok(())
+    }
+
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
-        // Serialize native RuntimeData to bytes via msgpack
-        let req_bytes = super::data_transfer::to_bytes(&data).map_err(Error::Execution)?;
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(IpcCommand::Round {
-                req_bytes,
-                reply: reply_tx,
-            })
+        self.process_with_copies(data, CopyContext::legacy().clone())
             .await
-            .map_err(|e| Error::IpcError(format!("ipc cmd send: {e}")))?;
+    }
 
-        let resp_bytes = reply_rx
-            .await
-            .map_err(|e| Error::IpcError(format!("ipc reply recv: {e}")))?
-            .map_err(Error::IpcError)?;
+    async fn process_with_ctx(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let copies = self.call_authority(ctx.node_id(), ctx.session_id(), ctx.copy_context())?;
+        self.process_with_copies(data, copies).await
+    }
 
-        // Deserialize response bytes back to native RuntimeData via msgpack
-        super::data_transfer::from_bytes(&resp_bytes)
-            .map_err(|e| Error::IpcError(format!("decode response: {e}")))
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: HashMap<String, RuntimeData>,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let copies = self.call_authority(ctx.node_id(), ctx.session_id(), ctx.copy_context())?;
+        let data = inputs
+            .into_values()
+            .next()
+            .ok_or_else(|| Error::Execution("No input data provided".into()))?;
+        self.process_with_copies(data, copies).await
+    }
+
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+        mut callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        let output = self.process_with_ctx(data, ctx).await?;
+        callback(output)?;
+        Ok(1)
     }
 }
 
@@ -179,6 +268,7 @@ impl AsyncStreamingNode for MultiprocessNativeNode {
 fn spawn_ipc_thread(
     in_channel: String,
     out_channel: String,
+    stopping: Arc<AtomicBool>,
 ) -> Result<mpsc::Sender<IpcCommand>, Error> {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<IpcCommand>(64);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -186,65 +276,35 @@ fn spawn_ipc_thread(
     std::thread::Builder::new()
         .name(format!("rm-mp-ipc-{in_channel}"))
         .spawn(move || {
-            // All iceoryx2 setup happens on this thread because
-            // Publisher and Subscriber are !Send.
-            let setup = || -> Result<_, String> {
-                let node = NodeBuilder::new()
-                    .create::<ipc::Service>()
-                    .map_err(|e| format!("node create: {e:?}"))?;
-
-                let in_service = node
-                    .service_builder(
-                        &ServiceName::new(&in_channel)
-                            .map_err(|e| format!("input service name: {e:?}"))?,
-                    )
-                    .publish_subscribe::<[u8]>()
-                    .max_publishers(2)
-                    .max_subscribers(2)
-                    .subscriber_max_buffer_size(64)
-                    .open_or_create()
-                    .map_err(|e| format!("input service: {e:?}"))?;
-
-                let out_service = node
-                    .service_builder(
-                        &ServiceName::new(&out_channel)
-                            .map_err(|e| format!("output service name: {e:?}"))?,
-                    )
-                    .publish_subscribe::<[u8]>()
-                    .max_publishers(2)
-                    .max_subscribers(2)
-                    .subscriber_max_buffer_size(64)
-                    .open_or_create()
-                    .map_err(|e| format!("output service: {e:?}"))?;
-
-                let publisher = in_service
-                    .publisher_builder()
-                    .initial_max_slice_len(MAX_SLICE_LEN)
-                    .create()
-                    .map_err(|e| format!("publisher create: {e:?}"))?;
-                let subscriber = out_service
-                    .subscriber_builder()
-                    .create()
-                    .map_err(|e| format!("subscriber create: {e:?}"))?;
-                Ok((publisher, subscriber))
-            };
-
-            let (publisher, subscriber) = match setup() {
-                Ok(p) => {
-                    let _ = ready_tx.send(Ok(()));
-                    p
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
-            };
+            let (publisher, subscriber) =
+                match super::runner::open_channels(&in_channel, &out_channel) {
+                    Ok(p) => {
+                        let _ = ready_tx.send(Ok(()));
+                        p
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
 
             while let Some(cmd) = cmd_rx.blocking_recv() {
                 match cmd {
-                    IpcCommand::Round { req_bytes, reply } => {
-                        let result = round_trip(&publisher, &subscriber, &req_bytes);
+                    IpcCommand::Round {
+                        data,
+                        copies,
+                        reply,
+                    } => {
+                        if reply.is_closed() {
+                            continue;
+                        }
+                        let result = round_trip(&publisher, &subscriber, &data, &copies, &stopping);
+                        let failed = result.is_err();
                         let _ = reply.send(result);
+                        // A late response must never be mistaken for the next request.
+                        if failed {
+                            break;
+                        }
                     }
                 }
             }
@@ -259,49 +319,57 @@ fn spawn_ipc_thread(
     Ok(cmd_tx)
 }
 
-fn round_trip<P, S>(publisher: &P, subscriber: &S, req: &[u8]) -> Result<Vec<u8>, String>
-where
-    P: PublishApi,
-    S: ReceiveApi,
-{
-    publisher.publish_bytes(req)?;
+fn round_trip<P: PublishApi, S: ReceiveApi>(
+    publisher: &P,
+    subscriber: &S,
+    data: &RuntimeData,
+    copies: &CopyContext,
+    stopping: &AtomicBool,
+) -> Result<RuntimeData, String> {
+    if stopping.load(Ordering::Acquire) {
+        return Err("native compatibility IPC stopped".into());
+    }
+    publisher.publish_data(data, copies)?;
     loop {
-        if let Some(payload) = subscriber.receive_bytes()? {
-            return Ok(payload);
+        if stopping.load(Ordering::Acquire) {
+            return Err("native compatibility IPC stopped".into());
+        }
+        if let Some(data) = subscriber.receive_data(copies)? {
+            return Ok(data);
         }
         std::thread::yield_now();
     }
 }
 
-// Wrappers so the round_trip helper isn't tied to a specific iceoryx2
-// generic signature in the function's where-clause (keeps the trait
-// surface tiny and the borrows explicit).
 trait PublishApi {
-    fn publish_bytes(&self, bytes: &[u8]) -> Result<(), String>;
+    fn publish_data(&self, data: &RuntimeData, copies: &CopyContext) -> Result<(), String>;
 }
 trait ReceiveApi {
-    fn receive_bytes(&self) -> Result<Option<Vec<u8>>, String>;
+    fn receive_data(&self, copies: &CopyContext) -> Result<Option<RuntimeData>, String>;
 }
 
-impl PublishApi for iceoryx2::port::publisher::Publisher<ipc::Service, [u8], ()> {
-    fn publish_bytes(&self, bytes: &[u8]) -> Result<(), String> {
-        let sample = self
-            .loan_slice_uninit(bytes.len())
-            .map_err(|e| format!("loan: {e:?}"))?;
-        let sample = sample.write_from_slice(bytes);
-        sample.send().map_err(|e| format!("send: {e:?}"))?;
-        Ok(())
+impl PublishApi for super::runner::NativePublisher {
+    fn publish_data(&self, data: &RuntimeData, copies: &CopyContext) -> Result<(), String> {
+        super::runner::publish_runtime_data(self, data, copies)
     }
 }
 
-impl ReceiveApi for iceoryx2::port::subscriber::Subscriber<ipc::Service, [u8], ()> {
-    fn receive_bytes(&self) -> Result<Option<Vec<u8>>, String> {
-        match self.receive().map_err(|e| format!("receive: {e:?}"))? {
-            Some(sample) => Ok(Some(sample.payload().to_vec())),
+impl ReceiveApi for super::runner::NativeSubscriber {
+    fn receive_data(&self, copies: &CopyContext) -> Result<Option<RuntimeData>, String> {
+        match self
+            .receive()
+            .map_err(|error| format!("receive: {error:?}"))?
+        {
+            // Decode while the native loan is alive, eliminating the private wire snapshot.
+            Some(sample) => {
+                super::data_transfer::from_bytes_with_copy_context(sample.payload(), copies)
+                    .map(Some)
+            }
             None => Ok(None),
         }
     }
 }
 
-// Native RuntimeData flows directly between host and plugin via
-// msgpack serialization — no conversion layer needed.
+#[cfg(test)]
+#[path = "factory_copy_tests.rs"]
+mod copy_tests;
