@@ -20,7 +20,9 @@
 
 use crate::data::{RuntimeData, TEXT_CHANNEL_DEFAULT};
 use crate::error::Error;
-use crate::llm::{ChatBackend, ChatBackendConfig, ProviderKind};
+use crate::llm::{
+    ChatBackend, ChatBackendConfig, ChatTurnContext, LlmFallbackConfig, ProviderKind,
+};
 use crate::nodes::AsyncStreamingNode;
 use remotemedia_traits::runtime_context::{InitializeContextRead, NodeRuntimeContextRead};
 use serde::{Deserialize, Serialize};
@@ -138,6 +140,21 @@ pub struct OpenAIChatConfig {
     /// drives the wire format — pick what matches your `base_url`.
     #[serde(default, alias = "provider")]
     pub provider: ProviderKind,
+
+    // ── Deadline + fallback (llm-backend-fallback) ──────────────────
+    /// Cancel the primary request and treat the turn as failed
+    /// (reason `deadline`) when no visible text or tool-call delta has
+    /// arrived this many milliseconds after the request was issued.
+    /// Omit to wait indefinitely (subject to the 10 s connect and 120 s
+    /// per-chunk timeouts).
+    #[serde(default, alias = "firstOutputDeadlineMs")]
+    pub first_output_deadline_ms: Option<u64>,
+
+    /// Provider to re-issue the turn to when the primary fails with
+    /// `deadline`, `connect`, `http_status`, or `stream_error` before
+    /// any visible output. Never used once output has started.
+    #[serde(default)]
+    pub fallback: Option<LlmFallbackConfig>,
 }
 
 impl Default for OpenAIChatConfig {
@@ -160,6 +177,8 @@ impl Default for OpenAIChatConfig {
             active_tools: None,
             tool_choice: None,
             provider: ProviderKind::default(),
+            first_output_deadline_ms: None,
+            fallback: None,
         }
     }
 }
@@ -181,6 +200,9 @@ impl Default for OpenAIChatConfig {
 pub struct OpenAIChatNode {
     config: OpenAIChatConfig,
     backend: Arc<ChatBackend>,
+    /// Manifest node id (from the factory), used in `llm_fallback`
+    /// events when no runtime context is available.
+    node_id: Option<String>,
 }
 
 impl OpenAIChatNode {
@@ -190,7 +212,14 @@ impl OpenAIChatNode {
         Self {
             config,
             backend: Arc::new(ChatBackend::new(profile)),
+            node_id: None,
         }
+    }
+
+    /// Set the manifest node id reported in fallback events.
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.node_id = Some(node_id.into());
+        self
     }
 
     /// Resolve the effective API key (config → env var).
@@ -271,6 +300,19 @@ impl OpenAIChatNode {
                 .filter(|s| !s.is_empty()),
             tools: self.build_tool_registry(),
             tool_choice: self.config.tool_choice.clone(),
+            first_output_deadline_ms: self.config.first_output_deadline_ms,
+            fallback: self.config.fallback.clone(),
+        }
+    }
+
+    fn turn_context(
+        &self,
+        cancel_gate: Option<Arc<crate::transport::CancelGate>>,
+    ) -> ChatTurnContext {
+        ChatTurnContext {
+            cancel_gate,
+            node_id: self.node_id.clone(),
+            control: None,
         }
     }
 
@@ -390,7 +432,13 @@ impl AsyncStreamingNode for OpenAIChatNode {
         // AsyncStreamingNode shape), so the backend gets no cancel
         // gate. The pipeline runtime always uses the streaming path.
         self.backend
-            .run(&session_id, user_msg, &cfg, None, &mut cb)
+            .run_turn(
+                &session_id,
+                user_msg,
+                &cfg,
+                &self.turn_context(None),
+                &mut cb,
+            )
             .await?;
 
         outputs
@@ -428,7 +476,13 @@ impl AsyncStreamingNode for OpenAIChatNode {
         let cfg = self.backend_config();
         let user_msg = serde_json::json!({"role": "user", "content": user_text});
         self.backend
-            .run(&sid, user_msg, &cfg, None, &mut callback)
+            .run_turn(
+                &sid,
+                user_msg,
+                &cfg,
+                &self.turn_context(None),
+                &mut callback,
+            )
             .await
     }
 
@@ -470,19 +524,20 @@ impl AsyncStreamingNode for OpenAIChatNode {
         // don't need to (they're cancelled by the universal future-drop
         // mechanism), but the chat backend wants the explicit gate so
         // it can `.protect()` non-cancelable tool dispatches.
-        let cancel_gate = ctx
+        let runtime = ctx
             .as_any()
-            .downcast_ref::<crate::nodes::NodeRuntimeContext>()
-            .map(|c| Arc::clone(&c.cancel_gate));
-        if let Some(context) = ctx
-            .as_any()
-            .downcast_ref::<crate::nodes::NodeRuntimeContext>()
-        {
+            .downcast_ref::<crate::nodes::NodeRuntimeContext>();
+        let mut turn = self.turn_context(runtime.map(|c| Arc::clone(&c.cancel_gate)));
+        if !ctx.node_id().is_empty() {
+            turn.node_id = Some(ctx.node_id().to_string());
+        }
+        if let Some(context) = runtime {
             self.backend
                 .refresh_office_observation(&sid, &context.control)?;
+            turn.control = Some(Arc::clone(&context.control));
         }
         self.backend
-            .run(&sid, user_msg, &cfg, cancel_gate, &mut callback)
+            .run_turn(&sid, user_msg, &cfg, &turn, &mut callback)
             .await
     }
 }
@@ -496,12 +551,12 @@ pub struct OpenAIChatNodeFactory;
 impl crate::nodes::StreamingNodeFactory for OpenAIChatNodeFactory {
     fn create(
         &self,
-        _node_id: String,
+        node_id: String,
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn crate::nodes::StreamingNode>, Error> {
         let config: OpenAIChatConfig = serde_json::from_value(params.clone()).unwrap_or_default();
-        let node = OpenAIChatNode::with_config(config);
+        let node = OpenAIChatNode::with_config(config).with_node_id(node_id);
         Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(node))))
     }
 
@@ -838,6 +893,44 @@ mod tests {
         assert!(schema.accepts.contains(&RuntimeDataType::Json));
         assert!(schema.produces.contains(&RuntimeDataType::Text));
         assert!(schema.config_schema.is_some());
+    }
+
+    #[test]
+    fn test_fallback_settings_parse_and_reach_backend_config() {
+        let params = serde_json::json!({
+            "base_url": "http://agent-gateway/v1",
+            "firstOutputDeadlineMs": 1500,
+            "fallback": {
+                "provider": "openai",
+                "baseUrl": "http://127.0.0.1:8080/v1",
+                "model": "qwen2.5-7b",
+                "apiKeyEnv": "LOCAL_LLM_KEY"
+            }
+        });
+        let config: OpenAIChatConfig = serde_json::from_value(params).unwrap();
+        assert_eq!(config.first_output_deadline_ms, Some(1500));
+        let fb = config.fallback.clone().unwrap();
+        assert_eq!(fb.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+        assert_eq!(fb.api_key_env.as_deref(), Some("LOCAL_LLM_KEY"));
+        let cfg = OpenAIChatNode::with_config(config).backend_config();
+        assert_eq!(cfg.first_output_deadline_ms, Some(1500));
+        assert_eq!(cfg.fallback, Some(fb));
+    }
+
+    #[test]
+    fn test_fallback_settings_default_off() {
+        let config: OpenAIChatConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        let cfg = OpenAIChatNode::with_config(config).backend_config();
+        assert_eq!(cfg.first_output_deadline_ms, None);
+        assert!(cfg.fallback.is_none());
+    }
+
+    #[test]
+    fn test_schema_lists_fallback_settings() {
+        let schema = OpenAIChatNodeFactory.schema().unwrap();
+        let text = serde_json::to_string(&schema.config_schema).unwrap();
+        assert!(text.contains("first_output_deadline_ms"), "{text}");
+        assert!(text.contains("api_key_env"), "{text}");
     }
 
     #[test]
