@@ -5,6 +5,9 @@ use crate::media::video::VideoEncoderConfig;
 use crate::peer::PeerConnection;
 use remotemedia_types::{CopyContext, CopyPolicy};
 
+#[path = "router_video_ingress_tests.rs"]
+mod ingress;
+
 #[tokio::test]
 async fn video_copy_session_router_retains_policy_through_legacy_frame_adapter() {
     let peer = Arc::new(

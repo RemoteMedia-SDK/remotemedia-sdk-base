@@ -467,6 +467,7 @@ impl SessionMetrics {
 /// layer between WebRTC peers and the application (which uses PipelineTransport).
 pub struct SessionRouter {
     copies: remotemedia_types::CopyContext,
+    output_allocator: Arc<dyn remotemedia_types::OutputAllocator>,
     /// Session ID
     session_id: SessionId,
 
@@ -523,6 +524,15 @@ impl SessionRouter {
         self
     }
 
+    /// Select storage for decoded media before sharing this router with callers.
+    pub fn with_output_allocator(
+        mut self,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Self {
+        self.output_allocator = allocator;
+        self
+    }
+
     /// Create a new session router
     ///
     /// # Arguments
@@ -542,6 +552,7 @@ impl SessionRouter {
 
         Ok(Self {
             copies: remotemedia_types::CopyContext::legacy().clone(),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
             session_id,
             session,
             peer_manager,
@@ -611,7 +622,7 @@ impl SessionRouter {
     /// # Arguments
     ///
     /// * `peer_id` - Peer ID that sent the data
-    /// * `payload` - RTP payload (encoded audio or video)
+    /// * `payload` - Opus payload or complete depacketized video sample
     /// * `is_audio` - True for audio, false for video
     pub async fn route_incoming(
         &self,
@@ -654,7 +665,13 @@ impl SessionRouter {
                 let video_track = peer.video_track().await.ok_or_else(|| {
                     Error::MediaTrackError("No video track configured".to_string())
                 })?;
-                rtp_to_runtime_data(payload, false, None, Some(&video_track)).await?
+                video_track
+                    .decode_rtp_payload_with_context(
+                        payload,
+                        &self.copies,
+                        self.output_allocator.clone(),
+                    )
+                    .await?
             };
 
         // Record metrics
@@ -669,6 +686,28 @@ impl SessionRouter {
         }
 
         Ok(runtime_data)
+    }
+
+    /// Receive a complete depacketized video sample without a borrowed-input snapshot.
+    /// Codec-required transfers still use this router's authority and output provider.
+    pub async fn route_incoming_video_owned(
+        &self,
+        peer_id: &str,
+        payload: remotemedia_types::SharedBytes,
+    ) -> Result<RuntimeData> {
+        let start = Instant::now();
+        let bytes = payload.len();
+        let peer = self.peer_manager.get_peer(peer_id).await?;
+        let video_track = peer.video_track().await.ok_or_else(|| {
+            Error::MediaTrackError("No video track configured".to_string())
+        })?;
+        let frame = video_track
+            .decode_owned_payload_with_context(payload, &self.copies, self.output_allocator.clone())
+            .await?;
+        let mut metrics = self.metrics.write().await;
+        metrics.record_video_in(bytes);
+        metrics.record_latency(start.elapsed().as_micros() as u64);
+        Ok(frame)
     }
 
     /// Route outgoing data to peers (T127)

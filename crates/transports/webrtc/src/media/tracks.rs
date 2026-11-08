@@ -70,7 +70,20 @@ impl VideoDecoderNode {
     pub fn new(_config: VideoDecoderConfig) -> Result<Self> {
         Ok(Self)
     }
-    pub async fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
+    pub async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
+        self.process_with_copy_context(
+            data,
+            CopyContext::legacy().clone(),
+            Arc::new(remotemedia_types::HeapOutputAllocator),
+        )
+        .await
+    }
+    pub async fn process_with_copy_context(
+        &self,
+        _data: RuntimeData,
+        _copies: CopyContext,
+        _allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Result<RuntimeData> {
         Err(crate::Error::EncodingError(
             "Video support is disabled".to_string(),
         ))
@@ -97,6 +110,18 @@ async fn video_copy_disabled_backend_keeps_explicit_error_without_materializatio
         .unwrap_err();
     assert!(error.to_string().contains("Video support is disabled"));
     assert!(encoder.process(RuntimeData::Binary(vec![1].into())).await.is_err());
+    let decoder = VideoDecoderNode;
+    assert!(decoder
+        .process_with_copy_context(
+            RuntimeData::Binary(vec![1].into()),
+            copies.clone(),
+            Arc::new(remotemedia_types::HeapOutputAllocator),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Video support is disabled"));
+    assert!(decoder.process(RuntimeData::Binary(vec![1].into())).await.is_err());
     assert!(copies.report().entries.iter()
         .all(|(_, c)| c.copied_bytes == 0 && c.rejected == 0));
 }
@@ -652,11 +677,11 @@ impl VideoTrack {
         Arc::clone(&self.track)
     }
 
-    /// Decode received RTP packet to RuntimeData (uses core VideoDecoderNode)
+    /// Decode an assembled codec sample using legacy copy authority.
     ///
     /// # Arguments
     ///
-    /// * `payload` - RTP payload (encoded video bitstream)
+    /// * `payload` - Complete encoded video sample, after RTP depacketization
     ///
     /// # Returns
     ///
@@ -664,22 +689,48 @@ impl VideoTrack {
     ///
     /// # Note
     ///
-    /// Decodes RTP payload using core VideoDecoderNode (VP8/H.264/AV1 via ac-ffmpeg).
-    /// Phase 5 T068: RTP depacketization and decoding
+    /// Does not assemble fragmented RTP payloads. Prefer the owning contextual API
+    /// when the depacketizer already supplies an immutable sample owner.
     pub async fn decode_rtp_payload(&self, payload: &[u8]) -> Result<RuntimeData> {
-        use remotemedia_core::nodes::streaming_node::AsyncStreamingNode;
+        self.decode_rtp_payload_with_context(
+            payload,
+            CopyContext::legacy(),
+            Arc::new(remotemedia_types::HeapOutputAllocator),
+        )
+        .await
+    }
 
-        // Create encoded RuntimeData from RTP payload
+    /// Snapshot a borrowed assembled sample under caller authority before decoding.
+    pub async fn decode_rtp_payload_with_context(
+        &self,
+        payload: &[u8],
+        copies: &CopyContext,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Result<RuntimeData> {
+        let owner = copies
+            .materialize(
+                remotemedia_types::CopyReason::BorrowedInput,
+                payload.len() as u64,
+                || payload.to_vec().into(),
+            )
+            .map_err(|e| Error::EncodingError(e.to_string()))?;
+        self.decode_owned_payload_with_context(owner, copies, allocator)
+            .await
+    }
+
+    /// Retain an assembled encoded sample and use the selected output provider.
+    /// Backend padding and decoded-plane transfers remain counted or rejected.
+    pub async fn decode_owned_payload_with_context(
+        &self,
+        payload: remotemedia_types::SharedBytes,
+        copies: &CopyContext,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Result<RuntimeData> {
+        let arrival_ts_us = now_micros();
         let encoded_data = RuntimeData::Video {
-            pixel_data: remotemedia_types::CopyContext::legacy()
-                .materialize(
-                    remotemedia_types::CopyReason::BorrowedInput,
-                    payload.len() as u64,
-                    || payload.to_vec().into(),
-                )
-                .expect("legacy policy permits borrowed RTP materialization"),
-            width: 1280, // Will be overridden by decoder
-            height: 720,
+            pixel_data: payload,
+            width: 0, // Read from the encoded sample by the decoder.
+            height: 0,
             format: PixelFormat::Encoded,
             codec: Some(self.codec),
             frame_number: 0,
@@ -691,8 +742,17 @@ impl VideoTrack {
 
         // Decode using core VideoDecoderNode
         self.decoder
-            .process(encoded_data)
+            .process_with_copy_context(encoded_data, copies.clone(), allocator)
             .await
+            .map(|mut frame| {
+                if let RuntimeData::Video {
+                    arrival_ts_us: arrival,
+                    ..
+                } = &mut frame {
+                    *arrival = Some(arrival_ts_us);
+                }
+                frame
+            })
             .map_err(|e| Error::EncodingError(format!("Video decoding failed: {}", e)))
     }
 

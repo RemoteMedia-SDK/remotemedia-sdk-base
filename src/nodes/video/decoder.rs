@@ -102,6 +102,26 @@ impl VideoDecoderNode {
         .await
         .map_err(|e| CodecError::TaskFailed(e.to_string()))?
     }
+
+    /// Decode for a transport using its copy authority and selected output provider.
+    /// Retains both across blocking work and applies the configured corruption policy.
+    pub async fn process_with_copy_context(
+        &self,
+        input: RuntimeData,
+        copies: remotemedia_types::CopyContext,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Result<RuntimeData, Error> {
+        let decoder = Arc::clone(&self.decoder);
+        let result = tokio::task::spawn_blocking(move || {
+            decoder
+                .lock()
+                .unwrap()
+                .decode_with_context(input, &copies, allocator.as_ref())
+        })
+        .await
+        .map_err(|e| Error::Execution(format!("Decoder task failed: {e}")))?;
+        self.finish_decode(result)
+    }
     // Leniency handles corrupt bitstreams, never policy, allocation, layout or task failures.
     fn finish_decode(&self, result: Result<RuntimeData, CodecError>) -> Result<RuntimeData, Error> {
         match result {
@@ -143,16 +163,8 @@ impl AsyncStreamingNode for VideoDecoderNode {
         let allocator = ctx.output_allocator().ok_or_else(|| {
             Error::Execution("VideoDecoder requires a selected output allocator".into())
         })?;
-        let decoder = Arc::clone(&self.decoder);
-        let result = tokio::task::spawn_blocking(move || {
-            decoder
-                .lock()
-                .unwrap()
-                .decode_with_context(input, &copies, allocator.as_ref())
-        })
-        .await
-        .map_err(|e| Error::Execution(format!("Decoder task failed: {e}")))?;
-        self.finish_decode(result)
+        self.process_with_copy_context(input, copies, allocator)
+            .await
     }
 
     async fn process_multi_with_ctx(
