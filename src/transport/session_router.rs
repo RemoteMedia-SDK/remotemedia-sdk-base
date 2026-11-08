@@ -1467,6 +1467,10 @@ impl SessionRouter {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> (JoinHandle<()>, JoinHandle<()>) {
         let (fan_tx, mut fan_rx) = mpsc::channel::<RuntimeData>(NODE_FANOUT_CAPACITY);
+        // Endpoint-call opt-in (openspec: add-agent-harness-integration).
+        let rpc_methods = node.rpc_methods();
+        let call_mode = super::call_routing::call_mode(&rpc_methods, control.is_some());
+        let envelope_calls: super::call_routing::EnvelopeCalls = Default::default();
         let NodeTelemetryHandle {
             tel,
             idx: node_idx,
@@ -1481,10 +1485,31 @@ impl SessionRouter {
         let fan_probes = probes.clone();
         let fan_tel = tel.clone();
         let mut fan_shutdown = shutdown.clone();
+        let fan_envelope_calls = envelope_calls.clone();
         let fan_handle = tokio::spawn(async move {
             let forward = async move {
                 let tel = fan_tel;
+                // Dropped with this task: aborts reply forwarders, which
+                // cancels their in-flight endpoint calls.
+                let mut call_tasks = super::call_routing::CallTasks::default();
                 while let Some(out) = fan_rx.recv().await {
+                    // `__call__` envelopes from opted-in nodes become endpoint
+                    // calls and never reach taps, intercepts or successors.
+                    if call_mode != super::call_routing::CallMode::Legacy {
+                        if let Some(ctrl) = &fan_control {
+                            if let Some(parsed) = super::call_routing::parse_call_envelope(&out) {
+                                super::call_routing::start_envelope_call(
+                                    ctrl,
+                                    &fan_node_id,
+                                    parsed,
+                                    call_mode,
+                                    &fan_envelope_calls,
+                                    &mut call_tasks,
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     tel.node(node_idx).outputs.fetch_add(1, RELAXED);
                     let kept = match &fan_control {
                         Some(ctrl) => ctrl.on_node_output(&fan_node_id, None, out).await,
@@ -1645,12 +1670,12 @@ impl SessionRouter {
             Box::new(fan_tx.downgrade()),
         );
         let (control_tx, mut control_rx) = mpsc::channel::<RuntimeData>(16);
-        let rpc_rx = if node.rpc_methods().is_empty() {
+        let rpc_rx = if rpc_methods.is_empty() {
             None
         } else {
             control
                 .as_ref()
-                .map(|control| control.register_rpc(&node_id))
+                .map(|control| control.register_rpc(&node_id, &rpc_methods))
         };
         let input_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let filter_generation = input_generation.clone();
@@ -1767,11 +1792,12 @@ impl SessionRouter {
             // barge path.
             .with_cancel_gate(Arc::clone(&cancel));
 
-            let rpc_handle = rpc_rx.map(|rx| {
+            let rpc_handle = rpc_rx.map(|(rx, call_replies)| {
                 super::rpc_dispatch::RpcTask(tokio::spawn(super::rpc_dispatch::run(
                     node.clone(),
                     bound_ctx.clone(),
                     rx,
+                    call_replies,
                     shutdown.clone(),
                 )))
             });
@@ -2200,6 +2226,15 @@ impl SessionRouter {
                             node_id = %main_node_id,
                             "Runtime: in-flight call cancelled by barge_in"
                         );
+                        // Envelope-originated endpoint calls belong to the
+                        // cancelled processing call: cancel them at the host.
+                        if let Some(ctrl) = &control {
+                            super::call_routing::cancel_envelope_calls(
+                                ctrl,
+                                &main_node_id,
+                                &envelope_calls,
+                            );
+                        }
                         // Dropping the dispatch_fut here cascades drop
                         // through every awaited future inside the
                         // node call (HTTP streams, IPC sends, etc.),

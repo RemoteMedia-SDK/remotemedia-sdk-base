@@ -27,11 +27,13 @@ use std::sync::Arc;
 
 // Re-export submodules
 pub mod avatar_session;
+mod call_routing;
 pub mod cancel_gate;
 pub mod client;
 pub mod control_transport;
 pub mod data;
 pub mod embedded_python_env;
+pub mod endpoint;
 mod managed_ardy;
 pub mod pacer;
 pub mod perf_aggregator;
@@ -51,8 +53,13 @@ pub mod executor;
 pub use cancel_gate::{CancelGate, ProtectGuard};
 pub use client::{ClientStreamSession, PipelineClient, TransportType};
 pub use control_transport::{
-    ControlTransport, InProcControlTransport, InterceptReplyHandle, InterceptRequest,
-    InterceptSession,
+    ControlTransport, EndpointHostSession, InProcControlTransport, InterceptReplyHandle,
+    InterceptRequest, InterceptSession,
+};
+pub use endpoint::{
+    CallOptions, CancelReason, EndpointCallError, EndpointCallStream, EndpointError, EndpointHost,
+    EndpointInfo, EndpointMethodInfo, EndpointPresence, EndpointReplier, EndpointSpec, HostEvent,
+    HostKind, IncomingCall,
 };
 pub use data::{Participant, TransportData};
 pub use executor::{

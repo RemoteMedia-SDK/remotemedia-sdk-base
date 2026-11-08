@@ -30,7 +30,7 @@ pub use descriptor::{
 };
 pub use size::approx_payload_bytes;
 pub use snapshot::{
-    EdgeTelemetry, ErrorInfo, NodeStatus, NodeTelemetry, QueueDepth, TelemetrySnapshot,
+    EdgeTelemetry, EndpointAdapterTelemetry, EndpointTelemetry, ErrorInfo, NodeStatus, NodeTelemetry, QueueDepth, TelemetrySnapshot,
 };
 
 use crate::executor::StreamingScheduler;

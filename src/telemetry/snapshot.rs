@@ -8,6 +8,7 @@
 use crate::data::LatencyPercentiles;
 use crate::transport::session_control::NodeState;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// `kind` discriminator value.
 pub const SNAPSHOT_KIND: &str = "telemetry_snapshot";
@@ -33,6 +34,48 @@ pub struct TelemetrySnapshot {
     pub is_final: bool,
     pub nodes: Vec<NodeTelemetry>,
     pub edges: Vec<EdgeTelemetry>,
+    /// Client-hosted endpoint calls, per endpoint and method (omitted while
+    /// no endpoint call has been issued in the session).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<EndpointTelemetry>,
+}
+
+/// Cumulative call counters for one `(endpoint, method)`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EndpointTelemetry {
+    pub endpoint: String,
+    pub method: String,
+    /// Whether the endpoint is hosted right now.
+    pub hosted: bool,
+    /// Kind of the current host, when hosted.
+    pub host_kind: Option<crate::transport::endpoint::HostKind>,
+    /// Calls issued.
+    pub calls: u64,
+    /// Calls that completed successfully.
+    pub ok: u64,
+    /// Failures by kind (`timeout`, `no_responder`, `responder_gone`,
+    /// `overloaded`, `cancelled`, `unavailable`, `error`, …).
+    pub errors: BTreeMap<String, u64>,
+    /// Replies discarded because their call had already finished.
+    pub late: u64,
+    /// Latency of successful calls (cumulative), when histograms are on.
+    pub latency_us: Option<LatencyPercentiles>,
+    /// Per-adapter attribution, where the host names the adapter (agent
+    /// hosts: `EndpointSpec::adapter` or the reply's `meta.adapter`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub adapters: Vec<EndpointAdapterTelemetry>,
+}
+
+/// Outcome counters attributed to one adapter of an endpoint method.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EndpointAdapterTelemetry {
+    pub adapter: String,
+    pub calls: u64,
+    pub ok: u64,
+    pub errors: BTreeMap<String, u64>,
+    pub late: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
