@@ -180,6 +180,17 @@ impl DataChannel {
     /// # Returns
     /// Result indicating success or failure
     pub async fn send_message(&self, msg: &DataChannelMessage) -> Result<()> {
+        self.send_message_with_context(msg, CopyContext::legacy())
+            .await
+    }
+
+    /// Attribute or reject envelope bulk serialization before writing payload
+    /// bytes. This does not account native network serialization/encryption.
+    pub async fn send_message_with_context(
+        &self,
+        msg: &DataChannelMessage,
+        copies: &CopyContext,
+    ) -> Result<()> {
         // T164: Validate message size
         if msg.exceeds_max_size() {
             return Err(Error::DataChannelError(format!(
@@ -199,9 +210,12 @@ impl DataChannel {
         }
 
         // Serialize message
-        let bytes = msg
-            .encode()
-            .map_err(|e| Error::DataChannelError(format!("Failed to serialize message: {}", e)))?;
+        let bytes = msg.encode_with_context(copies).map_err(|e| match e {
+            super::messages::DataChannelEncodeError::CopyRejected(rejected) => {
+                Error::Other(rejected.into())
+            }
+            other => Error::DataChannelError(format!("Failed to serialize message: {}", other)),
+        })?;
 
         let bytes_len = bytes.len();
 
@@ -311,7 +325,7 @@ impl DataChannel {
                 *messages_received.write().await += 1;
 
                 // Parse message
-                match DataChannelMessage::decode(&data) {
+                match DataChannelMessage::decode_owned(data) {
                     Ok(parsed) => {
                         debug!("Received {} bytes on data channel '{}'", data_len, label);
                         handler(parsed).await;

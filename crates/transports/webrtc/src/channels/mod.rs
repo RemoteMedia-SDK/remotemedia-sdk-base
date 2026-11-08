@@ -29,10 +29,25 @@
 //! ledger. A receive snapshot rejected by policy is delivered as an error.
 //! Transport byte/message statistics are separate from these copy counters.
 //!
-//! This is wrapper ownership, not zero-copy network delivery. WebRTC receive
-//! buffering, SCTP/DTLS, protobuf envelopes, chunking and network/device transfers
-//! remain separate boundaries. Structured decoding still allocates its decoded
-//! payload, although dispatch no longer copies the incoming wire buffer first.
+//! [`DataChannelMessage::decode_owned`] retains modern protobuf bulk fields as
+//! ranges of the incoming wire owner. Borrowed decoding and legacy JSON/base64
+//! decoding still allocate payload storage. Envelope encoding copies bulk bytes
+//! into the wire buffer; `encode_with_context` and `send_message_with_context`
+//! account for that copy or reject it under strict policy.
+//!
+//! [`DataChannelSplitter::split_owned`] retains slices. Reassembly retains each
+//! incoming chunk, forwards a single chunk unchanged, and explicitly accounts
+//! for multi-chunk assembly through `feed_chunk_with_context`. Its byte limit
+//! covers logical payload lengths, not complete retained backing allocations.
+//!
+//! Bulk message fields, reassembly results, and reassembly output channels use
+//! `bytes::Bytes`. Constructors still accept `Vec<u8>` via `Into<Bytes>`;
+//! struct literals can use `.into()`. Callers requiring mutable storage must
+//! explicitly materialize it, for example with `.to_vec()`.
+//!
+//! These guarantees cover wrapper and envelope ownership. WebRTC receive
+//! buffering, SCTP/DTLS, inner DataBuffer decoding and network/device transfers
+//! remain separate boundaries and do not have an end-to-end zero-copy guarantee.
 //!
 //! # RTP vs Data Channel
 //!

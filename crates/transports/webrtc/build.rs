@@ -125,6 +125,9 @@ fn compile_protos() {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        .bytes(".remotemedia.v1.webrtc.BinaryFrame.data")
+        .bytes(".remotemedia.v1.webrtc.RuntimeDataFrame.data_buffer")
+        .bytes(".remotemedia.v1.webrtc.ChunkFrame.data")
         .out_dir("src/generated")
         .compile_protos(
             &[

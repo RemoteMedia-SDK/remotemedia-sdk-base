@@ -1052,14 +1052,14 @@ impl ServerPeer {
 
                             // Try to decode message as our binary DataChannelMessage envelope
                             use crate::channels::DataChannelMessage;
-                            let parsed_msg = match DataChannelMessage::decode(&msg.data[..]) {
+                            let parsed_msg = match DataChannelMessage::decode_owned(msg.data.clone()) {
                                 Ok(m) => Some(m),
                                 Err(e) => {
                                     // Fallback to legacy raw DataBuffer decode for old clients
                                     match crate::generated::DataBuffer::decode(&msg.data[..]) {
                                         Ok(_) => {
                                             info!("Decoded legacy raw DataBuffer from data channel (peer {})", peer_id);
-                                            Some(DataChannelMessage::runtime_data(msg.data.to_vec()))
+                                            Some(DataChannelMessage::runtime_data(msg.data.clone()))
                                         }
                                         Err(_) => {
                                             error!("Failed to decode DataChannelMessage envelope or raw DataBuffer: {}", e);

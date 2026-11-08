@@ -271,7 +271,18 @@ async fn channel_owners_real_loopback_retains_receives_and_attributes_compatibil
         });
         let message = DataChannelMessage::binary(vec![0, 255, 13, 7]);
         let wire_len = message.encode().unwrap().len() as u64;
-        sender.send_message(&message).await.unwrap();
+        assert!(sender
+            .send_message_with_context(&message, &strict)
+            .await
+            .is_err());
+        sender
+            .send_message_with_context(&message, &send)
+            .await
+            .unwrap();
+        assert_eq!(
+            counts(&send, CopyReason::PortableSerialization).copied_bytes,
+            4
+        );
         assert_eq!(rx.recv().await.unwrap(), message);
         assert_eq!(sender.bytes_sent().await, 192 + wire_len);
         assert_eq!(receiver.bytes_received().await, 192 + wire_len);

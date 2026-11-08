@@ -808,9 +808,19 @@ impl PeerConnection {
     ///
     /// Result indicating success or error.
     pub async fn send_data_channel_message(&self, msg: &DataChannelMessage) -> Result<()> {
+        self.send_data_channel_message_with_context(msg, remotemedia_types::CopyContext::legacy())
+            .await
+    }
+
+    /// Attribute the envelope's bulk-to-wire materialization to its caller.
+    pub async fn send_data_channel_message_with_context(
+        &self,
+        msg: &DataChannelMessage,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<()> {
         let channel = self.channel_for_operation().await?;
 
-        channel.send_message(msg).await
+        channel.send_message_with_context(msg, copies).await
     }
 
     /// Send raw binary data over the data channel

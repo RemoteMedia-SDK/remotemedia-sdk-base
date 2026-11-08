@@ -364,8 +364,8 @@ pub struct TextFrame {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BinaryFrame {
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub data: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "2")]
     pub content_type: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "3")]
@@ -374,8 +374,8 @@ pub struct BinaryFrame {
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RuntimeDataFrame {
     /// Protobuf-encoded DataBuffer bytes.
-    #[prost(bytes = "vec", tag = "1")]
-    pub data_buffer: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub data_buffer: ::prost::bytes::Bytes,
     #[prost(string, optional, tag = "2")]
     pub content_type: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "3")]
@@ -398,8 +398,8 @@ pub struct ChunkFrame {
     #[prost(string, optional, tag = "7")]
     pub data_type_hint: ::core::option::Option<::prost::alloc::string::String>,
     /// Raw chunk payload bytes. Must not be base64.
-    #[prost(bytes = "vec", tag = "8")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub data: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DataChannelEnvelope {
