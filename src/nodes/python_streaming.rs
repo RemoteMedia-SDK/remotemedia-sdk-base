@@ -132,6 +132,114 @@ impl PythonStreamingNode {
         }
         Ok(())
     }
+    fn legacy_copies(
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+    ) -> Result<remotemedia_types::CopyContext, Error> {
+        match ctx.copy_context() {
+            Some(copies) if copies.policy() == remotemedia_types::CopyPolicy::AllowCopies => Ok(copies),
+            _ => Err(Error::Execution("Legacy Python execution requires explicit allow_copies; use mapped execution for strict calls".into())),
+        }
+    }
+
+    async fn stream_with_copies<F>(
+        &self,
+        data: RuntimeData,
+        session_id: Option<String>,
+        callback: F,
+        copies: remotemedia_types::CopyContext,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        // Ensure the Python node is initialized
+        self.ensure_initialized().await?;
+
+        tracing::info!(
+            "[PythonStreamingNode] process_streaming called for node {} (type: {}) session {:?}, data type: {}",
+            self.node_id, self.node_type, session_id, data.data_type()
+        );
+
+        // Get session_id (from parameter or from node)
+        let session_id_opt = session_id.or_else(|| self.session_id.clone());
+        tracing::info!(
+            "[PythonStreamingNode] Node {}: resolved session_id to {:?}",
+            self.node_id,
+            session_id_opt
+        );
+
+        // Timeline marker: when a JSON intent arrives at the kimodo
+        // motion node, publish "motion_intent" so the UI can show that
+        // the diffusion request was dispatched. The matching
+        // "motion_visible" event would come later from cc_render once
+        // the first pose actually drives the avatar — that one's a
+        // future addition; this one is enough to bracket the slowest
+        // typical bottleneck (LLM tool call → Kimodo daemon RPC).
+        if self.node_type == "KimodoMotionNode" && matches!(data, RuntimeData::Json(_)) {
+            if let Some(sid) = session_id_opt.as_deref() {
+                crate::transport::session_control::publish_timeline_event(
+                    sid,
+                    "motion_intent",
+                    None,
+                    &self.node_id,
+                );
+            }
+        }
+
+        // CRITICAL: MultiprocessExecutor methods don't need &mut self anymore (as of the multiprocess redesign)
+        // They use Arc/RwLock internally, so we can safely get a shared reference and release the lock
+        // This allows concurrent requests to be processed in parallel
+        let executor = {
+            let mut executor_guard = self.executor.lock().await;
+            let executor = executor_guard
+                .as_mut()
+                .ok_or_else(|| Error::Execution("Python node not initialized".to_string()))?;
+
+            // Downcast to MultiprocessExecutor
+            let mp_executor = executor
+                .as_any_mut()
+                .downcast_mut::<crate::python::multiprocess::MultiprocessExecutor>()
+                .ok_or_else(|| {
+                    Error::Execution("Failed to downcast to MultiprocessExecutor".to_string())
+                })?;
+
+            // Clone the Arc to get a shared reference we can use outside the lock
+            // SAFETY: MultiprocessExecutor's process_runtime_data_streaming only needs &self
+            // because all mutable state is behind Arc<RwLock<...>>
+            mp_executor as *const crate::python::multiprocess::MultiprocessExecutor
+        };
+
+        // Release the lock here before calling process_runtime_data_streaming
+        // This allows other requests to proceed concurrently
+
+        // Use process_runtime_data_streaming which waits for outputs and invokes callback
+        tracing::info!(
+            "[PythonStreamingNode] Node {}: calling mp_executor.process_runtime_data_streaming",
+            self.node_id
+        );
+        let result = unsafe {
+            // SAFETY: The executor pointer is valid for the lifetime of self because:
+            // 1. PythonStreamingNode owns the Box<dyn PythonExecutor> in self.executor
+            // 2. The MultiprocessExecutor will not be dropped while self exists
+            // 3. process_runtime_data_streaming only needs &self (all state is Arc/RwLock)
+            (*executor)
+                .process_runtime_data_streaming_with_copy_context(
+                    data,
+                    session_id_opt,
+                    callback,
+                    &copies,
+                )
+                .await
+        };
+
+        tracing::info!("[PythonStreamingNode] Node {}: mp_executor.process_runtime_data_streaming returned {:?}", self.node_id, result);
+
+        tracing::debug!(
+            "Node {}: process_runtime_data_streaming returned {:?}",
+            self.node_id,
+            result.as_ref().map(|_| "Ok").unwrap_or("Err")
+        );
+        result
+    }
 }
 
 #[async_trait::async_trait]
@@ -211,7 +319,6 @@ impl AsyncStreamingNode for PythonStreamingNode {
         result.ok_or_else(|| Error::Execution("No output from Python node".to_string()))
     }
 
-    // Override the trait's process_streaming method to use true streaming
     async fn process_streaming<F>(
         &self,
         data: RuntimeData,
@@ -221,88 +328,70 @@ impl AsyncStreamingNode for PythonStreamingNode {
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
-        // Ensure the Python node is initialized
-        self.ensure_initialized().await?;
+        self.stream_with_copies(
+            data,
+            session_id,
+            callback,
+            remotemedia_types::CopyContext::legacy().clone(),
+        )
+        .await
+    }
 
-        tracing::info!(
-            "[PythonStreamingNode] process_streaming called for node {} (type: {}) session {:?}, data type: {}",
-            self.node_id, self.node_type, session_id, data.data_type()
-        );
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+        callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        let copies = Self::legacy_copies(ctx)?;
+        let session = (!ctx.session_id().is_empty()).then(|| ctx.session_id().to_owned());
+        self.stream_with_copies(data, session, callback, copies)
+            .await
+    }
 
-        // Get session_id (from parameter or from node)
-        let session_id_opt = session_id.or_else(|| self.session_id.clone());
-        tracing::info!(
-            "[PythonStreamingNode] Node {}: resolved session_id to {:?}",
-            self.node_id,
-            session_id_opt
-        );
+    async fn process_with_ctx(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let mut output = None;
+        self.process_streaming_with_ctx(data, ctx, |value| {
+            output = Some(value);
+            Err(Error::Execution("StopIteration".into()))
+        })
+        .await?;
+        output.ok_or_else(|| Error::Execution("No output from Python node".into()))
+    }
 
-        // Timeline marker: when a JSON intent arrives at the kimodo
-        // motion node, publish "motion_intent" so the UI can show that
-        // the diffusion request was dispatched. The matching
-        // "motion_visible" event would come later from cc_render once
-        // the first pose actually drives the avatar — that one's a
-        // future addition; this one is enough to bracket the slowest
-        // typical bottleneck (LLM tool call → Kimodo daemon RPC).
-        if self.node_type == "KimodoMotionNode" && matches!(data, RuntimeData::Json(_)) {
-            if let Some(sid) = session_id_opt.as_deref() {
-                crate::transport::session_control::publish_timeline_event(
-                    sid,
-                    "motion_intent",
-                    None,
-                    &self.node_id,
-                );
-            }
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: std::collections::HashMap<String, RuntimeData>,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        Self::legacy_copies(ctx)?;
+        let (_, data) = inputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Execution("No input data provided".into()))?;
+        self.process_with_ctx(data, ctx).await
+    }
+
+    async fn process_control_with_ctx(
+        &self,
+        message: RuntimeData,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+    ) -> Result<bool, Error> {
+        Self::legacy_copies(ctx)?;
+        if crate::transport::session_control::aux_port_of(&message).as_deref()
+            != Some(crate::transport::session_control::BARGE_IN_PORT)
+        {
+            return Ok(false);
         }
-
-        // CRITICAL: MultiprocessExecutor methods don't need &mut self anymore (as of the multiprocess redesign)
-        // They use Arc/RwLock internally, so we can safely get a shared reference and release the lock
-        // This allows concurrent requests to be processed in parallel
-        let executor = {
-            let mut executor_guard = self.executor.lock().await;
-            let executor = executor_guard
-                .as_mut()
-                .ok_or_else(|| Error::Execution("Python node not initialized".to_string()))?;
-
-            // Downcast to MultiprocessExecutor
-            let mp_executor = executor
-                .as_any_mut()
-                .downcast_mut::<crate::python::multiprocess::MultiprocessExecutor>()
-                .ok_or_else(|| {
-                    Error::Execution("Failed to downcast to MultiprocessExecutor".to_string())
-                })?;
-
-            // Clone the Arc to get a shared reference we can use outside the lock
-            // SAFETY: MultiprocessExecutor's process_runtime_data_streaming only needs &self
-            // because all mutable state is behind Arc<RwLock<...>>
-            mp_executor as *const crate::python::multiprocess::MultiprocessExecutor
-        };
-
-        // Release the lock here before calling process_runtime_data_streaming
-        // This allows other requests to proceed concurrently
-
-        // Use process_runtime_data_streaming which waits for outputs and invokes callback
-        tracing::info!(
-            "[PythonStreamingNode] Node {}: calling mp_executor.process_runtime_data_streaming",
-            self.node_id
-        );
-        let result = unsafe {
-            // SAFETY: The executor pointer is valid for the lifetime of self because:
-            // 1. PythonStreamingNode owns the Box<dyn PythonExecutor> in self.executor
-            // 2. The MultiprocessExecutor will not be dropped while self exists
-            // 3. process_runtime_data_streaming only needs &self (all state is Arc/RwLock)
-            (*executor)
-                .process_runtime_data_streaming(data, session_id_opt, callback)
-                .await
-        };
-
-        tracing::info!("[PythonStreamingNode] Node {}: mp_executor.process_runtime_data_streaming returned {:?}", self.node_id, result);
-
-        tracing::debug!(
-            "Node {}: process_runtime_data_streaming returned {:?}",
-            self.node_id,
-            result.as_ref().map(|_| "Ok").unwrap_or("Err")
-        );
-        result
+        self.process_streaming_with_ctx(message, ctx, |_| Ok(()))
+            .await?;
+        Ok(true)
     }
 }

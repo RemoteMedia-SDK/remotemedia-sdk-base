@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
 #[cfg(feature = "multiprocess")]
-use super::data_transfer::{from_python_wire, to_python_wire};
+use super::data_transfer::to_python_wire;
 #[cfg(feature = "multiprocess")]
 use super::health_monitor::{HealthMonitor, ProcessEvent};
 #[cfg(feature = "multiprocess")]
@@ -598,11 +598,38 @@ impl MultiprocessExecutor {
         &self, // Changed from &mut self - all state is behind Arc/RwLock
         input: crate::data::RuntimeData,
         session_id: Option<String>,
-        mut callback: F,
+        callback: F,
     ) -> Result<usize>
     where
         F: FnMut(crate::data::RuntimeData) -> Result<()> + Send,
     {
+        self.process_runtime_data_streaming_with_copy_context(
+            input,
+            session_id,
+            callback,
+            remotemedia_types::CopyContext::legacy(),
+        )
+        .await
+    }
+
+    /// Legacy execution requires copying; carry the caller's ledger through both codecs.
+    /// Python serialization and iceoryx staging remain distinct boundaries.
+    #[cfg(feature = "multiprocess")]
+    pub async fn process_runtime_data_streaming_with_copy_context<F>(
+        &self,
+        input: crate::data::RuntimeData,
+        session_id: Option<String>,
+        mut callback: F,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<usize>
+    where
+        F: FnMut(crate::data::RuntimeData) -> Result<()> + Send,
+    {
+        if copies.policy() != remotemedia_types::CopyPolicy::AllowCopies {
+            return Err(Error::Execution(
+                "Legacy Python execution requires allow_copies; use mapped execution".into(),
+            ));
+        }
         let ctx = self
             .current_context
             .as_ref()
@@ -619,7 +646,12 @@ impl MultiprocessExecutor {
         );
 
         // Convert input to Python IPC wire bytes
-        let ipc_data = Self::to_ipc_runtime_data(&input, &session_id);
+        let ipc_data = crate::multiprocess::data_transfer::to_python_wire_with_copy_context(
+            &input,
+            &session_id,
+            copies,
+        )
+        .map_err(Error::Execution)?;
 
         tracing::debug!(
             "[Multiprocess] Converted input data for node '{}': {} bytes",
@@ -731,7 +763,9 @@ impl MultiprocessExecutor {
                             ipc_output.len()
                         );
 
-                        let output_data = Self::from_ipc_runtime_data(ipc_output)?;
+                        let output_data = crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(
+                            ipc_output.into(), copies,
+                        ).map_err(Error::Execution)?;
 
                         tracing::debug!(
                         "[Multiprocess] Converted to RuntimeData, invoking callback for node '{}'",
@@ -847,7 +881,7 @@ impl MultiprocessExecutor {
         );
 
         // Convert input to Python IPC wire bytes
-        let ipc_data = Self::to_ipc_runtime_data(&input, session_id);
+        let ipc_data = Self::to_ipc_runtime_data(&input, session_id)?;
 
         tracing::info!(
             "[send_data_to_node] Converted RuntimeData to IPC wire: {} bytes",
@@ -920,7 +954,7 @@ impl MultiprocessExecutor {
         data: crate::data::RuntimeData,
     ) -> Result<()> {
         // Convert to Python IPC wire bytes
-        let ipc_data = Self::to_ipc_runtime_data(&data, session_id);
+        let ipc_data = Self::to_ipc_runtime_data(&data, session_id)?;
 
         // Get the IPC thread from global sessions storage
         let global_sessions = global_sessions();
@@ -968,15 +1002,21 @@ impl MultiprocessExecutor {
 
     /// Convert main RuntimeData to Python IPC wire bytes
     #[cfg(feature = "multiprocess")]
-    pub fn to_ipc_runtime_data(data: &crate::data::RuntimeData, session_id: &str) -> Vec<u8> {
-        to_python_wire(data, session_id)
+    pub fn to_ipc_runtime_data(
+        data: &crate::data::RuntimeData,
+        session_id: &str,
+    ) -> Result<Vec<u8>> {
+        to_python_wire(data, session_id).map_err(Error::Execution)
     }
 
     /// Convert Python IPC wire bytes back to main RuntimeData
     #[cfg(feature = "multiprocess")]
     pub fn from_ipc_runtime_data(bytes: Vec<u8>) -> Result<crate::data::RuntimeData> {
-        from_python_wire(&bytes)
-            .map_err(|e| Error::Execution(format!("Invalid IPC wire data: {e}")))
+        crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(
+            bytes.into(),
+            remotemedia_types::CopyContext::legacy(),
+        )
+        .map_err(|e| Error::Execution(format!("Invalid IPC wire data: {e}")))
     }
 
     /// Create a new multiprocess executor
@@ -1917,7 +1957,10 @@ sys.stdout.flush()
         let node_id_clone = node_id.to_string();
         let session_id_clone = session_id.to_string();
         let control = self.get_control();
-        let process = self.sessions.read().await
+        let process = self
+            .sessions
+            .read()
+            .await
             .get(session_id)
             .and_then(|session| session.node_processes.get(node_id))
             .cloned()
@@ -1948,10 +1991,12 @@ sys.stdout.flush()
                 poll_count += 1;
                 if poll_count % 100 == 0 {
                     let status = handle.block_on(async { process.status.read().await.clone() });
-                    if matches!(status, super::process_manager::ProcessStatus::Error(_)
-                        | super::process_manager::ProcessStatus::Stopped
-                        | super::process_manager::ProcessStatus::Stopping)
-                    {
+                    if matches!(
+                        status,
+                        super::process_manager::ProcessStatus::Error(_)
+                            | super::process_manager::ProcessStatus::Stopped
+                            | super::process_manager::ProcessStatus::Stopping
+                    ) {
                         return Err(Error::Execution(format!(
                             "Node {node_id_clone} exited before readiness: {status:?}"
                         )));

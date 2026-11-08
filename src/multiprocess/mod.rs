@@ -33,6 +33,7 @@
 //! whichever attaches first creates the service.
 
 pub mod data_transfer;
+mod python_wire;
 
 /// Typed mapped runner for existing node traits and direct output allocation.
 /// The legacy `runner::Plugin` remains a copying compatibility protocol.
