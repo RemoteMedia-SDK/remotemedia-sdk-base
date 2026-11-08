@@ -166,6 +166,9 @@ pub struct SessionRouter {
     /// deadlocking with a node task that's blocked on `loopback_tx.send`.
     node_inputs: HashMap<String, mpsc::Sender<DataPacket>>,
 
+    /// One authority per node, shared by initialization, execution and IPC output.
+    node_materialization: remotemedia_core::transport::NodeMaterializationCopies,
+
     /// Whether the router is running
     running: bool,
 
@@ -208,7 +211,7 @@ impl SessionRouter {
         client_tx: mpsc::Sender<Result<StreamResponse, Status>>,
     ) -> Result<(Self, mpsc::Sender<()>), Status> {
         // Build and validate the pipeline graph (spec 021)
-        let (graph, descriptor, successors) = {
+        let (graph, descriptor, successors, node_materialization) = {
             let session_guard = session.lock().await;
             let graph = PipelineGraph::from_manifest(&session_guard.manifest).map_err(|e| {
                 error!(
@@ -237,7 +240,16 @@ impl SessionRouter {
                     .or_default()
                     .push((idx, c.to.clone()));
             }
-            (graph, descriptor, successors)
+            let copies = remotemedia_core::transport::NodeMaterializationCopies::new(
+                &session_id,
+                session_guard
+                    .manifest
+                    .nodes
+                    .iter()
+                    .map(|node| node.id.as_str()),
+                Default::default(), // Existing gRPC compatibility policy: AllowCopies.
+            );
+            (graph, descriptor, successors, copies)
         };
         let telemetry = Arc::new(SessionTelemetry::new(
             &descriptor,
@@ -285,6 +297,7 @@ impl SessionRouter {
             _shutdown_tx: shutdown_tx,
             node_tasks: HashMap::new(),
             node_inputs: HashMap::new(),
+            node_materialization,
             running: false,
             control: None,
             #[cfg(feature = "multiprocess")]
@@ -451,6 +464,11 @@ impl SessionRouter {
                         node_id: node_id.clone(),
                         control: self.control.clone(),
                     };
+                    let copies = self
+                        .node_materialization
+                        .context(&node_id)
+                        .map_err(|error| Status::internal(error.to_string()))?;
+                    let init_ctx = init_ctx.with_copy_context(copies);
                     match node.initialize(&init_ctx).await {
                         Ok(_) => {
                             info!(
@@ -843,12 +861,18 @@ impl SessionRouter {
             node_id: node_id_clone.clone(),
             control: Some(control.clone()),
         };
+        let copies = self
+            .node_materialization
+            .context(&node_id_clone)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let init_ctx = init_ctx.with_copy_context(copies.clone());
         let runtime_ctx = remotemedia_core::nodes::NodeRuntimeContext::for_session(
             session_id.clone(),
             node_id_clone.clone(),
             control,
             node.make_session_state(&init_ctx),
-        );
+        )
+        .with_copy_context(copies);
 
         // Check if this is a multiprocess node and set up continuous output draining
         #[cfg(feature = "multiprocess")]

@@ -599,6 +599,11 @@ pub struct MultiprocessExecutor {
     /// Current node context
     current_context: Option<ExecutorNodeContext>,
 
+    /// Fixed before initialization; owns startup and background-output accounting.
+    initial_copies: Option<remotemedia_types::CopyContext>,
+    /// Canonical identity survives cleanup so the bound ledger cannot migrate.
+    initial_scope: Option<(String, String)>,
+
     /// Docker support
     #[cfg(feature = "docker")]
     docker_support: Option<Arc<DockerSupport>>,
@@ -866,9 +871,10 @@ impl MultiprocessExecutor {
         .await
     }
 
-    /// Bind continuously produced output to this session/node authority. This
-    /// context is not replaced by later input requests. Registration applies to
-    /// subsequent native receives, not frames already copied before it arrives.
+    /// Supply output authority for an executor without initialization authority.
+    /// An initialization binding takes precedence and cannot be replaced by a
+    /// callback or input request. Otherwise registration applies only to later
+    /// receives, not frames already copied before the command arrives.
     #[cfg(feature = "multiprocess")]
     pub async fn register_output_callback_with_copy_context(
         &self,
@@ -1103,6 +1109,8 @@ impl MultiprocessExecutor {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
             current_context: None,
+            initial_copies: None,
+            initial_scope: None,
             #[cfg(feature = "docker")]
             docker_support,
             env_manager,
@@ -1114,6 +1122,51 @@ impl MultiprocessExecutor {
         executor.setup_failure_handling();
 
         executor
+    }
+
+    /// A lifetime-bound executor cannot be reassigned to another node/session.
+    pub(crate) fn validate_initialization_scope(&self, node: &str, session: &str) -> Result<()> {
+        if self
+            .initial_scope
+            .as_ref()
+            .is_some_and(|(prior_node, prior_session)| {
+                prior_node != node || prior_session != session
+            })
+        {
+            return Err(Error::Execution(
+                "A bound legacy executor cannot initialize another node/session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bind lifetime output accounting before initialization. A clone of the
+    /// same authority may reassert the binding; labels alone cannot rebind it.
+    pub fn bind_initial_copy_context(
+        &mut self,
+        copies: remotemedia_types::CopyContext,
+    ) -> Result<()> {
+        if copies.policy() != remotemedia_types::CopyPolicy::AllowCopies {
+            return Err(Error::Execution(
+                "Legacy Python initialization requires allow_copies; use mapped execution".into(),
+            ));
+        }
+        if let Some(bound) = &self.initial_copies {
+            return if bound.same_authority(&copies) {
+                Ok(())
+            } else {
+                Err(Error::Execution(
+                    "Legacy Python initialization copy authority is already bound".into(),
+                ))
+            };
+        }
+        if self.current_context.is_some() {
+            return Err(Error::Execution(
+                "Cannot attribute an already initialized legacy Python worker retroactively".into(),
+            ));
+        }
+        self.initial_copies = Some(copies);
+        Ok(())
     }
 
     /// Set the control bus handle for forwarding progress events from
@@ -2157,6 +2210,7 @@ sys.stdout.flush()
         let session_id_clone = session_id.to_string();
 
         // Spawn dedicated OS thread
+        let initial_copies = self.initial_copies.clone();
         let handle = std::thread::spawn(move || {
             tracing::debug!("IPC thread starting for node: {}", node_id_clone);
 
@@ -2224,9 +2278,9 @@ sys.stdout.flush()
             // Uses blocking_send from this sync OS thread so a full queue
             // naturally stalls the iceoryx2 subscriber loop below.
             let mut output_callback: Option<tokio::sync::mpsc::Sender<SharedBytes>> = None;
-            // Independent of request SendData authority: sources may emit between
-            // calls. A registered consumer supplies the stable session/node scope.
-            let mut output_copies = CopyContext::legacy().clone();
+            // Bind before the first receive. Callback contexts are a compatibility
+            // fallback only for executors created without initialization authority.
+            let mut callback_copies = CopyContext::legacy().clone();
 
             // Main loop: process commands using persistent publishers/subscribers
             loop {
@@ -2280,7 +2334,7 @@ sys.stdout.flush()
                             node_id_clone
                         );
                         output_callback = Some(callback_tx);
-                        output_copies = copies;
+                        callback_copies = copies;
                     }
                     Ok(IpcCommand::Shutdown) => {
                         tracing::debug!("IPC thread shutting down for node: {}", node_id_clone);
@@ -2317,7 +2371,9 @@ sys.stdout.flush()
 
                         // No command, poll subscriber for incoming data
                         // Use receive_bytes() for Python IPC — the wire format is not bincode
-                        match subscriber.receive_shared_bytes_with_copy_context(&output_copies) {
+                        match subscriber.receive_shared_bytes_with_copy_context(
+                            initial_copies.as_ref().unwrap_or(&callback_copies),
+                        ) {
                             Ok(Some(output_data)) => {
                                 deliver_ipc_output(output_data, &mut output_callback, &resp_tx);
                             }
@@ -2582,20 +2638,20 @@ sys.stdout.flush()
 #[async_trait]
 impl ExecutorNodeExecutor for MultiprocessExecutor {
     async fn initialize(&mut self, ctx: &ExecutorNodeContext) -> Result<()> {
+        let session_id = ctx
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("default_{}", ctx.node_id));
+        self.validate_initialization_scope(&ctx.node_id, &session_id)?;
+        if self.initial_copies.is_some() && self.initial_scope.is_none() {
+            self.initial_scope = Some((ctx.node_id.clone(), session_id.clone()));
+        }
         tracing::debug!(
             "Initializing multiprocess node: {} ({})",
             ctx.node_id,
             ctx.node_type
         );
-
-        // Store context for later use
         self.current_context = Some(ctx.clone());
-
-        // Get or create session
-        let session_id = ctx
-            .session_id
-            .clone()
-            .unwrap_or_else(|| format!("default_{}", ctx.node_id));
 
         // Ensure session exists
         if !self.sessions.read().await.contains_key(&session_id) {

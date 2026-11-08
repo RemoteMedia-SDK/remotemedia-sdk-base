@@ -934,13 +934,17 @@ impl SessionRouter {
         // child, so we don't leak partially-initialised processes.
         let session_id = self.session_id.clone();
         let control = self.control.clone();
+        let node_materialization = self.node_materialization.clone();
         let init_futures = created.into_iter().map(|(id, ty, node)| {
+            let copies = node_materialization.context(&id);
             let init_ctx = InitializeContext {
                 session_id: session_id.clone(),
                 node_id: id.clone(),
                 control: control.clone(),
             };
             async move {
+                let copies = copies.map_err(|error| (id.clone(), ty.clone(), error))?;
+                let init_ctx = init_ctx.with_copy_context(copies);
                 match node.initialize(&init_ctx).await {
                     Ok(()) => Ok((id, ty, node)),
                     Err(e) => Err((id, ty, e)),
@@ -1816,6 +1820,7 @@ impl SessionRouter {
                 node_id: main_node_id.clone(),
                 control: control.clone(),
             };
+            let init_ctx_for_state = init_ctx_for_state.with_copy_context(materialization.clone());
             let session_state = node_ref.make_session_state(&init_ctx_for_state);
             let ctx_control = control
                 .clone()

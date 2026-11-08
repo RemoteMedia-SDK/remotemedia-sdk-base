@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, sync::Arc};
 pub struct NodeMaterializationCopies(Arc<BTreeMap<String, CopyContext>>);
 
 impl NodeMaterializationCopies {
-    pub(crate) fn new<'a>(
+    pub fn new<'a>(
         session: &str,
         nodes: impl Iterator<Item = &'a str>,
         policy: CopyPolicy,
@@ -29,7 +29,7 @@ impl NodeMaterializationCopies {
         ))
     }
 
-    pub(crate) fn context(&self, node: &str) -> crate::Result<CopyContext> {
+    pub fn context(&self, node: &str) -> crate::Result<CopyContext> {
         self.0.get(node).cloned().ok_or_else(|| {
             crate::Error::ConfigError(format!("node materialization policy has no node '{node}'"))
         })

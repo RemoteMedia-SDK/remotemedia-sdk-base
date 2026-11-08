@@ -1,13 +1,62 @@
 //! Focused tests of the production legacy IPC thread and fan-out.
 use super::*;
 
+#[tokio::test]
+async fn legacy_ipc_initial_binding_rejects_rebind_and_retroactive_attribution() {
+    use remotemedia_types::CopyPolicy;
+    let copies = CopyContext::new(CopyPolicy::AllowCopies, "initial");
+    let mut executor = MultiprocessExecutor::new(MultiprocessConfig::default());
+    assert!(executor
+        .bind_initial_copy_context(CopyContext::new(CopyPolicy::RequireZeroCopy, "strict"))
+        .is_err());
+    assert!(executor.initial_copies.is_none());
+    executor.bind_initial_copy_context(copies.clone()).unwrap();
+    executor.bind_initial_copy_context(copies.clone()).unwrap();
+    assert!(executor
+        .bind_initial_copy_context(CopyContext::new(CopyPolicy::AllowCopies, "initial"))
+        .is_err());
+    let prior = ExecutorNodeContext {
+        node_id: "first".into(),
+        node_type: "NoSuchPythonNode".into(),
+        session_id: Some("session".into()),
+        params: serde_json::json!({}),
+        metadata: HashMap::new(),
+    };
+    executor.initial_scope = Some((prior.node_id.clone(), prior.session_id.clone().unwrap()));
+    // Cleanup clears current execution state, but must retain the bound identity.
+    ExecutorNodeExecutor::cleanup(&mut executor).await.unwrap();
+    let mut other = prior.clone();
+    other.node_id = "other".into();
+    assert!(ExecutorNodeExecutor::initialize(&mut executor, &other)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("another node/session"));
+    let mut legacy = MultiprocessExecutor::new(MultiprocessConfig::default());
+    legacy.current_context = Some(prior);
+    assert!(legacy
+        .bind_initial_copy_context(copies)
+        .unwrap_err()
+        .to_string()
+        .contains("retroactively"));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn legacy_ipc_thread_keeps_background_authority_separate_from_requests() {
+    verify_background_authority(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_ipc_initial_authority_covers_output_before_registration() {
+    verify_background_authority(true).await;
+}
+
+async fn verify_background_authority(bind_before_spawn: bool) {
     use futures::FutureExt;
     use remotemedia_types::{CopyPolicy, CopyReason, RuntimeData};
     use std::panic::AssertUnwindSafe;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    let executor = MultiprocessExecutor::new(MultiprocessConfig::default());
+    let mut executor = MultiprocessExecutor::new(MultiprocessConfig::default());
     let session = format!(
         "ledger-{}-{}",
         std::process::id(),
@@ -17,6 +66,13 @@ async fn legacy_ipc_thread_keeps_background_authority_separate_from_requests() {
             .as_nanos()
     );
     let node = "fixture";
+    let output_copies =
+        CopyContext::new(CopyPolicy::AllowCopies, format!("session/{session}/output"));
+    if bind_before_spawn {
+        executor
+            .bind_initial_copy_context(output_copies.clone())
+            .unwrap();
+    }
     let registry = executor.channel_registry().clone();
     let mut channels = Vec::new();
     for suffix in ["input", "output", "control"] {
@@ -45,8 +101,6 @@ async fn legacy_ipc_thread_keeps_background_authority_separate_from_requests() {
         .or_default()
         .insert(node.into(), thread.command_tx.clone());
     let (callback_tx, mut callback_rx) = tokio::sync::mpsc::channel(1);
-    let output_copies =
-        CopyContext::new(CopyPolicy::AllowCopies, format!("session/{session}/output"));
     let requests = [
         CopyContext::new(CopyPolicy::AllowCopies, "request/a"),
         CopyContext::new(CopyPolicy::AllowCopies, "request/b"),
@@ -61,11 +115,46 @@ async fn legacy_ipc_thread_keeps_background_authority_separate_from_requests() {
     // Always close receivers/remove routing and join the actual IPC thread, even
     // when a test assertion fails. No Python worker or model is started here.
     let result = AssertUnwindSafe(async {
+        let mut responses = thread.response_rx.lock().await;
+        if bind_before_spawn {
+            let startup_input = CopyContext::new(CopyPolicy::AllowCopies, "startup-input");
+            executor
+                .send_data_to_node_with_copy_context(
+                    node,
+                    &session,
+                    RuntimeData::Text("ready".into()),
+                    &startup_input,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), responses.recv())
+                    .await
+                    .unwrap(),
+                Some(IpcResponse::SendComplete)
+            ));
+            output_publisher.send(&wire).unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), responses.recv())
+                    .await
+                    .unwrap(),
+                Some(IpcResponse::OutputData(_))
+            ));
+        }
+        let callback_copies = if bind_before_spawn {
+            CopyContext::new(CopyPolicy::AllowCopies, "later-callback")
+        } else {
+            output_copies.clone()
+        };
         executor
-            .register_output_callback_with_copy_context(node, &session, callback_tx, &output_copies)
+            .register_output_callback_with_copy_context(
+                node,
+                &session,
+                callback_tx,
+                &callback_copies,
+            )
             .await
             .unwrap();
-        let mut responses = thread.response_rx.lock().await;
         let mut retained = None;
         for index in 0..3 {
             if index < requests.len() {
@@ -110,9 +199,10 @@ async fn legacy_ipc_thread_keeps_background_authority_separate_from_requests() {
             let RuntimeData::Tensor { data, .. } = data else {
                 panic!("missing tensor")
             };
-            assert_eq!(data.as_slice().as_ptr(), unsafe {
-                response.as_slice().as_ptr().add(wire.len() - 1024)
-            });
+            assert_eq!(
+                data.as_slice().as_ptr(),
+                response.as_slice()[wire.len() - 1024..].as_ptr()
+            );
             retained = Some(data.slice(7..23).unwrap());
         }
         let copied = |context: &CopyContext, reason| {
@@ -126,7 +216,7 @@ async fn legacy_ipc_thread_keeps_background_authority_separate_from_requests() {
         };
         assert_eq!(
             copied(&output_copies, CopyReason::PrivateIpcIngress).copied_bytes,
-            (wire.len() * 3) as u64
+            (wire.len() * if bind_before_spawn { 4 } else { 3 }) as u64
         );
         assert_eq!(
             copied(&output_copies, CopyReason::PortableDeserialization).copied_bytes,
@@ -136,6 +226,12 @@ async fn legacy_ipc_thread_keeps_background_authority_separate_from_requests() {
             copied(&output_copies, CopyReason::BorrowedInput).copied_bytes,
             0
         );
+        if bind_before_spawn {
+            assert_eq!(
+                copied(&callback_copies, CopyReason::PrivateIpcIngress).copied_bytes,
+                0
+            );
+        }
         for request in &requests {
             assert_eq!(copied(request, CopyReason::BorrowedInput).completed, 1);
             assert_eq!(

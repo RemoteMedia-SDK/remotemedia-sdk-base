@@ -62,6 +62,18 @@ pub struct InitializeContext {
 }
 
 impl InitializeContext {
+    /// Attach the session's existing ledger without changing context literals.
+    /// The wrapper preserves the host-context downcast used by legacy adapters.
+    pub fn with_copy_context(
+        self,
+        copies: remotemedia_types::CopyContext,
+    ) -> impl InitializeContextRead {
+        InitializeContextWithCopies {
+            context: self,
+            copies,
+        }
+    }
+
     /// Emit a progress event on the control bus.
     ///
     /// Clients subscribed to `__system__.out` receive these as JSON events
@@ -109,6 +121,29 @@ impl remotemedia_traits::runtime_context::InitializeContextRead for InitializeCo
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+struct InitializeContextWithCopies {
+    context: InitializeContext,
+    copies: remotemedia_types::CopyContext,
+}
+
+impl InitializeContextRead for InitializeContextWithCopies {
+    fn copy_context(&self) -> Option<remotemedia_types::CopyContext> {
+        Some(self.copies.clone())
+    }
+    fn session_id(&self) -> &str {
+        &self.context.session_id
+    }
+    fn node_id(&self) -> &str {
+        &self.context.node_id
+    }
+    fn emit_progress(&self, status: &str, message: &str) {
+        self.context.emit_progress(status, message)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        &self.context
     }
 }
 
