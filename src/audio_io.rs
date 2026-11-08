@@ -80,51 +80,99 @@ pub fn pick_stream_config(
     device_name: &str,
     channels: u16,
     sample_rate: u32,
-    channel_hint: &str,
+    hint: &str,
 ) -> Result<SupportedStreamConfig> {
     let all: Vec<_> = ranges.collect();
+    if all.is_empty() {
+        anyhow::bail!("Device '{device_name}' reports no supported stream configs.");
+    }
     let mut matching: Vec<_> = all
         .iter()
         .filter(|r| r.channels() == channels)
         .cloned()
         .collect();
-    if matching.is_empty() {
-        let counts: std::collections::BTreeSet<u16> = all.iter().map(|r| r.channels()).collect();
-        let counts: Vec<String> = counts.iter().map(u16::to_string).collect();
-        if counts.is_empty() {
-            anyhow::bail!("Device '{device_name}' reports no supported stream configs.");
-        }
-        anyhow::bail!(
-            "Device '{device_name}' doesn't support {channels} channel(s); it supports {} \
-             channel(s).{channel_hint}",
-            counts.join(", ")
-        );
-    }
     matching.sort_by_key(|r| r.sample_format() != cpal::SampleFormat::F32);
-    let rates: Vec<String> = matching
+    if let Some(c) = matching.iter().find_map(|r| {
+        r.clone()
+            .try_with_sample_rate(cpal::SampleRate(sample_rate))
+    }) {
+        return Ok(c);
+    }
+    Err(anyhow::anyhow!(unsupported_config_message(
+        &all,
+        device_name,
+        channels,
+        sample_rate,
+        hint
+    )))
+}
+
+/// Everything wrong with `channels` x `sample_rate` on a device, and every
+/// combination it does support, in one message: an agent or user fixing the
+/// params should not have to learn the constraints one failed start at a
+/// time.
+fn unsupported_config_message(
+    all: &[cpal::SupportedStreamConfigRange],
+    device_name: &str,
+    channels: u16,
+    sample_rate: u32,
+    hint: &str,
+) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    let covers = |r: &cpal::SupportedStreamConfigRange| {
+        r.min_sample_rate().0 <= sample_rate && sample_rate <= r.max_sample_rate().0
+    };
+    // channels -> the rates (or rate ranges) offered with that count.
+    let mut by_channels: BTreeMap<u16, BTreeSet<(u32, u32)>> = BTreeMap::new();
+    for r in all {
+        by_channels
+            .entry(r.channels())
+            .or_default()
+            .insert((r.min_sample_rate().0, r.max_sample_rate().0));
+    }
+    let rates_text = |rates: &BTreeSet<(u32, u32)>| {
+        rates
+            .iter()
+            .map(|&(lo, hi)| {
+                if lo == hi {
+                    format!("{lo}")
+                } else {
+                    format!("{lo}..{hi}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut wrong = Vec::new();
+    if !by_channels.contains_key(&channels) {
+        wrong.push(format!("channels {channels} is not supported"));
+    }
+    if !all.iter().any(covers) {
+        wrong.push(format!("sample_rate {sample_rate} is not supported"));
+    } else if by_channels.contains_key(&channels) {
+        wrong.push(format!(
+            "sample_rate {sample_rate} is not supported with {channels} channel(s)"
+        ));
+    }
+    let supported = by_channels
         .iter()
-        .map(|r| {
-            let (lo, hi) = (r.min_sample_rate().0, r.max_sample_rate().0);
-            if lo == hi {
-                format!("{lo}")
-            } else {
-                format!("{lo}..{hi}")
-            }
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    matching
-        .into_iter()
-        .find_map(|r| r.try_with_sample_rate(cpal::SampleRate(sample_rate)))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Device '{device_name}' doesn't support {sample_rate} Hz with {channels} channel(s); \
-                 it supports {} Hz. Set sample_rate to a supported rate (and resample with \
-                 FastResampleNode where a node needs another rate).",
-                rates.join(", ")
-            )
-        })
+        .map(|(c, rates)| format!("{c} channel(s) at {} Hz", rates_text(rates)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    // One fixed combination: say exactly what to set.
+    let only = match (by_channels.len(), by_channels.iter().next()) {
+        (1, Some((c, rates))) if rates.len() == 1 => {
+            let &(lo, hi) = rates.iter().next().expect("one rate");
+            (lo == hi).then(|| format!(" Set channels: {c}, sample_rate: {lo}."))
+        }
+        _ => None,
+    }
+    .unwrap_or_else(|| " Set channels and sample_rate to one of these.".into());
+    format!(
+        "Device '{device_name}' cannot open {channels} channel(s) at {sample_rate} Hz: {}. \
+         It supports {supported}.{only}{hint}",
+        wrong.join(", ")
+    )
 }
 
 /// Get a specific audio host by name
@@ -254,7 +302,7 @@ impl AudioCapture {
             &device_name,
             config.channels,
             config.sample_rate,
-            " Set `channels` to a count it supports (2 for a stereo-only USB mic).",
+            " Resample with FastResampleNode where another node needs a different rate or channel count.",
         )?;
 
         let (audio_tx, audio_rx) = broadcast::channel(100);
@@ -377,17 +425,65 @@ pub fn pick_output_config(
         .ok_or_else(|| {
             anyhow::anyhow!("Device '{device_name}' reports no supported stream configs.")
         })?;
+    // The node maps `channels` onto the device's own, so only the rate can
+    // be wrong here: do not tell the caller to change its channel count.
     let c = pick_stream_config(
-        all.into_iter(),
+        all.iter().cloned(),
         device_name,
         device_channels,
         sample_rate,
         "",
-    )?;
+    )
+    .map_err(|_| {
+        anyhow::anyhow!(mapped_rate_message(
+            &all,
+            device_name,
+            channels,
+            device_channels,
+            sample_rate
+        ))
+    })?;
     tracing::info!(
         "Device '{device_name}' has no {channels}-channel output; playing on its {device_channels} channels"
     );
     Ok((c, device_channels))
+}
+
+/// The error for an output device that has no `channels`-channel config
+/// (so `channels` would be mapped onto its `device_channels`) and no
+/// `sample_rate` either.
+fn mapped_rate_message(
+    all: &[cpal::SupportedStreamConfigRange],
+    device_name: &str,
+    channels: u16,
+    device_channels: u16,
+    sample_rate: u32,
+) -> String {
+    let rates: std::collections::BTreeSet<(u32, u32)> = all
+        .iter()
+        .filter(|r| r.channels() == device_channels)
+        .map(|r| (r.min_sample_rate().0, r.max_sample_rate().0))
+        .collect();
+    let text = rates
+        .iter()
+        .map(|&(lo, hi)| {
+            if lo == hi {
+                format!("{lo}")
+            } else {
+                format!("{lo}..{hi}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let set = match rates.iter().next() {
+        Some(&(lo, hi)) if rates.len() == 1 && lo == hi => format!("Set sample_rate: {lo}"),
+        _ => "Set sample_rate to one of these".to_string(),
+    };
+    format!(
+        "Device '{device_name}' cannot play at {sample_rate} Hz: sample_rate {sample_rate} is not \
+         supported. It plays {channels}-channel audio on its {device_channels} channels at {text} Hz. \
+         {set} (resample upstream with FastResampleNode where the audio has another rate)."
+    )
 }
 
 /// Write one interleaved input frame (`input.len()` channels) to an output
@@ -642,5 +738,93 @@ impl AudioPlayback {
     /// Get the playback configuration
     pub fn config(&self) -> &PlaybackConfig {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cpal::{SampleFormat, SampleRate, SupportedBufferSize, SupportedStreamConfigRange};
+
+    fn range(ch: u16, lo: u32, hi: u32) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(
+            ch,
+            SampleRate(lo),
+            SampleRate(hi),
+            SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        )
+    }
+
+    fn err(ranges: Vec<SupportedStreamConfigRange>, ch: u16, rate: u32) -> String {
+        pick_stream_config(ranges.into_iter(), "Mic", ch, rate, "")
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn a_stereo_48k_only_mic_names_both_wrong_params_and_the_fix_at_once() {
+        let msg = err(vec![range(2, 48000, 48000)], 1, 16000);
+        assert!(msg.contains("channels 1 is not supported"), "{msg}");
+        assert!(msg.contains("sample_rate 16000 is not supported"), "{msg}");
+        assert!(
+            msg.contains("It supports 2 channel(s) at 48000 Hz."),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Set channels: 2, sample_rate: 48000."),
+            "{msg}"
+        );
+        assert!(!msg.contains("  "), "no stray whitespace: {msg}");
+    }
+
+    #[test]
+    fn a_rate_only_valid_with_other_channels_says_so_and_lists_every_combination() {
+        let msg = err(
+            vec![range(1, 8000, 48000), range(2, 48000, 48000)],
+            2,
+            16000,
+        );
+        assert!(
+            msg.contains("sample_rate 16000 is not supported with 2 channel(s)"),
+            "{msg}"
+        );
+        assert!(!msg.contains("channels 2 is not supported"), "{msg}");
+        assert!(
+            msg.contains("1 channel(s) at 8000..48000 Hz; 2 channel(s) at 48000 Hz"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Set channels and sample_rate to one of these."),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_speaker_with_another_layout_is_only_asked_for_a_rate() {
+        let err = pick_output_config(vec![range(8, 48000, 48000)].into_iter(), "X4", 2, 16000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot play at 16000 Hz"), "{err}");
+        assert!(
+            err.contains("plays 2-channel audio on its 8 channels at 48000 Hz"),
+            "{err}"
+        );
+        assert!(err.contains("Set sample_rate: 48000"), "{err}");
+        assert!(!err.contains("Set channels"), "{err}");
+        assert!(!err.contains("  "), "no stray whitespace: {err}");
+    }
+
+    #[test]
+    fn a_supported_combination_opens() {
+        let c = pick_stream_config(
+            vec![range(2, 44100, 48000)].into_iter(),
+            "Mic",
+            2,
+            48000,
+            "",
+        )
+        .unwrap();
+        assert_eq!((c.channels(), c.sample_rate().0), (2, 48000));
     }
 }

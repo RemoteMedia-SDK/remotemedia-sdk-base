@@ -56,6 +56,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+/// After a node fails to initialize, how long the other nodes get to finish
+/// (or fail too, so their errors are reported together) before startup is
+/// aborted and the rest are cancelled.
+pub const INIT_FAILURE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Default capacity for the router's internal input channel.
 ///
 /// Sized for ~160 ms of headroom at 48 kHz / 20 ms frames (8 frames × 20 ms).
@@ -707,7 +712,7 @@ impl SessionRouter {
     /// This pre-creates and caches all nodes before streaming starts,
     /// eliminating cold-start latency.
     pub async fn initialize_nodes(&mut self) -> Result<()> {
-        use futures::future::try_join_all;
+        use futures::stream::{FuturesUnordered, StreamExt};
 
         let total = self.manifest.nodes.len();
         tracing::info!(
@@ -724,6 +729,9 @@ impl SessionRouter {
         // params here so the multiprocess executor can provision its
         // venv on first call to initialize().
         let mut created: Vec<(String, String, Box<dyn StreamingNode>)> = Vec::with_capacity(total);
+        // Every node that cannot be created, not just the first: a manifest
+        // with two bad nodes should not take two attempts to learn that.
+        let mut create_failures: Vec<(String, String, Error)> = Vec::new();
         for node_spec in &self.manifest.nodes {
             let mut params = node_spec.params.clone();
             if let Some(ref py_deps) = node_spec.python_deps {
@@ -809,15 +817,45 @@ impl SessionRouter {
                     }
                 }
             }
-            let node = node_span(&self.session_id, &node_spec.id).in_scope(|| {
+            let made = node_span(&self.session_id, &node_spec.id).in_scope(|| {
                 self.registry.create_node(
                     &node_spec.node_type,
                     node_spec.id.clone(),
                     &params,
                     Some(self.session_id.clone()),
                 )
-            })?;
-            created.push((node_spec.id.clone(), node_spec.node_type.clone(), node));
+            });
+            match made {
+                Ok(node) => created.push((node_spec.id.clone(), node_spec.node_type.clone(), node)),
+                Err(e) => {
+                    create_failures.push((node_spec.id.clone(), node_spec.node_type.clone(), e))
+                }
+            }
+        }
+        if !create_failures.is_empty() {
+            for (id, ty, e) in &create_failures {
+                tracing::error!(
+                    session_id = %self.session_id,
+                    node_id = %id,
+                    node_type = %ty,
+                    error = %e,
+                    "Node creation failed; aborting session startup"
+                );
+            }
+            // One failure keeps its original error (and message).
+            if create_failures.len() == 1 {
+                return Err(create_failures.pop().expect("one").2);
+            }
+            let lines: Vec<String> = create_failures
+                .iter()
+                .map(|(id, ty, e)| format!("- Node '{id}' ({ty}): {e}"))
+                .collect();
+            return Err(Error::Execution(format!(
+                "{} of {} nodes could not be created:\n{}",
+                create_failures.len(),
+                total,
+                lines.join("\n")
+            )));
         }
 
         // Phase 2: emit `loading_node` for every node up front so the
@@ -890,9 +928,51 @@ impl SessionRouter {
             .instrument(span)
         });
 
-        let initialised = match try_join_all(init_futures).await {
-            Ok(v) => v,
-            Err((id, ty, e)) => {
+        // Collect every node's result. After the first failure the others
+        // get INIT_FAILURE_GRACE to finish (a misconfigured device fails in
+        // milliseconds, so its error is reported alongside the first) before
+        // the rest are dropped, which cancels them: a slow model load must
+        // not delay the report.
+        let mut pending: FuturesUnordered<_> = init_futures.collect();
+        let mut initialised = Vec::with_capacity(total);
+        let mut failures: Vec<(String, String, Error)> = Vec::new();
+        let mut deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let next = match deadline {
+                None => pending.next().await,
+                Some(d) => match tokio::time::timeout_at(d, pending.next()).await {
+                    Ok(n) => n,
+                    Err(_) => break,
+                },
+            };
+            match next {
+                None => break,
+                Some(Ok(done)) => initialised.push(done),
+                Some(Err(failed)) => {
+                    deadline
+                        .get_or_insert_with(|| tokio::time::Instant::now() + INIT_FAILURE_GRACE);
+                    failures.push(failed);
+                }
+            }
+        }
+        if !failures.is_empty() {
+            let done: std::collections::HashSet<&str> = initialised
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .chain(failures.iter().map(|(id, _, _)| id.as_str()))
+                .collect();
+            let unchecked: Vec<String> = self
+                .manifest
+                .nodes
+                .iter()
+                .filter(|n| !done.contains(n.id.as_str()))
+                .map(|n| format!("'{}' ({})", n.id, n.node_type))
+                .collect();
+            drop(pending);
+            // Report in manifest order.
+            let order = |id: &str| self.manifest.nodes.iter().position(|n| n.id == id);
+            failures.sort_by_key(|(id, _, _)| order(id));
+            for (id, ty, e) in &failures {
                 tracing::error!(
                     session_id = %self.session_id,
                     node_id = %id,
@@ -902,15 +982,37 @@ impl SessionRouter {
                 );
                 self.emit_node_loading_event(
                     "error",
-                    &id,
+                    id,
                     &format!("Node '{}' ({}) failed to initialize: {}", id, ty, e),
                 );
+            }
+            let still = if unchecked.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\nNot checked (still initializing when startup was aborted): {}",
+                    unchecked.join(", ")
+                )
+            };
+            if failures.len() == 1 {
+                let (id, ty, e) = &failures[0];
                 return Err(Error::Execution(format!(
-                    "Node '{}' ({}) failed to initialize: {}",
-                    id, ty, e
+                    "Node '{}' ({}) failed to initialize: {}{}",
+                    id, ty, e, still
                 )));
             }
-        };
+            let lines: Vec<String> = failures
+                .iter()
+                .map(|(id, ty, e)| format!("- Node '{id}' ({ty}): {e}"))
+                .collect();
+            return Err(Error::Execution(format!(
+                "{} of {} nodes failed to initialize:\n{}{}",
+                failures.len(),
+                total,
+                lines.join("\n"),
+                still
+            )));
+        }
 
         // Phase 4: move every initialised node into `cached_nodes`. The
         // router emitted an authoritative `node_ready` for each as it
@@ -2904,6 +3006,137 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("'mic' (PanicInitNode)"), "{msg}");
         assert!(msg.contains("panicked: sample rate out of range"), "{msg}");
+    }
+
+    /// A node whose creation or initialization behaves as its type says.
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Ok,
+        FailInit(&'static str),
+        SlowInit,
+        FailCreate(&'static str),
+    }
+    struct ModeNode(Mode);
+    #[async_trait::async_trait]
+    impl crate::nodes::AsyncStreamingNode for ModeNode {
+        fn node_type(&self) -> &str {
+            "ModeNode"
+        }
+        async fn initialize(
+            &self,
+            _ctx: &dyn crate::nodes::InitializeContextRead,
+        ) -> crate::Result<()> {
+            match self.0 {
+                Mode::FailInit(why) => Err(Error::Execution(why.into())),
+                Mode::SlowInit => {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+        async fn process(&self, data: RuntimeData) -> crate::Result<RuntimeData> {
+            Ok(data)
+        }
+    }
+    struct ModeFactory(&'static str, Mode);
+    impl crate::nodes::StreamingNodeFactory for ModeFactory {
+        fn node_type(&self) -> &str {
+            self.0
+        }
+        fn create(
+            &self,
+            _node_id: String,
+            _params: &serde_json::Value,
+            _session_id: Option<String>,
+        ) -> crate::Result<Box<dyn StreamingNode>> {
+            if let Mode::FailCreate(why) = self.1 {
+                return Err(Error::Execution(why.into()));
+            }
+            Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(
+                ModeNode(self.1),
+            ))))
+        }
+    }
+
+    async fn start_err(nodes: Vec<(&str, &str)>, factories: Vec<ModeFactory>) -> String {
+        let mut registry = StreamingNodeRegistry::new();
+        for f in factories {
+            registry.register(Arc::new(f));
+        }
+        let manifest = create_test_manifest(nodes, vec![]);
+        let (output, _rx) = ClientOutputRouter::new(8);
+        let (mut router, _) = SessionRouter::new(
+            "init-errors".into(),
+            Arc::new(manifest),
+            Arc::new(registry),
+            output,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), router.initialize_nodes())
+            .await
+            .expect("initialize_nodes returned")
+            .expect_err("startup fails")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn every_failing_node_is_reported_not_just_the_first() {
+        let msg = start_err(
+            vec![("mic", "FailA"), ("ok", "Fine"), ("speaker", "FailB")],
+            vec![
+                ModeFactory("FailA", Mode::FailInit("mic: 1 channel unsupported")),
+                ModeFactory("Fine", Mode::Ok),
+                ModeFactory("FailB", Mode::FailInit("speaker: 16000 Hz unsupported")),
+            ],
+        )
+        .await;
+        assert!(msg.contains("2 of 3 nodes failed to initialize:
+"), "{msg}");
+        let mic = msg.find("- Node 'mic' (FailA): ").expect("mic listed");
+        let spk = msg.find("- Node 'speaker' (FailB): ").expect("speaker listed");
+        assert!(mic < spk, "manifest order: {msg}");
+        assert!(msg.contains("1 channel unsupported") && msg.contains("16000 Hz unsupported"));
+        assert!(!msg.contains("Not checked"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_node_does_not_delay_the_report_and_is_named_unchecked() {
+        let t0 = std::time::Instant::now();
+        let msg = start_err(
+            vec![("mic", "FailA"), ("stt", "Slow")],
+            vec![
+                ModeFactory("FailA", Mode::FailInit("mic: unsupported")),
+                ModeFactory("Slow", Mode::SlowInit),
+            ],
+        )
+        .await;
+        assert!(t0.elapsed() < INIT_FAILURE_GRACE + std::time::Duration::from_secs(2));
+        // A single failure keeps the original message shape.
+        assert!(
+            msg.contains("Node 'mic' (FailA) failed to initialize:"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Not checked (still initializing when startup was aborted): 'stt' (Slow)"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_node_that_cannot_be_created_is_reported() {
+        let msg = start_err(
+            vec![("a", "BadA"), ("b", "Fine"), ("c", "BadC")],
+            vec![
+                ModeFactory("BadA", Mode::FailCreate("unknown param 'rate'")),
+                ModeFactory("Fine", Mode::Ok),
+                ModeFactory("BadC", Mode::FailCreate("unknown param 'chans'")),
+            ],
+        )
+        .await;
+        assert!(msg.contains("2 of 3 nodes could not be created:
+"), "{msg}");
+        assert!(msg.contains("- Node 'a' (BadA): ") && msg.contains("- Node 'c' (BadC): "));
     }
 
     #[tokio::test]
