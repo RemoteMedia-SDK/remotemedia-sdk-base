@@ -105,7 +105,7 @@ mod tests {
                 ssrc: 1,
                 marker: false,
             },
-            payload: vec![sequence as u8],
+            payload: vec![sequence as u8].into(),
         }
     }
 

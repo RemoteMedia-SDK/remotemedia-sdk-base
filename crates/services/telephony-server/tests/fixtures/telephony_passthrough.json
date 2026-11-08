@@ -1,0 +1,11 @@
+{
+  "version": "v1",
+  "metadata": {
+    "name": "telephony-passthrough",
+    "description": "Minimal RTP transport test pipeline."
+  },
+  "nodes": [
+    { "id": "passthrough", "node_type": "PassthroughNode", "params": {} }
+  ],
+  "connections": []
+}

@@ -149,7 +149,7 @@ fn spawn_media_loop(
     active_sessions: Arc<tokio::sync::Mutex<HashMap<String, ActiveSession>>>,
 ) {
     tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
+        let mut buf = vec![0u8; 1500];
         let mut pending_samples: Vec<f32> = Vec::new();
         let mut latched = false;
         let mut remote_rtp_addr = session.remote_rtp_addr;
@@ -163,8 +163,8 @@ fn spawn_media_loop(
             remote_rtp_addr
         );
         for _ in 0..5 {
-            if let Ok(rtp_packet) = session.outbound_media.packetize_audio_frame(&silence_frame) {
-                let rtp_bytes = rtp_packet.write();
+            if let Ok(rtp_bytes) = session.outbound_media.packetize_audio_datagram(&silence_frame)
+                .map_err(|error| warn!("RTP silence output rejected for call {}: {}", call_id, error)) {
                 let _ = session
                     .rtp_socket
                     .send_to(&rtp_bytes, remote_rtp_addr)
@@ -177,8 +177,9 @@ fn spawn_media_loop(
             // Read inbound RTP
             let mut read_ok = false;
             match session.rtp_socket.recv_from(&mut buf).await {
-                Ok((mut len, mut src)) => {
-                    let mut packet_buf = buf.to_vec();
+                Ok((len, mut src)) => {
+                    let mut packet_buf = std::mem::replace(&mut buf, vec![0; 1500]);
+                    packet_buf.truncate(len);
                     loop {
                         if !latched {
                             info!(
@@ -189,7 +190,7 @@ fn spawn_media_loop(
                             latched = true;
                         }
                         if src.ip() == remote_rtp_addr.ip() {
-                            match session.inbound_media.receive_datagram(&packet_buf[..len]) {
+                            match session.inbound_media.receive_owned_datagram(packet_buf.into()) {
                                 Ok(frames) => {
                                     for frame in frames {
                                         // Send decoded audio to pipeline
@@ -209,12 +210,11 @@ fn spawn_media_loop(
                         }
 
                         // Try to receive next pending packet non-blocking to prevent queue backup
-                        let mut temp_buf = [0u8; 1500];
-                        match session.rtp_socket.try_recv_from(&mut temp_buf) {
+                        match session.rtp_socket.try_recv_from(&mut buf) {
                             Ok((next_len, next_src)) => {
-                                len = next_len;
                                 src = next_src;
-                                packet_buf = temp_buf.to_vec();
+                                packet_buf = std::mem::replace(&mut buf, vec![0; 1500]);
+                                packet_buf.truncate(next_len);
                             }
                             Err(_) => {
                                 break;
@@ -494,7 +494,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                 ParticipantRole::User,
                                                                 accepted.codec_map.clone(),
                                                                 4, // jitter buffer depth
-                                                            );
+                                                            ).with_copy_context(accepted.copies.clone());
 
                                                             // Build outbound RTP media session (encode pipeline output)
                                                             let outbound_media = RtpOutboundMediaSession::new(
@@ -515,7 +515,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                                     0,
                                                                     20,
                                                                 ).expect("fallback outbound RTP creation failed")
-                                                            });
+                                                            }).with_copy_context(accepted.copies.clone());
 
                                                             let rtp_socket = Arc::new(accepted.rtp_socket);
                                                             let local_rtp_addr = accepted.local_rtp_addr;
@@ -693,7 +693,7 @@ mod tests {
     fn test_manifest_loading() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let manifest_path = std::path::Path::new(manifest_dir)
-            .join("../../../examples/manifests/telephony_passthrough.json");
+            .join("tests/fixtures/telephony_passthrough.json");
         let content = std::fs::read_to_string(manifest_path).expect("failed to read test manifest");
         let parsed = manifest::parse(&content).unwrap();
         assert_eq!(parsed.version, "v1");

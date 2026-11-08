@@ -14,6 +14,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = true }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3" }
 
 async-trait = { workspace = true }
 dashmap = { workspace = true }
