@@ -5,6 +5,7 @@
 
 use super::config::PeerCapabilities;
 use remotemedia_core::data::RuntimeData;
+use remotemedia_types::SharedBytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -77,7 +78,7 @@ impl PipelineOutputEvent {
     pub fn new(peer_id: String, data: RuntimeData) -> Self {
         Self {
             peer_id,
-            data,
+            data: data.into_shared(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
@@ -92,17 +93,17 @@ pub struct DataReceivedEvent {
     /// Source peer's identifier
     pub peer_id: String,
     /// Raw data bytes
-    pub data: Vec<u8>,
+    pub data: SharedBytes,
     /// Nanosecond timestamp
     pub timestamp: u64,
 }
 
 impl DataReceivedEvent {
     /// Create a new data received event
-    pub fn new(peer_id: String, data: Vec<u8>) -> Self {
+    pub fn new(peer_id: String, data: impl Into<SharedBytes>) -> Self {
         Self {
             peer_id,
-            data,
+            data: data.into(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)

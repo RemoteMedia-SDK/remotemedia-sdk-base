@@ -867,7 +867,11 @@ impl WebRtcServerCore {
     }
 }
 
-/// Convert a bridge event from the WebRTC signaling layer to an FFI event
+#[cfg(test)]
+#[path = "observer_tests.rs"]
+mod observer_tests;
+
+/// Convert a bridge event from the WebRTC signaling layer to an FFI event.
 fn convert_bridge_to_ffi_event(bridge_event: &WebRtcEventBridge) -> WebRtcEvent {
     match bridge_event {
         WebRtcEventBridge::PeerConnected {
@@ -900,21 +904,13 @@ fn convert_bridge_to_ffi_event(bridge_event: &WebRtcEventBridge) -> WebRtcEvent 
         }
         WebRtcEventBridge::PipelineOutput {
             peer_id,
-            data_json,
+            data,
             timestamp_ns,
-        } => {
-            // Deserialize RuntimeData from JSON
-            let runtime_data = serde_json::from_str(data_json).unwrap_or_else(|e| {
-                tracing::warn!("Failed to deserialize pipeline output RuntimeData: {}", e);
-                remotemedia_core::data::RuntimeData::Text(format!("Error deserializing: {}", e))
-            });
-
-            WebRtcEvent::PipelineOutput(PipelineOutputEvent {
-                peer_id: peer_id.clone(),
-                data: runtime_data,
-                timestamp: *timestamp_ns,
-            })
-        }
+        } => WebRtcEvent::PipelineOutput(PipelineOutputEvent {
+            peer_id: peer_id.clone(),
+            data: data.clone(),
+            timestamp: *timestamp_ns,
+        }),
         WebRtcEventBridge::DataReceived {
             peer_id,
             data,

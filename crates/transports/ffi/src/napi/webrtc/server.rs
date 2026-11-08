@@ -395,30 +395,24 @@ impl WebRtcServer {
                     }
                     remotemedia_webrtc::signaling::WebRtcEventBridge::PipelineOutput {
                         peer_id,
-                        data_json,
+                        data,
                         timestamp_ns,
                     } => {
-                        // Parse the data_json to extract data type
-                        let (data_type, data_str) = if let Ok(runtime_data) =
-                            serde_json::from_str::<remotemedia_core::data::RuntimeData>(&data_json)
-                        {
-                            use remotemedia_core::data::RuntimeData;
-                            match &runtime_data {
-                                RuntimeData::Audio { samples, sample_rate, channels, .. } => (
-                                    "audio".to_string(),
-                                    serde_json::json!({ "sample_rate": sample_rate, "channels": channels, "num_samples": samples.len() }).to_string(),
-                                ),
-                                RuntimeData::Text(content) => ("text".to_string(), serde_json::json!({ "content": content }).to_string()),
-                                RuntimeData::Video { width, height, format, .. } => (
-                                    "video".to_string(),
-                                    serde_json::json!({ "width": width, "height": height, "format": format!("{:?}", format) }).to_string(),
-                                ),
-                                RuntimeData::Binary(data) => ("binary".to_string(), serde_json::json!({ "size": data.len() }).to_string()),
-                                RuntimeData::Json(value) => ("json".to_string(), value.to_string()),
-                                _ => ("unknown".to_string(), "{}".to_string()),
-                            }
-                        } else {
-                            ("unknown".to_string(), data_json)
+                        use remotemedia_core::data::RuntimeData;
+                        // Summarize metadata directly; do not serialize bulk payloads.
+                        let (data_type, data_str) = match &data {
+                            RuntimeData::Audio { samples, sample_rate, channels, .. } => (
+                                "audio".to_string(),
+                                serde_json::json!({ "sample_rate": sample_rate, "channels": channels, "num_samples": samples.len() }).to_string(),
+                            ),
+                            RuntimeData::Text(content) => ("text".to_string(), serde_json::json!({ "content": content }).to_string()),
+                            RuntimeData::Video { width, height, format, .. } => (
+                                "video".to_string(),
+                                serde_json::json!({ "width": width, "height": height, "format": format!("{:?}", format) }).to_string(),
+                            ),
+                            RuntimeData::Binary(data) => ("binary".to_string(), serde_json::json!({ "size": data.len() }).to_string()),
+                            RuntimeData::Json(value) => ("json".to_string(), value.to_string()),
+                            _ => ("unknown".to_string(), "{}".to_string()),
                         };
                         let data = PipelineOutputData {
                             peer_id: peer_id.clone(),

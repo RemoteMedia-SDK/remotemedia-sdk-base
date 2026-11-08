@@ -3,7 +3,7 @@ use super::*;
 use remotemedia_types::{AudioSamples, PayloadStorage, RuntimeMetadata, TensorEncoding};
 
 mod numpy;
-pub(super) mod storage;
+pub(crate) mod storage;
 
 fn value_error(error: impl std::fmt::Display) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(error.to_string())

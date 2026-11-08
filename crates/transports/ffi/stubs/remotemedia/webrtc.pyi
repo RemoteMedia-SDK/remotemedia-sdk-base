@@ -81,11 +81,21 @@ class PipelineOutputEvent:
     data: bytes
     timestamp: int
 
+    @property
+    def runtime_data(self) -> Any:
+        """Canonical runtime value with retained read-only bulk buffers."""
+        ...
+
 class DataReceivedEvent:
     """Event emitted when raw data is received from a peer."""
     peer_id: str
     data: bytes
     timestamp: int
+
+    @property
+    def view(self) -> memoryview:
+        """Read-only view retaining the original receive allocation."""
+        ...
 
 class ErrorEvent:
     """Error event."""

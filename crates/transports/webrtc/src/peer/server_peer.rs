@@ -523,11 +523,13 @@ impl SharedPipelineSession {
         let session_id = self.session_id().to_string();
         tokio::spawn(async move {
             loop {
-                let transport_data = match rx.recv().await {
+                let mut transport_data = match rx.recv().await {
                     Ok(data) => data,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
+                // Promote legacy Vec audio once before any per-peer clone.
+                transport_data.data = transport_data.data.into_shared();
                 let targets: Vec<PeerOutputTarget> =
                     output_targets.read().await.values().cloned().collect();
                 if targets.is_empty() {
@@ -542,11 +544,9 @@ impl SharedPipelineSession {
                 for target in targets {
                     #[cfg(feature = "ws-signaling")]
                     if let Some(ref tx) = target.event_tx {
-                        let data_json = serde_json::to_string(&transport_data.data)
-                            .unwrap_or_else(|_| "{}".to_string());
                         let event = WebRtcEventBridge::pipeline_output(
                             target.dispatcher.peer_id.clone(),
-                            data_json,
+                            transport_data.data.clone(),
                             current_timestamp_ns(),
                         );
                         if let Err(e) = tx.try_send(event) {
@@ -1042,7 +1042,7 @@ impl ServerPeer {
                             if let Some(ref tx) = event_tx {
                                 let event = WebRtcEventBridge::data_received(
                                     peer_id.clone(),
-                                    msg.data.to_vec(),
+                                    remotemedia_types::SharedBytes::from_owner(msg.data.clone()),
                                     current_timestamp_ns(),
                                 );
                                 if let Err(e) = tx.send(event).await {

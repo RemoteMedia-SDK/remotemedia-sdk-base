@@ -3,9 +3,15 @@
 //! These event types flow from the WebSocket signaling handler to the FFI layer
 //! without creating circular dependencies between crates.
 
+use remotemedia_core::data::RuntimeData;
+use remotemedia_types::SharedBytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+
+#[cfg(test)]
+#[path = "event_owner_tests.rs"]
+mod owner_tests;
 
 /// Bridge event types for WebRTC FFI integration
 ///
@@ -35,8 +41,8 @@ pub enum WebRtcEventBridge {
     PipelineOutput {
         /// Target peer's identifier
         peer_id: String,
-        /// Serialized RuntimeData (using serde_json for cross-crate compatibility)
-        data_json: String,
+        /// Owning runtime value; bulk clones retain the original allocation.
+        data: RuntimeData,
         /// Nanosecond timestamp
         timestamp_ns: u64,
     },
@@ -46,7 +52,7 @@ pub enum WebRtcEventBridge {
         /// Source peer's identifier
         peer_id: String,
         /// Raw data bytes
-        data: Vec<u8>,
+        data: SharedBytes,
         /// Nanosecond timestamp
         timestamp_ns: u64,
     },
@@ -95,19 +101,19 @@ impl WebRtcEventBridge {
     }
 
     /// Create a pipeline output event
-    pub fn pipeline_output(peer_id: String, data_json: String, timestamp_ns: u64) -> Self {
+    pub fn pipeline_output(peer_id: String, data: RuntimeData, timestamp_ns: u64) -> Self {
         Self::PipelineOutput {
             peer_id,
-            data_json,
+            data: data.into_shared(),
             timestamp_ns,
         }
     }
 
     /// Create a data received event
-    pub fn data_received(peer_id: String, data: Vec<u8>, timestamp_ns: u64) -> Self {
+    pub fn data_received(peer_id: String, data: impl Into<SharedBytes>, timestamp_ns: u64) -> Self {
         Self::DataReceived {
             peer_id,
-            data,
+            data: data.into(),
             timestamp_ns,
         }
     }

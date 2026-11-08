@@ -14,7 +14,7 @@ use remotemedia_types::CopyContext;
 #[cfg(test)]
 #[path = "marshal/buffer_tests.rs"]
 mod buffer_tests;
-mod buffers;
+pub(crate) mod buffers;
 pub(crate) use buffers::storage::{materialize, view as payload_view};
 #[cfg(test)]
 #[path = "marshal/control_tests.rs"]
