@@ -59,6 +59,11 @@ pub struct PythonNodeConfig {
 
     /// Execution mode: "multiprocess" (default) or "inprocess" (PyO3)
     pub execution_mode: PythonExecutionMode,
+
+    /// JSON Schema for the node's manifest `params` (documentation and
+    /// `remotemedia validate` checks). Python nodes accept `**kwargs`, so
+    /// these schemas describe known params without forbidding others.
+    pub config_schema: Option<serde_json::Value>,
 }
 
 impl Default for PythonNodeConfig {
@@ -73,6 +78,7 @@ impl Default for PythonNodeConfig {
             accepts: Vec::new(),
             produces: Vec::new(),
             execution_mode: PythonExecutionMode::default(),
+            config_schema: None,
         }
     }
 }
@@ -125,6 +131,12 @@ impl PythonNodeConfig {
     }
 
     /// Set execution mode to in-process (PyO3)
+    /// Set the JSON Schema of the node's manifest `params`.
+    pub fn with_config_schema(mut self, schema: serde_json::Value) -> Self {
+        self.config_schema = Some(schema);
+        self
+    }
+
     pub fn with_inprocess(mut self, inprocess: bool) -> Self {
         self.execution_mode = if inprocess {
             PythonExecutionMode::InProcess
@@ -280,7 +292,19 @@ pub fn register_default_python_nodes() {
             )
             .with_category("stt")
             .accepts(["audio"])
-            .produces(["text"]),
+            .produces(["text"])
+            .with_config_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "model_id": {"type": "string", "default": "openai/whisper-tiny.en",
+                                 "description": "HuggingFace model id (e.g. openai/whisper-base)"},
+                    "language": {"type": ["string", "null"], "default": "en"},
+                    "device": {"type": ["string", "null"], "description": "cpu, cuda or mps; auto when omitted"},
+                    "torch_dtype": {"type": "string", "default": "float32"},
+                    "chunk_length_s": {"type": "integer", "minimum": 1, "default": 30}
+                },
+                "additionalProperties": true
+            })),
     );
 
     // TTS nodes
@@ -290,7 +314,20 @@ pub fn register_default_python_nodes() {
             .with_description("Text-to-speech using Kokoro TTS")
             .with_category("tts")
             .accepts(["text"])
-            .produces(["audio"]),
+            .produces(["audio"])
+            .with_config_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "lang_code": {"type": "string", "default": "a"},
+                    "voice": {"type": "string", "default": "af_heart"},
+                    "speed": {"type": "number", "exclusiveMinimum": 0, "default": 1.0},
+                    "split_pattern": {"type": "string"},
+                    "sample_rate": {"type": "integer", "default": 24000},
+                    "stream_chunks": {"type": "boolean", "default": true},
+                    "skip_tokens": {"type": ["array", "null"], "items": {"type": "string"}}
+                },
+                "additionalProperties": true
+            })),
     );
 
     register_python_node(

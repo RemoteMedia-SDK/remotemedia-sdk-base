@@ -72,28 +72,31 @@ impl CapabilityMismatch {
     /// Returns a human-readable suggestion string based on the mismatch type.
     pub fn generate_suggestion(&self) -> Option<String> {
         match (self.media_type.as_str(), self.constraint_name.as_str()) {
+            // Converter names are registered node types (see the
+            // conversion registry); an agent following the suggestion must
+            // be able to use the name as `node_type` verbatim.
             ("audio", "sample_rate") => Some(format!(
-                "Insert AudioResample node between '{}' and '{}' to convert {} Hz to {} Hz",
+                "Insert a FastResampleNode between '{}' and '{}' to convert {} Hz to {} Hz (params: source_rate, target_rate)",
                 self.source_node, self.target_node, self.source_value, self.target_requirement
             )),
             ("audio", "channels") => Some(format!(
-                "Insert ChannelMixer node between '{}' and '{}' to convert {} channel(s) to {} channel(s)",
+                "Insert a FastResampleNode between '{}' and '{}' to convert {} channel(s) to {} channel(s)",
                 self.source_node, self.target_node, self.source_value, self.target_requirement
             )),
             ("audio", "format") => Some(format!(
-                "Insert AudioFormatConvert node between '{}' and '{}' to convert {} to {}",
+                "Insert a FastFormatConverterNode between '{}' and '{}' to convert {} to {}",
                 self.source_node, self.target_node, self.source_value, self.target_requirement
             )),
             ("video", "width" | "height") => Some(format!(
-                "Insert VideoResize node between '{}' and '{}' to resize video",
+                "Insert a VideoScaler between '{}' and '{}' to resize video",
                 self.source_node, self.target_node
             )),
             ("video", "framerate") => Some(format!(
-                "Insert FrameRateConvert node between '{}' and '{}' to change framerate",
-                self.source_node, self.target_node
+                "No built-in frame-rate converter is registered; produce {} fps at '{}' or accept {} fps at '{}'",
+                self.target_requirement, self.source_node, self.source_value, self.target_node
             )),
             ("video", "pixel_format") => Some(format!(
-                "Insert PixelFormatConvert node between '{}' and '{}' to convert pixel format",
+                "Insert a VideoFormatConverter between '{}' and '{}' to convert pixel format",
                 self.source_node, self.target_node
             )),
             ("type", "media_type") => Some(format!(
@@ -778,7 +781,7 @@ mod tests {
 
         assert!(mismatch.suggestion.is_some());
         let suggestion = mismatch.suggestion.unwrap();
-        assert!(suggestion.contains("AudioResample"));
+        assert!(suggestion.contains("FastResampleNode"));
         assert!(suggestion.contains("mic"));
         assert!(suggestion.contains("whisper"));
         assert!(suggestion.contains("48000"));
@@ -802,6 +805,6 @@ mod tests {
 
         let display = mismatch.display_message();
         assert!(display.contains("Suggestion:"));
-        assert!(display.contains("AudioResample"));
+        assert!(display.contains("FastResampleNode"));
     }
 }

@@ -12,7 +12,7 @@
 //! {
 //!   "valid": false,
 //!   "errors":   [{"code": "capability_mismatch", "message": "...", "from": "mic", "to": "stt",
-//!                 "suggestion": "Insert AudioResample node between 'mic' and 'stt' ..."}],
+//!                 "suggestion": "Insert a FastResampleNode between 'mic' and 'stt' ..."}],
 //!   "warnings": [],
 //!   "connections": [{"from": "mic", "to": "stt", "ok": false,
 //!                    "resolved": {"output": {"type": "audio", "sample_rate": 48000},
@@ -20,7 +20,7 @@
 //!                    "mismatch": {"media_type": "audio", "constraint": "sample_rate",
 //!                                 "source_value": "48000", "target_requirement": "16000",
 //!                                 "message": "..."},
-//!                    "suggestion": "Insert AudioResample node between ..."}],
+//!                    "suggestion": "Insert a FastResampleNode between ..."}],
 //!   "unknown_node_types": []
 //! }
 //! ```
@@ -55,6 +55,11 @@ pub mod codes {
     /// conversion node (reported as a warning).
     pub const AUTO_CONVERTED: &str = "auto_converted";
     pub const PLUGIN_LOAD_FAILED: &str = "plugin_load_failed";
+    /// A node's params violate its published JSON Schema (error).
+    pub const INVALID_PARAMS: &str = "invalid_params";
+    /// A node has params but publishes no schema, so they are not checked
+    /// (warning).
+    pub const PARAMS_UNCHECKED: &str = "params_unchecked";
 }
 
 /// Result of validating one manifest.
@@ -69,6 +74,21 @@ pub struct ManifestReport {
     pub connections: Vec<ConnectionReport>,
     /// Distinct node types with no registered factory, sorted.
     pub unknown_node_types: Vec<String>,
+    /// What a client must send: one entry per node nothing feeds that is
+    /// not a source (see [`super::hints`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ingress: Vec<IngressEntry>,
+}
+
+/// One entry point of a pipeline.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct IngressEntry {
+    pub node: String,
+    pub node_type: String,
+    /// The node's input in the caps DSL (`audio(sample_rate=16000, ...)`),
+    /// or null when it declares no constraint.
+    pub accepts: Option<Value>,
 }
 
 /// One error or warning.
@@ -89,7 +109,7 @@ pub struct ReportIssue {
 }
 
 impl ReportIssue {
-    fn new(code: &str, message: impl Into<String>) -> Self {
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
         Self {
             code: code.to_string(),
             message: message.into(),
@@ -349,6 +369,9 @@ pub fn validate_manifest_report(
         report.connections.push(entry);
     }
 
+    // Near-miss names, params checks and ingress for whoever fixes it.
+    super::hints::apply_hints(&mut report, manifest, registry);
+
     report.valid = report.errors.is_empty();
     report
 }
@@ -475,7 +498,7 @@ mod tests {
         assert!(mismatch.source_value.contains("48000"));
         assert!(mismatch.target_requirement.contains("16000"));
         let suggestion = conn.suggestion.as_deref().unwrap();
-        assert!(suggestion.contains("AudioResample"), "{suggestion}");
+        assert!(suggestion.contains("FastResampleNode"), "{suggestion}");
         assert_eq!(report.errors[0].code, codes::CAPABILITY_MISMATCH);
         assert!(report.errors[0].suggestion.is_some());
 
@@ -568,7 +591,7 @@ mod tests {
             .suggestion
             .as_deref()
             .unwrap()
-            .contains("AudioResample"));
+            .contains("FastResampleNode"));
     }
 
     #[test]

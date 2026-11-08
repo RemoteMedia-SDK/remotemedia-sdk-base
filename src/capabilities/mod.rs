@@ -62,6 +62,9 @@ pub mod manifest_negotiation;
 // Agent-facing validation report (add-agent-harness-integration)
 pub mod report;
 
+/// Agent-facing hints: near-miss node types, params checks, ingress, catalog.
+pub mod hints;
+
 // Re-export main types for convenience
 pub use constraints::{
     AudioConstraints, AudioSampleFormat, ConstraintValue, FileConstraints, JsonConstraints,
@@ -89,6 +92,6 @@ pub use manifest_negotiation::{
 };
 
 pub use report::{
-    validate_manifest_report, ConnectionReport, ManifestReport, MismatchReport, ReportIssue,
-    ResolvedConnection,
+    validate_manifest_report, ConnectionReport, IngressEntry, ManifestReport, MismatchReport,
+    ReportIssue, ResolvedConnection,
 };

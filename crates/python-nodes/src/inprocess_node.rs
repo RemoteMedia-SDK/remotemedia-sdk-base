@@ -228,6 +228,10 @@ impl remotemedia_core::nodes::StreamingNodeFactory for DynamicInProcessPythonNod
             schema = schema.category(cat);
         }
 
+        if let Some(ref params) = self.config.config_schema {
+            schema = schema.config_schema(params.clone());
+        }
+
         // Convert string types to RuntimeDataType
         let accepts: Vec<remotemedia_core::nodes::schema::RuntimeDataType> = self
             .config
