@@ -239,6 +239,7 @@ pub(crate) fn build_snapshot(
                 first_output_latency_us,
                 circuit_open,
                 last_error: tel.last_error(idx),
+                llm_fallbacks: cell.llm_fallbacks.load(Relaxed),
             }
         })
         .collect();

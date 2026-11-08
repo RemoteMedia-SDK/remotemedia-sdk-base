@@ -27,7 +27,10 @@ pub mod tool_dispatch;
 pub mod traits;
 
 pub use anthropic_profile::AnthropicProfile;
-pub use chat_backend::{ChatBackend, ChatBackendConfig};
+pub use chat_backend::{
+    ChatBackend, ChatBackendConfig, ChatFailureKind, ChatTurnContext, LlmFallbackConfig,
+    HISTORY_PROVIDER_KEY, LLM_FALLBACK_EVENT,
+};
 pub use gemini_profile::GeminiProfile;
 pub use history::HistoryEntry;
 pub use provider::{ChatRequest, ChatStreamEvent, OpenAIProfile, ProviderProfile};
@@ -47,6 +50,9 @@ use std::sync::Arc;
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    /// Wire name `openai`; `open_a_i` (the old derived spelling) is
+    /// still accepted.
+    #[serde(rename = "openai", alias = "open_a_i")]
     OpenAI,
     Anthropic,
 }
@@ -72,5 +78,24 @@ impl ProviderKind {
             ProviderKind::OpenAI => "https://api.openai.com/v1",
             ProviderKind::Anthropic => "https://api.anthropic.com/v1",
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_kind_tests {
+    use super::ProviderKind;
+
+    #[test]
+    fn provider_kind_accepts_openai_spelling() {
+        for name in ["openai", "open_a_i"] {
+            let kind: ProviderKind = serde_json::from_value(serde_json::json!(name)).unwrap();
+            assert_eq!(kind, ProviderKind::OpenAI);
+        }
+        assert_eq!(
+            serde_json::to_value(ProviderKind::OpenAI).unwrap(),
+            serde_json::json!("openai")
+        );
+        let kind: ProviderKind = serde_json::from_value(serde_json::json!("anthropic")).unwrap();
+        assert_eq!(kind, ProviderKind::Anthropic);
     }
 }

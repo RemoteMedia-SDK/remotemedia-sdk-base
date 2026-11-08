@@ -169,6 +169,8 @@ pub struct NodeCell {
     pub(crate) bypassed: AtomicU64,
     pub(crate) discarded: AtomicU64,
     pub(crate) busy_us: AtomicU64,
+    /// Turns this node re-issued to an LLM fallback provider.
+    pub(crate) llm_fallbacks: AtomicU64,
     /// Microseconds since the telemetry epoch at which the in-flight
     /// dispatch started, **plus one** so that `0` means idle.
     pub(crate) in_flight_since_us: AtomicU64,
@@ -209,6 +211,7 @@ impl NodeCell {
             bypassed: AtomicU64::new(0),
             discarded: AtomicU64::new(0),
             busy_us: AtomicU64::new(0),
+            llm_fallbacks: AtomicU64::new(0),
             in_flight_since_us: AtomicU64::new(0),
             last_error_at_us: AtomicU64::new(0),
             alive: AtomicBool::new(false),
@@ -556,6 +559,13 @@ impl SessionTelemetry {
             }
         }
         out
+    }
+
+    /// Count one LLM fallback on `node_id` (unknown ids are ignored).
+    pub fn record_llm_fallback(&self, node_id: &str) {
+        if let Some(i) = self.node_index(node_id) {
+            self.nodes[i].llm_fallbacks.fetch_add(1, Relaxed);
+        }
     }
 
     pub(crate) fn last_error(&self, idx: usize) -> Option<ErrorInfo> {
