@@ -1,6 +1,6 @@
 //! Explicit host authorization for manifest-selected native mapped workers.
 use super::{
-    plugin_toml::{PluginNativeExecutable, PluginRustMeta},
+    plugin_toml::{PluginNativeExecutable, PluginNativeWorker, PluginRustMeta},
     resolver,
 };
 use crate::multiprocess::native_worker::{NativeWorkerFactory, WIRE_VERSION};
@@ -91,12 +91,30 @@ impl MappedNativePluginRuntime {
                 })?;
                 let executable = resolve_executable(&root, artifact)?;
                 // SAFETY: the host authorized this exact root under new's lifetime contract.
-                unsafe { NativeWorkerFactory::for_sessions(executable, worker.node_type.clone()) }
-                    .with_snapshot_inputs(worker.snapshot_inputs.clone())?
-                    .with_snapshot_outputs(worker.snapshot_outputs.clone())
+                let factory = unsafe {
+                    NativeWorkerFactory::for_sessions(executable, worker.node_type.clone())
+                };
+                configure_factory(factory, worker)
             })
             .collect()
     }
+}
+
+fn configure_factory(
+    factory: NativeWorkerFactory,
+    worker: &PluginNativeWorker,
+) -> Result<NativeWorkerFactory> {
+    let factory = factory
+        .with_snapshot_inputs(worker.snapshot_inputs.clone())?
+        .with_snapshot_outputs(worker.snapshot_outputs.clone())?;
+    let factory = if let Some(declaration) = worker.buffer_contract.clone() {
+        factory.with_buffer_contract(move |_, protocol| Ok(Some(declaration.bind(protocol))))
+    } else {
+        factory
+    };
+    // Validate this static declaration before the package registers any factories.
+    crate::nodes::StreamingNodeFactory::try_buffer_contract(&factory, &serde_json::Value::Null)?;
+    Ok(factory)
 }
 
 fn resolve_executable(root: &Path, artifact: &PluginNativeExecutable) -> Result<PathBuf> {

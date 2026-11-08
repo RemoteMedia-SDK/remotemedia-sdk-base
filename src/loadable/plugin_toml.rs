@@ -144,6 +144,10 @@ pub struct PluginPythonMeta {
 #[serde(deny_unknown_fields)]
 pub struct PluginPythonMapped {
     pub runner_protocol: u16,
+    /// Static promises for each named node type, covering all parameters and lanes.
+    /// Omission remains unknown; declarations never authorize package execution.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub buffer_contracts: BTreeMap<String, PluginMappedBufferContract>,
     /// Optional output-copy negotiation; a capability request, not permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_copy_protocol: Option<u16>,
@@ -193,6 +197,9 @@ pub struct PluginNativeMapped {
 #[serde(deny_unknown_fields)]
 pub struct PluginNativeWorker {
     pub node_type: String,
+    /// Static buffer promises for every instance of this worker type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_contract: Option<PluginMappedBufferContract>,
     pub executables: BTreeMap<String, PluginNativeExecutable>,
     #[serde(default)]
     pub snapshot_inputs: Vec<String>,
@@ -206,6 +213,34 @@ pub struct PluginNativeExecutable {
     /// Relative path inside the resolved package root.
     pub file: String,
     pub sha256: String,
+}
+
+/// Static package-authored buffer capabilities, bound to the actual host adapter.
+/// The package cannot select or override the runtime's transport protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginMappedBufferContract {
+    pub version: u16,
+    pub inputs: BTreeMap<String, remotemedia_traits::buffer_contract::BufferPortContract>,
+    pub outputs: BTreeMap<String, remotemedia_traits::buffer_contract::BufferPortContract>,
+    pub production: remotemedia_traits::buffer_contract::BufferProduction,
+    pub retention: Option<remotemedia_traits::buffer_contract::BufferRetention>,
+}
+
+impl PluginMappedBufferContract {
+    pub(crate) fn bind(
+        &self,
+        protocol: &remotemedia_traits::buffer_contract::BufferProtocol,
+    ) -> remotemedia_traits::buffer_contract::BufferContract {
+        remotemedia_traits::buffer_contract::BufferContract {
+            version: self.version,
+            protocol: protocol.clone(),
+            inputs: self.inputs.clone(),
+            outputs: self.outputs.clone(),
+            production: self.production.clone(),
+            retention: self.retention,
+        }
+    }
 }
 
 /// Errors when parsing or validating a `plugin.toml`.

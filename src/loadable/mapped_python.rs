@@ -104,6 +104,15 @@ impl MappedPythonPluginRuntime {
                 package_root.display()
             )));
         }
+        if let Some(unknown) = mapped
+            .buffer_contracts
+            .keys()
+            .find(|name| !metadata.node_types.contains(name))
+        {
+            return Err(Error::ConfigError(format!(
+                "mapped Python buffer declaration names unregistered node type '{unknown}'"
+            )));
+        }
         let module_root = package_root
             .join(&metadata.module_root)
             .canonicalize()
@@ -135,6 +144,7 @@ impl MappedPythonPluginRuntime {
         config: MappedPythonConfig,
         mapped: &PluginPythonMapped,
     ) -> Result<MappedPythonFactory> {
+        let declaration = mapped.buffer_contracts.get(&config.node_type).cloned();
         // SAFETY: factories has checked this exact package against the roots
         // authorized under new's contract, including its runtime artifacts.
         let factory = unsafe { MappedPythonFactory::for_sessions(config) }
@@ -149,10 +159,21 @@ impl MappedPythonPluginRuntime {
         } else {
             factory
         };
-        Ok(if mapped.output_copy_protocol.is_some() {
+        let factory = if mapped.output_copy_protocol.is_some() {
             factory.with_output_copies()
         } else {
             factory
-        })
+        };
+        let factory = if let Some(declaration) = declaration {
+            factory.with_buffer_contract(move |_, protocol| Ok(Some(declaration.bind(protocol))))
+        } else {
+            factory
+        };
+        // The declaration is parameter-independent: inspect it before registration or provisioning.
+        crate::nodes::StreamingNodeFactory::try_buffer_contract(
+            &factory,
+            &serde_json::Value::Null,
+        )?;
+        Ok(factory)
     }
 }
