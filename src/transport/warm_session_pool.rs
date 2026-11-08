@@ -171,6 +171,10 @@ struct WarmEntry {
 }
 
 impl WarmSessionPool {
+    pub(crate) fn belongs_to(&self, executor: &PipelineExecutor) -> bool {
+        std::ptr::eq(self.executor.as_ref(), executor)
+    }
+
     /// Construct a pool with the default [`WarmPoolConfig`].
     pub fn new(executor: Arc<PipelineExecutor>) -> Arc<Self> {
         Self::with_config(executor, WarmPoolConfig::default())

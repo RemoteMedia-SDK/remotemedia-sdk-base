@@ -44,6 +44,12 @@ use tokio::task::JoinHandle;
 /// Configuration for PipelineExecutor
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
+    /// Optional authoritative policy for preflight, node materialization,
+    /// transport adaptation and mapped-worker ingress. When set, it overrides
+    /// their individual policy fields. Strict mode requires buffer_preflight
+    /// with an explicit retention budget. None preserves independent settings.
+    /// This governs instrumented boundaries, not arbitrary plugin/backend code.
+    pub pipeline_copy_policy: Option<remotemedia_types::CopyPolicy>,
     /// Optional static buffer-contract gate before node creation. This checks
     /// declarations only, not dynamic payloads or whole-pipeline copy freedom.
     pub buffer_preflight: Option<super::buffer_preflight::BufferPreflightConfig>,
@@ -104,6 +110,7 @@ pub struct ExecutorConfig {
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
+            pipeline_copy_policy: None,
             buffer_preflight: None,
             ingress_retention: None,
             node_materialization_policy: remotemedia_types::CopyPolicy::AllowCopies,
@@ -130,6 +137,31 @@ impl Default for ExecutorConfig {
             ))]
             mapped_python_plugins: None,
         }
+    }
+}
+
+impl ExecutorConfig {
+    fn resolve_copy_policy(mut self) -> Result<Self> {
+        let Some(policy) = self.pipeline_copy_policy else {
+            return Ok(self);
+        };
+        if policy == remotemedia_types::CopyPolicy::RequireZeroCopy
+            && self.buffer_preflight.is_none()
+        {
+            return Err(Error::ConfigError(
+                "pipeline_copy_policy RequireZeroCopy requires buffer_preflight with an explicit node_retention_budget".into(),
+            ));
+        }
+        if let Some(preflight) = &mut self.buffer_preflight {
+            preflight.policy = policy;
+        }
+        self.node_materialization_policy = policy;
+        self.transport_materialization_policy = policy;
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        {
+            self.mapped_input_policy = policy;
+        }
+        Ok(self)
     }
 }
 
@@ -724,6 +756,7 @@ impl PipelineExecutor {
 
     /// Create a new PipelineExecutor with custom configuration
     pub fn with_config(config: ExecutorConfig) -> Result<Self> {
+        let config = config.resolve_copy_policy()?;
         let scheduler = Arc::new(StreamingScheduler::new(config.scheduler_config.clone()));
         // Use the default registry with all built-in nodes registered
         let registry = Arc::new(RwLock::new(
@@ -1022,6 +1055,9 @@ impl PipelineExecutor {
     ///
     /// Calling `set_default_pool` again replaces the previous pool. Use
     /// [`Self::clear_default_pool`] to detach without replacing.
+    /// The pool must belong to this executor; create_session rejects foreign
+    /// pools before checkout so their factories, budgets or policies cannot
+    /// replace this executor's configuration.
     pub fn set_default_pool(
         &self,
         pool: std::sync::Arc<crate::transport::warm_session_pool::WarmSessionPool>,
@@ -1231,6 +1267,11 @@ impl PipelineExecutor {
             pool.is_some()
         );
         if let Some(pool) = pool {
+            if !pool.belongs_to(self) {
+                return Err(Error::ConfigError(
+                    "warm session pool belongs to a different executor; its factories, budgets and copy policies cannot be substituted".into(),
+                ));
+            }
             tracing::info!("create_session: delegating to warm pool");
             return pool.acquire(manifest).await;
         }
