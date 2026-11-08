@@ -209,8 +209,8 @@ impl PipelineClient for HttpPipelineClient {
             .map_err(remotemedia_core::Error::RemoteExecutionFailed)?;
 
         // Parse response
-        let bytes = read_response(response, &self.copies).await?;
-        let execute_response: ExecuteResponse = codec::decode(&bytes, &self.copies)?;
+        let body = crate::body::JsonBody::collect(response.bytes_stream(), usize::MAX).await?;
+        let execute_response: ExecuteResponse = body.decode(&self.copies)?;
 
         Ok(execute_response.output)
     }
@@ -571,40 +571,6 @@ async fn delete_session(
         response.error_for_status().map_err(codec::error)?;
     }
     Ok(())
-}
-
-async fn read_response(
-    response: reqwest::Response,
-    copies: &CopyContext,
-) -> remotemedia_core::Result<bytes::Bytes> {
-    let mut stream = response.bytes_stream();
-    let mut chunks = Vec::new();
-    let mut size = 0usize;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(codec::error)?;
-        size = size
-            .checked_add(chunk.len())
-            .ok_or_else(|| codec::error("HTTP body size overflow"))?;
-        if !chunk.is_empty() {
-            chunks.push(chunk);
-        }
-    }
-    if chunks.len() <= 1 {
-        return Ok(chunks.pop().unwrap_or_default());
-    }
-    copies
-        .materialize(
-            remotemedia_types::CopyReason::VecMaterialization,
-            size as u64,
-            || {
-                let mut bytes = Vec::with_capacity(size);
-                for chunk in chunks {
-                    bytes.extend_from_slice(&chunk);
-                }
-                bytes::Bytes::from(bytes)
-            },
-        )
-        .map_err(codec::error)
 }
 
 #[cfg(test)]

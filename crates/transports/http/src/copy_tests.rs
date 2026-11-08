@@ -27,7 +27,7 @@ fn audio() -> TransportData {
     })
 }
 
-fn bulk_cases() -> [RuntimeData; 6] {
+pub(crate) fn bulk_cases() -> [RuntimeData; 6] {
     use remotemedia_types::{ImageFormat, PixelFormat};
     [
         audio().data,

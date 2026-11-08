@@ -31,11 +31,14 @@ clients distinct contexts when separate accounting is required.
 
 Bulk JSON encoding/decoding reports logical payload bytes and rejects under
 `RequireZeroCopy`. Contiguous response and SSE wire chunks retain their storage.
-Fragmented responses/events and multiline SSE data require separately counted
-assembly and also reject under strict policy, including metadata-only fragments.
+Unary response bodies retain network chunks and decode across them without a
+full-body assembly. Fragmented SSE events and multiline SSE data require
+separately counted assembly and also reject under strict policy, including
+metadata-only fragments.
 Counts exclude JSON codec internals, metadata allocations and HTTP/TLS/kernel
-transfers. This API does not negotiate or certify zero-copy execution remotely;
-the server's independent policy migration is still in progress.
+transfers. This API does not negotiate or certify zero-copy execution remotely.
+The transport plugin accepts `extra_config: {"copy_policy":"require_zero_copy"}`
+(or `"allow_copies"`); invalid policy values are rejected.
 
 SSE accepts LF/CRLF event boundaries, split UTF-8 and multiline data, with a
 16 MiB per-event limit. Malformed/truncated events and explicit `event: error`
@@ -60,8 +63,29 @@ The HTTP server implements the `PipelineTransport` trait and exposes:
 **SSE Implementation:**
 - Uses `tokio::sync::broadcast` channel for multiple subscribers
 - Each session can have multiple concurrent SSE connections
-- Handles lagged subscribers gracefully (logs warning and skips)
+- Reports lagged subscribers with a terminal SSE error instead of silently skipping
 - Keeps alive with periodic heartbeat
+
+HTTP handlers use each core session's `transport_materialization_policy` for
+bulk JSON decoding and encoding. Unary requests first parse only the manifest,
+then decode the input under the newly created session's authority. Request bodies
+retain chunks, with a 2 MiB limit. `session_copy_context(id)` exposes active stream
+accounting; `with_copy_observer` lets the host retain unary and streaming contexts
+after closure. The synchronous observer runs before bulk conversion and must
+return promptly; retaining or bounding report history is the host's responsibility.
+
+An independent task drains pipeline outputs. Each output is serialized once into
+immutable wire storage and broadcast by ownership, with capacity for 100 outputs.
+SSE framing emits separate prefix, payload and suffix chunks. Input handlers never
+wait for output while holding the session map lock. Explicit deletion stops and
+joins the drainer and core session; cancellation of a unary handler schedules the
+same cleanup. SSE disconnection alone does not delete a remotely owned session.
+
+Serialization failures and observed core `node_error` events terminate the HTTP
+session and reach SSE consumers as explicit errors. The error subscription is
+installed before HTTP input is accepted; it does not replay ephemeral errors
+emitted before attachment by an autonomous source. The core's general node-error
+policy is unchanged. HTTP JSON remains an accounted copying compatibility path.
 
 ## Usage
 

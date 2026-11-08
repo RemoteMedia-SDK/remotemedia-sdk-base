@@ -58,6 +58,7 @@
 //! ```
 
 pub mod builder;
+mod body;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod client;
