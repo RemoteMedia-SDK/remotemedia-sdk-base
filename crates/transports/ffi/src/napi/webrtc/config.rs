@@ -43,6 +43,43 @@ impl From<core_config::TurnServerConfig> for TurnServer {
 /// WebRTC server configuration for Node.js
 #[napi(object)]
 #[derive(Debug, Clone)]
+pub struct PipelineBufferConfig {
+    pub policy: String,
+    /// Nonnegative safe integer, including zero for metadata-only graphs.
+    pub node_retention_owners: f64,
+    /// Nonnegative safe integer; never silently rounded or truncated.
+    pub node_retention_bytes: f64,
+}
+
+fn retention_budget(value: f64, field: &str) -> Result<u64> {
+    if !value.is_finite() || value.fract() != 0.0 || !(0.0..=9007199254740991.0).contains(&value) {
+        return Err(Error::from_reason(format!(
+            "pipelineBuffers.{field} must be a nonnegative safe integer"
+        )));
+    }
+    Ok(value as u64)
+}
+
+impl PipelineBufferConfig {
+    fn to_core_config(&self) -> Result<core_config::PipelineBufferConfig> {
+        Ok(core_config::PipelineBufferConfig {
+            policy: core_config::parse_copy_policy(&self.policy, "pipelineBuffers.policy")
+                .map_err(Error::from_reason)?,
+            node_retention_owners: retention_budget(
+                self.node_retention_owners,
+                "nodeRetentionOwners",
+            )?,
+            node_retention_bytes: retention_budget(
+                self.node_retention_bytes,
+                "nodeRetentionBytes",
+            )?,
+        })
+    }
+}
+
+/// WebRTC server configuration for Node.js
+#[napi(object)]
+#[derive(Debug, Clone)]
 pub struct WebRtcServerConfig {
     /// Port for embedded gRPC signaling server (mutually exclusive with signaling_url)
     pub port: Option<u32>,
@@ -70,6 +107,8 @@ pub struct WebRtcServerConfig {
 
     /// Instrumented transport policy; defaults to allow_copies.
     pub transport_materialization_policy: Option<String>,
+    /// Optional unified core policy and explicit retention budgets.
+    pub pipeline_buffers: Option<PipelineBufferConfig>,
 }
 
 impl WebRtcServerConfig {
@@ -123,6 +162,11 @@ impl WebRtcServerConfig {
                     .unwrap_or("allow_copies"),
             )
             .map_err(Error::from_reason)?,
+            pipeline_buffers: self
+                .pipeline_buffers
+                .as_ref()
+                .map(PipelineBufferConfig::to_core_config)
+                .transpose()?,
         };
 
         // Validate the config

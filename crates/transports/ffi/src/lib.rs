@@ -158,7 +158,8 @@ fn remotemedia_ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "python-webrtc")]
     {
         use python::webrtc::config::{
-            PeerCapabilities, PeerInfo, SessionInfo, TurnServer, WebRtcServerConfig,
+            PeerCapabilities, PeerInfo, PipelineBufferConfig, SessionInfo, TurnServer,
+            WebRtcServerConfig,
         };
         use python::webrtc::events::{
             DataReceivedEvent, ErrorEvent, PeerConnectedEvent, PeerDisconnectedEvent,
@@ -171,6 +172,7 @@ fn remotemedia_ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
         webrtc_module.add_class::<WebRtcServer>()?;
         webrtc_module.add_class::<WebRtcSession>()?;
         webrtc_module.add_class::<WebRtcServerConfig>()?;
+        webrtc_module.add_class::<PipelineBufferConfig>()?;
         webrtc_module.add_class::<TurnServer>()?;
         webrtc_module.add_class::<PeerCapabilities>()?;
         webrtc_module.add_class::<PeerInfo>()?;

@@ -49,6 +49,43 @@ impl From<&TurnServer> for crate::webrtc::config::TurnServerConfig {
 }
 
 /// WebRTC server configuration for Python
+#[pyclass(get_all, frozen)]
+#[derive(Clone, Debug)]
+pub struct PipelineBufferConfig {
+    pub policy: String,
+    pub node_retention_owners: u64,
+    pub node_retention_bytes: u64,
+}
+
+#[pymethods]
+impl PipelineBufferConfig {
+    #[new]
+    fn new(policy: &str, node_retention_owners: u64, node_retention_bytes: u64) -> PyResult<Self> {
+        crate::webrtc::config::parse_copy_policy(policy, "pipeline_buffers.policy")
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(Self {
+            policy: policy.to_owned(),
+            node_retention_owners,
+            node_retention_bytes,
+        })
+    }
+}
+
+impl PipelineBufferConfig {
+    fn to_core_config(&self) -> PyResult<crate::webrtc::config::PipelineBufferConfig> {
+        Ok(crate::webrtc::config::PipelineBufferConfig {
+            policy: crate::webrtc::config::parse_copy_policy(
+                &self.policy,
+                "pipeline_buffers.policy",
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?,
+            node_retention_owners: self.node_retention_owners,
+            node_retention_bytes: self.node_retention_bytes,
+        })
+    }
+}
+
+/// WebRTC server configuration for Python
 #[pyclass]
 #[derive(Clone, Debug)]
 pub struct WebRtcServerConfig {
@@ -85,12 +122,16 @@ pub struct WebRtcServerConfig {
     /// Instrumented transport policy: allow_copies or require_zero_copy.
     #[pyo3(get, set)]
     pub transport_materialization_policy: String,
+
+    /// Optional unified core policy and explicit retention budgets.
+    #[pyo3(get, set)]
+    pub pipeline_buffers: Option<PipelineBufferConfig>,
 }
 
 #[pymethods]
 impl WebRtcServerConfig {
     #[new]
-    #[pyo3(signature = (port=None, signaling_url=None, manifest=None, stun_servers=None, turn_servers=None, max_peers=10, audio_codec="opus", video_codec="vp9", transport_materialization_policy="allow_copies"))]
+    #[pyo3(signature = (port=None, signaling_url=None, manifest=None, stun_servers=None, turn_servers=None, max_peers=10, audio_codec="opus", video_codec="vp9", transport_materialization_policy="allow_copies", pipeline_buffers=None))]
     fn new(
         py: Python<'_>,
         port: Option<u16>,
@@ -102,6 +143,7 @@ impl WebRtcServerConfig {
         audio_codec: Option<&str>,
         video_codec: Option<&str>,
         transport_materialization_policy: &str,
+        pipeline_buffers: Option<PipelineBufferConfig>,
     ) -> PyResult<Self> {
         crate::webrtc::config::parse_transport_copy_policy(transport_materialization_policy)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -126,6 +168,7 @@ impl WebRtcServerConfig {
             audio_codec: audio_codec.unwrap_or("opus").to_string(),
             video_codec: video_codec.unwrap_or("vp9").to_string(),
             transport_materialization_policy: transport_materialization_policy.to_owned(),
+            pipeline_buffers,
         })
     }
 
@@ -207,6 +250,11 @@ impl WebRtcServerConfig {
                 &self.transport_materialization_policy,
             )
             .map_err(pyo3::exceptions::PyValueError::new_err)?,
+            pipeline_buffers: self
+                .pipeline_buffers
+                .as_ref()
+                .map(PipelineBufferConfig::to_core_config)
+                .transpose()?,
         };
 
         // Validate the config

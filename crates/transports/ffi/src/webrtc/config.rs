@@ -138,6 +138,19 @@ pub struct WebRtcServerConfig {
     /// Policy for instrumented transport copies; independent of node policies.
     #[serde(default)]
     pub transport_materialization_policy: CopyPolicy,
+
+    /// Unified core policy and explicit node-retention budget; overrides transport policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_buffers: Option<PipelineBufferConfig>,
+}
+
+/// One policy for preflight, node, transport and mapped-worker materialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineBufferConfig {
+    pub policy: CopyPolicy,
+    pub node_retention_owners: u64,
+    pub node_retention_bytes: u64,
 }
 
 fn default_max_peers() -> u32 {
@@ -157,25 +170,43 @@ impl Default for WebRtcServerConfig {
             video_codec: VideoCodec::Vp9,
             reconnect: ReconnectConfig::default(),
             transport_materialization_policy: CopyPolicy::AllowCopies,
+            pipeline_buffers: None,
         }
     }
 }
 
 /// Parse the canonical policy names shared by Python and Node configuration.
 pub(crate) fn parse_transport_copy_policy(value: &str) -> Result<CopyPolicy, String> {
-    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|_| {
-        "transport_materialization_policy must be allow_copies or require_zero_copy".to_owned()
-    })
+    parse_copy_policy(value, "transport_materialization_policy")
+}
+
+pub(crate) fn parse_copy_policy(value: &str, field: &str) -> Result<CopyPolicy, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .map_err(|_| format!("{field} must be allow_copies or require_zero_copy"))
 }
 
 #[cfg(test)]
 #[path = "transport_policy_tests.rs"]
 mod transport_policy_tests;
 
+#[cfg(test)]
+#[path = "pipeline_policy_tests.rs"]
+mod pipeline_policy_tests;
+
 impl WebRtcServerConfig {
-    /// Preserve transport policy when creating an executor for either FFI frontend.
+    /// Preserve independent or unified policy for either FFI frontend.
     pub fn to_executor_config(&self) -> remotemedia_core::transport::ExecutorConfig {
         remotemedia_core::transport::ExecutorConfig {
+            pipeline_copy_policy: self.pipeline_buffers.as_ref().map(|config| config.policy),
+            buffer_preflight: self.pipeline_buffers.as_ref().map(|config| {
+                remotemedia_core::transport::buffer_preflight::BufferPreflightConfig {
+                    policy: config.policy,
+                    node_retention_budget: remotemedia_traits::buffer_contract::BufferRetention {
+                        owners: config.node_retention_owners,
+                        bytes: config.node_retention_bytes,
+                    },
+                }
+            }),
             transport_materialization_policy: self.transport_materialization_policy,
             ..Default::default()
         }
@@ -404,6 +435,7 @@ mod tests {
             video_codec: VideoCodec::Vp9,
             reconnect: ReconnectConfig::default(),
             transport_materialization_policy: CopyPolicy::AllowCopies,
+            pipeline_buffers: None,
         };
         assert!(config.validate().is_ok());
         assert!(config.is_embedded());
@@ -423,6 +455,7 @@ mod tests {
             video_codec: VideoCodec::Vp8,
             reconnect: ReconnectConfig::default(),
             transport_materialization_policy: CopyPolicy::AllowCopies,
+            pipeline_buffers: None,
         };
         assert!(config.validate().is_ok());
         assert!(!config.is_embedded());

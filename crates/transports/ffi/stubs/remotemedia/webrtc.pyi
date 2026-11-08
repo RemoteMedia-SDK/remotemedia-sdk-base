@@ -19,6 +19,16 @@ class TurnServer:
 
     def __init__(self, url: str, username: str, credential: str) -> None: ...
 
+class PipelineBufferConfig:
+    """Immutable unified core policy with explicit node-retention budgets."""
+    @property
+    def policy(self) -> str: ...
+    @property
+    def node_retention_owners(self) -> int: ...
+    @property
+    def node_retention_bytes(self) -> int: ...
+    def __init__(self, policy: str, node_retention_owners: int, node_retention_bytes: int) -> None: ...
+
 class WebRtcServerConfig:
     """WebRTC server configuration."""
     port: Optional[int]
@@ -30,6 +40,7 @@ class WebRtcServerConfig:
     audio_codec: str
     video_codec: str
     transport_materialization_policy: str
+    pipeline_buffers: Optional[PipelineBufferConfig]
 
     def __init__(
         self,
@@ -43,6 +54,7 @@ class WebRtcServerConfig:
         audio_codec: str = "opus",
         video_codec: str = "vp9",
         transport_materialization_policy: str = "allow_copies",
+        pipeline_buffers: Optional[PipelineBufferConfig] = None,
     ) -> None: ...
 
 class PeerCapabilities:

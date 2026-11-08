@@ -308,6 +308,13 @@ export interface TurnServer {
   credential: string;
 }
 
+/** Unified core policy; budgets must be nonnegative safe integers. */
+export interface PipelineBufferConfig {
+  policy: 'allow_copies' | 'require_zero_copy';
+  nodeRetentionOwners: number;
+  nodeRetentionBytes: number;
+}
+
 /** WebRTC server configuration */
 export interface WebRtcServerConfig {
   /** Port for embedded signaling server (mutually exclusive with signalingUrl) */
@@ -328,6 +335,8 @@ export interface WebRtcServerConfig {
   videoCodec?: 'vp8' | 'vp9' | 'h264';
   /** Policy for instrumented transport copies; defaults to allow_copies. */
   transportMaterializationPolicy?: 'allow_copies' | 'require_zero_copy';
+  /** Overrides independent policy and requires both explicit retention budgets. */
+  pipelineBuffers?: PipelineBufferConfig;
 }
 
 /** Peer media capabilities */

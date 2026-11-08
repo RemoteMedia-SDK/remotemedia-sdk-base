@@ -159,6 +159,7 @@ fn transport_policy_node_conversion_validates_and_preserves_selection() {
         audio_codec: None,
         video_codec: None,
         transport_materialization_policy: None,
+        pipeline_buffers: None,
     };
     for (value, expected) in [
         (None, CopyPolicy::AllowCopies),
