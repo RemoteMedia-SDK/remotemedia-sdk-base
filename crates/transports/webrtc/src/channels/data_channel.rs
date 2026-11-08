@@ -6,7 +6,7 @@
 // Public API types - fields and methods used by library consumers, not internally
 #![allow(dead_code)]
 
-use super::messages::{DataChannelMessage, MAX_MESSAGE_SIZE};
+use super::messages::{DataChannelDecodeError, DataChannelMessage, MAX_MESSAGE_SIZE};
 use crate::config::DataChannelMode;
 use crate::{Error, Result};
 use bytes::Bytes;
@@ -304,38 +304,37 @@ impl DataChannel {
         F: Fn(DataChannelMessage) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let bytes_received = Arc::clone(&self.bytes_received);
-        let messages_received = Arc::clone(&self.messages_received);
         let label = self.label.clone();
         let handler = Arc::new(handler);
-
-        self.rtc_channel.on_message(Box::new(move |msg| {
-            let bytes_received = Arc::clone(&bytes_received);
-            let messages_received = Arc::clone(&messages_received);
+        self.on_message_with_context(CopyContext::legacy().clone(), move |result| {
             let label = label.clone();
             let handler = Arc::clone(&handler);
 
-            // Parse the message
-            let data = msg.data;
-            let data_len = data.len();
-
-            Box::pin(async move {
-                // Update statistics
-                *bytes_received.write().await += data_len as u64;
-                *messages_received.write().await += 1;
-
-                // Parse message
-                match DataChannelMessage::decode_owned(data) {
+            async move {
+                match result {
                     Ok(parsed) => {
-                        debug!("Received {} bytes on data channel '{}'", data_len, label);
                         handler(parsed).await;
                     }
                     Err(e) => {
                         warn!("Failed to parse message on channel '{}': {}", label, e);
                     }
                 }
-            })
-        }));
+            }
+        });
+    }
+
+    /// Retain modern wire owners and attribute legacy decoding to the caller.
+    /// Parse errors and policy rejection reach the handler; receive statistics
+    /// still count network bytes. The callback retains its authority until removed.
+    pub fn on_message_with_context<F, Fut>(&self, copies: CopyContext, handler: F)
+    where
+        F: Fn(std::result::Result<DataChannelMessage, DataChannelDecodeError>) -> Fut
+            + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.on_binary_message_owned(move |data| {
+            handler(DataChannelMessage::decode_owned_with_context(data, &copies))
+        });
     }
 
     /// Set raw binary message handler (for efficiency)

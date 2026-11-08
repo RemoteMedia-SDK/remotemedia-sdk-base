@@ -867,6 +867,21 @@ impl PeerConnection {
         Ok(())
     }
 
+    /// Receive owning envelopes with explicit copy authority and typed errors.
+    pub async fn on_data_channel_message_with_context<F, Fut>(
+        &self,
+        copies: remotemedia_types::CopyContext,
+        handler: F,
+    ) -> Result<()>
+    where
+        F: Fn(std::result::Result<DataChannelMessage, crate::channels::DataChannelDecodeError>) -> Fut
+            + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.channel_for_operation().await?.on_message_with_context(copies, handler);
+        Ok(())
+    }
+
     /// Close the data channel
     pub async fn close_data_channel(&self) -> Result<()> {
         let channel_guard = self.data_channel.read().await;
