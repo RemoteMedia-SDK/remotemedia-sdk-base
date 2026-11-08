@@ -112,7 +112,6 @@ async fn native_compat_context_hooks_reject_strict_before_transport() {
 async fn native_compat_real_worker_attributes_each_call_and_drops_wire_snapshot() {
     let node = fixture();
     let input = RuntimeData::Binary((0..64).collect::<Vec<u8>>().into());
-    let wire_len = super::super::data_transfer::to_bytes(&input).unwrap().len() as u64;
     let a = CopyContext::new(CopyPolicy::AllowCopies, "session-a");
     let b = CopyContext::new(CopyPolicy::AllowCopies, "session-b");
     let ctx_a = context(&node, a.clone());
@@ -156,7 +155,7 @@ async fn native_compat_real_worker_attributes_each_call_and_drops_wire_snapshot(
         );
         assert_eq!(
             counts(copies, CopyReason::PrivateIpcIngress).copied_bytes,
-            2 * wire_len * calls
+            0
         );
         assert_eq!(
             counts(copies, CopyReason::VecMaterialization).copied_bytes,
@@ -244,7 +243,7 @@ async fn native_compat_drop_stops_pending_round_and_reaps_worker() {
     )
     .await
     .is_err());
-    assert!(counts(&copies, CopyReason::PrivateIpcIngress).copied_bytes > 0);
+    assert!(!node.reporter.status(1).unwrap()); // Metadata-only call is still in progress.
     let commands = node.cmd_tx.clone();
     let child = node.child.clone();
     drop(node);
@@ -427,7 +426,7 @@ async fn native_compat_all_bulk_variants_report_both_sides_before_return() {
         );
         assert_eq!(
             counts(&copies, CopyReason::PrivateIpcIngress).copied_bytes,
-            2 * wire.len() as u64
+            0
         );
         assert!(copies
             .report()

@@ -6,8 +6,9 @@
 //! with an existing `StreamingNode` implementation.
 //!
 //! Replaces the hand-rolled iceoryx2 boilerplate every plugin binary
-//! would otherwise reinvent. Same channel naming, same wire format,
-//! same READY signal as the Python multiprocess runner.
+//! would otherwise reinvent. Channel naming and wire format remain compatible.
+//! Factory-launched workers negotiate readiness and copy reporting separately;
+//! standalone workers retain the legacy READY log.
 //!
 //! # Example
 //!
@@ -32,11 +33,11 @@
 //! environment variables; `Plugin::from_env` reads them and binds to
 //! the standard `{session}_{node}_input/output` iceoryx2 services.
 
+pub(super) use super::native_wire::publish_runtime_data;
 use iceoryx2::prelude::*;
-use remotemedia_types::{CopyContext, CopyReason, RuntimeData};
+use remotemedia_types::{CopyContext, RuntimeData};
 
-/// Matches the global iceoryx2 config the channel registry uses.
-const MAX_SLICE_LEN: usize = 1024 * 1024;
+use super::data_transfer::MAX_SLICE_LEN;
 
 /// One-shot plugin runner. Wraps service setup + the receive/process/send
 /// loop so plugin authors only write the handler.
@@ -219,24 +220,4 @@ pub(super) fn open_channels(
         .create()
         .map_err(|e| format!("subscriber create: {e:?}"))?;
     Ok((publisher, subscriber))
-}
-
-/// Serialize once, then account the separate transfer into the native loan.
-/// Completion describes copied bytes even if subsequent publication fails.
-pub(super) fn publish_runtime_data(
-    publisher: &NativePublisher,
-    data: &RuntimeData,
-    copies: &CopyContext,
-) -> Result<(), String> {
-    let bytes = super::data_transfer::to_bytes_with_copy_context(data, copies)?;
-    let sample = copies
-        .materialize_result(CopyReason::PrivateIpcIngress, bytes.len() as u64, || {
-            let sample = publisher
-                .loan_slice_uninit(bytes.len())
-                .map_err(|e| format!("loan: {e:?}"))?;
-            Ok::<_, String>(sample.write_from_slice(&bytes))
-        })
-        .map_err(|error| error.to_string())??;
-    sample.send().map_err(|error| format!("send: {error:?}"))?;
-    Ok(())
 }
