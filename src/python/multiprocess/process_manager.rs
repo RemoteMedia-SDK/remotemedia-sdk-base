@@ -204,6 +204,8 @@ impl Default for SpawnConfig {
 
 /// Process manager for spawning and monitoring Python nodes
 pub struct ProcessManager {
+    /// Each reporting service retains the exact initialization ledger until joined exit.
+    copy_authorities: Arc<std::sync::Mutex<HashMap<u32, Arc<super::copy_authority::CopyAuthority>>>>,
     /// Active processes
     processes: Arc<RwLock<HashMap<u32, ProcessHandle>>>,
 
@@ -256,6 +258,7 @@ impl ProcessManager {
 
         Self {
             processes: Arc::new(RwLock::new(HashMap::new())),
+            copy_authorities: Arc::new(std::sync::Mutex::new(HashMap::new())),
             spawn_config: Arc::new(RwLock::new(spawn_config)),
             config,
             exit_handlers: Arc::new(RwLock::new(Vec::new())),
@@ -291,6 +294,21 @@ impl ProcessManager {
         params: &Value,
         session_id: &str,
     ) -> Result<ProcessHandle> {
+        self.spawn_node_with_copy_context(node_type, node_id, params, session_id, None).await
+    }
+
+    /// Native legacy launch with acknowledged reports to the retained host ledger.
+    pub async fn spawn_node_with_copy_context(
+        &self,
+        node_type: &str,
+        node_id: &str,
+        params: &Value,
+        session_id: &str,
+        copies: Option<remotemedia_types::CopyContext>,
+    ) -> Result<ProcessHandle> {
+        let authority = copies.map(|copies| {
+            super::copy_authority::CopyAuthority::start(copies, node_id, session_id)
+        }).transpose().map_err(|error| Error::Execution(format!("Copy authority startup failed: {error}")))?;
         tracing::info!(
             "Spawning process for node: {} ({}) in session: {}",
             node_id,
@@ -316,6 +334,10 @@ impl ProcessManager {
             session_id,       // Pass session_id for channel naming
             "--params-stdin", // Signal that params come from stdin
         ]);
+
+        if authority.is_some() {
+            command.arg("--copy-authority-stdin");
+        }
 
         // Add custom node registration modules
         for module in &spawn_config.register_modules {
@@ -406,16 +428,26 @@ impl ProcessManager {
         };
 
         // Write params to stdin (avoids command-line length limits)
-        if !params.is_null() {
+        {
             use std::io::Write;
-            if let Some(mut stdin) = child.stdin.take() {
-                let params_json = params.to_string();
-                stdin.write_all(params_json.as_bytes()).map_err(|e| {
-                    Error::Execution(format!("Failed to write params to stdin: {}", e))
-                })?;
-                // Drop stdin to close the pipe
-                drop(stdin);
+            let bootstrap = match &authority {
+                Some(authority) => serde_json::json!({
+                    "params": params, "copy_authority": authority.bootstrap(),
+                }),
+                None => params.clone(),
+            };
+            // Always close stdin, including null parameters. On failure reap the
+            // newly spawned child before releasing its reporting capability.
+            let result = child.stdin.take().ok_or_else(|| std::io::Error::other("missing child stdin"))
+                .and_then(|mut stdin| stdin.write_all(bootstrap.to_string().as_bytes()));
+            if let Err(error) = result {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Execution(format!("Failed to write child bootstrap: {error}")));
             }
+        }
+        if let Some(authority) = authority {
+            self.copy_authorities.lock().unwrap().insert(pid, Arc::new(authority));
         }
 
         // Create process handle
@@ -453,7 +485,12 @@ impl ProcessManager {
         );
 
         // Update status
-        *process.status.write().await = ProcessStatus::Stopping;
+        {
+            let mut status = process.status.write().await;
+            if !matches!(*status, ProcessStatus::Error(_)) {
+                *status = ProcessStatus::Stopping;
+            }
+        }
 
         // Try graceful termination first (SIGTERM on Unix, terminate on Windows)
         if let Some(ref mut child) = *process.inner.lock().await {
@@ -494,8 +531,23 @@ impl ProcessManager {
             }
         }
 
-        // Update status and remove from registry
-        *process.status.write().await = ProcessStatus::Stopped;
+        if let Some(child) = process.inner.lock().await.as_mut() {
+            child.wait().map_err(|error| Error::Execution(format!("Failed to confirm process exit: {error}")))?;
+        }
+        let authority = self.copy_authorities.lock().unwrap().get(&process.id).cloned();
+        let accounting_ok = if let Some(authority) = authority {
+            tokio::task::spawn_blocking(move || authority.finish()).await
+                .is_ok_and(|result| result.is_ok())
+        } else { true };
+        // Termination succeeded even if forced shutdown interrupted reporting.
+        // Preserve that distinction in status and the failed-operation ledger.
+        let mut status = process.status.write().await;
+        if !accounting_ok {
+            *status = ProcessStatus::Error("Copy accounting interrupted by shutdown".into());
+        } else if !matches!(*status, ProcessStatus::Error(_)) {
+            *status = ProcessStatus::Stopped;
+        }
+        drop(status);
         self.processes.write().await.remove(&process.id);
 
         tracing::info!("Process {} terminated", process.id);
@@ -506,6 +558,7 @@ impl ProcessManager {
     fn start_monitoring(&self, process: ProcessHandle, stderr: Option<std::process::ChildStderr>) {
         let processes = self.processes.clone();
         let handlers = self.exit_handlers.clone();
+        let copy_authorities = self.copy_authorities.clone();
 
         // Spawn task to capture stderr output
         if let Some(stderr) = stderr {
@@ -524,11 +577,29 @@ impl ProcessManager {
 
         // Spawn monitoring task
         tokio::spawn(async move {
+            let mut reporting_failed = false;
             loop {
+                if !reporting_failed {
+                    reporting_failed = copy_authorities.lock().unwrap().get(&process.id)
+                        .is_some_and(|authority| authority.failed());
+                    if reporting_failed {
+                        // An idle worker must not survive loss of its reporting authority.
+                        let _ = process.kill().await;
+                    }
+                }
                 // Check process status
                 if let Some(exit_status) = process.exit_status().await {
                     // Process exited
-                    let reason = if exit_status.success() {
+                    let authority = copy_authorities.lock().unwrap().get(&process.id).cloned();
+                    let accounting_ok = if let Some(authority) = authority {
+                        tokio::task::spawn_blocking(move || authority.finish()).await
+                            .is_ok_and(|result| result.is_ok())
+                    } else { true };
+                    copy_authorities.lock().unwrap().remove(&process.id);
+                    let reason = if !accounting_ok {
+                        tracing::error!("Python copy accounting did not close cleanly for node {}", process.node_id);
+                        ExitReason::Error(-1)
+                    } else if exit_status.success() {
                         ExitReason::Normal
                     } else if let Some(code) = exit_status.code() {
                         ExitReason::Error(code)

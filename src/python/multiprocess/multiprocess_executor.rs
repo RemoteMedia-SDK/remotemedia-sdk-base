@@ -3019,6 +3019,9 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                         let should_use_docker = self.should_use_docker(&ctx.node_id).await?;
 
                         if should_use_docker {
+                            if self.initial_copies.is_some() {
+                                return Err(Error::Execution("Attributed legacy Docker execution has no copy-authority transport; use mapped placement or explicit unbound compatibility".into()));
+                            }
                             // Docker is available, proceed with container spawn
                             let docker_support = self.docker_support.as_ref().expect(
                                 "Docker support should be Some when should_use_docker returns true",
@@ -3057,13 +3060,13 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                                 ctx.node_id
                             );
                             self.process_manager
-                                .spawn_node(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id)
+                                .spawn_node_with_copy_context(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id, self.initial_copies.clone())
                                 .await?
                         }
                     } else {
                         // Regular multiprocess execution (Docker not requested)
                         self.process_manager
-                            .spawn_node(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id)
+                            .spawn_node_with_copy_context(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id, self.initial_copies.clone())
                             .await?
                     }
                 }
@@ -3071,7 +3074,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 {
                     // Regular multiprocess execution (Docker feature not enabled)
                     self.process_manager
-                        .spawn_node(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id)
+                        .spawn_node_with_copy_context(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id, self.initial_copies.clone())
                         .await?
                 }
             };
