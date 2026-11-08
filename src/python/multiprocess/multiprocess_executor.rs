@@ -76,6 +76,13 @@ fn global_sessions(
 enum IpcCommand {
     /// Send data to the node's input channel (serialized Python wire bytes)
     SendData { bytes: Vec<u8> },
+    /// Publish to the node's input channel WITHOUT an `IpcResponse` ack.
+    ///
+    /// Used for out-of-band frames (endpoint-call `__call_reply__`
+    /// deliveries) that may be sent while a `process_runtime_data_streaming`
+    /// collector owns the shared response channel: an extra `SendComplete`
+    /// there would be misread as the ack for the collector's own input.
+    SendDataNoAck { bytes: Vec<u8> },
     /// Register a bounded callback channel for continuous output forwarding.
     ///
     /// The IPC thread uses `blocking_send` on this channel, so a full queue
@@ -908,6 +915,39 @@ impl MultiprocessExecutor {
                 )))
             }
         }
+    }
+
+    /// Fire-and-forget, out-of-band send to a node's Python process: the
+    /// frame is published on the node's input channel without an IPC ack and
+    /// without touching the executor's response channel, so it can be sent
+    /// while a `process()` call for the same node is in flight. The Python
+    /// side must not answer it with an `EndOfInput` sentinel.
+    ///
+    /// Used to deliver endpoint-call `__call_reply__` chunks
+    /// (openspec: add-agent-harness-integration).
+    #[cfg(feature = "multiprocess")]
+    pub async fn send_out_of_band(
+        session_id: &str,
+        node_id: &str,
+        data: crate::data::RuntimeData,
+    ) -> Result<()> {
+        let bytes = Self::to_ipc_runtime_data(&data, session_id);
+        let tx = {
+            let global_sessions = global_sessions();
+            let sessions = global_sessions.read().await;
+            sessions
+                .get(session_id)
+                .and_then(|s| s.get(node_id))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Execution(format!(
+                        "IPC thread not found for node {node_id} in session {session_id}"
+                    ))
+                })?
+        };
+        tx.send(IpcCommand::SendDataNoAck { bytes })
+            .await
+            .map_err(|e| Error::Execution(format!("Failed to send to IPC thread: {e}")))
     }
 
     /// Send data to a node's IPC thread without waiting for response (fire-and-forget)
@@ -2185,6 +2225,15 @@ sys.stdout.flush()
                         // Continue polling in the main loop - don't break out!
                         // The subscriber will be polled continuously even between commands
                         // to ensure we capture all output from streaming nodes
+                    }
+                    Ok(IpcCommand::SendDataNoAck { bytes }) => {
+                        if let Err(e) = publisher.send(&bytes) {
+                            tracing::warn!(
+                                "[IPC Thread] Node '{}': out-of-band publish failed: {}",
+                                node_id_clone,
+                                e
+                            );
+                        }
                     }
                     Ok(IpcCommand::RegisterOutputCallback { callback_tx }) => {
                         tracing::debug!(

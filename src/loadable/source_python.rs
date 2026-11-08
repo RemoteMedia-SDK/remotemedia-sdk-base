@@ -229,6 +229,37 @@ impl StreamingNode for SourcePythonNode {
         false
     }
 
+    /// Only the runtime-delivered `__call_reply__` uses the native lane
+    /// (call-reply-only lane); other `@rpc` methods keep reaching the
+    /// runner's dispatcher through the input path.
+    fn rpc_methods(&self) -> Vec<remotemedia_traits::rpc::RpcMethod> {
+        vec![remotemedia_traits::call::call_reply_method()]
+    }
+
+    /// Forward `__call_reply__` to the runner out of band — published even
+    /// while a `process()` round is in flight, with no output expected.
+    async fn call_rpc(
+        &self,
+        request: remotemedia_traits::rpc::RpcRequest,
+        _ctx: &dyn NodeRuntimeContextRead,
+        _replies: &mut remotemedia_traits::rpc::RpcResponder,
+    ) -> Result<(), Error> {
+        if request.method != remotemedia_traits::call::CALL_REPLY_METHOD {
+            return Err(Error::Execution(format!(
+                "unknown RPC method: {}",
+                request.method
+            )));
+        }
+        let frame = remotemedia_plugin_sdk::python_subprocess::call_reply_frame(&request);
+        let wire = WireRuntimeData::now_text(&frame, &self.session_id);
+        self.cmd_tx
+            .send(IpcCommand::Send {
+                req_bytes: wire.to_bytes(),
+            })
+            .await
+            .map_err(|e| Error::Execution(format!("ipc cmd send: {e}")))
+    }
+
     async fn process_async(
         &self,
         data: RuntimeData,
