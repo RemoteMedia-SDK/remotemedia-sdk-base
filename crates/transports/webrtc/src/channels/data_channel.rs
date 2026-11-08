@@ -9,10 +9,12 @@
 use super::messages::{DataChannelMessage, MAX_MESSAGE_SIZE};
 use crate::config::DataChannelMode;
 use crate::{Error, Result};
+use bytes::Bytes;
+use remotemedia_types::{CopyContext, CopyReason, CopyRejected};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
-use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::{OnMessageHdlrFn, RTCDataChannel};
 use webrtc::peer_connection::RTCPeerConnection;
 
 /// Data channel state
@@ -223,11 +225,36 @@ impl DataChannel {
     /// # Arguments
     /// * `data` - Raw bytes to send
     pub async fn send_binary(&self, data: &[u8]) -> Result<()> {
-        if data.len() > MAX_MESSAGE_SIZE {
+        self.send_binary_with_context(data, CopyContext::legacy())
+            .await
+    }
+
+    /// Snapshot borrowed bytes with explicit attribution before handing them to
+    /// WebRTC. This policy covers wrapper staging, not SCTP/DTLS/network copies.
+    pub async fn send_binary_with_context(&self, data: &[u8], copies: &CopyContext) -> Result<()> {
+        self.validate_binary_send(data.len()).await?;
+        let owned = copies
+            .materialize(CopyReason::BorrowedInput, data.len() as u64, || {
+                Bytes::copy_from_slice(data)
+            })
+            .map_err(anyhow::Error::from)?;
+        self.send_binary_bytes(owned).await
+    }
+
+    /// Send an owning byte range without a wrapper payload copy. Use
+    /// `Bytes::from_owner(shared_bytes)` to retain a runtime allocation and its
+    /// budget. WebRTC serialization, encryption and network transfers remain
+    /// outside this wrapper's copy accounting; this is not a strict network path.
+    pub async fn send_binary_owned(&self, data: Bytes) -> Result<()> {
+        self.validate_binary_send(data.len()).await?;
+        self.send_binary_bytes(data).await
+    }
+
+    async fn validate_binary_send(&self, len: usize) -> Result<()> {
+        if len > MAX_MESSAGE_SIZE {
             return Err(Error::DataChannelError(format!(
                 "Data size {} exceeds maximum {} bytes",
-                data.len(),
-                MAX_MESSAGE_SIZE
+                len, MAX_MESSAGE_SIZE
             )));
         }
 
@@ -239,8 +266,12 @@ impl DataChannel {
             )));
         }
 
+        Ok(())
+    }
+
+    async fn send_binary_bytes(&self, data: Bytes) -> Result<()> {
         self.rtc_channel
-            .send(&data.to_vec().into())
+            .send(&data)
             .await
             .map_err(|e| Error::DataChannelError(format!("Failed to send binary: {}", e)))?;
 
@@ -271,7 +302,7 @@ impl DataChannel {
             let handler = Arc::clone(&handler);
 
             // Parse the message
-            let data = msg.data.to_vec();
+            let data = msg.data;
             let data_len = data.len();
 
             Box::pin(async move {
@@ -302,15 +333,53 @@ impl DataChannel {
         F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        self.on_binary_message_with_context(CopyContext::legacy().clone(), move |result| {
+            handler(result.expect("legacy copy policy permits byte snapshots"))
+        });
+    }
+
+    /// Receive a mutable snapshot with explicit copy authority. A rejected
+    /// snapshot reaches the handler as an error without reading payload bytes.
+    /// Receive statistics count network bytes even when snapshot policy rejects.
+    pub fn on_binary_message_with_context<F, Fut>(&self, copies: CopyContext, handler: F)
+    where
+        F: Fn(std::result::Result<Vec<u8>, CopyRejected>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.on_binary_message_owned(move |data| {
+            handler(
+                copies.materialize(CopyReason::VecMaterialization, data.len() as u64, || {
+                    data.to_vec()
+                }),
+            )
+        });
+    }
+
+    /// Receive WebRTC's existing immutable owner. Clones and slices may outlive
+    /// the callback and channel. Registering any message handler replaces the
+    /// previous handler, as with the underlying RTCDataChannel API.
+    pub fn on_binary_message_owned<F, Fut>(&self, handler: F)
+    where
+        F: Fn(Bytes) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.rtc_channel.on_message(self.binary_handler(handler));
+    }
+
+    fn binary_handler<F, Fut>(&self, handler: F) -> OnMessageHdlrFn
+    where
+        F: Fn(Bytes) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let bytes_received = Arc::clone(&self.bytes_received);
         let messages_received = Arc::clone(&self.messages_received);
         let handler = Arc::new(handler);
 
-        self.rtc_channel.on_message(Box::new(move |msg| {
+        Box::new(move |msg| {
             let bytes_received = Arc::clone(&bytes_received);
             let messages_received = Arc::clone(&messages_received);
             let handler = Arc::clone(&handler);
-            let data = msg.data.to_vec();
+            let data = msg.data;
             let data_len = data.len();
 
             Box::pin(async move {
@@ -318,7 +387,7 @@ impl DataChannel {
                 *messages_received.write().await += 1;
                 handler(data).await;
             })
-        }));
+        })
     }
 
     /// Get the channel label
@@ -381,6 +450,10 @@ impl DataChannel {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "data_channel_ownership_tests.rs"]
+mod ownership_tests;
 
 /// Channel statistics
 #[derive(Debug, Clone, Default)]

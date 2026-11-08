@@ -15,6 +15,25 @@
 //! - [`crate::config::DataChannelMode`] - Reliable vs unreliable delivery
 //! - [`ControlMessage`] - Pre-defined control message types
 //!
+//! # Buffer ownership
+//!
+//! [`DataChannel::send_binary_owned`] accepts an owning `bytes::Bytes` range;
+//! `Bytes::from_owner(shared_bytes)` preserves a runtime buffer and its budget.
+//! [`DataChannel::on_binary_message_owned`] forwards the incoming WebRTC owner,
+//! whose slices can outlive the callback and channel. Neither wrapper stages the
+//! payload in another buffer.
+//!
+//! Borrowed sends and mutable `Vec` callbacks remain available. Their
+//! `*_with_context` variants attribute the required snapshot to the caller's
+//! copy authority; context-free calls use the explicitly unattributed legacy
+//! ledger. A receive snapshot rejected by policy is delivered as an error.
+//! Transport byte/message statistics are separate from these copy counters.
+//!
+//! This is wrapper ownership, not zero-copy network delivery. WebRTC receive
+//! buffering, SCTP/DTLS, protobuf envelopes, chunking and network/device transfers
+//! remain separate boundaries. Structured decoding still allocates its decoded
+//! payload, although dispatch no longer copies the incoming wire buffer first.
+//!
 //! # RTP vs Data Channel
 //!
 //! - `RuntimeData::Audio` / `RuntimeData::Video` → RTP media tracks

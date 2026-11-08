@@ -791,6 +791,13 @@ impl PeerConnection {
         }
     }
 
+    async fn channel_for_operation(&self) -> Result<tokio::sync::RwLockReadGuard<'_, DataChannel>> {
+        tokio::sync::RwLockReadGuard::try_map(self.data_channel.read().await, Option::as_ref)
+            .map_err(|_| {
+                Error::DataChannelError("No data channel configured for this peer".to_string())
+            })
+    }
+
     /// Send a message over the data channel (T168)
     ///
     /// # Arguments
@@ -801,10 +808,7 @@ impl PeerConnection {
     ///
     /// Result indicating success or error.
     pub async fn send_data_channel_message(&self, msg: &DataChannelMessage) -> Result<()> {
-        let channel_guard = self.data_channel.read().await;
-        let channel = channel_guard.as_ref().ok_or_else(|| {
-            Error::DataChannelError("No data channel configured for this peer".to_string())
-        })?;
+        let channel = self.channel_for_operation().await?;
 
         channel.send_message(msg).await
     }
@@ -815,12 +819,26 @@ impl PeerConnection {
     ///
     /// * `data` - Raw bytes to send
     pub async fn send_data_channel_binary(&self, data: &[u8]) -> Result<()> {
-        let channel_guard = self.data_channel.read().await;
-        let channel = channel_guard.as_ref().ok_or_else(|| {
-            Error::DataChannelError("No data channel configured for this peer".to_string())
-        })?;
+        self.send_data_channel_binary_with_context(data, remotemedia_types::CopyContext::legacy())
+            .await
+    }
 
-        channel.send_binary(data).await
+    /// Send borrowed data with attribution for its required wrapper snapshot.
+    /// This does not negotiate a zero-copy network transport.
+    pub async fn send_data_channel_binary_with_context(
+        &self,
+        data: &[u8],
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<()> {
+        let channel = self.channel_for_operation().await?;
+
+        channel.send_binary_with_context(data, copies).await
+    }
+
+    /// Forward an owning byte range without the borrowed-send staging copy.
+    pub async fn send_data_channel_binary_owned(&self, data: bytes::Bytes) -> Result<()> {
+        let channel = self.channel_for_operation().await?;
+        channel.send_binary_owned(data).await
     }
 
     /// Set message handler for incoming data channel messages
@@ -833,10 +851,7 @@ impl PeerConnection {
         F: Fn(DataChannelMessage) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let channel_guard = self.data_channel.read().await;
-        let channel = channel_guard.as_ref().ok_or_else(|| {
-            Error::DataChannelError("No data channel configured for this peer".to_string())
-        })?;
+        let channel = self.channel_for_operation().await?;
 
         channel.on_message(handler);
         Ok(())
