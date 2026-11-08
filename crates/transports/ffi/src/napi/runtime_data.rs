@@ -1,11 +1,11 @@
 //! RuntimeData serialization/deserialization for Node.js
 //!
-//! This module provides zero-copy deserialization of RuntimeData from
-//! iceoryx2 shared memory buffers into JavaScript objects.
+//! This module borrows legacy Python wire payloads while parsing metadata.
+//! MessagePack payload decoding is a separate, counted compatibility operation.
 //!
 //! # Wire Format
 //!
-//! The wire format matches `data_transfer.rs` in core:
+//! The wire format matches `python_wire.rs` in core:
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
@@ -20,8 +20,8 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 
+use super::buffers::InputBuffer;
 use super::error::IpcError;
-use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 /// Data type discriminants (matches Rust RuntimeData enum)
@@ -105,9 +105,12 @@ pub struct FileMetadata {
 /// Returns metadata without copying the payload, allowing zero-copy
 /// access to the underlying data.
 #[napi]
-pub fn parse_runtime_data_header(buffer: Buffer) -> napi::Result<ParsedRuntimeData> {
-    let bytes = buffer.as_ref();
+pub fn parse_runtime_data_header(buffer: InputBuffer) -> napi::Result<ParsedRuntimeData> {
+    let buffer = buffer.into_buffer()?;
+    parse_runtime_data_header_bytes(&buffer)
+}
 
+pub(super) fn parse_runtime_data_header_bytes(bytes: &[u8]) -> napi::Result<ParsedRuntimeData> {
     if bytes.len() < 15 {
         return Err(IpcError::SerializationError(
             "Buffer too small for RuntimeData header".to_string(),
@@ -148,6 +151,12 @@ pub fn parse_runtime_data_header(buffer: Buffer) -> napi::Result<ParsedRuntimeDa
     ]);
 
     let payload_offset = (header_offset + 12) as u32;
+    let end = (payload_offset as usize)
+        .checked_add(payload_len as usize)
+        .ok_or_else(|| napi::Error::from_reason("RuntimeData payload length overflow"))?;
+    if end > bytes.len() {
+        return Err(napi::Error::from_reason("Truncated RuntimeData payload"));
+    }
 
     Ok(ParsedRuntimeData {
         data_type,
@@ -160,8 +169,18 @@ pub fn parse_runtime_data_header(buffer: Buffer) -> napi::Result<ParsedRuntimeDa
 
 /// Parse audio buffer metadata from payload
 #[napi]
-pub fn parse_audio_metadata(buffer: Buffer, payload_offset: u32) -> napi::Result<AudioMetadata> {
-    let bytes = buffer.as_ref();
+pub fn parse_audio_metadata(
+    buffer: InputBuffer,
+    payload_offset: u32,
+) -> napi::Result<AudioMetadata> {
+    let buffer = buffer.into_buffer()?;
+    parse_audio_metadata_bytes(&buffer, payload_offset)
+}
+
+pub(super) fn parse_audio_metadata_bytes(
+    bytes: &[u8],
+    payload_offset: u32,
+) -> napi::Result<AudioMetadata> {
     let offset = payload_offset as usize;
 
     if bytes.len() < offset + AUDIO_HEADER_SIZE {
@@ -203,8 +222,18 @@ pub fn parse_audio_metadata(buffer: Buffer, payload_offset: u32) -> napi::Result
 
 /// Parse video frame metadata from payload
 #[napi]
-pub fn parse_video_metadata(buffer: Buffer, payload_offset: u32) -> napi::Result<VideoMetadata> {
-    let bytes = buffer.as_ref();
+pub fn parse_video_metadata(
+    buffer: InputBuffer,
+    payload_offset: u32,
+) -> napi::Result<VideoMetadata> {
+    let buffer = buffer.into_buffer()?;
+    parse_video_metadata_bytes(&buffer, payload_offset)
+}
+
+pub(super) fn parse_video_metadata_bytes(
+    bytes: &[u8],
+    payload_offset: u32,
+) -> napi::Result<VideoMetadata> {
     let offset = payload_offset as usize;
 
     if bytes.len() < offset + VIDEO_HEADER_SIZE {
@@ -266,8 +295,15 @@ pub fn parse_video_metadata(buffer: Buffer, payload_offset: u32) -> napi::Result
 /// stream_id_len (2 bytes) | stream_id (variable)
 /// ```
 #[napi]
-pub fn parse_file_metadata(buffer: Buffer, payload_offset: u32) -> napi::Result<FileMetadata> {
-    let bytes = buffer.as_ref();
+pub fn parse_file_metadata(buffer: InputBuffer, payload_offset: u32) -> napi::Result<FileMetadata> {
+    let buffer = buffer.into_buffer()?;
+    parse_file_metadata_bytes(&buffer, payload_offset)
+}
+
+pub(super) fn parse_file_metadata_bytes(
+    bytes: &[u8],
+    payload_offset: u32,
+) -> napi::Result<FileMetadata> {
     let mut pos = payload_offset as usize;
 
     // Minimum size check: 2+0 + 2+0 + 2+0 + 8 + 8 + 8 + 2+0 = 32 bytes

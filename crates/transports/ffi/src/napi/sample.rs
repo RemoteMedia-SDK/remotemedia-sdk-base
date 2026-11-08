@@ -1,123 +1,129 @@
-//! Sample lifecycle management for Node.js
-//!
-//! Provides ReceivedSample and LoanedSample types for zero-copy IPC.
-
-use super::error::IpcError;
-use super::runtime_data::parse_runtime_data_header;
-use napi::bindgen_prelude::*;
+//! Immutable native receive owners and exclusive native producer loans.
+use super::{
+    buffers::output_buffer, pipeline::NapiRuntimeData, runtime_data,
+    subscriber::native::NativeReceived,
+};
+use napi::{bindgen_prelude::Buffer, Env, Error, Result};
 use napi_derive::napi;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use remotemedia_types::{CopyContext, CopyReason, RuntimeData, SharedBytes};
 
-/// A received sample with zero-copy buffer access
-///
-/// IMPORTANT: Always call release() when done processing to return
-/// the slot to the publisher's loan pool.
+/// Retains a native sample. Slices and toBinary outputs keep it alive independently.
 #[napi]
 pub struct ReceivedSample {
-    /// Raw buffer data (owned Vec for lifetime safety)
-    buffer: Vec<u8>,
-    /// Timestamp when sample was published (nanoseconds)
-    timestamp_ns: u64,
-    /// Whether this sample has been released
-    is_released: Arc<AtomicBool>,
+    bytes: Option<SharedBytes>,
+    copies: CopyContext,
+    timestamp_ns: i64,
+    size: u32,
 }
-
+impl ReceivedSample {
+    pub(super) fn new(received: NativeReceived) -> Self {
+        let size = received.bytes.len() as u32;
+        Self {
+            bytes: Some(received.bytes),
+            copies: received.copies,
+            timestamp_ns: received.timestamp_ns,
+            size,
+        }
+    }
+    fn bytes(&self) -> Result<&SharedBytes> {
+        self.bytes
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Sample already released"))
+    }
+}
 #[napi]
 impl ReceivedSample {
-    /// Create a new received sample from buffer data
-    pub(crate) fn new(buffer: Vec<u8>, timestamp_ns: u64) -> Self {
-        Self {
-            buffer,
-            timestamp_ns,
-            is_released: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Get the buffer containing the received payload
-    ///
-    /// WARNING: Do not use this buffer after calling release()
+    /// Counted snapshot into final JS-owned storage. It survives release/close.
     #[napi(getter)]
-    pub fn buffer(&self) -> napi::Result<Buffer> {
-        if self.is_released.load(Ordering::SeqCst) {
-            return Err(IpcError::SampleError("Sample already released".to_string()).into());
-        }
-
-        // Create a Buffer that shares ownership with the Vec
-        Ok(Buffer::from(self.buffer.clone()))
+    pub fn buffer(&self, env: Env) -> Result<Buffer> {
+        let bytes = self.bytes()?;
+        let operation = self
+            .copies
+            .begin(CopyReason::BorrowedInput, bytes.len() as u64)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let mut output = output_buffer(env, bytes.len())?;
+        output.as_mut().copy_from_slice(bytes.as_slice());
+        operation.complete();
+        Ok(output)
     }
-
-    /// Get the size of the payload in bytes
     #[napi(getter)]
     pub fn size(&self) -> u32 {
-        self.buffer.len() as u32
+        self.size
     }
-
-    /// Check if this sample has been released
     #[napi(getter)]
     pub fn is_released(&self) -> bool {
-        self.is_released.load(Ordering::SeqCst)
+        self.bytes.is_none()
     }
-
-    /// Get the timestamp when the sample was published (nanoseconds)
+    /// Local arrival time in nanoseconds since the Unix epoch.
     #[napi(getter)]
     pub fn timestamp_ns(&self) -> i64 {
-        self.timestamp_ns as i64
+        self.timestamp_ns
     }
-
-    /// Release the sample back to the publisher's pool
-    ///
-    /// This must be called when done processing to prevent pool exhaustion.
     #[napi]
-    pub fn release(&self) -> napi::Result<()> {
-        if self.is_released.swap(true, Ordering::SeqCst) {
-            return Err(IpcError::SampleError("Sample already released".to_string()).into());
-        }
-        // The actual iceoryx2 sample is dropped when the IPC thread
-        // finishes with it. This just marks our wrapper as released.
+    pub fn release(&mut self) -> Result<()> {
+        self.bytes
+            .take()
+            .ok_or_else(|| Error::from_reason("Sample already released"))?;
         Ok(())
     }
-
-    /// Parse this sample as RuntimeData
-    ///
-    /// The sample is NOT automatically released after this call.
-    /// You must still call release() when done.
     #[napi]
-    pub fn to_runtime_data(&self) -> napi::Result<super::runtime_data::ParsedRuntimeData> {
-        if self.is_released.load(Ordering::SeqCst) {
-            return Err(IpcError::SampleError("Sample already released".to_string()).into());
-        }
-
-        parse_runtime_data_header(Buffer::from(self.buffer.clone()))
+    pub fn read_byte(&self, index: u32) -> Result<u32> {
+        self.bytes()?
+            .as_slice()
+            .get(index as usize)
+            .map(|byte| *byte as u32)
+            .ok_or_else(|| Error::from_reason("Sample index out of bounds"))
     }
-}
-
-impl Drop for ReceivedSample {
-    fn drop(&mut self) {
-        if !self.is_released.load(Ordering::SeqCst) {
-            tracing::warn!(
-                "ReceivedSample dropped without explicit release() - \
-                 this may cause loan pool exhaustion"
-            );
-        }
+    #[napi]
+    pub fn slice(&self, start: u32, end: u32) -> Result<ReceivedSample> {
+        let bytes = self
+            .bytes()?
+            .slice(start as usize..end as usize)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(Self::new(NativeReceived {
+            bytes,
+            copies: self.copies.clone(),
+            timestamp_ns: self.timestamp_ns,
+        }))
+    }
+    /// Owning handoff of raw bytes to the pipeline, without serialization/copying.
+    #[napi]
+    pub fn to_binary(&self) -> Result<NapiRuntimeData> {
+        Ok(NapiRuntimeData::from_runtime(RuntimeData::Binary(
+            self.bytes()?.clone(),
+        )))
+    }
+    /// Parse legacy Python wire metadata directly; this does not decode MessagePack.
+    #[napi]
+    pub fn to_runtime_data(&self) -> Result<runtime_data::ParsedRuntimeData> {
+        runtime_data::parse_runtime_data_header_bytes(self.bytes()?.as_slice())
+    }
+    /// Borrow audio metadata without exporting a mutable payload snapshot.
+    #[napi]
+    pub fn audio_metadata(&self, payload_offset: u32) -> Result<runtime_data::AudioMetadata> {
+        runtime_data::parse_audio_metadata_bytes(self.bytes()?.as_slice(), payload_offset)
+    }
+    /// Borrow video metadata without exporting a mutable payload snapshot.
+    #[napi]
+    pub fn video_metadata(&self, payload_offset: u32) -> Result<runtime_data::VideoMetadata> {
+        runtime_data::parse_video_metadata_bytes(self.bytes()?.as_slice(), payload_offset)
+    }
+    /// Parse file-reference metadata directly from the retained native payload.
+    #[napi]
+    pub fn file_metadata(&self, payload_offset: u32) -> Result<runtime_data::FileMetadata> {
+        runtime_data::parse_file_metadata_bytes(self.bytes()?.as_slice(), payload_offset)
+    }
+    /// Explicit counted MessagePack compatibility decoding under the receive policy.
+    #[napi]
+    pub fn decode(&self) -> Result<NapiRuntimeData> {
+        remotemedia_core::multiprocess::data_transfer::from_bytes_with_copy_context(
+            self.bytes()?.as_slice(),
+            &self.copies,
+        )
+        .map(NapiRuntimeData::from_runtime)
+        .map_err(Error::from_reason)
     }
 }
 
 mod loan;
 pub use loan::LoanedSample;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_received_sample_lifecycle() {
-        let sample = ReceivedSample::new(vec![1, 2, 3, 4], 12345);
-        assert!(!sample.is_released());
-        assert_eq!(sample.size(), 4);
-        assert_eq!(sample.timestamp_ns(), 12345);
-        sample.release().unwrap();
-        assert!(sample.is_released());
-        assert!(sample.release().is_err());
-    }
-}

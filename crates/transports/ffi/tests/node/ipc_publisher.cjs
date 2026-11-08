@@ -18,17 +18,18 @@ function counts(session, reason = 'borrowed_input') {
   return JSON.parse(session.copyReport()).entries.find(([name]) => name === reason)[1];
 }
 
-// The receiving process deliberately uses the existing copying callback adapter.
-// This proves native delivery across a process, not zero-copy receive (S3).
+// Separate-process strict receive reads native storage without a Buffer snapshot.
 if (process.argv[2] === '--receiver') {
-  const session = runtime.createSession({id: process.argv[3]});
+  const session = runtime.createSession({id: process.argv[3], requireZeroCopy:true});
   const subscriber = session.channel('bytes').createSubscriber();
-  subscriber.onData(sample => {
-    const bytes = [...sample.buffer];
+  subscriber.onData((sample, error) => {
+    if (error) throw error;
+    const bytes = Array.from({length:sample.size}, (_, index) => sample.readByte(index));
     sample.release();
     subscriber.close();
     session.close();
-    process.send({ bytes }, () => process.exit(0));
+    const copied = JSON.parse(session.copyReport()).entries.reduce((sum, [, c]) => sum + c.copied_bytes, 0);
+    process.send({ bytes, copied }, () => process.exit(0));
   });
   process.send({ready: true});
 } else {
@@ -43,7 +44,8 @@ if (process.argv[2] === '--receiver') {
       assert.equal(publisher.tryLoan(1), null);
       assert.throws(() => loan.set(8, 1), /bounds/);
       assert.throws(() => loan.set(0, 256), /255/);
-      assert.throws(() => channel.createSubscriber(), /strict receive is unsupported/);
+      const strictReceiver = channel.createSubscriber();
+      strictReceiver.close();
       const env = {...process.env};
       delete env.NODE_TEST_CONTEXT;
       child = fork(__filename, ['--receiver', session.id], {
@@ -61,7 +63,9 @@ if (process.argv[2] === '--receiver') {
       assert.throws(() => loan.send(), /consumed/);
       assert.throws(() => loan.fill(0), /consumed/);
       try {
-        assert.deepEqual((await received)[0].bytes, [7, 7, 7, 99, 7, 7, 7, 7]);
+        const result = (await received)[0];
+        assert.deepEqual(result.bytes, [7, 7, 7, 99, 7, 7, 7, 7]);
+        assert.equal(result.copied, 0);
       } catch (error) {
         throw new Error(`Native receive failed: ${error}; child stderr: ${errors.slice(-4000)}`);
       }

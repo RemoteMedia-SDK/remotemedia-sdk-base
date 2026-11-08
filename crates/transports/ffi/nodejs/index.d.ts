@@ -100,15 +100,58 @@ export function isControlMessage(data: RuntimeData): data is RuntimeData & { typ
 // =============================================================================
 
 /**
- * Compatibility receive wrapper. Its Buffer getter currently makes a snapshot.
+ * Immutable native receive owner. Slices and pipeline handoffs retain storage.
  */
 export interface ReceivedSample {
+  /** Counted independent snapshot; nonempty export rejects under strict policy. */
   readonly buffer: Buffer;
   readonly size: number;
   readonly isReleased: boolean;
-  readonly timestampNs: bigint;
+  /** Local arrival time as a JS number; nanosecond precision is approximate. */
+  readonly timestampNs: number;
   release(): void;
-  toRuntimeData(): RuntimeData;
+  readByte(index: number): number;
+  slice(start: number, end: number): ReceivedSample;
+  toBinary(): import('./native-buffers').NapiRuntimeData;
+  /** Legacy Python envelope metadata; does not decode MessagePack. */
+  toRuntimeData(): ParsedRuntimeData;
+  audioMetadata(payloadOffset: number): AudioMetadata;
+  videoMetadata(payloadOffset: number): VideoMetadata;
+  fileMetadata(payloadOffset: number): FileMetadata;
+  /** Explicit counted MessagePack decoding under this IPC session's policy. */
+  decode(): import('./native-buffers').NapiRuntimeData;
+}
+
+export interface ParsedRuntimeData {
+  dataType: number;
+  sessionId: string;
+  timestampNs: number;
+  payloadOffset: number;
+  payloadLen: number;
+}
+export interface AudioMetadata {
+  sampleRate: number;
+  channels: number;
+  numSamples: number;
+  samplesOffset: number;
+}
+export interface VideoMetadata {
+  width: number;
+  height: number;
+  format: number;
+  codec: number;
+  frameNum: number;
+  isKeyframe: boolean;
+  pixelDataOffset: number;
+}
+export interface FileMetadata {
+  path: string;
+  filename?: string;
+  mimeType?: string;
+  size?: number;
+  offset?: number;
+  length?: number;
+  streamId?: string;
 }
 
 /**
@@ -136,11 +179,13 @@ export interface Subscriber {
   readonly isValid: boolean;
   readonly pendingCount: number;
   readonly bufferSize: number;
+  readonly borrowedCount: number;
+  readonly maxBorrowedSamples: number;
   receive(): ReceivedSample | null;
   receiveTimeout(timeoutMs: number): Promise<ReceivedSample | null>;
   receiveAsync(): Promise<ReceivedSample>;
-  onData(callback: (sample: ReceivedSample) => void): () => void;
-  [Symbol.asyncIterator](): AsyncIterableIterator<ReceivedSample>;
+  onData(callback: (sample: ReceivedSample | null, error: Error | null) => void): () => void;
+  unsubscribe(): void;
   close(): void;
 }
 

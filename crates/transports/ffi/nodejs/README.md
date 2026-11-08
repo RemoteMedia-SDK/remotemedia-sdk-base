@@ -25,54 +25,27 @@ npm install @matbee/remotemedia-native
 ## Quick Start
 
 ```typescript
-import {
-  createSession,
-  NapiRuntimeData,
-  isNativeLoaded,
-} from '@matbee/remotemedia-native';
+import { createSession } from '@matbee/remotemedia-native';
 
-// Check if native bindings loaded successfully
-if (!isNativeLoaded()) {
-  console.error('Native bindings failed to load');
-  process.exit(1);
-}
-
-// Create an IPC session for zero-copy communication
 const session = createSession({
-  id: 'my_session',
-  default_channel_config: {
-    capacity: 64,
-    max_payload_size: 1_048_576, // 1MB
-  },
+  id: 'my_session', requireZeroCopy: true,
+  defaultChannelConfig: { capacity: 2, maxPayloadSize: 1_048_576 },
 });
-
-// Create a channel for audio data
-const channel = session.channel('audio_data');
-
-// Publisher side
-const publisher = channel.createPublisher();
-const audioData = NapiRuntimeData.audio(
-  new Float32Array(16000), // 1 second of silence at 16kHz
-  16000, // sample rate
-  1      // channels
-);
-publisher.publish(audioData);
-
-// Subscriber side
+const channel = session.channel('bytes');
 const subscriber = channel.createSubscriber();
-const unsubscribe = subscriber.onData((sample) => {
+const publisher = channel.createPublisher();
+try {
+  const loan = publisher.loan(16);
+  loan.fill(7); // Generate directly in the native loan.
+  loan.send();
+  const sample = await subscriber.receiveAsync();
   try {
-    const buffer = sample.buffer;
-    // Process audio data...
-  } finally {
-    sample.release(); // IMPORTANT: Return sample to pool
-  }
-});
-
-// Cleanup
-unsubscribe();
-subscriber.close();
-publisher.close();
+    console.log(sample.readByte(0)); // 7; no Buffer export.
+    // sample.toBinary() hands retained native storage to a pipeline.
+  } finally { sample.release(); }
+} finally {
+  subscriber.close(); publisher.close(); session.close();
+}
 ```
 
 ## API Reference
@@ -153,29 +126,50 @@ write into the loan, and it remains valid after sending or releasing the loan.
 Create an IPC session with `requireZeroCopy: true` to reject nonempty copying
 operations. Direct `loan`/`set`/`fill`/`send` remains available. `session.copyReport()`
 returns that IPC session's JSON accounting report, separate from core pipeline
-accounting. Strict subscriber creation currently rejects because receive-side
-ownership migration is incomplete. The compatibility subscriber below still
-copies its payload. Synchronous per-byte setters are not a throughput benchmark.
+accounting. Native receive, readByte, retained slices and toBinary pipeline
+handoff also work under strict policy. Synchronous per-byte setters and the 2 ms
+receive polling interval are not a throughput or latency acceptance result.
 
 ### Subscriber
 
 ```typescript
 const subscriber = channel.createSubscriber();
-
-// Register callback
-const unsubscribe = subscriber.onData((sample) => {
-  const buffer = sample.buffer;
-  const timestamp = sample.timestampNs;
-  
-  // Process data...
-  
-  sample.release(); // Required!
+const unsubscribe = subscriber.onData((sample, error) => {
+  if (error) { console.error(error); return; }
+  if (!sample) return;
+  try {
+    console.log(sample.readByte(0));
+    // const owned = sample.toBinary(); // independently retains the native sample
+  } finally { sample.release(); }
 });
-
-// Cleanup
-unsubscribe();
-subscriber.close();
+// Later: unsubscribe(); subscriber.close();
 ```
+
+`receive()` returns null when empty or when retained owners fill the native borrow
+budget. `receiveTimeout(ms)` waits up to the deadline; `receiveAsync()` waits for
+data. Both reject on close. Pull receives reject while a callback is registered.
+Callbacks deliver `(sample, null)` or a terminal `(null, error)`; unsubscribe,
+close and environment teardown stop delivery and release queued owners. A thrown
+callback exception remains visible to Node's uncaught-exception handling.
+
+`borrowedCount` counts native samples held by wrappers, slices, callback deliveries
+and pipeline owners. `maxBorrowedSamples` is the smaller of the native service's
+negotiated borrow limit and the requested receive buffer size. It is distinct from
+native queue capacity. Retaining all slots stops further borrowing; the bounded
+native queue retains its negotiated overflow behavior. `pendingCount` counts only
+queued JS callback deliveries. GC releases abandoned owners; explicit `release()`
+returns wrapper ownership promptly. Retained slices and `toBinary()` results stay
+valid after wrapper release and publisher/subscriber/session close.
+
+`sample.buffer` is an independent, counted mutable snapshot and rejects nonempty
+exports in strict sessions. `decode()` explicitly decodes MessagePack under the
+receiver session's copy policy. `toRuntimeData()` parses the legacy Python wire
+header; `audioMetadata(offset)`, `videoMetadata(offset)` and `fileMetadata(offset)`
+parse metadata without snapshotting the native payload. Metadata offsets use the
+current sample view. These are different wire formats. `timestampNs` is local
+arrival time represented as a JS number, so nanosecond precision is approximate.
+Public Buffer-based metadata parsers reject SharedArrayBuffer storage.
+
 
 ## Pipeline Execution
 

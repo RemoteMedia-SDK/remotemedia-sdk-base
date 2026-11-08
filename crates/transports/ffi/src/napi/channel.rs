@@ -7,7 +7,7 @@ use super::error::IpcError;
 use super::publisher::NapiPublisher;
 use super::subscriber::NapiSubscriber;
 use napi_derive::napi;
-use remotemedia_types::{CopyContext, CopyPolicy};
+use remotemedia_types::CopyContext;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -108,17 +108,16 @@ impl NapiChannel {
             return Err(IpcError::ChannelError("Channel is closed".to_string()).into());
         }
 
-        if self.copies.policy() == CopyPolicy::RequireZeroCopy {
-            return Err(napi::Error::from_reason(
-                "Node subscriber ownership migration is incomplete; strict receive is unsupported",
-            ));
-        }
-
         let buffer = buffer_size
             .map(|s| s as usize)
             .unwrap_or(self.config.capacity());
 
-        NapiSubscriber::new(self.name.clone(), buffer)
+        NapiSubscriber::new(
+            self.name.clone(),
+            buffer,
+            self.is_open.clone(),
+            self.copies.clone(),
+        )
     }
 
     /// Close the channel and release resources
