@@ -397,6 +397,7 @@ impl WebRtcServer {
                         peer_id,
                         data,
                         timestamp_ns,
+                        ..
                     } => {
                         use remotemedia_core::data::RuntimeData;
                         // Summarize metadata directly; do not serialize bulk payloads.
@@ -432,6 +433,7 @@ impl WebRtcServer {
                         peer_id,
                         data,
                         timestamp_ns,
+                        ..
                     } => {
                         let data = DataReceivedData {
                             peer_id: peer_id.clone(),

@@ -4,7 +4,7 @@
 //! without creating circular dependencies between crates.
 
 use remotemedia_core::data::RuntimeData;
-use remotemedia_types::SharedBytes;
+use remotemedia_types::{CopyContext, SharedBytes};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -45,6 +45,8 @@ pub enum WebRtcEventBridge {
         data: RuntimeData,
         /// Nanosecond timestamp
         timestamp_ns: u64,
+        /// Originating session authority, retained through observer fan-out.
+        copies: CopyContext,
     },
 
     /// Emitted when raw data arrives on a WebRTC data channel
@@ -55,6 +57,8 @@ pub enum WebRtcEventBridge {
         data: SharedBytes,
         /// Nanosecond timestamp
         timestamp_ns: u64,
+        /// Originating session authority, retained through observer fan-out.
+        copies: CopyContext,
     },
 
     /// Emitted on errors
@@ -102,19 +106,41 @@ impl WebRtcEventBridge {
 
     /// Create a pipeline output event
     pub fn pipeline_output(peer_id: String, data: RuntimeData, timestamp_ns: u64) -> Self {
+        Self::pipeline_output_with_context(peer_id, data, timestamp_ns, CopyContext::legacy())
+    }
+
+    /// Create an event retaining the originating session copy authority.
+    pub fn pipeline_output_with_context(
+        peer_id: String,
+        data: RuntimeData,
+        timestamp_ns: u64,
+        copies: &CopyContext,
+    ) -> Self {
         Self::PipelineOutput {
             peer_id,
             data: data.into_shared(),
             timestamp_ns,
+            copies: copies.clone(),
         }
     }
 
     /// Create a data received event
     pub fn data_received(peer_id: String, data: impl Into<SharedBytes>, timestamp_ns: u64) -> Self {
+        Self::data_received_with_context(peer_id, data, timestamp_ns, CopyContext::legacy())
+    }
+
+    /// Create an event retaining the originating session copy authority.
+    pub fn data_received_with_context(
+        peer_id: String,
+        data: impl Into<SharedBytes>,
+        timestamp_ns: u64,
+        copies: &CopyContext,
+    ) -> Self {
         Self::DataReceived {
             peer_id,
             data: data.into(),
             timestamp_ns,
+            copies: copies.clone(),
         }
     }
 

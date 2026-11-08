@@ -906,19 +906,23 @@ fn convert_bridge_to_ffi_event(bridge_event: &WebRtcEventBridge) -> WebRtcEvent 
             peer_id,
             data,
             timestamp_ns,
+            copies,
         } => WebRtcEvent::PipelineOutput(PipelineOutputEvent {
             peer_id: peer_id.clone(),
             data: data.clone(),
             timestamp: *timestamp_ns,
+            copies: copies.clone(),
         }),
         WebRtcEventBridge::DataReceived {
             peer_id,
             data,
             timestamp_ns,
+            copies,
         } => WebRtcEvent::DataReceived(DataReceivedEvent {
             peer_id: peer_id.clone(),
             data: data.clone(),
             timestamp: *timestamp_ns,
+            copies: copies.clone(),
         }),
         WebRtcEventBridge::Error {
             code,

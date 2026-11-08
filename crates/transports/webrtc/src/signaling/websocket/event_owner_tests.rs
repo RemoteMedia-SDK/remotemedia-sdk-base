@@ -1,5 +1,5 @@
 use super::*;
-use remotemedia_types::BufferBudget;
+use remotemedia_types::{BufferBudget, CopyPolicy};
 
 #[test]
 fn observer_legacy_audio_is_promoted_before_event_fanout() {
@@ -38,6 +38,7 @@ fn observer_legacy_audio_is_promoted_before_event_fanout() {
 #[test]
 fn observer_events_and_queue_clones_retain_original_buffers() {
     for pipeline in [false, true] {
+        let copies = CopyContext::new(CopyPolicy::RequireZeroCopy, "observer-queue");
         let budget = BufferBudget::new(1, 16);
         let RuntimeData::Binary(source) = budget
             .admit(RuntimeData::Binary(vec![7; 16].into()))
@@ -47,9 +48,14 @@ fn observer_events_and_queue_clones_retain_original_buffers() {
         };
         let pointer = source.as_ptr();
         let event = if pipeline {
-            WebRtcEventBridge::pipeline_output("peer".into(), RuntimeData::Binary(source), 42)
+            WebRtcEventBridge::pipeline_output_with_context(
+                "peer".into(),
+                RuntimeData::Binary(source),
+                42,
+                &copies,
+            )
         } else {
-            WebRtcEventBridge::data_received("peer".into(), source, 42)
+            WebRtcEventBridge::data_received_with_context("peer".into(), source, 42, &copies)
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         tx.try_send(event.clone()).unwrap();
@@ -58,13 +64,18 @@ fn observer_events_and_queue_clones_retain_original_buffers() {
             WebRtcEventBridge::PipelineOutput {
                 data: RuntimeData::Binary(data),
                 timestamp_ns: 42,
+                copies: received_copies,
                 ..
             }
             | WebRtcEventBridge::DataReceived {
                 data,
                 timestamp_ns: 42,
+                copies: received_copies,
                 ..
-            } => data,
+            } => {
+                assert!(copies.same_authority(&received_copies));
+                data
+            }
             _ => unreachable!(),
         };
         assert_eq!(data.as_ptr(), pointer);

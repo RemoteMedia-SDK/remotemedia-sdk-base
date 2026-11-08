@@ -110,19 +110,20 @@ pub struct PipelineOutputEvent {
     /// Existing timestamp value, preserved from the event bridge.
     #[pyo3(get)]
     pub timestamp: u64,
+    copies: CopyContext,
 }
 
 #[pymethods]
 impl PipelineOutputEvent {
     #[getter]
     fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        self.data_with_context(py, CopyContext::legacy())
+        self.data_with_context(py, &self.copies)
     }
 
     /// Canonical Python runtime value with owning read-only bulk views.
     #[getter]
     fn runtime_data(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        crate::marshal::runtime_data_to_python(py, &self.runtime_data)
+        crate::marshal::runtime_data_to_python_with_context(py, &self.runtime_data, &self.copies)
     }
 
     fn __repr__(&self) -> String {
@@ -172,6 +173,7 @@ impl From<crate::webrtc::events::PipelineOutputEvent> for PipelineOutputEvent {
             runtime_data: e.data.into_shared(),
             serialized: Default::default(),
             timestamp: e.timestamp,
+            copies: e.copies,
         }
     }
 }
@@ -186,13 +188,14 @@ pub struct DataReceivedEvent {
     data_bytes: SharedBytes,
     #[pyo3(get)]
     pub timestamp: u64,
+    copies: CopyContext,
 }
 
 #[pymethods]
 impl DataReceivedEvent {
     #[getter]
     fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        self.data_with_context(py, CopyContext::legacy())
+        self.data_with_context(py, &self.copies)
     }
 
     /// Read-only memoryview retaining the original receive allocation.
@@ -232,6 +235,7 @@ impl From<crate::webrtc::events::DataReceivedEvent> for DataReceivedEvent {
             peer_id: e.peer_id,
             data_bytes: e.data,
             timestamp: e.timestamp,
+            copies: e.copies,
         }
     }
 }

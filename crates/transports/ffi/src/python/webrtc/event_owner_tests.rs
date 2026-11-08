@@ -10,6 +10,7 @@ fn observer_python_legacy_audio_promotes_without_copy() {
         let event = PipelineOutputEvent::from(crate::webrtc::events::PipelineOutputEvent {
             peer_id: "peer".into(),
             timestamp: 42,
+            copies: CopyContext::legacy().clone(),
             data: RuntimeData::Audio {
                 samples: remotemedia_types::AudioSamples::Vec(samples),
                 sample_rate: 48000,

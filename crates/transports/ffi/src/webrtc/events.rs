@@ -5,7 +5,7 @@
 
 use super::config::PeerCapabilities;
 use remotemedia_core::data::RuntimeData;
-use remotemedia_types::SharedBytes;
+use remotemedia_types::{CopyContext, SharedBytes};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -71,14 +71,22 @@ pub struct PipelineOutputEvent {
     pub data: RuntimeData,
     /// Nanosecond timestamp
     pub timestamp: u64,
+    /// Originating session copy authority.
+    pub copies: CopyContext,
 }
 
 impl PipelineOutputEvent {
     /// Create a new pipeline output event
     pub fn new(peer_id: String, data: RuntimeData) -> Self {
+        Self::new_with_context(peer_id, data, CopyContext::legacy())
+    }
+
+    /// Create an event retaining the originating session copy authority.
+    pub fn new_with_context(peer_id: String, data: RuntimeData, copies: &CopyContext) -> Self {
         Self {
             peer_id,
             data: data.into_shared(),
+            copies: copies.clone(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
@@ -96,14 +104,26 @@ pub struct DataReceivedEvent {
     pub data: SharedBytes,
     /// Nanosecond timestamp
     pub timestamp: u64,
+    /// Originating session copy authority.
+    pub copies: CopyContext,
 }
 
 impl DataReceivedEvent {
     /// Create a new data received event
     pub fn new(peer_id: String, data: impl Into<SharedBytes>) -> Self {
+        Self::new_with_context(peer_id, data, CopyContext::legacy())
+    }
+
+    /// Create an event retaining the originating session copy authority.
+    pub fn new_with_context(
+        peer_id: String,
+        data: impl Into<SharedBytes>,
+        copies: &CopyContext,
+    ) -> Self {
         Self {
             peer_id,
             data: data.into(),
+            copies: copies.clone(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)

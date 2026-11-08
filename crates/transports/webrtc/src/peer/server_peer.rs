@@ -402,6 +402,8 @@ struct PeerOutputTarget {
 /// fanned out to registered peers while all peer inputs share one core router.
 pub struct SharedPipelineSession {
     core: Arc<CoreSharedPipelineSession>,
+    #[cfg(feature = "ws-signaling")]
+    observer_copies: remotemedia_types::CopyContext,
     output_targets: Arc<RwLock<HashMap<String, PeerOutputTarget>>>,
     close_when_empty: bool,
 }
@@ -414,8 +416,12 @@ impl SharedPipelineSession {
     ) -> Result<Arc<Self>> {
         let session_id = core.session_id().to_string();
         let receivers = core.subscribe_outputs();
+        #[cfg(feature = "ws-signaling")]
+        let observer_copies = core.transport_copy_context().await;
         let shared = Arc::new(Self {
             core,
+            #[cfg(feature = "ws-signaling")]
+            observer_copies,
             output_targets: Arc::new(RwLock::new(HashMap::new())),
             close_when_empty,
         });
@@ -521,6 +527,8 @@ impl SharedPipelineSession {
     ) {
         let output_targets = Arc::clone(&self.output_targets);
         let session_id = self.session_id().to_string();
+        #[cfg(feature = "ws-signaling")]
+        let observer_copies = self.observer_copies.clone();
         tokio::spawn(async move {
             loop {
                 let mut transport_data = match rx.recv().await {
@@ -544,10 +552,11 @@ impl SharedPipelineSession {
                 for target in targets {
                     #[cfg(feature = "ws-signaling")]
                     if let Some(ref tx) = target.event_tx {
-                        let event = WebRtcEventBridge::pipeline_output(
+                        let event = WebRtcEventBridge::pipeline_output_with_context(
                             target.dispatcher.peer_id.clone(),
                             transport_data.data.clone(),
                             current_timestamp_ns(),
+                            &observer_copies,
                         );
                         if let Err(e) = tx.try_send(event) {
                             trace!(
@@ -1043,10 +1052,11 @@ impl ServerPeer {
                             // Emit raw data received event for FFI integration
                             #[cfg(feature = "ws-signaling")]
                             if let Some(ref tx) = event_tx {
-                                let event = WebRtcEventBridge::data_received(
+                                let event = WebRtcEventBridge::data_received_with_context(
                                     peer_id.clone(),
                                     remotemedia_types::SharedBytes::from_owner(msg.data.clone()),
                                     current_timestamp_ns(),
+                                    &copies,
                                 );
                                 if let Err(e) = tx.send(event).await {
                                     warn!("Failed to emit data_received event: {}", e);
