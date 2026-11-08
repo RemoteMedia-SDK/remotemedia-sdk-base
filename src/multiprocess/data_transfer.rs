@@ -114,6 +114,24 @@ pub fn from_bytes_with_copy_context(
         .map_err(|e| format!("msgpack deserialize: {e}"))
 }
 
+/// Decode exactly one compatibility frame; trailing bytes are an error rather
+/// than silently dropping another concatenated message. Existing stream-style
+/// from_bytes callers retain their behavior.
+pub fn from_frame_with_copy_context(
+    bytes: &[u8],
+    copies: &CopyContext,
+) -> Result<RuntimeData, String> {
+    let payload = bytes.strip_prefix(LEGACY_AUDIO_RMP_PREFIX).unwrap_or(bytes);
+    let mut decoder = rmp_serde::Deserializer::new(std::io::Cursor::new(payload));
+    let data = copies
+        .deserialize(&mut decoder)
+        .map_err(|e| format!("msgpack deserialize: {e}"))?;
+    if decoder.position() != payload.len() as u64 {
+        return Err("msgpack frame contains trailing bytes".into());
+    }
+    Ok(data)
+}
+
 /// Legacy Python wire helpers, distinct from the MessagePack codec above.
 pub use super::python_wire::{
     from_owned_python_wire_with_copy_context, from_python_wire, from_python_wire_with_copy_context,
