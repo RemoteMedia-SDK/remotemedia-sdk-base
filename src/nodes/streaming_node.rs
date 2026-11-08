@@ -116,6 +116,10 @@ impl remotemedia_traits::runtime_context::InitializeContextRead for InitializeCo
 #[derive(Clone)]
 pub struct StreamingNodeRegistry {
     factories: HashMap<String, Arc<dyn StreamingNodeFactory>>,
+    /// Build identity of node types registered with one (loadable / Python
+    /// plugins). Types absent here are built-in, or Python when the factory
+    /// says so.
+    implementations: HashMap<String, crate::telemetry::NodeImplementation>,
 }
 
 impl StreamingNodeRegistry {
@@ -123,13 +127,40 @@ impl StreamingNodeRegistry {
     pub fn new() -> Self {
         Self {
             factories: HashMap::new(),
+            implementations: HashMap::new(),
         }
     }
 
     /// Register a streaming node factory
     pub fn register(&mut self, factory: Arc<dyn StreamingNodeFactory>) {
         let node_type = factory.node_type().to_string();
+        self.implementations.remove(&node_type);
         self.factories.insert(node_type, factory);
+    }
+
+    /// Register a factory together with its build identity (plugin name,
+    /// version, digest, load time), reported in session descriptors.
+    pub fn register_with_implementation(
+        &mut self,
+        factory: Arc<dyn StreamingNodeFactory>,
+        implementation: crate::telemetry::NodeImplementation,
+    ) {
+        let node_type = factory.node_type().to_string();
+        self.implementations
+            .insert(node_type.clone(), implementation);
+        self.factories.insert(node_type, factory);
+    }
+
+    /// Build identity of `node_type`: the registered one, else `python`
+    /// for Python factories, else `builtin`.
+    pub fn implementation(&self, node_type: &str) -> crate::telemetry::NodeImplementation {
+        if let Some(found) = self.implementations.get(node_type) {
+            return found.clone();
+        }
+        match self.factories.get(node_type) {
+            Some(f) if f.is_python_node() => crate::telemetry::NodeImplementation::python(),
+            _ => crate::telemetry::NodeImplementation::builtin(),
+        }
     }
 
     /// Drain the factories from another registry, transferring ownership.
@@ -148,7 +179,16 @@ impl StreamingNodeRegistry {
     /// Factories from `other` override any existing entries in `self` with
     /// the same node type.
     pub(crate) fn merge_from(&mut self, other: &mut StreamingNodeRegistry) {
+        let mut implementations = std::mem::take(&mut other.implementations);
         for (k, v) in other.drain_factories() {
+            match implementations.remove(&k) {
+                Some(implementation) => {
+                    self.implementations.insert(k.clone(), implementation);
+                }
+                None => {
+                    self.implementations.remove(&k);
+                }
+            }
             self.factories.insert(k, v);
         }
     }

@@ -716,6 +716,22 @@ impl PipelineExecutor {
                 plugin_toml.plugin.name
             ))
         })?;
+        let implementation = crate::telemetry::NodeImplementation {
+            kind: crate::telemetry::ImplementationKind::Python,
+            plugin_name: Some(plugin_toml.plugin.name.clone()),
+            plugin_version: Some(plugin_toml.plugin.version.clone()),
+            digest: Some(if hash.starts_with("sha256:") {
+                hash.clone()
+            } else {
+                format!("sha256:{hash}")
+            }),
+            loaded_at_ms: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            ),
+        };
         let mut registry = self.registry.write().await;
         for node_type in &py.node_types {
             let plugin = crate::loadable::source_python::SourcePythonPlugin {
@@ -728,7 +744,7 @@ impl PipelineExecutor {
             let factory = std::sync::Arc::new(
                 crate::loadable::source_python::SourcePythonFactory::new(plugin),
             );
-            registry.register(factory);
+            registry.register_with_implementation(factory, implementation.clone());
         }
         Ok(())
     }

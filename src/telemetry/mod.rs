@@ -19,6 +19,7 @@
 //! (≈1 µs per record) only run while observed in [`TelemetryLevel::Auto`].
 
 pub mod descriptor;
+pub mod identity;
 pub mod publisher;
 pub mod redact;
 pub mod size;
@@ -28,6 +29,7 @@ pub use descriptor::{
     EdgeDescriptor, EdgeKind, NodeDescriptor, PortDescriptor, QueueCapacity, SessionDescriptor,
     CLIENT_NODE_ID,
 };
+pub use identity::{file_digest, params_hash, ImplementationKind, NodeImplementation};
 pub use size::approx_payload_bytes;
 pub use snapshot::{
     EdgeTelemetry, ErrorInfo, NodeStatus, NodeTelemetry, QueueDepth, TelemetrySnapshot,
