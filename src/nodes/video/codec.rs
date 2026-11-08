@@ -4,30 +4,10 @@
 //! Primary backend: ac-ffmpeg (FFmpeg bindings)
 //! Optional: rav1e (pure Rust AV1 encoder)
 //!
-//! ## ac-ffmpeg Integration Status
-//!
-//! The codec implementations below provide functional mock encoding/decoding
-//! that enables end-to-end testing of the video pipeline architecture.
-//!
-//! To enable actual FFmpeg encoding/decoding, implement the TODOs in:
-//! - FFmpegEncoder::encode() - Use ac-ffmpeg VideoEncoder
-//! - FFmpegDecoder::decode() - Use ac-ffmpeg VideoDecoder
-//!
-//! FFmpeg 7.1.1 is installed with libvpx (VP8), libx264 (H.264), and libaom/librav1e (AV1).
-//!
-//! Key ac-ffmpeg API elements (from source inspection):
-//! - VideoDecoder::new(codec_name) or VideoDecoder::builder(codec_name).build()
-//! - VideoEncoder::builder(codec_name).pixel_format(fmt).width(w).height(h).time_base(tb).bit_rate(br).build()
-//! - PixelFormat: parse from strings "yuv420p", "rgb24", "nv12", etc.
-//! - VideoFrameMut::black(format, width, height) - Create frame, use planes_mut()[i].data_mut() to write pixels
-//! - decoder.push(packet), decoder.take() -> Option<VideoFrame>
-//! - encoder.push(frame), encoder.take() -> Option<Packet>
-//! - Packet data access: packet is from demuxer or needs PacketMut construction
-//!
-//! References:
-//! - Source: ~/.cargo/registry/src/.../ac-ffmpeg-0.19.0/src/codec/video/
-//! - Docs: https://docs.rs/ac-ffmpeg/0.19.0
-//! - Examples: https://github.com/angelcam/rust-ac-ffmpeg/tree/master/examples
+//! The `video` feature runs real ac-ffmpeg backends; codec availability depends
+//! on the linked FFmpeg build. Single encoded packets retain their immutable
+//! FFmpeg owner. Input frame/packet staging and decoded frame packing remain
+//! separate ownership and layout boundaries.
 
 use super::decoder::VideoDecoderConfig;
 use super::encoder::VideoEncoderConfig;
@@ -100,11 +80,7 @@ pub trait VideoDecoderBackend: Send + Sync {
 
 /// FFmpeg encoder implementation
 ///
-/// Currently returns mock encoded frames. To enable actual encoding:
-/// 1. Use VideoEncoder::builder() from ac-ffmpeg
-/// 2. Create VideoFrameMut from pixel_data
-/// 3. Push frame, take packets
-/// 4. Return bitstream as encoded RuntimeData
+/// Lazily selects an available encoder and retains single-packet output storage.
 #[cfg(feature = "video")]
 pub struct FFmpegEncoder {
     config: VideoEncoderConfig,
@@ -398,21 +374,17 @@ impl VideoEncoderBackend for FFmpegEncoder {
             CodecError::EncodingFailed(format!("Failed to push frame to encoder: {}", e))
         })?;
 
-        // Collect encoded packets
-        let mut bitstream = Vec::new();
-        let mut is_keyframe = false;
-
-        while let Some(packet) = encoder.take().map_err(|e| {
-            CodecError::EncodingFailed(format!("Failed to take packet from encoder: {}", e))
-        })? {
-            bitstream.extend_from_slice(packet.data());
-            is_keyframe |= packet.is_key();
-        }
+        // Preserve a single packet's immutable FFmpeg owner. Multiple packets
+        // require contiguous aggregation in the existing RuntimeData wire shape.
+        // Context-free backend calls retain explicit legacy attribution until
+        // the execution-context migration covers the other codec boundaries.
+        let (bitstream, is_keyframe) =
+            super::packets::take_encoded(encoder, remotemedia_types::CopyContext::legacy())?;
 
         self.frame_count += 1;
 
         Ok(RuntimeData::Video {
-            pixel_data: bitstream.into(),
+            pixel_data: bitstream,
             width,
             height,
             format: PixelFormat::Encoded,
@@ -437,11 +409,8 @@ impl VideoEncoderBackend for FFmpegEncoder {
 
 /// FFmpeg decoder implementation
 ///
-/// Currently returns mock decoded frames. To enable actual decoding:
-/// 1. Use VideoDecoder::new() from ac-ffmpeg
-/// 2. Create Packet from bitstream (may need PacketMut)
-/// 3. Push packet, take frames
-/// 4. Copy frame planes to RuntimeData
+/// Lazily creates a decoder and reuses complete FFmpeg packet owners. Arbitrary
+/// packet ingress and raw frame output still require staging.
 #[cfg(feature = "video")]
 pub struct FFmpegDecoder {
     config: VideoDecoderConfig,
@@ -514,13 +483,11 @@ impl VideoDecoderBackend for FFmpegDecoder {
 
         let decoder = self.decoder.as_mut().unwrap();
 
-        // Create packet from bitstream
+        // Reuse a complete FFmpeg packet owner when available. Arbitrary bytes
+        // still require padded backend storage and explicit legacy attribution.
         use ac_ffmpeg::codec::Decoder;
-        use ac_ffmpeg::packet::PacketMut;
-
-        let mut packet_mut = PacketMut::new(pixel_data.len());
-        packet_mut.data_mut().copy_from_slice(&pixel_data);
-        let packet = packet_mut.freeze();
+        let packet =
+            super::packets::decoder_packet(pixel_data, remotemedia_types::CopyContext::legacy())?;
 
         // Decode packet
         decoder.push(packet).map_err(|e| {
