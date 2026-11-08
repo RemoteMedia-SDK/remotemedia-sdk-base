@@ -31,6 +31,8 @@ use super::constraints::MediaCapabilities;
 use super::negotiation::{negotiate_pipeline_default, InsertedNode, NegotiationResult};
 use super::validation::CapabilityMismatch;
 
+mod buffer_limits;
+
 /// Result of negotiating a manifest against the live registry.
 #[derive(Debug, Clone)]
 pub struct NegotiationOutcome {
@@ -92,7 +94,8 @@ pub fn negotiate_manifest(
             inserted_nodes: Vec::new(),
             warnings: Vec::new(),
         },
-        NegotiationResult::Negotiated(caps) => {
+        NegotiationResult::Negotiated(mut caps) => {
+            buffer_limits::bind(&manifest, registry, &mut caps.inserted_nodes);
             let rewritten = splice_inserted_nodes(&manifest, &caps.inserted_nodes);
             NegotiationOutcome {
                 manifest: Arc::new(rewritten),
