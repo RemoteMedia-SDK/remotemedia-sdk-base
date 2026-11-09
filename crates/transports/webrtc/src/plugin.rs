@@ -51,35 +51,7 @@ impl TransportPlugin for WebRtcTransportPlugin {
         config: &ServerConfig,
         executor: Arc<PipelineExecutor>,
     ) -> Result<Box<dyn remotemedia_core::transport::PipelineTransport>> {
-        use crate::config::WebRtcTransportConfig;
-        use crate::transport::WebRtcTransport;
-
-        // Note: executor is provided but WebRtcTransport creates its own PipelineExecutor
-        // in execute()/stream() methods per the trait implementation
-        let _ = executor;
-
-        // Use default WebRTC configuration
-        // TODO: ServerConfig currently doesn't have extra_config field.
-        // When it's added, extract WebRTC-specific settings like:
-        // - signaling_url from config.address or extra_config
-        // - stun_servers from extra_config
-        // - turn_servers from extra_config
-        // - max_peers from extra_config
-        let mut webrtc_config = WebRtcTransportConfig::default();
-
-        // Use config.address as signaling_url if provided and valid
-        if !config.address.is_empty()
-            && (config.address.starts_with("ws://") || config.address.starts_with("wss://"))
-        {
-            webrtc_config.signaling_url = config.address.clone();
-        }
-
-        // Create WebRTC transport (note: constructor is sync, not async)
-        let transport = WebRtcTransport::new(webrtc_config).map_err(|e| {
-            remotemedia_core::Error::Transport(format!("Failed to create WebRTC transport: {}", e))
-        })?;
-
-        Ok(Box::new(transport))
+        Ok(Box::new(server_transport(config, &executor)?))
     }
 
     fn validate_config(&self, extra_config: &serde_json::Value) -> Result<()> {
@@ -121,5 +93,70 @@ impl TransportPlugin for WebRtcTransportPlugin {
         }
 
         Ok(())
+    }
+}
+
+/// Build the server transport. WebRtcTransport creates its own sessions in
+/// execute()/stream(); the executor supplies the transport copy policy so a
+/// strict executor never yields a permissive, unattributed transport ledger.
+fn server_transport(
+    config: &ServerConfig,
+    executor: &PipelineExecutor,
+) -> Result<crate::transport::WebRtcTransport> {
+    use crate::config::WebRtcTransportConfig;
+    use crate::transport::WebRtcTransport;
+
+    let copies = remotemedia_core::data::CopyContext::new(
+        executor.transport_materialization_policy(),
+        "webrtc/server/transport/materialization",
+    );
+
+    // Use default WebRTC configuration
+    // TODO: ServerConfig currently doesn't have extra_config field.
+    // When it's added, extract WebRTC-specific settings like:
+    // - signaling_url from config.address or extra_config
+    // - stun_servers from extra_config
+    // - turn_servers from extra_config
+    // - max_peers from extra_config
+    let mut webrtc_config = WebRtcTransportConfig::default();
+
+    // Use config.address as signaling_url if provided and valid
+    if !config.address.is_empty()
+        && (config.address.starts_with("ws://") || config.address.starts_with("wss://"))
+    {
+        webrtc_config.signaling_url = config.address.clone();
+    }
+
+    // Create WebRTC transport (note: constructor is sync, not async)
+    WebRtcTransport::new_with_copy_context(webrtc_config, copies).map_err(|e| {
+        remotemedia_core::Error::Transport(format!("Failed to create WebRTC transport: {}", e))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remotemedia_core::data::CopyPolicy;
+    use remotemedia_core::transport::ExecutorConfig;
+
+    #[tokio::test]
+    async fn server_transport_inherits_executor_copy_policy() {
+        for policy in [CopyPolicy::AllowCopies, CopyPolicy::RequireZeroCopy] {
+            let executor = PipelineExecutor::with_config(ExecutorConfig {
+                transport_materialization_policy: policy,
+                ..Default::default()
+            })
+            .unwrap();
+            let server = ServerConfig {
+                address: String::new(),
+                tls_config: None,
+            };
+            let transport = server_transport(&server, &executor).unwrap();
+            assert_eq!(transport.copy_context().policy(), policy);
+            assert_eq!(
+                transport.copy_context().boundary(),
+                "webrtc/server/transport/materialization"
+            );
+        }
     }
 }

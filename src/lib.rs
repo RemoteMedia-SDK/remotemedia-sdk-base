@@ -130,6 +130,8 @@ pub mod data {
     };
     // Owning bulk storage carried by `RuntimeData` payload variants.
     pub use remotemedia_types::{SharedBuffer, SharedBytes};
+    // Copy authority for framework boundaries that must materialize payloads.
+    pub use remotemedia_types::{CopyContext, CopyPolicy, CopyReason, CopyRejected};
 }
 
 #[cfg(feature = "hf-download")]

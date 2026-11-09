@@ -8,7 +8,9 @@
 #![allow(dead_code)]
 
 use crate::{
-    adapters::{data_buffer_to_runtime_data, runtime_data_to_data_buffer},
+    adapters::{
+        data_buffer_into_runtime_data_with_context, runtime_data_to_data_buffer_with_context,
+    },
     auth::{check_auth, AuthConfig},
     generated::{
         pipeline_execution_service_server::PipelineExecutionService, ErrorResponse, ErrorType,
@@ -279,8 +281,21 @@ impl PipelineExecutionService for ExecutionServiceImpl {
 
         // Convert first data input to TransportData
         // For unary execution, we expect exactly one input
+        // One attributed compatibility ledger per unary request: the wire decode
+        // and encode below are the request's only framework payload copies.
+        static UNARY_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let copies = remotemedia_core::data::CopyContext::new(
+            remotemedia_core::data::CopyPolicy::AllowCopies,
+            format!(
+                "grpc/unary/{}/transport/materialization",
+                UNARY_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        );
         let input = if let Some((node_id, data_buffer)) = req.data_inputs.into_iter().next() {
-            match data_buffer_to_runtime_data(&data_buffer) {
+            match data_buffer_into_runtime_data_with_context(data_buffer, None, &copies)
+                .ok()
+                .flatten()
+            {
                 Some(runtime_data) => TransportData::new(runtime_data),
                 None => {
                     self.metrics
@@ -383,7 +398,8 @@ impl PipelineExecutionService for ExecutionServiceImpl {
         };
 
         // Convert output to protobuf format
-        let output_buffer = runtime_data_to_data_buffer(&output.data);
+        let output_buffer = runtime_data_to_data_buffer_with_context(&output.data, &copies)
+            .map_err(|rejected| Status::failed_precondition(rejected.to_string()))?;
         let mut data_outputs = HashMap::new();
         data_outputs.insert("output".to_string(), output_buffer);
 

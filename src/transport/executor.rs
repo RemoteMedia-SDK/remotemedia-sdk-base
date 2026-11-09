@@ -994,6 +994,13 @@ impl PipelineExecutor {
         self.control_bus.clone()
     }
 
+    /// Resolved transport materialization policy (after `pipeline_copy_policy`).
+    /// Transports that are not session-scoped build their ledger from this so a
+    /// strict executor never gets a permissive, unattributed transport.
+    pub fn transport_materialization_policy(&self) -> remotemedia_types::CopyPolicy {
+        self.config.transport_materialization_policy
+    }
+
     /// Get the scheduler reference
     pub fn scheduler(&self) -> &Arc<StreamingScheduler> {
         &self.scheduler

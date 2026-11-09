@@ -198,6 +198,60 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
     }
 }
 
+/// Encode for the gRPC wire under an explicit copy authority. Protobuf fields
+/// own their bytes, so the visible bulk payload is a counted
+/// `PortableSerialization`; strict policy rejects before encoding.
+pub fn runtime_data_to_data_buffer_with_context(
+    data: &RuntimeData,
+    copies: &remotemedia_core::data::CopyContext,
+) -> Result<DataBuffer, remotemedia_core::data::CopyRejected> {
+    copies.materialize(
+        remotemedia_core::data::CopyReason::PortableSerialization,
+        data.bulk_payload_bytes() as u64,
+        || runtime_data_to_data_buffer(data),
+    )
+}
+
+/// Decode an owned DataBuffer under an explicit copy authority.
+///
+/// Video, tensor, NumPy and binary bytes move into shared storage without a
+/// copy. Audio arrives as little-endian bytes and must be converted to f32
+/// samples; that conversion is a counted `PortableDeserialization`, rejected
+/// under strict policy before it runs.
+pub fn data_buffer_into_runtime_data_with_context(
+    mut buffer: DataBuffer,
+    arrival_ts_us: Option<u64>,
+    copies: &remotemedia_core::data::CopyContext,
+) -> Result<Option<RuntimeData>, remotemedia_core::data::CopyRejected> {
+    let owned = match buffer.data_type.as_mut() {
+        Some(DataType::Video(video)) => Some(std::mem::take(&mut video.pixel_data)),
+        Some(DataType::Tensor(tensor)) => Some(std::mem::take(&mut tensor.data)),
+        Some(DataType::Binary(binary)) => Some(std::mem::take(&mut binary.data)),
+        Some(DataType::Numpy(numpy)) => Some(std::mem::take(&mut numpy.data)),
+        _ => None,
+    };
+    let audio_bytes = match &buffer.data_type {
+        Some(DataType::Audio(audio)) => audio.samples.len() as u64,
+        _ => 0,
+    };
+    let mut decoded = copies.materialize(
+        remotemedia_core::data::CopyReason::PortableDeserialization,
+        audio_bytes,
+        || data_buffer_to_runtime_data_with_arrival(&buffer, arrival_ts_us),
+    )?;
+    if let (Some(bytes), Some(data)) = (owned, decoded.as_mut()) {
+        let shared: remotemedia_core::data::SharedBytes = bytes.into();
+        match data {
+            RuntimeData::Video { pixel_data, .. } => *pixel_data = shared,
+            RuntimeData::Tensor { data, .. } => *data = shared,
+            RuntimeData::Numpy { data, .. } => *data = shared,
+            RuntimeData::Binary(data) => *data = shared,
+            _ => {}
+        }
+    }
+    Ok(decoded)
+}
+
 /// Convert Protobuf DataBuffer to core RuntimeData
 ///
 /// Note: For spec 026 drift monitoring, use `data_buffer_to_runtime_data_with_arrival()`
@@ -346,6 +400,41 @@ pub fn data_buffer_to_runtime_data_with_arrival(
 }
 
 /// Convert TransportData to Protobuf DataBuffer
+/// Counted variant of [`transport_data_to_data_buffer`].
+pub fn transport_data_to_data_buffer_with_context(
+    data: &TransportData,
+    copies: &remotemedia_core::data::CopyContext,
+) -> Result<DataBuffer, remotemedia_core::data::CopyRejected> {
+    copies.materialize(
+        remotemedia_core::data::CopyReason::PortableSerialization,
+        data.data.bulk_payload_bytes() as u64,
+        || transport_data_to_data_buffer(data),
+    )
+}
+
+/// Owning, counted variant of [`data_buffer_to_transport_data`]: bulk bytes move
+/// into shared storage; audio conversion is charged to `copies`.
+pub fn data_buffer_into_transport_data_with_context(
+    buffer: DataBuffer,
+    copies: &remotemedia_core::data::CopyContext,
+) -> Result<Option<TransportData>, remotemedia_core::data::CopyRejected> {
+    let metadata = buffer.metadata.clone();
+    let Some(runtime_data) = data_buffer_into_runtime_data_with_context(buffer, None, copies)?
+    else {
+        return Ok(None);
+    };
+    let mut transport_data = TransportData::new(runtime_data);
+    if let Some(seq) = metadata.get("sequence").and_then(|s| s.parse::<u64>().ok()) {
+        transport_data.sequence = Some(seq);
+    }
+    for (key, value) in metadata {
+        if key != "sequence" {
+            transport_data.metadata.insert(key, value);
+        }
+    }
+    Ok(Some(transport_data))
+}
+
 pub fn transport_data_to_data_buffer(data: &TransportData) -> DataBuffer {
     let mut buffer = runtime_data_to_data_buffer(&data.data);
 
@@ -563,5 +652,89 @@ mod tests {
             }
             _ => panic!("Expected RuntimeData::File"),
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_authority_tests {
+    use super::*;
+    use remotemedia_core::data::{CopyContext, CopyPolicy, CopyReason};
+
+    fn counts(copies: &CopyContext, reason: CopyReason) -> (u64, u64, u64) {
+        copies
+            .report()
+            .entries
+            .into_iter()
+            .find(|(entry, _)| *entry == reason)
+            .map(|(_, c)| (c.completed, c.copied_bytes, c.rejected))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn owned_decode_moves_bulk_bytes_and_counts_audio_conversion() {
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "grpc-adapter-test");
+        let bytes = vec![7_u8; 4096];
+        let original = bytes.as_ptr();
+        let buffer = DataBuffer {
+            data_type: Some(DataType::Binary(BinaryBuffer {
+                data: bytes,
+                mime_type: "application/octet-stream".into(),
+            })),
+            metadata: Default::default(),
+        };
+        let decoded = data_buffer_into_runtime_data_with_context(buffer, None, &copies)
+            .unwrap()
+            .unwrap();
+        let RuntimeData::Binary(shared) = &decoded else {
+            panic!("expected binary")
+        };
+        assert_eq!(shared.as_ptr(), original, "owned decode must not copy");
+        assert_eq!(counts(&copies, CopyReason::PortableDeserialization).1, 0);
+
+        let audio = RuntimeData::Audio {
+            samples: vec![0.5_f32; 16].into(),
+            sample_rate: 16_000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: None,
+        };
+        let wire = runtime_data_to_data_buffer_with_context(&audio, &copies).unwrap();
+        assert_eq!(
+            counts(&copies, CopyReason::PortableSerialization),
+            (1, 64, 0)
+        );
+        let back = data_buffer_into_runtime_data_with_context(wire, None, &copies)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(back, RuntimeData::Audio { ref samples, .. } if samples.len() == 16));
+        assert_eq!(
+            counts(&copies, CopyReason::PortableDeserialization),
+            (1, 64, 0)
+        );
+    }
+
+    #[test]
+    fn strict_ledgers_reject_wire_copies_before_converting() {
+        let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "grpc-adapter-strict");
+        let binary = RuntimeData::Binary(vec![1_u8; 8].into());
+        assert!(runtime_data_to_data_buffer_with_context(&binary, &strict).is_err());
+        let wire = runtime_data_to_data_buffer(&RuntimeData::Audio {
+            samples: vec![0.25_f32; 4].into(),
+            sample_rate: 8_000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: None,
+        });
+        assert!(data_buffer_into_runtime_data_with_context(wire, None, &strict).is_err());
+        let (_, _, rejected) = counts(&strict, CopyReason::PortableSerialization);
+        assert_eq!(rejected, 1);
+        // Metadata-only payloads need no copy and pass under strict.
+        let text =
+            runtime_data_to_data_buffer_with_context(&RuntimeData::Text("hi".into()), &strict);
+        assert!(text.is_ok());
     }
 }

@@ -39,6 +39,7 @@ pub struct WebRtcServerBuilder {
     max_peers: Option<u32>,
     enable_data_channel: Option<bool>,
     jitter_buffer_ms: Option<u32>,
+    copies: Option<remotemedia_core::data::CopyContext>,
 }
 
 impl WebRtcServerBuilder {
@@ -50,6 +51,7 @@ impl WebRtcServerBuilder {
             max_peers: None,
             enable_data_channel: None,
             jitter_buffer_ms: None,
+            copies: None,
         }
     }
 
@@ -93,6 +95,14 @@ impl WebRtcServerBuilder {
         self
     }
 
+    /// Charge the transport's media copies to `copies` (for example a
+    /// strict, caller-owned ledger). Defaults to an attributed AllowCopies
+    /// ledger named `webrtc/builder/transport/materialization`.
+    pub fn copy_context(mut self, copies: remotemedia_core::data::CopyContext) -> Self {
+        self.copies = Some(copies);
+        self
+    }
+
     /// Build and validate the transport, returning a [`WebRtcTransportHandle`].
     pub fn build(self) -> std::result::Result<WebRtcTransportHandle, Box<dyn std::error::Error>> {
         let mut config = WebRtcTransportConfig::default();
@@ -113,7 +123,13 @@ impl WebRtcServerBuilder {
 
         config.validate()?;
 
-        let transport = WebRtcTransport::new(config)?;
+        let copies = self.copies.unwrap_or_else(|| {
+            remotemedia_core::data::CopyContext::new(
+                remotemedia_core::data::CopyPolicy::AllowCopies,
+                "webrtc/builder/transport/materialization",
+            )
+        });
+        let transport = WebRtcTransport::new_with_copy_context(config, copies)?;
 
         Ok(WebRtcTransportHandle { transport })
     }
@@ -385,3 +401,28 @@ mod grpc_builder {
 
 #[cfg(feature = "grpc-signaling")]
 pub use grpc_builder::{WebRtcSignalingServer, WebRtcSignalingServerBuilder};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remotemedia_core::data::{CopyContext, CopyPolicy};
+
+    #[test]
+    fn server_builder_uses_attributed_or_caller_ledger() {
+        let handle = WebRtcServerBuilder::new().build().unwrap();
+        let copies = handle.transport().copy_context();
+        assert_eq!(copies.policy(), CopyPolicy::AllowCopies);
+        assert_eq!(
+            copies.boundary(),
+            "webrtc/builder/transport/materialization"
+        );
+        assert!(!copies.same_authority(CopyContext::legacy()));
+
+        let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "caller");
+        let handle = WebRtcServerBuilder::new()
+            .copy_context(strict.clone())
+            .build()
+            .unwrap();
+        assert!(handle.transport().copy_context().same_authority(&strict));
+    }
+}

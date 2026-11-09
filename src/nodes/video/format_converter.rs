@@ -42,175 +42,177 @@ impl Default for VideoFormatConverterConfig {
 
 /// Format converter backend trait
 pub trait VideoFormatConverterBackend: Send + Sync {
-    /// Convert pixel format
-    fn convert(&mut self, input: RuntimeData) -> Result<RuntimeData, String>;
+    /// Convert pixel format. Raw input is staged into the backend and the
+    /// result written into `allocator`; both transfers are charged to `copies`
+    /// (strict policy rejects them before any payload access).
+    fn convert(
+        &mut self,
+        input: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+        allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<RuntimeData, String>;
 }
 
 /// FFmpeg-based format converter using swscale
 #[cfg(feature = "video")]
 pub struct FFmpegFormatConverter {
     config: VideoFormatConverterConfig,
-    scaler: Option<ac_ffmpeg::codec::video::VideoFrameScaler>,
 }
 
 #[cfg(feature = "video")]
 impl FFmpegFormatConverter {
     pub fn new(config: VideoFormatConverterConfig) -> Result<Self, String> {
-        Ok(Self {
-            config,
-            scaler: None, // Lazy initialization
-        })
+        Ok(Self { config })
     }
 
-    fn pixel_format_to_string(format: PixelFormat) -> &'static str {
+    /// Native format name and visible plane shapes `(row bytes, rows)`.
+    fn source_layout(
+        format: PixelFormat,
+        width: usize,
+        height: usize,
+    ) -> Result<(&'static str, Vec<(usize, usize)>), String> {
+        let even = width % 2 == 0 && height % 2 == 0;
         match format {
-            PixelFormat::Yuv420p => "yuv420p",
-            PixelFormat::I420 => "yuv420p", // I420 is same as YUV420P
-            PixelFormat::NV12 => "nv12",
-            PixelFormat::Rgb24 => "rgb24",
-            PixelFormat::Rgba32 => "rgba",
-            _ => "yuv420p",
+            PixelFormat::Yuv420p | PixelFormat::I420 if even => Ok((
+                "yuv420p",
+                vec![
+                    (width, height),
+                    (width / 2, height / 2),
+                    (width / 2, height / 2),
+                ],
+            )),
+            PixelFormat::NV12 if even => Ok(("nv12", vec![(width, height), (width, height / 2)])),
+            PixelFormat::Yuv420p | PixelFormat::I420 | PixelFormat::NV12 => {
+                Err("4:2:0 input requires even dimensions".to_string())
+            }
+            PixelFormat::Rgb24 => Ok(("rgb24", vec![(width * 3, height)])),
+            PixelFormat::Rgba32 => Ok(("rgba", vec![(width * 4, height)])),
+            other => Err(format!("unsupported source pixel format: {other:?}")),
         }
+    }
+
+    /// Stage a tightly packed input span into FFmpeg's strided planes. This is
+    /// a counted ownership transfer, authorized before allocation or writes.
+    fn stage(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<ac_ffmpeg::codec::video::VideoFrame, String> {
+        use ac_ffmpeg::codec::video::{frame::get_pixel_format, VideoFrameMut};
+
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return Err("invalid frame dimensions".to_string());
+        }
+        let (w, h) = (width as usize, height as usize);
+        let (name, shapes) = Self::source_layout(format, w, h)?;
+        let expected = shapes.iter().try_fold(0usize, |acc, &(columns, rows)| {
+            acc.checked_add(columns.checked_mul(rows)?)
+        });
+        if expected != Some(data.len()) {
+            return Err("frame buffer size mismatch: span length differs from dimensions".into());
+        }
+        let transfer = copies
+            .begin(
+                remotemedia_types::CopyReason::ForeignPoolIngress,
+                data.len() as u64,
+            )
+            .map_err(|e| e.to_string())?;
+        let mut frame = VideoFrameMut::black(get_pixel_format(name), w, h);
+        let mut planes = frame.planes_mut();
+        if planes.len() < shapes.len() {
+            return Err("native frame has too few planes".to_string());
+        }
+        for (plane, &(columns, rows)) in planes.iter_mut().zip(&shapes) {
+            let stride = plane.line_size();
+            crate::data::video::validate_plane_span(plane.data_mut().len(), stride, columns, rows)
+                .map_err(|e| e.to_string())?;
+        }
+        let mut offset = 0;
+        for (plane, &(columns, rows)) in planes.iter_mut().zip(&shapes) {
+            let stride = plane.line_size();
+            let dst = plane.data_mut();
+            for row in 0..rows {
+                dst[row * stride..row * stride + columns]
+                    .copy_from_slice(&data[offset..offset + columns]);
+                offset += columns;
+            }
+        }
+        drop(planes);
+        transfer.complete();
+        Ok(frame.freeze())
     }
 }
 
 #[cfg(feature = "video")]
 impl VideoFormatConverterBackend for FFmpegFormatConverter {
-    fn convert(&mut self, input: RuntimeData) -> Result<RuntimeData, String> {
-        use ac_ffmpeg::codec::video::{frame::get_pixel_format, VideoFrameMut, VideoFrameScaler};
-
-        // Extract video frame
-        let (pixel_data, width, height, src_format, codec, frame_number, timestamp_us, is_keyframe) =
-            match input {
-                RuntimeData::Video {
-                    pixel_data,
-                    width,
-                    height,
-                    format,
-                    codec,
-                    frame_number,
-                    timestamp_us,
-                    is_keyframe,
-                    ..
-                } => (
-                    pixel_data,
-                    width,
-                    height,
-                    format,
-                    codec,
-                    frame_number,
-                    timestamp_us,
-                    is_keyframe,
-                ),
-                _ => return Err("Expected video frame".to_string()),
-            };
+    fn convert(
+        &mut self,
+        input: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+        allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<RuntimeData, String> {
+        let RuntimeData::Video {
+            pixel_data,
+            width,
+            height,
+            format: src_format,
+            codec,
+            frame_number,
+            timestamp_us,
+            is_keyframe,
+            stream_id,
+            arrival_ts_us,
+        } = input
+        else {
+            return Err("Expected video frame".to_string());
+        };
 
         // Only convert raw frames (not encoded)
         if src_format == PixelFormat::Encoded || codec.is_some() {
             return Err("Cannot convert encoded frames - decode first".to_string());
         }
 
-        // If format matches, return as-is
-        if src_format == self.config.target_format {
+        let target = self.config.target_format;
+        let same = src_format == target
+            || matches!(
+                (src_format, target),
+                (PixelFormat::Yuv420p, PixelFormat::I420)
+                    | (PixelFormat::I420, PixelFormat::Yuv420p)
+            );
+        // Same layout: forward the original owner unchanged.
+        if same {
             return Ok(RuntimeData::Video {
                 pixel_data,
                 width,
                 height,
-                format: src_format,
+                format: target,
                 codec,
                 frame_number,
                 timestamp_us,
                 is_keyframe,
-                stream_id: None,
-                arrival_ts_us: None,
+                stream_id,
+                arrival_ts_us,
             });
         }
 
-        // Lazy initialize scaler/converter
-        if self.scaler.is_none() {
-            let src_fmt_str = Self::pixel_format_to_string(src_format);
-            let dst_fmt_str = Self::pixel_format_to_string(self.config.target_format);
-
-            let src_pixel_format = get_pixel_format(src_fmt_str);
-            let dst_pixel_format = get_pixel_format(dst_fmt_str);
-
-            let scaler = VideoFrameScaler::builder()
-                .source_pixel_format(src_pixel_format)
-                .source_width(width as usize)
-                .source_height(height as usize)
-                .target_pixel_format(dst_pixel_format)
-                .target_width(width as usize)
-                .target_height(height as usize)
-                .build()
-                .map_err(|e| format!("Failed to create format converter: {}", e))?;
-
-            self.scaler = Some(scaler);
-        }
-
-        let scaler = self.scaler.as_mut().unwrap();
-
-        // Create source frame and copy pixel data
-        let src_fmt_str = Self::pixel_format_to_string(src_format);
-        let src_pixel_format = get_pixel_format(src_fmt_str);
-        let mut src_frame = VideoFrameMut::black(src_pixel_format, width as usize, height as usize);
-
-        // Copy pixel data to frame planes
-        let y_size = (width * height) as usize;
-        let uv_size = (width * height / 4) as usize;
-
-        if pixel_data.len() >= y_size + 2 * uv_size {
-            let mut planes_mut = src_frame.planes_mut();
-
-            if planes_mut.len() > 0 {
-                let y_plane = planes_mut[0].data_mut();
-                let copy_len = y_plane.len().min(y_size);
-                y_plane[..copy_len].copy_from_slice(&pixel_data[..copy_len]);
-            }
-
-            if planes_mut.len() > 1 {
-                let u_plane = planes_mut[1].data_mut();
-                let copy_len = u_plane.len().min(uv_size);
-                u_plane[..copy_len].copy_from_slice(&pixel_data[y_size..y_size + copy_len]);
-            }
-
-            if planes_mut.len() > 2 {
-                let v_plane = planes_mut[2].data_mut();
-                let copy_len = v_plane.len().min(uv_size);
-                v_plane[..copy_len]
-                    .copy_from_slice(&pixel_data[y_size + uv_size..y_size + uv_size + copy_len]);
-            }
-        }
-
-        // Convert the frame
-        let converted_frame = scaler
-            .scale(&src_frame.freeze())
-            .map_err(|e| format!("Format conversion failed: {}", e))?;
-
-        // Extract converted pixel data
-        let mut converted_pixel_data = Vec::new();
-        let planes = converted_frame.planes();
-
-        // Only access first 3 planes (Y, U, V for YUV formats)
-        for i in 0..3 {
-            if i < planes.len() {
-                let plane_data = planes[i].data();
-                if !plane_data.is_empty() {
-                    converted_pixel_data.extend_from_slice(plane_data);
-                }
-            }
-        }
+        let source = Self::stage(&pixel_data, width, height, src_format, copies)?;
+        // Convert and pack into the selected output provider (counted).
+        let pixel_data = super::decoded_frames::decoder_frame(&source, target, copies, allocator)
+            .map_err(|e| format!("Format conversion failed: {e}"))?;
 
         Ok(RuntimeData::Video {
-            pixel_data: converted_pixel_data.into(),
+            pixel_data,
             width,
             height,
-            format: self.config.target_format,
+            format: target,
             codec,
             frame_number,
             timestamp_us,
             is_keyframe,
-            stream_id: None,
-            arrival_ts_us: None,
+            stream_id,
+            arrival_ts_us,
         })
     }
 }
@@ -240,12 +242,17 @@ impl VideoFormatConverterNode {
         }
     }
 
-    /// Convert a video frame asynchronously
-    async fn convert_frame(&self, input: RuntimeData) -> Result<RuntimeData, String> {
+    /// Convert a video frame asynchronously under explicit copy authority.
+    async fn convert_frame(
+        &self,
+        input: RuntimeData,
+        copies: remotemedia_types::CopyContext,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Result<RuntimeData, String> {
         let converter = Arc::clone(&self.converter);
         tokio::task::spawn_blocking(move || {
             let mut c = converter.lock().unwrap();
-            c.convert(input)
+            c.convert(input, &copies, allocator.as_ref())
         })
         .await
         .map_err(|e| format!("Converter task failed: {}", e))?
@@ -258,10 +265,45 @@ impl AsyncStreamingNode for VideoFormatConverterNode {
         "VideoFormatConverter"
     }
 
-    async fn process(&self, input: RuntimeData) -> Result<RuntimeData, Error> {
-        self.convert_frame(input)
+    async fn process_with_ctx(
+        &self,
+        input: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let copies = ctx.copy_context().ok_or_else(|| {
+            Error::Execution("VideoFormatConverter requires context copy authority".into())
+        })?;
+        let allocator = ctx
+            .output_allocator()
+            .unwrap_or_else(|| Arc::new(remotemedia_types::HeapOutputAllocator));
+        self.convert_frame(input, copies, allocator)
             .await
             .map_err(|e| Error::Execution(format!("Format conversion failed: {}", e)))
+    }
+
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        input: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+        mut callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        callback(self.process_with_ctx(input, ctx).await?)?;
+        Ok(1)
+    }
+
+    /// Context-free compatibility path: charged to the global legacy ledger
+    /// and allocated on the heap. Sessions use `process_with_ctx`.
+    async fn process(&self, input: RuntimeData) -> Result<RuntimeData, Error> {
+        self.convert_frame(
+            input,
+            remotemedia_types::CopyContext::legacy().clone(),
+            Arc::new(remotemedia_types::HeapOutputAllocator),
+        )
+        .await
+        .map_err(|e| Error::Execution(format!("Format conversion failed: {}", e)))
     }
 
     async fn process_multi(
@@ -338,5 +380,117 @@ mod tests {
         assert_eq!(output.as_ptr(), pixel_data.as_ptr());
         assert!(output.shares_storage(&pixel_data));
         assert_eq!(output.as_slice(), pixel_data.as_slice());
+    }
+
+    #[cfg(feature = "video")]
+    fn ingress(copies: &remotemedia_types::CopyContext) -> remotemedia_types::CopyCounts {
+        copies
+            .report()
+            .entries
+            .into_iter()
+            .find(|(reason, _)| *reason == remotemedia_types::CopyReason::ForeignPoolIngress)
+            .unwrap()
+            .1
+    }
+
+    #[cfg(feature = "video")]
+    fn frame(pixel_data: Vec<u8>, width: u32, height: u32, format: PixelFormat) -> RuntimeData {
+        RuntimeData::Video {
+            pixel_data: pixel_data.into(),
+            width,
+            height,
+            format,
+            codec: None,
+            frame_number: 7,
+            timestamp_us: 9,
+            is_keyframe: true,
+            stream_id: Some("cam".into()),
+            arrival_ts_us: Some(11),
+        }
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn converter_strict_policy_rejects_before_staging() {
+        use remotemedia_types::{CopyContext, CopyPolicy, HeapOutputAllocator};
+        let mut backend = FFmpegFormatConverter::new(VideoFormatConverterConfig {
+            target_format: PixelFormat::Rgba32,
+            ..Default::default()
+        })
+        .unwrap();
+        let copies = CopyContext::new(CopyPolicy::RequireZeroCopy, "strict");
+        let input = frame(vec![9; 4 * 4 * 3], 4, 4, PixelFormat::Rgb24);
+        assert!(backend
+            .convert(input, &copies, &HeapOutputAllocator)
+            .is_err());
+        let counts = ingress(&copies);
+        assert_eq!(counts.completed, 0);
+        assert_eq!(counts.rejected, 1);
+        assert_eq!(counts.rejected_bytes, 48);
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn converter_counts_staging_and_output_and_keeps_metadata() {
+        use remotemedia_types::{CopyContext, CopyPolicy, HeapOutputAllocator};
+        let mut backend = FFmpegFormatConverter::new(VideoFormatConverterConfig {
+            target_format: PixelFormat::Rgba32,
+            ..Default::default()
+        })
+        .unwrap();
+        let rgb: Vec<u8> = (0..4 * 4 * 3).map(|i| (i * 5 % 256) as u8).collect();
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "session");
+        let input = frame(rgb.clone(), 4, 4, PixelFormat::Rgb24);
+        let RuntimeData::Video {
+            pixel_data,
+            width,
+            height,
+            format,
+            frame_number,
+            timestamp_us,
+            is_keyframe,
+            stream_id,
+            arrival_ts_us,
+            ..
+        } = backend
+            .convert(input, &copies, &HeapOutputAllocator)
+            .unwrap()
+        else {
+            panic!("expected video")
+        };
+        assert_eq!((width, height, format), (4, 4, PixelFormat::Rgba32));
+        assert_eq!((frame_number, timestamp_us, is_keyframe), (7, 9, true));
+        assert_eq!(stream_id.as_deref(), Some("cam"));
+        assert_eq!(arrival_ts_us, Some(11));
+        let expected: Vec<u8> = rgb
+            .chunks(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect();
+        assert_eq!(pixel_data.as_slice(), expected.as_slice());
+        let counts = ingress(&copies);
+        assert_eq!(counts.completed, 2, "input staging + provider output");
+        assert_eq!(counts.copied_bytes, 48 + 64);
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn converter_rejects_malformed_spans_and_odd_420() {
+        use remotemedia_types::{CopyContext, CopyPolicy, HeapOutputAllocator};
+        let mut backend = FFmpegFormatConverter::new(VideoFormatConverterConfig {
+            target_format: PixelFormat::Rgb24,
+            ..Default::default()
+        })
+        .unwrap();
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "session");
+        for input in [
+            frame(vec![0; 10], 4, 4, PixelFormat::Yuv420p),
+            frame(vec![0; 13], 3, 3, PixelFormat::Yuv420p),
+            frame(vec![0; 16], 4, 4, PixelFormat::Unspecified),
+        ] {
+            assert!(backend
+                .convert(input, &copies, &HeapOutputAllocator)
+                .is_err());
+        }
+        assert_eq!(ingress(&copies).completed, 0);
     }
 }

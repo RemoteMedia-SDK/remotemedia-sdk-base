@@ -18,7 +18,7 @@
 // StreamSession is intentionally kept private for internal use
 #![allow(private_interfaces)]
 
-use crate::adapters::runtime_data_to_data_buffer;
+use crate::adapters::{runtime_data_to_data_buffer, runtime_data_to_data_buffer_with_context};
 use crate::generated::{
     stream_response::Response as StreamResponseType, ChunkResult, StreamResponse,
 };
@@ -168,6 +168,9 @@ pub struct SessionRouter {
 
     /// One authority per node, shared by initialization, execution and IPC output.
     node_materialization: remotemedia_core::transport::NodeMaterializationCopies,
+    /// Session transport ledger: gRPC wire encode/decode of bulk payloads is a
+    /// counted copying boundary (compatibility policy).
+    transport_copies: remotemedia_core::data::CopyContext,
 
     /// Whether the router is running
     running: bool,
@@ -282,6 +285,7 @@ impl SessionRouter {
         let (loopback_tx, loopback_rx) = mpsc::channel(grpc_loopback_capacity());
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let shutdown_tx_clone = shutdown_tx.clone();
+        let session_id_for_copies = session_id.clone();
 
         let router = Self {
             session_id,
@@ -298,6 +302,10 @@ impl SessionRouter {
             node_tasks: HashMap::new(),
             node_inputs: HashMap::new(),
             node_materialization,
+            transport_copies: remotemedia_core::data::CopyContext::new(
+                remotemedia_core::data::CopyPolicy::AllowCopies,
+                format!("session/{session_id_for_copies}/transport/materialization"),
+            ),
             running: false,
             control: None,
             #[cfg(feature = "multiprocess")]
@@ -324,6 +332,11 @@ impl SessionRouter {
         control.set_descriptor(Arc::new(self.descriptor.clone()));
         control.set_telemetry(self.telemetry.clone());
         self.control = Some(control);
+    }
+
+    /// The session's transport copy ledger, shared with its control bus.
+    pub fn transport_copy_context(&self) -> remotemedia_core::data::CopyContext {
+        self.transport_copies.clone()
     }
 
     /// The session's live telemetry handle.
@@ -1335,7 +1348,9 @@ impl SessionRouter {
             .egress_edge(&packet.from_node)
             .and_then(|i| self.telemetry.edge(i));
         let bytes = approx_payload_bytes(&packet.data);
-        let output_buffer = runtime_data_to_data_buffer(&packet.data);
+        let output_buffer =
+            runtime_data_to_data_buffer_with_context(&packet.data, &self.transport_copies)
+                .map_err(|rejected| Status::failed_precondition(rejected.to_string()))?;
 
         let mut data_outputs = HashMap::new();
         data_outputs.insert(packet.from_node, output_buffer);
@@ -1407,6 +1422,12 @@ impl SessionRouter {
                     None => loopback_open = false,
                 },
             }
+        }
+        // A node may send its last output after the final drain above and
+        // before its task completes; release anything still queued.
+        while let Ok(packet) = self.loopback_rx.try_recv() {
+            released += 1;
+            drop(packet);
         }
         if released > 0 {
             debug!(

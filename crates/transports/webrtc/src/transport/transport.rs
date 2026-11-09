@@ -92,6 +92,11 @@ impl WebRtcTransport {
         })
     }
 
+    /// The ledger charged with this transport's media copies.
+    pub fn copy_context(&self) -> CopyContext {
+        self.copies.clone()
+    }
+
     /// Start the transport
     ///
     /// Connects to the signaling server and announces this peer.

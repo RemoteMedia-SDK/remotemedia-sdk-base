@@ -405,9 +405,12 @@ async fn handle_inbound_frame(
                 let mut rx = ctrl.subscribe_system();
                 let pb_addr = core_addr_to_pb(&core);
                 let tx = out_tx.clone();
+                let copies = ctrl.transport_copy_context();
                 let task = tokio::spawn(async move {
                     while let Some(data) = rx.recv().await {
-                        let Some(pb) = runtime_data_to_pb(&data) else { continue };
+                        let Some(pb) = runtime_data_to_pb(&data, &copies) else {
+                            continue;
+                        };
                         let event = ControlEvent {
                             event: Some(PbEvent::Tap(TapEvent {
                                 addr: Some(pb_addr.clone()),
@@ -432,6 +435,7 @@ async fn handle_inbound_frame(
 
             let pb_addr = core_addr_to_pb(&core);
             let tx = out_tx.clone();
+            let copies = ctrl.transport_copy_context();
             let task = tokio::spawn(async move {
                 loop {
                     let data = match rx.recv().await {
@@ -455,7 +459,7 @@ async fn handle_inbound_frame(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
-                    let pb = match runtime_data_to_pb(&data) {
+                    let pb = match runtime_data_to_pb(&data, &copies) {
                         Some(b) => b,
                         None => continue,
                     };
@@ -494,7 +498,7 @@ async fn handle_inbound_frame(
                     Some(core.clone()),
                 )
             })?;
-            let rt = pb_to_runtime_data(data)
+            let rt = pb_to_runtime_data(data, &ctrl.transport_copy_context())
                 .map_err(|e| error(ControlErrorCode::Internal, e, Some(core.clone())))?;
             ctrl.publish_scoped(&core, rt, rpc_scope)
                 .await
@@ -525,6 +529,7 @@ async fn handle_inbound_frame(
 
             let pb_addr = core_addr_to_pb(&core);
             let tx = out_tx.clone();
+            let copies = ctrl.transport_copy_context();
             let task = tokio::spawn(async move {
                 while let Some(event) = events.recv().await {
                     if let CoreEvent::InterceptRequest {
@@ -533,7 +538,7 @@ async fn handle_inbound_frame(
                         ..
                     } = event
                     {
-                        let pb = match runtime_data_to_pb(&data) {
+                        let pb = match runtime_data_to_pb(&data, &copies) {
                             Some(b) => b,
                             None => continue,
                         };
@@ -561,7 +566,7 @@ async fn handle_inbound_frame(
         }
 
         Some(PbOp::InterceptReply(reply)) => {
-            let decision = pb_decision_to_core(reply.decision)?;
+            let decision = pb_decision_to_core(reply.decision, &ctrl.transport_copy_context())?;
             ctrl.complete_intercept(reply.correlation_id, decision)
                 .map_err(|e| error(ControlErrorCode::Internal, e.to_string(), None))
         }
@@ -674,6 +679,7 @@ fn core_addr_to_pb(addr: &CoreAddress) -> PbAddress {
 
 fn pb_decision_to_core(
     decision: Option<crate::generated::InterceptDecision>,
+    copies: &remotemedia_core::data::CopyContext,
 ) -> Result<CoreDecision, ErrorEvent> {
     let decision = decision.ok_or_else(|| {
         error(
@@ -686,8 +692,8 @@ fn pb_decision_to_core(
         Some(PbDecision::Pass(_)) => Ok(CoreDecision::Pass),
         Some(PbDecision::Drop(_)) => Ok(CoreDecision::Drop),
         Some(PbDecision::Replace(data)) => {
-            let rt =
-                pb_to_runtime_data(data).map_err(|e| error(ControlErrorCode::Internal, e, None))?;
+            let rt = pb_to_runtime_data(data, copies)
+                .map_err(|e| error(ControlErrorCode::Internal, e, None))?;
             Ok(CoreDecision::Replace(rt))
         }
         None => Err(error(
@@ -707,17 +713,29 @@ fn pb_node_state_to_core(value: i32) -> Result<NodeState, String> {
     }
 }
 
+/// Decode an owned control payload under the session's transport authority.
 fn pb_to_runtime_data(
     data: crate::generated::DataBuffer,
+    copies: &remotemedia_core::data::CopyContext,
 ) -> Result<remotemedia_core::data::RuntimeData, String> {
-    crate::adapters::data_buffer_to_runtime_data(&data)
+    crate::adapters::data_buffer_into_runtime_data_with_context(data, None, copies)
+        .map_err(|rejected| rejected.to_string())?
         .ok_or_else(|| "unsupported or unset DataBuffer variant".to_string())
 }
 
+/// Encode a tap or intercept payload under the session's transport authority.
+/// A strict rejection skips this event; it never sends an uncounted copy.
 fn runtime_data_to_pb(
     rt: &remotemedia_core::data::RuntimeData,
+    copies: &remotemedia_core::data::CopyContext,
 ) -> Option<crate::generated::DataBuffer> {
-    Some(crate::adapters::runtime_data_to_data_buffer(rt))
+    match crate::adapters::runtime_data_to_data_buffer_with_context(rt, copies) {
+        Ok(buffer) => Some(buffer),
+        Err(rejected) => {
+            tracing::warn!(error = %rejected, "control event not encoded under copy policy");
+            None
+        }
+    }
 }
 
 fn error(

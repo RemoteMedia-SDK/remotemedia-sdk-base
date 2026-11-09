@@ -48,15 +48,26 @@ impl Default for VideoScalerConfig {
 
 /// Video scaler backend trait
 pub trait VideoScalerBackend: Send + Sync {
-    /// Scale a video frame to target dimensions
-    fn scale(&mut self, input: RuntimeData) -> Result<RuntimeData, String>;
+    /// Scale a video frame to target dimensions. Raw input is staged into the
+    /// backend and the result written into `allocator`; both transfers are
+    /// charged to `copies` (strict policy rejects them before any access).
+    fn scale(
+        &mut self,
+        input: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+        allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<RuntimeData, String>;
 }
 
 /// FFmpeg-based video scaler using swscale
 #[cfg(feature = "video")]
 pub struct FFmpegScaler {
     config: VideoScalerConfig,
-    scaler: Option<ac_ffmpeg::codec::video::VideoFrameScaler>,
+    /// Cached scaler with the (source, target) dimensions it was built for.
+    scaler: Option<(
+        (u32, u32, u32, u32),
+        ac_ffmpeg::codec::video::VideoFrameScaler,
+    )>,
 }
 
 #[cfg(feature = "video")]
@@ -112,41 +123,28 @@ impl FFmpegScaler {
 
 #[cfg(feature = "video")]
 impl VideoScalerBackend for FFmpegScaler {
-    fn scale(&mut self, input: RuntimeData) -> Result<RuntimeData, String> {
-        use ac_ffmpeg::codec::video::{frame::get_pixel_format, VideoFrameMut, VideoFrameScaler};
+    fn scale(
+        &mut self,
+        input: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+        allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<RuntimeData, String> {
+        use ac_ffmpeg::codec::video::{frame::get_pixel_format, VideoFrameScaler};
 
-        // Extract video frame
-        let (
+        let RuntimeData::Video {
             pixel_data,
-            src_width,
-            src_height,
+            width: src_width,
+            height: src_height,
             format,
             codec,
             frame_number,
             timestamp_us,
             is_keyframe,
-        ) = match input {
-            RuntimeData::Video {
-                pixel_data,
-                width,
-                height,
-                format,
-                codec,
-                frame_number,
-                timestamp_us,
-                is_keyframe,
-                ..
-            } => (
-                pixel_data,
-                width,
-                height,
-                format,
-                codec,
-                frame_number,
-                timestamp_us,
-                is_keyframe,
-            ),
-            _ => return Err("Expected video frame".to_string()),
+            stream_id,
+            arrival_ts_us,
+        } = input
+        else {
+            return Err("Expected video frame".to_string());
         };
 
         // Only scale raw frames (not encoded)
@@ -154,10 +152,9 @@ impl VideoScalerBackend for FFmpegScaler {
             return Err("Cannot scale encoded frames - decode first".to_string());
         }
 
-        // Calculate target dimensions
         let (target_width, target_height) = self.calculate_dimensions(src_width, src_height);
 
-        // If dimensions match, return as-is
+        // Same dimensions: forward the original owner unchanged.
         if target_width == src_width && target_height == src_height {
             return Ok(RuntimeData::Video {
                 pixel_data,
@@ -168,93 +165,53 @@ impl VideoScalerBackend for FFmpegScaler {
                 frame_number,
                 timestamp_us,
                 is_keyframe,
-                stream_id: None,
-                arrival_ts_us: None,
+                stream_id,
+                arrival_ts_us,
             });
         }
 
-        // Lazy initialize scaler
-        if self.scaler.is_none() {
-            let src_format = get_pixel_format("yuv420p");
-            let dst_format = get_pixel_format("yuv420p");
+        // Stage the raw input into FFmpeg's strided planes: a counted,
+        // stride-correct transfer (RGB input is converted, i.e. computed).
+        let source =
+            super::frames::encoder_frame(&pixel_data, src_width, src_height, format, copies)
+                .map_err(|e| format!("Failed to stage source frame: {e}"))?
+                .freeze();
 
+        let key = (src_width, src_height, target_width, target_height);
+        if self.scaler.as_ref().map(|(cached, _)| *cached) != Some(key) {
+            let yuv = get_pixel_format("yuv420p");
             let scaler = VideoFrameScaler::builder()
-                .source_pixel_format(src_format)
+                .source_pixel_format(yuv)
                 .source_width(src_width as usize)
                 .source_height(src_height as usize)
-                .target_pixel_format(dst_format)
+                .target_pixel_format(yuv)
                 .target_width(target_width as usize)
                 .target_height(target_height as usize)
                 .build()
                 .map_err(|e| format!("Failed to create scaler: {}", e))?;
-
-            self.scaler = Some(scaler);
+            self.scaler = Some((key, scaler));
         }
-
-        let scaler = self.scaler.as_mut().unwrap();
-
-        // Create source frame and copy pixel data
-        let src_format = get_pixel_format("yuv420p");
-        let mut src_frame =
-            VideoFrameMut::black(src_format, src_width as usize, src_height as usize);
-
-        // Copy pixel data to frame planes
-        let y_size = (src_width * src_height) as usize;
-        let uv_size = (src_width * src_height / 4) as usize;
-
-        if pixel_data.len() >= y_size + 2 * uv_size {
-            let mut planes_mut = src_frame.planes_mut();
-
-            if planes_mut.len() > 0 {
-                let y_plane = planes_mut[0].data_mut();
-                let copy_len = y_plane.len().min(y_size);
-                y_plane[..copy_len].copy_from_slice(&pixel_data[..copy_len]);
-            }
-
-            if planes_mut.len() > 1 {
-                let u_plane = planes_mut[1].data_mut();
-                let copy_len = u_plane.len().min(uv_size);
-                u_plane[..copy_len].copy_from_slice(&pixel_data[y_size..y_size + copy_len]);
-            }
-
-            if planes_mut.len() > 2 {
-                let v_plane = planes_mut[2].data_mut();
-                let copy_len = v_plane.len().min(uv_size);
-                v_plane[..copy_len]
-                    .copy_from_slice(&pixel_data[y_size + uv_size..y_size + uv_size + copy_len]);
-            }
-        }
-
-        // Scale the frame
-        let scaled_frame = scaler
-            .scale(&src_frame.freeze())
+        let (_, scaler) = self.scaler.as_mut().unwrap();
+        let scaled = scaler
+            .scale(&source)
             .map_err(|e| format!("Scaling failed: {}", e))?;
 
-        // Extract scaled pixel data
-        let mut scaled_pixel_data = Vec::new();
-        let planes = scaled_frame.planes();
-
-        // Only access first 3 planes (Y, U, V for YUV420P)
-        for i in 0..3 {
-            if i < planes.len() {
-                let plane_data = planes[i].data();
-                if !plane_data.is_empty() {
-                    scaled_pixel_data.extend_from_slice(plane_data);
-                }
-            }
-        }
+        // Transfer the backend-owned result into the selected output provider.
+        let pixel_data =
+            super::decoded_frames::decoder_frame(&scaled, PixelFormat::Yuv420p, copies, allocator)
+                .map_err(|e| format!("Failed to extract scaled frame: {e}"))?;
 
         Ok(RuntimeData::Video {
-            pixel_data: scaled_pixel_data.into(),
+            pixel_data,
             width: target_width,
             height: target_height,
-            format,
+            format: PixelFormat::Yuv420p,
             codec,
             frame_number,
             timestamp_us,
             is_keyframe,
-            stream_id: None,
-            arrival_ts_us: None,
+            stream_id,
+            arrival_ts_us,
         })
     }
 }
@@ -284,12 +241,17 @@ impl VideoScalerNode {
         }
     }
 
-    /// Scale a video frame asynchronously
-    async fn scale_frame(&self, input: RuntimeData) -> Result<RuntimeData, String> {
+    /// Scale a video frame asynchronously under explicit copy authority.
+    async fn scale_frame(
+        &self,
+        input: RuntimeData,
+        copies: remotemedia_types::CopyContext,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Result<RuntimeData, String> {
         let scaler = Arc::clone(&self.scaler);
         tokio::task::spawn_blocking(move || {
             let mut s = scaler.lock().unwrap();
-            s.scale(input)
+            s.scale(input, &copies, allocator.as_ref())
         })
         .await
         .map_err(|e| format!("Scaler task failed: {}", e))?
@@ -302,10 +264,45 @@ impl AsyncStreamingNode for VideoScalerNode {
         "VideoScaler"
     }
 
-    async fn process(&self, input: RuntimeData) -> Result<RuntimeData, Error> {
-        self.scale_frame(input)
+    async fn process_with_ctx(
+        &self,
+        input: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let copies = ctx.copy_context().ok_or_else(|| {
+            Error::Execution("VideoScaler requires context copy authority".into())
+        })?;
+        let allocator = ctx
+            .output_allocator()
+            .unwrap_or_else(|| Arc::new(remotemedia_types::HeapOutputAllocator));
+        self.scale_frame(input, copies, allocator)
             .await
             .map_err(|e| Error::Execution(format!("Video scaling failed: {}", e)))
+    }
+
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        input: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+        mut callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        callback(self.process_with_ctx(input, ctx).await?)?;
+        Ok(1)
+    }
+
+    /// Context-free compatibility path: charged to the global legacy ledger
+    /// and allocated on the heap. Sessions use `process_with_ctx`.
+    async fn process(&self, input: RuntimeData) -> Result<RuntimeData, Error> {
+        self.scale_frame(
+            input,
+            remotemedia_types::CopyContext::legacy().clone(),
+            Arc::new(remotemedia_types::HeapOutputAllocator),
+        )
+        .await
+        .map_err(|e| Error::Execution(format!("Video scaling failed: {}", e)))
     }
 
     async fn process_multi(
@@ -437,5 +434,120 @@ mod tests {
             }
             _ => panic!("Expected video frame"),
         }
+    }
+
+    #[cfg(feature = "video")]
+    fn ingress(copies: &remotemedia_types::CopyContext) -> remotemedia_types::CopyCounts {
+        copies
+            .report()
+            .entries
+            .into_iter()
+            .find(|(reason, _)| *reason == remotemedia_types::CopyReason::ForeignPoolIngress)
+            .unwrap()
+            .1
+    }
+
+    #[cfg(feature = "video")]
+    fn frame(pixel_data: Vec<u8>, width: u32, height: u32, format: PixelFormat) -> RuntimeData {
+        RuntimeData::Video {
+            pixel_data: pixel_data.into(),
+            width,
+            height,
+            format,
+            codec: None,
+            frame_number: 7,
+            timestamp_us: 9,
+            is_keyframe: true,
+            stream_id: Some("cam".into()),
+            arrival_ts_us: Some(11),
+        }
+    }
+
+    #[cfg(feature = "video")]
+    fn backend(w: u32, h: u32) -> FFmpegScaler {
+        FFmpegScaler::new(VideoScalerConfig {
+            target_width: w,
+            target_height: h,
+            algorithm: "bilinear".to_string(),
+            maintain_aspect_ratio: false,
+        })
+        .unwrap()
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn scaler_strict_policy_rejects_before_staging() {
+        use remotemedia_types::{CopyContext, CopyPolicy, HeapOutputAllocator};
+        let copies = CopyContext::new(CopyPolicy::RequireZeroCopy, "strict");
+        let input = frame(vec![128; 8 * 8 * 3 / 2], 8, 8, PixelFormat::Yuv420p);
+        assert!(backend(4, 4)
+            .scale(input, &copies, &HeapOutputAllocator)
+            .is_err());
+        let counts = ingress(&copies);
+        assert_eq!((counts.completed, counts.rejected), (0, 1));
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn scaler_counts_staging_and_output_and_rebuilds_on_size_change() {
+        use remotemedia_types::{CopyContext, CopyPolicy, HeapOutputAllocator};
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "session");
+        let mut scaler = backend(4, 4);
+        for (w, h) in [(8u32, 8u32), (16, 8)] {
+            let input = frame(
+                vec![128; (w * h * 3 / 2) as usize],
+                w,
+                h,
+                PixelFormat::Yuv420p,
+            );
+            let RuntimeData::Video {
+                pixel_data,
+                width,
+                height,
+                stream_id,
+                ..
+            } = scaler.scale(input, &copies, &HeapOutputAllocator).unwrap()
+            else {
+                panic!("expected video")
+            };
+            assert_eq!((width, height), (4, 4));
+            assert_eq!(pixel_data.len(), 4 * 4 * 3 / 2);
+            assert!(pixel_data
+                .as_slice()
+                .iter()
+                .all(|&b| (126..=130).contains(&b)));
+            assert_eq!(stream_id.as_deref(), Some("cam"));
+        }
+        let counts = ingress(&copies);
+        assert_eq!(counts.completed, 4);
+        assert_eq!(counts.copied_bytes, 96 + 24 + 192 + 24);
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn scaler_same_dimensions_forward_owner_without_copy() {
+        use remotemedia_types::{CopyContext, CopyPolicy, HeapOutputAllocator, SharedBytes};
+        let copies = CopyContext::new(CopyPolicy::RequireZeroCopy, "strict");
+        let owner: SharedBytes = vec![5u8; 24].into();
+        let input = RuntimeData::Video {
+            pixel_data: owner.clone(),
+            width: 4,
+            height: 4,
+            format: PixelFormat::Yuv420p,
+            codec: None,
+            frame_number: 0,
+            timestamp_us: 0,
+            is_keyframe: false,
+            stream_id: None,
+            arrival_ts_us: None,
+        };
+        let RuntimeData::Video { pixel_data, .. } = backend(4, 4)
+            .scale(input, &copies, &HeapOutputAllocator)
+            .unwrap()
+        else {
+            panic!("expected video")
+        };
+        assert!(pixel_data.shares_storage(&owner));
+        assert_eq!(ingress(&copies).rejected, 0);
     }
 }
