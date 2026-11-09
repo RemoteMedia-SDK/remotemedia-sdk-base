@@ -881,10 +881,12 @@ impl SessionRouter {
         let session_id = self.session_id.clone();
         let router_tx = self.loopback_tx.clone(); // Bounded loopback: node → router
         let probes = self.probes.clone(); // Phase B0 instrumentation
-        let control = self
-            .control
-            .clone()
-            .unwrap_or_else(|| SessionControl::new(session_id.clone()));
+        let control = self.control.clone().unwrap_or_else(|| {
+            SessionControl::with_transport_copy_context(
+                session_id.clone(),
+                self.transport_copies.clone(),
+            )
+        });
         let init_ctx = remotemedia_core::nodes::InitializeContext {
             session_id: session_id.clone(),
             node_id: node_id_clone.clone(),

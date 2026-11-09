@@ -48,14 +48,16 @@ impl FastAudioNode for FastVADNode {
             .ok_or_else(|| Error::Execution("VAD requires F32 format".into()))?;
 
         // Convert to mono if stereo
-        let mono_samples: Vec<f32> = if input.channels > 1 {
+        // Mono input is read in place; only stereo needs a computed downmix.
+        let mono_samples: std::borrow::Cow<[f32]> = if input.channels > 1 {
             // Average channels
             samples
                 .chunks(input.channels)
                 .map(|chunk| chunk.iter().sum::<f32>() / input.channels as f32)
-                .collect()
+                .collect::<Vec<f32>>()
+                .into()
         } else {
-            samples.to_vec()
+            samples.into()
         };
 
         let frame_size = self.frame_size();

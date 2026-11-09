@@ -281,6 +281,22 @@ impl AsyncStreamingNode for VideoFormatConverterNode {
             .map_err(|e| Error::Execution(format!("Format conversion failed: {}", e)))
     }
 
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: std::collections::HashMap<String, RuntimeData>,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        // Exactly one input: several named inputs would silently drop data.
+        if inputs.len() != 1 {
+            return Err(Error::Execution(format!(
+                "VideoFormatConverter accepts exactly one input, got {}",
+                inputs.len()
+            )));
+        }
+        let data = inputs.into_values().next().expect("one input");
+        self.process_with_ctx(data, ctx).await
+    }
+
     async fn process_streaming_with_ctx<F>(
         &self,
         input: RuntimeData,
@@ -492,5 +508,39 @@ mod tests {
                 .is_err());
         }
         assert_eq!(ingress(&copies).completed, 0);
+    }
+
+    #[cfg(feature = "video")]
+    #[tokio::test]
+    async fn converter_multi_input_keeps_context_authority() {
+        use remotemedia_types::{CopyContext, CopyPolicy};
+        let node = VideoFormatConverterNode::new(VideoFormatConverterConfig {
+            target_format: PixelFormat::Rgba32,
+            ..Default::default()
+        })
+        .unwrap();
+        let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "strict-node");
+        let ctx = crate::nodes::NodeRuntimeContext::for_test("s", "conv")
+            .with_copy_context(strict.clone());
+        let mut one = std::collections::HashMap::new();
+        one.insert(
+            "in".to_string(),
+            frame(vec![1; 48], 4, 4, PixelFormat::Rgb24),
+        );
+        // Strict context authority reaches the backend: staging is rejected.
+        assert!(node.process_multi_with_ctx(one, &ctx).await.is_err());
+        assert_eq!(ingress(&strict).rejected, 1);
+
+        let mut two = std::collections::HashMap::new();
+        two.insert(
+            "a".to_string(),
+            frame(vec![1; 48], 4, 4, PixelFormat::Rgb24),
+        );
+        two.insert(
+            "b".to_string(),
+            frame(vec![1; 48], 4, 4, PixelFormat::Rgb24),
+        );
+        let err = node.process_multi_with_ctx(two, &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("exactly one input"), "{err}");
     }
 }

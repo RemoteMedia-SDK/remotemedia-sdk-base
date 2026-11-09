@@ -298,13 +298,16 @@ impl SyncStreamingNode for AudioChannelSplitterNode {
                     return Ok(1);
                 }
 
-                let mono_samples: Vec<f32> = if *channels > 1 {
+                // Mono input is read in place; only multichannel needs a
+                // computed downmix.
+                let mono_samples: std::borrow::Cow<[f32]> = if *channels > 1 {
                     samples
                         .chunks(*channels as usize)
                         .map(|chunk| chunk.iter().sum::<f32>() / *channels as f32)
-                        .collect()
+                        .collect::<Vec<f32>>()
+                        .into()
                 } else {
-                    samples.to_vec()
+                    samples.as_slice().into()
                 };
 
                 let segments = state.segments.clone();

@@ -158,13 +158,18 @@ impl SpeculativeVADGate {
         let session_id = session_id.unwrap_or_else(|| "default".to_string());
 
         // Extract audio from RuntimeData
-        let (samples, sample_rate, channels) = match &data {
+        // Take the owner (legacy Vec storage is promoted in place, no copy).
+        let (samples, sample_rate, channels) = match data {
             RuntimeData::Audio {
                 samples,
                 sample_rate,
                 channels,
                 ..
-            } => (samples.clone(), *sample_rate, *channels),
+            } => (
+                crate::data::AudioSamples::Shared(samples.into_shared()),
+                sample_rate,
+                channels,
+            ),
             _ => {
                 return Err(Error::Execution(
                     "SpeculativeVADGate requires audio input".into(),
@@ -213,7 +218,7 @@ impl SpeculativeVADGate {
     /// Process audio chunk and determine if speculation should occur
     async fn process_audio_chunk(
         &self,
-        samples: &[f32],
+        samples: &crate::data::AudioSamples,
         sample_rate: u32,
         channels: u32,
         session_id: &str,
@@ -228,8 +233,10 @@ impl SpeculativeVADGate {
         let state = sessions.get_mut(session_id).unwrap();
 
         // **Step 1: Forward audio immediately (speculative)**
+        // Shares the input allocation (a refcount clone of shared storage)
+        // instead of copying every forwarded chunk.
         let audio_output = RuntimeData::Audio {
-            samples: samples.to_vec().into(),
+            samples: samples.clone(),
             sample_rate,
             channels,
             stream_id: None,
@@ -240,7 +247,7 @@ impl SpeculativeVADGate {
         outputs.push(audio_output);
 
         // **Step 2: Store in audio buffer for potential cancellation**
-        for &sample in samples {
+        for &sample in samples.as_slice() {
             if state.audio_buffer.len() >= state.buffer_capacity {
                 // Buffer is full - remove oldest sample (circular buffer behavior)
                 state.audio_buffer.pop_front();
@@ -409,6 +416,38 @@ mod tests {
             }
             _ => panic!("Expected audio output"),
         }
+    }
+
+    #[tokio::test]
+    async fn forwarded_audio_shares_the_input_allocation() {
+        let gate = SpeculativeVADGate::with_default();
+        let input: crate::data::AudioSamples = vec![0.1_f32; 480].into();
+        let pointer = input.as_slice().as_ptr();
+        let audio = RuntimeData::Audio {
+            samples: input,
+            sample_rate: 16000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: None,
+        };
+        let mut outputs = Vec::new();
+        use crate::nodes::AsyncStreamingNode;
+        gate.process_streaming(audio, Some("share".to_string()), |data| {
+            outputs.push(data);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let RuntimeData::Audio { samples, .. } = &outputs[0] else {
+            panic!("expected audio")
+        };
+        assert_eq!(
+            samples.as_slice().as_ptr(),
+            pointer,
+            "forwarded chunk was copied"
+        );
     }
 
     #[tokio::test]

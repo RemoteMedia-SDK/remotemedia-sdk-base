@@ -280,6 +280,22 @@ impl AsyncStreamingNode for VideoScalerNode {
             .map_err(|e| Error::Execution(format!("Video scaling failed: {}", e)))
     }
 
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: std::collections::HashMap<String, RuntimeData>,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        // Exactly one input: several named inputs would silently drop data.
+        if inputs.len() != 1 {
+            return Err(Error::Execution(format!(
+                "VideoScaler accepts exactly one input, got {}",
+                inputs.len()
+            )));
+        }
+        let data = inputs.into_values().next().expect("one input");
+        self.process_with_ctx(data, ctx).await
+    }
+
     async fn process_streaming_with_ctx<F>(
         &self,
         input: RuntimeData,
