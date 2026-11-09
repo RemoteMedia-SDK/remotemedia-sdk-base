@@ -18,3 +18,6 @@ pub mod telephony;
 // gRPC server bindings (only compiled with `grpc` feature)
 #[cfg(feature = "grpc")]
 pub mod grpc_server;
+
+/// Pipeline policy and buffer budgets, available without WebRTC.
+pub mod buffer_config;

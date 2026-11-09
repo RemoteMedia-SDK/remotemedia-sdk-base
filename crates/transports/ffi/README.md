@@ -186,6 +186,37 @@ if isinstance(result, np.ndarray):
 
 ## Owning Python buffers (Python 3.11+)
 
+Select the unified copy policy and explicit retention budgets when creating an
+ordinary or shared Python session:
+
+```python
+import remotemedia.runtime as rt
+
+buffers = rt.PipelineBufferConfig(
+    "require_zero_copy", node_retention_owners=64, node_retention_bytes=4 * 1024 * 1024,
+)
+session = await rt.create_streaming_session(manifest_json, pipeline_buffers=buffers)
+```
+
+The same keyword is accepted by `create_shared_streaming_session`. Omitting it
+preserves the default compatibility configuration. Strict configuration applies
+to core preflight and instrumented node, transport and mapped-worker boundaries;
+an undeclared or incompatible factory rejects before execution. It is not proof
+that arbitrary node or backend code never copies. The explicit node-retention
+budget also supplies the core ingress-owner budget; it is not a total process
+memory limit or a replacement for other queue and provider limits.
+Factories still need matching per-node layout, domain and retention declarations.
+For example, PassThrough is metadata-only until its parameters declare bounded
+bulk forwarding; a session-wide budget does not change that factory contract.
+
+These immutable configuration classes are available with the `python` feature,
+without WebRTC. Existing `runtime.webrtc` class names remain aliases when that
+feature is enabled. Optional `mapped_pool=rt.MappedPoolConfig(classes, max_bytes,
+max_leases)` selects bounded per-session mapped storage; each class is
+`rt.MappedSizeClass(bytes, slots)`. This requires `mapped-buffers` on Windows or
+Linux and rejects explicitly when unavailable. It never silently selects heap
+storage for a requested mapped pool.
+
 The native Python binding uses PyO3 0.28 and the Python 3.11 stable buffer ABI.
 The network-only Python client keeps its separate interpreter requirements.
 Runtime audio, binary, video, image, tensor and NumPy output retains immutable

@@ -144,21 +144,10 @@ pub struct WebRtcServerConfig {
     pub pipeline_buffers: Option<PipelineBufferConfig>,
 }
 
-/// One policy for preflight, node, transport and mapped-worker materialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PipelineBufferConfig {
-    pub policy: CopyPolicy,
-    pub node_retention_owners: u64,
-    pub node_retention_bytes: u64,
-    /// Optional per-session mapped storage for producer output loans.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mapped_pool: Option<MappedPoolConfig>,
-}
-
-#[path = "mapped_pool_config.rs"]
-mod mapped_pool_config;
-pub use mapped_pool_config::{MappedPoolConfig, MappedSizeClass};
+pub(crate) use crate::buffer_config::parse_copy_policy;
+pub use crate::buffer_config::{
+    ConfigValidationError, MappedPoolConfig, MappedSizeClass, PipelineBufferConfig,
+};
 
 fn default_max_peers() -> u32 {
     10
@@ -187,11 +176,6 @@ pub(crate) fn parse_transport_copy_policy(value: &str) -> Result<CopyPolicy, Str
     parse_copy_policy(value, "transport_materialization_policy")
 }
 
-pub(crate) fn parse_copy_policy(value: &str, field: &str) -> Result<CopyPolicy, String> {
-    serde_json::from_value(serde_json::Value::String(value.to_owned()))
-        .map_err(|_| format!("{field} must be allow_copies or require_zero_copy"))
-}
-
 #[cfg(test)]
 #[path = "transport_policy_tests.rs"]
 mod transport_policy_tests;
@@ -209,28 +193,14 @@ impl WebRtcServerConfig {
     pub fn to_executor_config(
         &self,
     ) -> Result<remotemedia_core::transport::ExecutorConfig, ConfigValidationError> {
-        self.validate_buffers()?;
-        Ok(remotemedia_core::transport::ExecutorConfig {
-            pipeline_copy_policy: self.pipeline_buffers.as_ref().map(|config| config.policy),
-            buffer_preflight: self.pipeline_buffers.as_ref().map(|config| {
-                remotemedia_core::transport::buffer_preflight::BufferPreflightConfig {
-                    policy: config.policy,
-                    node_retention_budget: remotemedia_traits::buffer_contract::BufferRetention {
-                        owners: config.node_retention_owners,
-                        bytes: config.node_retention_bytes,
-                    },
-                }
-            }),
-            transport_materialization_policy: self.transport_materialization_policy,
-            #[cfg(all(feature = "mapped-buffers", any(windows, target_os = "linux")))]
-            mapped_pool: self
-                .pipeline_buffers
-                .as_ref()
-                .and_then(|config| config.mapped_pool.as_ref())
-                .map(MappedPoolConfig::to_pool_config)
-                .transpose()?,
-            ..Default::default()
-        })
+        let mut config = self
+            .pipeline_buffers
+            .as_ref()
+            .map(PipelineBufferConfig::to_executor_config)
+            .transpose()?
+            .unwrap_or_default();
+        config.transport_materialization_policy = self.transport_materialization_policy;
+        Ok(config)
     }
 
     fn validate_buffers(&self) -> Result<(), ConfigValidationError> {
@@ -356,42 +326,6 @@ impl WebRtcServerConfig {
             shared_session_key: None,
         }
     }
-}
-
-/// Configuration validation errors
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum ConfigValidationError {
-    #[error("Invalid pipeline mapped pool: {0}")]
-    InvalidMappedPool(String),
-    #[error("Either port (embedded) or signaling_url (external) must be specified")]
-    MissingSignalingConfig,
-
-    #[error("Cannot specify both port and signaling_url - choose embedded or external signaling")]
-    ConflictingSignalingConfig,
-
-    #[error("Invalid port: {0} (must be non-zero)")]
-    InvalidPort(u16),
-
-    #[error("Invalid signaling URL: {0} (must start with grpc:// or grpcs://)")]
-    InvalidSignalingUrl(String),
-
-    #[error("At least one STUN server is required")]
-    NoStunServers,
-
-    #[error("Invalid STUN URL: {0} (must start with stun: or stuns:)")]
-    InvalidStunUrl(String),
-
-    #[error("Invalid TURN URL: {0} (must start with turn: or turns:)")]
-    InvalidTurnUrl(String),
-
-    #[error("TURN server username is required")]
-    MissingTurnUsername,
-
-    #[error("TURN server credential is required")]
-    MissingTurnCredential,
-
-    #[error("Invalid max_peers: {0} (must be 1-10)")]
-    InvalidMaxPeers(u32),
 }
 
 /// Peer capabilities (audio/video/data support)

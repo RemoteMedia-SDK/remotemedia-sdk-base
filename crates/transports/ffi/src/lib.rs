@@ -62,6 +62,9 @@
 
 #![warn(clippy::all)]
 
+// Shared configuration is independent of any network transport feature.
+pub mod buffer_config;
+
 // Python-specific modules (only compiled with `python` feature)
 #[cfg(feature = "python")]
 mod api;
@@ -133,6 +136,9 @@ fn remotemedia_ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_class::<streaming_session::PyStreamingSession>()?;
+    m.add_class::<python::buffer_config::PipelineBufferConfig>()?;
+    m.add_class::<python::buffer_config::MappedPoolConfig>()?;
+    m.add_class::<python::buffer_config::MappedSizeClass>()?;
 
     // In-proc control bus (PyAttachedSession + PySubscription + PyInterceptSession)
     m.add_class::<control_session::PyAttachedSession>()?;

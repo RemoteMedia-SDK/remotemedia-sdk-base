@@ -33,6 +33,7 @@ use remotemedia_core::transport::{
 };
 
 use crate::marshal::{python_to_runtime_data_with_context, runtime_data_into_python};
+use crate::python::buffer_config::PipelineBufferConfig;
 use remotemedia_types::OutputAllocator;
 
 mod input_copies;
@@ -383,17 +384,24 @@ fn pack_kind(py: Python<'_>, kind: &str, rd: RuntimeData) -> PyResult<Py<PyAny>>
 /// asyncio.run(main())
 /// ```
 #[pyfunction]
+#[pyo3(signature = (manifest_json, *, pipeline_buffers=None))]
 pub fn create_streaming_session(
     py: Python<'_>,
     manifest_json: String,
+    pipeline_buffers: Option<PipelineBufferConfig>,
 ) -> PyResult<Bound<'_, PyAny>> {
     // Capture asyncio task-locals for inline-async dispatch — mirrors the
     // setup execute_pipeline does so inline Python nodes inside the manifest
     // can resolve their event loop.
     super::inline_python_node::set_task_locals(pyo3_async_runtimes::tokio::get_current_locals(py)?);
 
+    let config = pipeline_buffers
+        .as_ref()
+        .map(PipelineBufferConfig::to_executor_config)
+        .transpose()?
+        .unwrap_or_default();
     future_into_py(py, async move {
-        let executor = PipelineExecutor::new()
+        let executor = PipelineExecutor::with_config(config)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create executor: {}", e)))?;
         // Register every plugin loaded so far via `rt.load_plugin(path)`
         // BEFORE the manifest is parsed — otherwise unknown-node-type
@@ -424,7 +432,9 @@ pub fn create_streaming_session(
     participant_role,
     track_id=None,
     modality=None,
-    display_name=None
+    display_name=None,
+    *,
+    pipeline_buffers=None
 ))]
 pub fn create_shared_streaming_session(
     py: Python<'_>,
@@ -435,11 +445,17 @@ pub fn create_shared_streaming_session(
     track_id: Option<String>,
     modality: Option<String>,
     display_name: Option<String>,
+    pipeline_buffers: Option<PipelineBufferConfig>,
 ) -> PyResult<Bound<'_, PyAny>> {
     super::inline_python_node::set_task_locals(pyo3_async_runtimes::tokio::get_current_locals(py)?);
 
+    let config = pipeline_buffers
+        .as_ref()
+        .map(PipelineBufferConfig::to_executor_config)
+        .transpose()?
+        .unwrap_or_default();
     future_into_py(py, async move {
-        let executor = PipelineExecutor::new()
+        let executor = PipelineExecutor::with_config(config)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create executor: {}", e)))?;
         for factory in crate::plugins::collect_registered_factories() {
             executor.register_factory(factory).await;
