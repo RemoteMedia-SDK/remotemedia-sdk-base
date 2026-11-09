@@ -66,27 +66,42 @@ impl SessionPacketSender {
         self.budget.clone()
     }
 
+    /// Shape a control publish for its destination rail. The main rail moves the
+    /// owner unchanged. Auxiliary JSON envelopes cannot represent typed media, so
+    /// those payloads are rejected instead of being replaced by a type tag. Binary
+    /// keeps its legacy base64 encoding on unbudgeted ingress as an explicit,
+    /// counted portable serialization charged to `copies` (rejected when strict).
     pub(crate) fn control_payload(
         &self,
         port: Option<&str>,
         data: crate::data::RuntimeData,
+        copies: &remotemedia_types::CopyContext,
     ) -> Result<crate::data::RuntimeData> {
         let Some(port) = port else { return Ok(data) };
         use crate::data::RuntimeData::*;
-        if self.budget.0.get_or_init(|| None).is_some()
-            && matches!(
-                &data,
-                Audio { .. }
-                    | Binary(_)
-                    | Video { .. }
-                    | Image { .. }
-                    | Tensor { .. }
-                    | Numpy { .. }
-            )
-        {
+        let binary_bytes = match &data {
+            Audio { .. } | Video { .. } | Image { .. } | Tensor { .. } | Numpy { .. } => {
+                return Err(Error::Execution(format!(
+                    "auxiliary port '{port}' carries a JSON envelope and cannot represent {} payloads; publish typed media on the node's main input",
+                    data.data_type()
+                )));
+            }
+            Binary(bytes) => Some(bytes.len() as u64),
+            _ => None,
+        };
+        let Some(bytes) = binary_bytes else {
+            return Ok(super::session_control::wrap_aux_port(port, data));
+        };
+        if self.budget.0.get_or_init(|| None).is_some() {
             return Err(Error::Execution("budgeted ingress cannot encode bulk payloads in auxiliary JSON envelopes; an explicit bulk-port adapter is required".into()));
         }
-        Ok(super::session_control::wrap_aux_port(port, data))
+        copies
+            .materialize(
+                remotemedia_types::CopyReason::PortableSerialization,
+                bytes,
+                || super::session_control::wrap_aux_port(port, data),
+            )
+            .map_err(|rejected| Error::Execution(rejected.to_string()))
     }
 
     /// Bind before the first send. Clones share the same binding. First use seals

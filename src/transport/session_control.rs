@@ -896,7 +896,7 @@ impl SessionControl {
                 .system_retained
                 .lock()
                 .expect("system_retained mutex poisoned");
-            let _ = sender.send(data);
+            let _ = sender.send(data.into_shared());
         }
     }
 
@@ -1121,7 +1121,7 @@ impl SessionControl {
             .taps
             .get(&key)
             .ok_or_else(|| crate::Error::Execution("RPC reply subscriber closed".into()))?;
-        tap.send(data)
+        tap.send(data.into_shared())
             .map_err(|_| crate::Error::Execution("RPC reply subscriber closed".into()))?;
         Ok(())
     }
@@ -1209,7 +1209,7 @@ impl SessionControl {
             })?
         };
 
-        let payload = tx.control_payload(addr.port.as_deref(), data)?;
+        let payload = tx.control_payload(addr.port.as_deref(), data, &self.transport_copies)?;
 
         let packet = DataPacket {
             data: payload,
@@ -2570,5 +2570,91 @@ mod discovery_tests {
         ctrl.clear_node_state("n");
         assert_eq!(tel.node(0).node_state(), NodeState::Enabled);
         assert!(ctrl.summary().has_telemetry);
+    }
+
+    fn legacy_audio(fill: f32) -> (RuntimeData, *const f32) {
+        let samples = vec![fill; 32];
+        let address = samples.as_ptr();
+        let data = RuntimeData::Audio {
+            samples: crate::data::AudioSamples::Vec(samples),
+            sample_rate: 16_000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: None,
+        };
+        (data, address)
+    }
+
+    fn shared_at(data: &RuntimeData, expected: *const f32) {
+        let RuntimeData::Audio { samples, .. } = data else {
+            panic!("expected audio");
+        };
+        assert!(!matches!(samples, crate::data::AudioSamples::Vec(_)));
+        assert_eq!(
+            samples.as_ptr(),
+            expected,
+            "control path copied the samples"
+        );
+    }
+
+    #[tokio::test]
+    async fn intercept_pass_and_replace_retain_promoted_owners() {
+        let ctrl = SessionControl::new("sess-identity");
+        let addr = ControlAddress::node_out("tts");
+        let mut tap = ctrl.subscribe(&addr).unwrap();
+        let mut events = ctrl.intercept(&addr, Some(Duration::from_secs(2))).unwrap();
+        for replace in [false, true] {
+            let (data, original) = legacy_audio(0.5);
+            let ctrl_dp = ctrl.clone();
+            let task = tokio::spawn(async move { ctrl_dp.on_node_output("tts", None, data).await });
+            let ControlEvent::InterceptRequest {
+                correlation_id,
+                data: requested,
+                ..
+            } = events.recv().await.unwrap()
+            else {
+                panic!("expected InterceptRequest");
+            };
+            shared_at(&requested, original);
+            shared_at(&tap.recv().await.unwrap(), original);
+            let (replacement, replaced) = legacy_audio(0.75);
+            let (decision, expected) = if replace {
+                (InterceptDecision::Replace(replacement), replaced)
+            } else {
+                (InterceptDecision::Pass, original)
+            };
+            ctrl.complete_intercept(correlation_id, decision).unwrap();
+            let forwarded = task.await.unwrap().expect("not dropped");
+            shared_at(&forwarded, expected);
+            // The client's request copy and the forwarded owner coexist.
+            shared_at(&requested, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn system_and_rpc_reply_broadcasts_promote_legacy_audio() {
+        let ctrl = SessionControl::new("sess-broadcast");
+        let mut system = ctrl
+            .subscribe(&ControlAddress::node_out(SYSTEM_PORT))
+            .unwrap();
+        let mut second = ctrl
+            .subscribe(&ControlAddress::node_out(SYSTEM_PORT))
+            .unwrap();
+        let (data, original) = legacy_audio(0.25);
+        ctrl.publish_system_ephemeral(data);
+        shared_at(&system.recv().await.unwrap(), original);
+        shared_at(&second.recv().await.unwrap(), original);
+
+        let reply = ControlAddress {
+            node_id: "tts".into(),
+            port: Some("__reply__".into()),
+            direction: Direction::Out,
+        };
+        let mut replies = ctrl.subscribe(&reply).unwrap();
+        let (data, original) = legacy_audio(0.125);
+        ctrl.publish_rpc_reply("tts", data).unwrap();
+        shared_at(&replies.recv().await.unwrap(), original);
     }
 }

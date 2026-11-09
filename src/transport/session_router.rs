@@ -46,6 +46,8 @@ mod input_queue;
 use input_queue::InputQueue;
 #[cfg(test)]
 mod children_tests;
+#[cfg(test)]
+mod routing_identity_tests;
 mod source_completion;
 #[cfg(test)]
 mod source_completion_tests;
@@ -141,11 +143,13 @@ impl ClientOutputRouter {
     /// Route one piece of sink output to the channel for its kind.
     ///
     /// Awaits when that kind's channel is full — backpressure is per-kind,
-    /// so a stalled video consumer no longer holds back audio.
+    /// so a stalled video consumer no longer holds back audio. Legacy Vec audio
+    /// is promoted first, so later consumer clones share the samples.
     pub async fn send(
         &self,
         data: RuntimeData,
     ) -> std::result::Result<(), mpsc::error::SendError<RuntimeData>> {
+        let data = data.into_shared();
         match &data {
             RuntimeData::Audio { .. } => self.audio_tx.send(data).await,
             RuntimeData::Video { .. } => self.video_tx.send(data).await,
@@ -158,6 +162,7 @@ impl ClientOutputRouter {
         &self,
         data: RuntimeData,
     ) -> std::result::Result<(), mpsc::error::TrySendError<RuntimeData>> {
+        let data = data.into_shared();
         match &data {
             RuntimeData::Audio { .. } => self.audio_tx.try_send(data),
             RuntimeData::Video { .. } => self.video_tx.try_send(data),

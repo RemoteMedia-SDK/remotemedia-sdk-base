@@ -254,7 +254,9 @@ impl SharedPipelineSession {
     ) {
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
-                let _ = tx.send(TransportData::new(data));
+                // Every subscriber clones on receive; promote once so those
+                // clones share one sample allocation.
+                let _ = tx.send(TransportData::new(data.into_shared()));
             }
         });
     }

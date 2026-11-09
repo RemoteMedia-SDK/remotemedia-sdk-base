@@ -128,6 +128,8 @@ pub mod data {
     pub use remotemedia_types::{
         AudioBuffer, AudioFormat, DataTypeHint, ImageFormat, RuntimeData, TensorBuffer, VideoFrame,
     };
+    // Owning bulk storage carried by `RuntimeData` payload variants.
+    pub use remotemedia_types::{SharedBuffer, SharedBytes};
 }
 
 #[cfg(feature = "hf-download")]

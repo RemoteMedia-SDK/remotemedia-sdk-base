@@ -261,7 +261,7 @@ pub(crate) struct StreamSession {
 
 impl StreamSession {
     /// Create new session from StreamInit request
-    fn new(
+    pub(crate) fn new(
         session_id: String,
         manifest: Manifest,
         recommended_chunk_size: u64,

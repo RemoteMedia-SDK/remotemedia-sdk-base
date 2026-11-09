@@ -70,3 +70,48 @@ async fn shared_session_transport_authority_is_isolated_and_survives_join() {
         assert_ne!(contexts[0].boundary(), contexts[1].boundary());
     }
 }
+
+#[tokio::test]
+async fn output_drainer_promotes_once_for_every_subscriber() {
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let (broadcast, _) = tokio::sync::broadcast::channel(4);
+    let mut first = broadcast.subscribe();
+    let mut second = broadcast.subscribe();
+    SharedPipelineSession::spawn_output_drainer(rx, broadcast);
+    let samples = vec![0.5_f32; 32];
+    let original = samples.as_ptr();
+    tx.send(crate::data::RuntimeData::Audio {
+        samples: crate::data::AudioSamples::Vec(samples),
+        sample_rate: 16_000,
+        channels: 1,
+        stream_id: None,
+        timestamp_us: None,
+        arrival_ts_us: None,
+        metadata: None,
+    })
+    .await
+    .unwrap();
+    for receiver in [&mut first, &mut second] {
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::data::RuntimeData::Audio { samples, .. } = &received.data else {
+            panic!("expected audio");
+        };
+        assert!(!matches!(samples, crate::data::AudioSamples::Vec(_)));
+        assert_eq!(
+            samples.as_ptr(),
+            original,
+            "subscriber receive copied the samples"
+        );
+    }
+    // Closing the router side ends the drainer without stranding subscribers.
+    drop(tx);
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), first.recv())
+            .await
+            .unwrap(),
+        Err(tokio::sync::broadcast::error::RecvError::Closed)
+    ));
+}

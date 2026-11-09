@@ -53,7 +53,9 @@ impl InputQueue {
                     self.node_id
                 ))
             })?,
-            None => data,
+            // Unbudgeted queues promote too: dispatch clones the dequeued
+            // input, which must never deep-copy legacy Vec audio.
+            None => data.into_shared(),
         };
         match self.sender.try_send(data) {
             Ok(()) => Ok(true),
@@ -145,6 +147,36 @@ mod tests {
             receiver,
             budget,
         )
+    }
+
+    #[tokio::test]
+    async fn unbudgeted_queue_promotes_legacy_vec_audio_without_copying() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let queue = InputQueue {
+            sender,
+            budget: None,
+            node_id: "test".into(),
+        };
+        let samples = vec![0.75_f32; 32];
+        let original = samples.as_ptr();
+        let audio = RuntimeData::Audio {
+            samples: crate::data::AudioSamples::Vec(samples),
+            sample_rate: 16_000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: None,
+        };
+        assert!(queue.send(audio).await.unwrap());
+        let RuntimeData::Audio { samples, .. } = receiver.recv().await.unwrap() else {
+            panic!("expected audio")
+        };
+        assert!(!matches!(samples, crate::data::AudioSamples::Vec(_)));
+        assert_eq!(samples.as_ptr(), original);
+        // Dispatch clones dequeued input; that clone now shares the samples.
+        let dispatched = samples.clone();
+        assert_eq!(dispatched.as_ptr(), original);
     }
 
     #[tokio::test]

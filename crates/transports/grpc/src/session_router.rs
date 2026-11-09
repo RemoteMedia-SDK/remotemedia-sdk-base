@@ -697,7 +697,12 @@ impl SessionRouter {
     }
 
     /// Route a packet through the pipeline
-    async fn route_packet(&mut self, packet: DataPacket) -> Result<(), Status> {
+    async fn route_packet(&mut self, mut packet: DataPacket) -> Result<(), Status> {
+        // Promote legacy Vec audio before any fan-out clone so every downstream
+        // receives a refcount handle to the same samples, regardless of whether
+        // the control bus (which also promotes) is attached or the packet is
+        // client ingress addressed to one node.
+        packet.data = packet.data.into_shared();
         // Node outputs pass through SessionControl before normal graph fan-out.
         // This publishes requested taps (including tool/blip/system events)
         // and applies any installed intercept without touching client ingress.
@@ -755,8 +760,10 @@ impl SessionRouter {
             };
         let bytes = approx_payload_bytes(&packet.data);
 
-        // Route to downstream nodes
-        for (edge_idx, next_node_id) in downstream_nodes {
+        // Route to downstream nodes; the last one takes the original owner.
+        let last = downstream_nodes.len().saturating_sub(1);
+        let mut packet = Some(packet);
+        for (index, (edge_idx, next_node_id)) in downstream_nodes.into_iter().enumerate() {
             // info!("🔀 Routing from '{}' → '{}'", packet.from_node, next_node_id);
 
             // Get or create the node task
@@ -768,7 +775,16 @@ impl SessionRouter {
             // The node task will handle both native and multiprocess nodes
             // Multiprocess nodes will internally use the IPC thread via process_streaming_async()
             if let Some(node_input) = self.node_inputs.get(&next_node_id) {
-                let packet_clone = packet.clone();
+                let packet_clone = if index == last {
+                    packet
+                        .take()
+                        .expect("packet is moved only into the last successor")
+                } else {
+                    packet
+                        .as_ref()
+                        .expect("packet is retained until the last successor")
+                        .clone()
+                };
                 let edge = edge_idx.and_then(|i| self.telemetry.edge(i));
                 // Bounded per-node input: `.await` stalls the router task
                 // when a node is saturated. Loopback capacity is sized
@@ -1081,11 +1097,19 @@ impl SessionRouter {
                                 match router_tx_for_cb.try_send(output_packet) {
                                     Ok(()) => Ok(()),
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        // This synchronous callback cannot await
+                                        // the router without risking a mutual
+                                        // wait on this node's input. Report the
+                                        // undelivered output instead of
+                                        // acknowledging a frame that was dropped.
                                         warn!(
-                                            "Loopback full — dropping output from '{}' (session saturated)",
+                                            "Loopback full — output from '{}' not delivered (session saturated)",
                                             node_id_for_cb
                                         );
-                                        Ok(())
+                                        Err(remotemedia_core::Error::Execution(format!(
+                                            "router loopback full; output {} from node '{}' was not delivered",
+                                            output_count, node_id_for_cb
+                                        )))
                                     }
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                         error!(
@@ -1359,10 +1383,36 @@ impl SessionRouter {
         // Close all node input channels
         self.node_inputs.clear();
 
-        // Wait for all tasks to complete
-        for (node_id, task) in self.node_tasks.drain() {
-            debug!("Waiting for node '{}' to shutdown", node_id);
-            let _ = task.await;
+        // Wait for all tasks while draining their loopback output. A node
+        // parked on a full loopback (`router_tx.send(..).await`) never reaches
+        // its closed input otherwise; the drained packets are released here
+        // because the session is ending and no consumer will route them.
+        let joins =
+            futures::future::join_all(self.node_tasks.drain().map(|(node_id, task)| async move {
+                debug!("Waiting for node '{}' to shutdown", node_id);
+                let _ = task.await;
+            }));
+        tokio::pin!(joins);
+        let mut loopback_open = true;
+        let mut released = 0_u64;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut joins => break,
+                packet = self.loopback_rx.recv(), if loopback_open => match packet {
+                    Some(packet) => {
+                        released += 1;
+                        drop(packet);
+                    }
+                    None => loopback_open = false,
+                },
+            }
+        }
+        if released > 0 {
+            debug!(
+                "Released {} undelivered loopback packets during shutdown",
+                released
+            );
         }
 
         info!("All node tasks shut down");
@@ -1394,3 +1444,7 @@ impl SessionRouter {
             .map_err(|e| format!("Failed to feed chunk: {}", e))
     }
 }
+
+#[cfg(test)]
+#[path = "session_router_tests.rs"]
+mod tests;

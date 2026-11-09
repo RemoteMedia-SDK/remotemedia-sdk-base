@@ -1,6 +1,6 @@
 use super::*;
 use crate::data::RuntimeData;
-use remotemedia_types::BufferBudgetUsage;
+use remotemedia_types::{BufferBudgetUsage, CopyContext, CopyPolicy, CopyReason};
 use std::collections::HashMap;
 
 fn packet(data: RuntimeData) -> DataPacket {
@@ -133,14 +133,113 @@ async fn binding_seals_all_clones_before_first_use_and_guards_auxiliary_bulk() {
     early_clone.send(text()).await.unwrap();
     drop(rx.recv().await);
     assert!(sender.bind_budget(BufferBudget::new(1, 8)).is_err());
+    let copies = CopyContext::legacy();
     assert!(sender
-        .control_payload(Some("aux"), RuntimeData::Binary(Vec::new().into()))
+        .control_payload(Some("aux"), RuntimeData::Binary(Vec::new().into()), copies)
         .is_err());
     assert!(sender
-        .control_payload(Some("aux"), RuntimeData::Text("ok".into()))
+        .control_payload(Some("aux"), RuntimeData::Text("ok".into()), copies)
         .is_ok());
     let (tx, _rx) = mpsc::channel(1);
     let legacy = SessionPacketSender::from(tx);
     legacy.try_send(text()).unwrap();
     assert!(legacy.bind_budget(BufferBudget::new(1, 8)).is_err());
+}
+
+fn counts_for(copies: &CopyContext, reason: CopyReason) -> remotemedia_types::CopyCounts {
+    copies
+        .report()
+        .entries
+        .into_iter()
+        .find(|(entry, _)| *entry == reason)
+        .map(|(_, counts)| counts)
+        .unwrap_or_default()
+}
+
+/// (completed operations, copied bytes, rejected operations) across all reasons.
+fn activity(copies: &CopyContext) -> (u64, u64, u64) {
+    copies
+        .report()
+        .entries
+        .iter()
+        .fold((0, 0, 0), |(done, bytes, rejected), (_, counts)| {
+            (
+                done + counts.completed,
+                bytes + counts.copied_bytes,
+                rejected + counts.rejected,
+            )
+        })
+}
+
+#[test]
+fn auxiliary_envelopes_reject_typed_media_and_count_legacy_binary_encoding() {
+    let (tx, _rx) = mpsc::channel(1);
+    let sender = SessionPacketSender::from(tx);
+    let copies = CopyContext::new(CopyPolicy::AllowCopies, "aux-envelope-test");
+    let audio = RuntimeData::Audio {
+        samples: vec![0.25_f32; 4].into(),
+        sample_rate: 16_000,
+        channels: 1,
+        stream_id: None,
+        timestamp_us: None,
+        arrival_ts_us: None,
+        metadata: None,
+    };
+    let tensor = RuntimeData::Tensor {
+        data: vec![1_u8; 8].into(),
+        shape: vec![2],
+        dtype: 0,
+        metadata: None,
+    };
+    for payload in [audio, tensor] {
+        let error = sender
+            .control_payload(Some("context"), payload, &copies)
+            .expect_err("typed media must not be replaced by a type tag");
+        assert!(error.to_string().contains("main input"), "{error}");
+    }
+    assert_eq!(
+        activity(&copies),
+        (0, 0, 0),
+        "rejected media copied nothing"
+    );
+
+    let main = sender
+        .control_payload(None, RuntimeData::Binary(vec![9_u8; 6].into()), &copies)
+        .unwrap();
+    assert!(matches!(main, RuntimeData::Binary(ref b) if b.len() == 6));
+    assert_eq!(activity(&copies), (0, 0, 0), "main rail forwards the owner");
+
+    let wrapped = sender
+        .control_payload(
+            Some("context"),
+            RuntimeData::Binary(vec![9_u8; 6].into()),
+            &copies,
+        )
+        .unwrap();
+    let RuntimeData::Json(envelope) = wrapped else {
+        panic!("expected envelope")
+    };
+    assert_eq!(envelope["payload"]["binary_b64"], "CQkJCQkJ");
+    let counts = counts_for(&copies, CopyReason::PortableSerialization);
+    assert_eq!((counts.completed, counts.copied_bytes), (1, 6));
+    assert_eq!(
+        activity(&copies),
+        (1, 6, 0),
+        "only the binary encoding is counted"
+    );
+
+    let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "aux-envelope-strict");
+    assert!(sender
+        .control_payload(
+            Some("context"),
+            RuntimeData::Binary(vec![1_u8; 3].into()),
+            &strict
+        )
+        .is_err());
+    let counts = counts_for(&strict, CopyReason::PortableSerialization);
+    assert_eq!((counts.rejected, counts.rejected_bytes), (1, 3));
+    assert_eq!(counts.completed, 0, "strict rejection precedes encoding");
+    assert!(sender
+        .control_payload(Some("context"), RuntimeData::Text("ok".into()), &strict)
+        .is_ok());
 }
