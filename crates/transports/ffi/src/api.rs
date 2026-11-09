@@ -50,163 +50,130 @@ fn map_runtime_error(e: remotemedia_core::Error) -> PyErr {
     }
 }
 
-/// Execute a pipeline from a JSON manifest
-///
-/// # Arguments
-/// * `manifest_json` - JSON string containing the pipeline manifest
-///
-/// # Returns
-/// Python coroutine that resolves to execution results
-///
-/// # Example (Python)
-/// ```python
-/// import asyncio
-/// from remotemedia._remotemedia_runtime import execute_pipeline
-///
-/// async def main():
-///     manifest = '{"version": "v1", ...}'
-///     results = await execute_pipeline(manifest)
-///     print(results)
-///
-/// asyncio.run(main())
-/// ```
+/// Execute one unary request with the real session's transport copy authority.
+/// All supplied inputs are validated; the historical API executes only the first.
+async fn execute_unary_python(
+    manifest_json: String,
+    input_data: Vec<Py<PyAny>>,
+    enable_metrics: bool,
+    pipeline_buffers: Option<crate::python::buffer_config::PipelineBufferConfig>,
+) -> PyResult<Py<PyAny>> {
+    let manifest: Manifest = serde_json::from_str(&manifest_json).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("Failed to parse manifest: {}", e))
+    })?;
+    let config = pipeline_buffers
+        .as_ref()
+        .map(crate::python::buffer_config::PipelineBufferConfig::to_executor_config)
+        .transpose()?
+        .unwrap_or_default();
+    let executor = PipelineExecutor::with_config(config).map_err(map_runtime_error)?;
+    for factory in crate::plugins::collect_registered_factories() {
+        executor.register_factory(factory).await;
+    }
+    let mut session = executor
+        .create_session(Arc::new(manifest))
+        .await
+        .map_err(map_runtime_error)?;
+    let copies = session.transport_copy_context();
+    let result = async {
+        let inputs = Python::attach(|py| {
+            input_data
+                .iter()
+                .map(|obj| {
+                    crate::marshal::python_to_runtime_data_with_context(py, obj.bind(py), &copies)
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })?;
+        let input = inputs
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| RuntimeData::Text(String::new()));
+        session
+            .send_input(TransportData::new(input))
+            .await
+            .map_err(map_runtime_error)?;
+        session.signal_input_complete();
+        session
+            .recv_output()
+            .await
+            .map_err(map_runtime_error)?
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("No output from pipeline"))
+    }
+    .await;
+    // Join cleanup even when input conversion or execution failed. Preserve the
+    // original operation error, and surface cleanup failures on successful runs.
+    let closed = session.close().await.map_err(map_runtime_error);
+    let joined = session.wait().await.map_err(map_runtime_error);
+    let output = result?;
+    closed?;
+    joined?;
+    Python::attach(|py| {
+        let outputs = crate::marshal::runtime_data_to_python_with_context(
+            py,
+            &output.data.into_shared(),
+            &copies,
+        )?;
+        if !enable_metrics {
+            return Ok(outputs);
+        }
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("outputs", outputs)?;
+        dict.set_item("metrics", "{}")?;
+        // Includes output decoding above; this is the instrumented transport
+        // ledger, not a claim about arbitrary model or device internals.
+        let report = serde_json::to_value(copies.report())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        dict.set_item("copy_report", crate::marshal::json_to_python(py, &report)?)?;
+        Ok(dict.into_any().unbind())
+    })
+}
+
+/// Execute a unary pipeline with an empty text input.
+/// `pipeline_buffers` configures the same copy policy and budgets as streaming.
+/// With metrics enabled, returns outputs, the legacy metrics field, and copy_report.
 #[pyfunction]
+#[pyo3(signature = (manifest_json, enable_metrics=None, *, pipeline_buffers=None))]
 pub fn execute_pipeline(
     py: Python<'_>,
     manifest_json: String,
     enable_metrics: Option<bool>,
+    pipeline_buffers: Option<crate::python::buffer_config::PipelineBufferConfig>,
 ) -> PyResult<Bound<'_, PyAny>> {
-    // Capture the asyncio loop / context so inline-async dispatch deep
-    // inside the executor can find them (session-router tokio spawns
-    // don't inherit task-locals). Must happen on the calling Python
-    // thread, before `future_into_py` moves us into tokio.
     super::inline_python_node::set_task_locals(pyo3_async_runtimes::tokio::get_current_locals(py)?);
-    future_into_py(py, async move {
-        // Parse manifest
-        let manifest: Manifest = serde_json::from_str(&manifest_json).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Failed to parse manifest: {}",
-                e
-            ))
-        })?;
-        let manifest = Arc::new(manifest);
-
-        // Create PipelineExecutor (spec 026 migration)
-        let executor = PipelineExecutor::new().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to create executor: {}",
-                e
-            ))
-        })?;
-
-        // Execute using PipelineExecutor (no input data for basic execution)
-        let input = TransportData::new(RuntimeData::Text(String::new()));
-        let output = executor
-            .execute_unary(manifest, input)
-            .await
-            .map_err(map_runtime_error)?;
-
-        // Convert output to Python
-        Python::attach(|py| {
-            // Use runtime_data_to_python for direct conversion (zero-copy for numpy!)
-            // This avoids JSON serialization and converts RuntimeData::Numpy directly to numpy arrays
-            let outputs_py = runtime_data_into_python(py, output.data)?;
-
-            // Include metrics if requested - now includes scheduler metrics from PipelineExecutor
-            if enable_metrics.unwrap_or(false) {
-                let dict = pyo3::types::PyDict::new(py);
-                dict.set_item("outputs", &outputs_py)?;
-                dict.set_item("metrics", "{}")?; // Placeholder - metrics exposed via executor.prometheus_metrics()
-                Ok(dict.into_any().unbind())
-            } else {
-                Ok(outputs_py) // runtime_data_to_python already returns PyObject (unbound)
-            }
-        })
-    })
+    future_into_py(
+        py,
+        execute_unary_python(
+            manifest_json,
+            Vec::new(),
+            enable_metrics.unwrap_or(false),
+            pipeline_buffers,
+        ),
+    )
 }
 
-/// Execute a pipeline with input data
-///
-/// # Arguments
-/// * `manifest_json` - JSON string containing the pipeline manifest
-/// * `input_data` - List of input items to process
-///
-/// # Returns
-/// Python coroutine that resolves to list of results
-///
-/// # Example (Python)
-/// ```python
-/// manifest = pipeline.serialize()
-/// results = await execute_pipeline_with_input(manifest, [1, 2, 3])
-/// ```
+/// Validate all input items and execute the first (or empty text for an empty list).
+/// Owners remain alive through execution; compatibility copies use the session ledger.
 #[pyfunction]
+#[pyo3(signature = (manifest_json, input_data, enable_metrics=None, *, pipeline_buffers=None))]
 pub fn execute_pipeline_with_input<'py>(
     py: Python<'py>,
     manifest_json: String,
     input_data: Vec<Bound<'py, PyAny>>,
     enable_metrics: Option<bool>,
+    pipeline_buffers: Option<crate::python::buffer_config::PipelineBufferConfig>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    // Capture asyncio task-locals for inline-async dispatch (see
-    // `execute_pipeline` for rationale).
     super::inline_python_node::set_task_locals(pyo3_async_runtimes::tokio::get_current_locals(py)?);
-
-    // Convert input_data to RuntimeData directly (zero-copy for numpy!)
-    let rust_input: Vec<RuntimeData> = input_data
-        .iter()
-        .map(|obj| python_to_runtime_data(py, obj))
-        .collect::<PyResult<Vec<_>>>()?;
-
-    future_into_py(py, async move {
-        // Parse manifest
-        let manifest: Manifest = serde_json::from_str(&manifest_json).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Failed to parse manifest: {}",
-                e
-            ))
-        })?;
-        let manifest = Arc::new(manifest);
-
-        // Create PipelineExecutor (spec 026 migration)
-        let executor = PipelineExecutor::new().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to create executor: {}",
-                e
-            ))
-        })?;
-
-        // Use first input item or empty text
-        let input_data = if let Some(first) = rust_input.first() {
-            first.clone()
-        } else {
-            RuntimeData::Text(String::new())
-        };
-
-        // Execute using PipelineExecutor - uses map_runtime_error for proper validation error handling
-        let input = TransportData::new(input_data);
-        let output = executor
-            .execute_unary(manifest, input)
-            .await
-            .map_err(map_runtime_error)?;
-
-        // Convert output to Python
-        Python::attach(|py| {
-            // Use runtime_data_to_python for direct conversion (zero-copy for numpy!)
-            // This avoids JSON serialization and converts RuntimeData::Numpy directly to numpy arrays
-            let outputs_py = runtime_data_into_python(py, output.data)?;
-
-            // Include metrics if requested - now includes scheduler metrics from PipelineExecutor
-            if enable_metrics.unwrap_or(false) {
-                let dict = pyo3::types::PyDict::new(py);
-                dict.set_item("outputs", &outputs_py)?;
-                dict.set_item("metrics", "{}")?; // Placeholder - metrics exposed via executor.prometheus_metrics()
-                Ok(dict.into_any().unbind())
-            } else {
-                Ok(outputs_py) // runtime_data_to_python already returns PyObject (unbound)
-            }
-        })
-    })
+    let inputs = input_data.into_iter().map(Bound::unbind).collect();
+    future_into_py(
+        py,
+        execute_unary_python(
+            manifest_json,
+            inputs,
+            enable_metrics.unwrap_or(false),
+            pipeline_buffers,
+        ),
+    )
 }
-
 /// Execute pipeline directly with Python Node instances (Feature 011)
 ///
 /// This function bypasses the node registry and executes Node instances

@@ -810,3 +810,30 @@ owner belongs to that standalone boundary, not retroactively to the destination
 session. The legacy `createStreamSession` loop, unary paths and independent
 WebRTC wrappers remain separate. Strict core policy does not certify arbitrary
 caller/backend operations as physically copy-free.
+
+### Python unary buffer policy
+
+`execute_pipeline(manifest_json, enable_metrics=None, *, pipeline_buffers=None)`
+and `execute_pipeline_with_input(manifest_json, input_data, enable_metrics=None,
+*, pipeline_buffers=None)` accept the same `PipelineBufferConfig` as streaming.
+They create the actual core session before conversion and use its transport copy
+context for both input and output. Immutable bytes and published native buffers
+retain their owners; private mutable input requires an accounted compatibility
+copy or raises `BufferError` under strict policy. Input conversion now occurs
+asynchronously during execution; keep mutable inputs unchanged until submission
+completes. Output views retain storage after unary shutdown.
+
+The existing list behavior is preserved: all items are validated, and only the
+first item is executed (empty input uses empty text). Compatibility copies for
+all validated items are counted. Prefer a one-element list for unary work and a
+streaming session for multiple requests. Input completion is signalled, and
+ordinary success/conversion/execution errors close and join the session before
+returning. Cancellation and arbitrary blocked nodes still require lifecycle work.
+
+With `enable_metrics=True`, the result contains `outputs`, the existing `metrics`
+placeholder, and `copy_report`, the session's instrumented transport ledger after
+output conversion. It does not report arbitrary model/device internals or replace
+node materialization reports. Without metrics, the result remains the output
+value. Inline Python node execution and `execute_pipeline_with_instances` still
+have separate legacy conversion boundaries; strict preflight does not certify
+those paths. Loaded plugin factories are registered before unary session creation.
