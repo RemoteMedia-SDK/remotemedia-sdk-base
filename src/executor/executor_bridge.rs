@@ -170,13 +170,12 @@ impl ExecutorBridge for MultiprocessExecutorBridge {
             self.session_id
         );
 
-        // For MVP: The multiprocess executor handles the actual execution
-        // TODO: Use params for runtime configuration in Phase 4 (US2)
-        // Data conversion between executors will be added in Phase 4 (US2)
-        // For now, we verify the node can be executed via multiprocess
-
-        // Return input data (actual execution happens through existing pipeline)
-        Ok(input_data)
+        // This bridge never reached the worker; echoing the input silently
+        // skipped the node. Reject explicitly, as streaming execution already does.
+        let _ = input_data;
+        Err(Error::Execution(format!(
+            "MultiprocessExecutorBridge cannot execute node '{node_id}' ({node_type}); run it through a streaming session"
+        )))
     }
 
     async fn execute_node_streaming(

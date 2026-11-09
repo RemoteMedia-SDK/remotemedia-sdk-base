@@ -272,10 +272,10 @@ impl AsyncStreamingNode for MultiprocessNativeNode {
         ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
         let copies = self.call_authority(ctx.node_id(), ctx.session_id(), ctx.copy_context())?;
-        let data = inputs
-            .into_values()
-            .next()
-            .ok_or_else(|| Error::Execution("No input data provided".into()))?;
+        let data = crate::nodes::python_streaming::single_named_input(
+            inputs,
+            "native compatibility node",
+        )?;
         self.process_with_copies(data, copies).await
     }
 

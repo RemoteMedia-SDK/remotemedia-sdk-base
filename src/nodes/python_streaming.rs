@@ -404,10 +404,7 @@ impl AsyncStreamingNode for PythonStreamingNode {
         ctx: &dyn crate::nodes::NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
         Self::legacy_copies(ctx)?;
-        let (_, data) = inputs
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Execution("No input data provided".into()))?;
+        let data = single_named_input(inputs, "legacy Python node")?;
         self.process_with_ctx(data, ctx).await
     }
 
@@ -426,4 +423,23 @@ impl AsyncStreamingNode for PythonStreamingNode {
             .await?;
         Ok(true)
     }
+}
+
+/// Legacy subprocess protocols carry one payload per turn. Reject several
+/// named inputs explicitly instead of forwarding an arbitrary one.
+pub(crate) fn single_named_input(
+    inputs: std::collections::HashMap<String, RuntimeData>,
+    adapter: &str,
+) -> Result<RuntimeData, Error> {
+    if inputs.len() > 1 {
+        let mut ports: Vec<_> = inputs.keys().cloned().collect();
+        ports.sort();
+        return Err(Error::Execution(format!(
+            "{adapter} accepts one input per call; received named inputs {ports:?}. Use a mapped worker for multi-input nodes"
+        )));
+    }
+    inputs
+        .into_values()
+        .next()
+        .ok_or_else(|| Error::Execution("No input data provided".into()))
 }

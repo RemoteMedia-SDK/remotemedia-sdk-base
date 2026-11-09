@@ -8,6 +8,8 @@ pub mod health_monitor;
 #[cfg(feature = "multiprocess")]
 pub mod ipc_channel;
 #[cfg(feature = "multiprocess")]
+mod legacy_call;
+#[cfg(feature = "multiprocess")]
 pub mod multiprocess_executor;
 #[cfg(feature = "multiprocess")]
 pub mod process_manager;

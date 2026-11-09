@@ -94,7 +94,7 @@ enum IpcCommand {
 
 /// Responses from the dedicated IPC thread
 #[cfg(feature = "multiprocess")]
-enum IpcResponse {
+pub(super) enum IpcResponse {
     /// Data received from the node's output channel (serialized Python wire bytes)
     OutputData(SharedBytes),
     /// Acknowledgment that data was sent successfully
@@ -283,6 +283,8 @@ pub struct NodeIpcThread {
     command_tx: tokio::sync::mpsc::Sender<IpcCommand>,
     /// Channel to receive responses from the IPC thread
     response_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<IpcResponse>>>,
+    /// Turns that ended before their EndOfInput; their responses are still queued.
+    abandoned: Arc<super::legacy_call::AbandonedTurns>,
     /// Handle to the OS thread (for cleanup)
     thread_handle: Option<std::thread::JoinHandle<()>>,
     /// Node ID this thread serves
@@ -691,159 +693,43 @@ impl MultiprocessExecutor {
             .get(&session_id)
             .ok_or_else(|| Error::Execution(format!("Session {} not found", session_id)))?;
 
-        let ipc_thread_cmd_tx = session
-            .ipc_threads
-            .get(&ctx.node_id)
-            .ok_or_else(|| {
-                Error::Execution(format!("IPC thread not found for node {}", ctx.node_id))
-            })?
-            .command_tx
-            .clone();
-
-        let ipc_thread_resp_rx = session
-            .ipc_threads
-            .get(&ctx.node_id)
-            .ok_or_else(|| {
-                Error::Execution(format!("IPC thread not found for node {}", ctx.node_id))
-            })?
-            .response_rx
-            .clone();
+        let thread = session.ipc_threads.get(&ctx.node_id).ok_or_else(|| {
+            Error::Execution(format!("IPC thread not found for node {}", ctx.node_id))
+        })?;
+        let ipc_thread_cmd_tx = thread.command_tx.clone();
+        let ipc_thread_resp_rx = thread.response_rx.clone();
+        let abandoned = thread.abandoned.clone();
 
         drop(sessions); // Release read lock
 
-        // Send data to IPC thread (fast, no blocking!)
-        tracing::debug!(
-            "[Multiprocess] Sending data to IPC thread for node '{}'",
-            ctx.node_id
-        );
-        ipc_thread_cmd_tx
-            .send(IpcCommand::SendData {
-                bytes: ipc_data,
-                copies: copies.clone(),
-            })
-            .await
-            .map_err(|e| Error::Execution(format!("Failed to send to IPC thread: {}", e)))?;
-
-        // Wait for send acknowledgment
+        // Hold the node's response lane for the whole turn, including the send,
+        // so concurrent turns cannot interleave their outputs.
         let mut resp_rx = ipc_thread_resp_rx.lock().await;
-        match tokio::time::timeout(std::time::Duration::from_secs(5), resp_rx.recv()).await {
-            Ok(Some(IpcResponse::SendComplete)) => {
-                tracing::debug!("Data sent successfully to node: {}", ctx.node_id);
-            }
-            Ok(Some(IpcResponse::Error(e))) => {
-                return Err(Error::Execution(format!("IPC send error: {}", e)));
-            }
-            Ok(None) | Err(_) => {
-                return Err(Error::Execution(format!(
-                    "Timeout waiting for send confirmation"
-                )));
-            }
-            _ => {}
-        }
-
-        // Collect outputs from IPC thread continuously
-        // The callback will control when to stop (e.g., based on end markers)
-        let mut output_count = 0;
-
-        tracing::debug!(
-            "[Multiprocess] Continuously collecting output from node '{}'",
-            ctx.node_id
-        );
-
-        // Upper bound only. The hot path is the `EndOfInput` sentinel — Python
-        // emits it after each `process()` call, so we return immediately.
-        // This fallback fires only if the Python node crashes or never signals
-        // completion (e.g. an older client without the sentinel).
-        let hard_timeout = std::time::Duration::from_secs(300);
-
-        loop {
-            tracing::debug!(
-                "[Multiprocess] Waiting for response from IPC thread for node '{}'",
-                ctx.node_id
-            );
-
-            match tokio::time::timeout(hard_timeout, resp_rx.recv()).await {
-                Err(_) => {
-                    // Timeout — no more outputs from the node for this input
-                    tracing::debug!(
-                        "[Multiprocess] Output receive timeout for node '{}' after {} outputs",
-                        ctx.node_id,
-                        output_count
-                    );
-                    return Ok(output_count);
-                }
-                Ok(recv_result) => match recv_result {
-                    Some(IpcResponse::OutputData(ipc_output)) => {
-                        // EndOfInput is the Python side's "done for this input"
-                        // signal. Check the first byte (wire data type) directly.
-                        // WireDataType::EndOfInput = 8
-                        if !ipc_output.is_empty() && ipc_output[0] == 8 {
-                            tracing::debug!(
-                            "[Multiprocess] Received EndOfInput from node '{}' after {} outputs",
-                            ctx.node_id,
-                            output_count
-                        );
-                            return Ok(output_count);
-                        }
-
-                        tracing::debug!(
-                            "[Multiprocess] Received OutputData from node '{}': {} bytes",
-                            ctx.node_id,
-                            ipc_output.len()
-                        );
-
-                        let output_data = crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(
-                            ipc_output.into(), copies,
-                        ).map_err(Error::Execution)?;
-
-                        tracing::debug!(
-                        "[Multiprocess] Converted to RuntimeData, invoking callback for node '{}'",
-                        ctx.node_id
-                    );
-
-                        // Forward all outputs - the callback decides when to stop
-                        match callback(output_data) {
-                            Ok(_) => {
-                                output_count += 1;
-                                tracing::debug!("[Multiprocess] Callback succeeded for node '{}', total outputs: {}", ctx.node_id, output_count);
-                            }
-                            Err(e) => {
-                                // Callback returned error - stop collecting
-                                tracing::debug!(
-                                    "Callback stopped collection for node {} after {} outputs: {}",
-                                    ctx.node_id,
-                                    output_count,
-                                    e
-                                );
-                                return Ok(output_count);
-                            }
-                        }
-                    }
-                    Some(IpcResponse::SendComplete) => {
-                        tracing::debug!("[Multiprocess] Received SendComplete from node '{}', continuing to poll for outputs", ctx.node_id);
-                        // Acknowledgment - ignore and continue polling for outputs
-                        continue;
-                    }
-                    Some(IpcResponse::Error(e)) => {
-                        tracing::error!(
-                            "[Multiprocess] IPC error from node '{}': {}",
-                            ctx.node_id,
-                            e
-                        );
-                        return Err(Error::Execution(format!("IPC error: {}", e)));
-                    }
-                    None => {
-                        // IPC thread disconnected
-                        tracing::debug!(
-                            "IPC thread disconnected for node {} after {} outputs",
-                            ctx.node_id,
-                            output_count
-                        );
-                        return Ok(output_count);
-                    }
-                }, // match recv_result
-            } // match timeout
-        }
+        let node_id = ctx.node_id.clone();
+        let send = async {
+            ipc_thread_cmd_tx
+                .send(IpcCommand::SendData {
+                    bytes: ipc_data,
+                    copies: copies.clone(),
+                })
+                .await
+                .map_err(|e| Error::Execution(format!("Failed to send to IPC thread: {}", e)))
+        };
+        super::legacy_call::run(
+            &mut resp_rx,
+            &abandoned,
+            super::legacy_call::Timeouts::default(),
+            &node_id,
+            send,
+            |frame| {
+                crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(
+                    frame, copies,
+                )
+                .map_err(Error::Execution)
+            },
+            &mut callback,
+        )
+        .await
     }
 
     /// Register a bounded callback channel for continuous output forwarding
@@ -2399,6 +2285,7 @@ sys.stdout.flush()
         Ok(NodeIpcThread {
             command_tx: cmd_tx,
             response_rx: Arc::new(tokio::sync::Mutex::new(resp_rx)),
+            abandoned: Arc::default(),
             thread_handle: Some(handle),
             node_id: node_id.to_string(),
         })
@@ -3173,18 +3060,13 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 .as_ref()
                 .ok_or_else(|| Error::Execution("Node not initialized".to_string()))?;
 
-            let _session_id = ctx
-                .session_id
-                .clone()
-                .unwrap_or_else(|| format!("default_{}", ctx.node_id));
-
-            // Send input to node process via IPC
-            // TODO: Use session_id for IPC channel routing
-            // This is a placeholder - actual IPC implementation will be in ipc_channel.rs
-            tracing::debug!("Processing input in multiprocess node: {}", ctx.node_id);
-
-            // For now, just pass through
-            Ok(vec![input])
+            // The JSON NodeExecutor surface never reached the worker; returning
+            // the input unchanged silently skipped the node. Reject explicitly.
+            let _ = input;
+            Err(Error::Execution(format!(
+                "multiprocess node '{}' does not support JSON NodeExecutor::process; run it through a streaming session (PythonStreamingNode)",
+                ctx.node_id
+            )))
         }
 
         #[cfg(not(feature = "multiprocess"))]
