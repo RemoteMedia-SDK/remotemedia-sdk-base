@@ -106,18 +106,25 @@ struct WireSize {
     limit: usize,
 }
 impl Write for WireSize {
+    #[inline]
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.bytes = self
-            .bytes
-            .checked_add(bytes.len())
-            .filter(|size| *size <= self.limit)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "native MessagePack size exceeds loan limit",
-                )
-            })?;
+        self.write_all(bytes)?;
         Ok(bytes.len())
+    }
+    /// MessagePack issues several tiny writes per element; overriding the
+    /// default retry loop keeps the sizing pass to one add and compare.
+    #[inline]
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self.bytes.checked_add(bytes.len()) {
+            Some(size) if size <= self.limit => {
+                self.bytes = size;
+                Ok(())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native MessagePack size exceeds loan limit",
+            )),
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -141,22 +148,37 @@ impl LoanWriter<'_> {
     }
 }
 impl Write for LoanWriter<'_> {
+    #[inline]
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let end = self
-            .written
-            .checked_add(bytes.len())
-            .filter(|end| *end <= self.destination.len())
-            .ok_or_else(|| {
-                io::Error::new(
+        self.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+    /// One bounds check and one copy per MessagePack write, instead of the
+    /// default retry loop and a per-byte store.
+    #[inline]
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let end = match self.written.checked_add(bytes.len()) {
+            Some(end) if end <= self.destination.len() => end,
+            _ => {
+                return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "native MessagePack exceeded sized loan",
-                )
-            })?;
-        for (out, byte) in self.destination[self.written..end].iter_mut().zip(bytes) {
-            out.write(*byte);
+                ))
+            }
+        };
+        let target = &mut self.destination[self.written..end];
+        // SAFETY: `target` is exactly `bytes.len()` writable elements, u8 and
+        // MaybeUninit<u8> share layout, and the source is a distinct borrow.
+        // Only initialized bytes are written; nothing reads the destination.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                target.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            );
         }
         self.written = end;
-        Ok(bytes.len())
+        Ok(())
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
