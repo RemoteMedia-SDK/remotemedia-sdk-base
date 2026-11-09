@@ -133,6 +133,77 @@ pub struct ProcessHandle {
 
     /// Execution target (process or container)
     pub execution_target: Arc<Mutex<Option<ExecutionTarget>>>,
+
+    /// The worker's whole process tree, terminated with it.
+    pub tree: Arc<ProcessTree>,
+}
+
+/// A Python worker's process tree, so termination reaches the processes it
+/// started, not only the direct child. On Unix the worker leads its own process
+/// group. On Windows it is the only member of its own kill-on-close job: the
+/// job is terminated explicitly, and closing its last handle (including when
+/// this process exits or crashes) kills whatever remains.
+#[derive(Default)]
+pub struct ProcessTree {
+    #[cfg(unix)]
+    group: Option<i32>,
+    #[cfg(windows)]
+    job: Option<win_job::Job>,
+}
+
+impl std::fmt::Debug for ProcessTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProcessTree")
+    }
+}
+
+impl ProcessTree {
+    /// Contain a freshly spawned worker. On Windows the child must have been
+    /// created suspended; this assigns it to its job and then resumes it.
+    pub(crate) fn adopt(child: &Child) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                group: Some(child.id() as i32),
+            }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                job: win_job::Job::adopt_and_resume(child),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            Self::default()
+        }
+    }
+
+    /// Ask every process in the tree to stop (SIGTERM to the Unix process
+    /// group). Returns false where no graceful tree signal exists.
+    pub(crate) fn terminate(&self) -> bool {
+        #[cfg(unix)]
+        if let Some(group) = self.group {
+            use nix::sys::signal::{killpg, Signal};
+            let _ = killpg(nix::unistd::Pid::from_raw(group), Signal::SIGTERM);
+            return true;
+        }
+        false
+    }
+
+    /// Kill every process in the tree.
+    pub(crate) fn kill(&self) {
+        #[cfg(unix)]
+        if let Some(group) = self.group {
+            use nix::sys::signal::{killpg, Signal};
+            let _ = killpg(nix::unistd::Pid::from_raw(group), Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+    }
 }
 
 impl ProcessHandle {
@@ -154,8 +225,9 @@ impl ProcessHandle {
         }
     }
 
-    /// Kill the process forcefully
+    /// Kill the process, and every process it started, forcefully
     pub async fn kill(&self) -> Result<()> {
+        self.tree.kill();
         if let Some(ref mut child) = *self.inner.lock().await {
             child
                 .kill()
@@ -414,11 +486,11 @@ impl ProcessManager {
 
         let pid = child.id();
 
-        // Windows has no parent-death signal: without the job, a worker
-        // outlives a host that exits or crashes and keeps answering on the
-        // next run's `session_0_*` channels.
-        #[cfg(windows)]
-        win_job::adopt_and_resume(&child);
+        // Contain the worker's process tree. Windows has no parent-death
+        // signal: without its kill-on-close job, a worker outlives a host that
+        // exits or crashes and keeps answering on the next run's
+        // `session_0_*` channels.
+        let tree = Arc::new(ProcessTree::adopt(&child));
 
         // Capture stderr for logging if process crashes
         let stderr_handle = if capture_output {
@@ -441,6 +513,7 @@ impl ProcessManager {
             let result = child.stdin.take().ok_or_else(|| std::io::Error::other("missing child stdin"))
                 .and_then(|mut stdin| stdin.write_all(bootstrap.to_string().as_bytes()));
             if let Err(error) = result {
+                tree.kill();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(Error::Execution(format!("Failed to write child bootstrap: {error}")));
@@ -460,6 +533,7 @@ impl ProcessManager {
             started_at: Instant::now(),
             inner: Arc::new(Mutex::new(Some(child))),
             execution_target: Arc::new(Mutex::new(None)),
+            tree,
         };
 
         // Register process
@@ -499,13 +573,16 @@ impl ProcessManager {
                 use nix::sys::signal::{kill, Signal};
                 use nix::unistd::Pid;
 
-                let pid = Pid::from_raw(child.id() as i32);
-                let _ = kill(pid, Signal::SIGTERM);
+                if !process.tree.terminate() {
+                    let pid = Pid::from_raw(child.id() as i32);
+                    let _ = kill(pid, Signal::SIGTERM);
+                }
             }
 
             #[cfg(windows)]
             {
-                // Windows doesn't have SIGTERM, just try to kill
+                // Windows has no SIGTERM: end the worker's whole job.
+                process.tree.kill();
                 let _ = child.kill();
             }
 
@@ -525,12 +602,15 @@ impl ProcessManager {
                     "Process {} did not terminate gracefully, forcing kill",
                     process.id
                 );
+                process.tree.kill();
                 child
                     .kill()
                     .map_err(|e| Error::Execution(format!("Failed to kill process: {}", e)))?;
             }
         }
 
+        // The worker exited; end anything it left behind in its tree.
+        process.tree.kill();
         if let Some(child) = process.inner.lock().await.as_mut() {
             child.wait().map_err(|error| Error::Execution(format!("Failed to confirm process exit: {error}")))?;
         }
@@ -709,6 +789,7 @@ impl ProcessManager {
                 container_id: container_id.clone(),
                 docker_client: docker_support.docker_client().clone(),
             }))),
+            tree: Arc::new(ProcessTree::default()),
         };
 
         // Register process (using node_id hash as key since we don't have a PID)
@@ -741,6 +822,101 @@ use nix;
 mod tests {
     use super::*;
 
+    fn alive(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::CloseHandle;
+            use windows::Win32::System::Threading::{
+                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            };
+            const STILL_ACTIVE: u32 = 259;
+            // SAFETY: a query-only handle opened and closed here.
+            unsafe {
+                let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+                    return false;
+                };
+                let mut code = 0u32;
+                let running = GetExitCodeProcess(process, &mut code).is_ok() && code == STILL_ACTIVE;
+                let _ = CloseHandle(process);
+                running
+            }
+        }
+    }
+
+    /// A worker that starts a long-running grandchild and reports its pid.
+    fn spawn_worker_with_grandchild(marker: &std::path::Path) -> (Child, ProcessTree, u32) {
+        let python = std::env::var("PYO3_PYTHON").unwrap_or_else(|_| "python3".into());
+        let mut command = Command::new(python);
+        command.args([
+            "-c",
+            "import subprocess, sys, time; \
+             p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); \
+             open(sys.argv[1], 'w').write(str(p.pid)); \
+             time.sleep(120)",
+        ]);
+        command.arg(marker);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(win_job::CREATE_SUSPENDED);
+        }
+        let child = command.spawn().unwrap();
+        let tree = ProcessTree::adopt(&child);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let grandchild = loop {
+            if let Some(pid) = std::fs::read_to_string(marker)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "worker did not start its grandchild");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(alive(grandchild));
+        (child, tree, grandchild)
+    }
+
+    fn assert_ends(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while alive(pid) {
+            assert!(Instant::now() < deadline, "process {pid} survived its worker's tree");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn killing_the_tree_ends_processes_the_worker_started() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut child, tree, grandchild) =
+            spawn_worker_with_grandchild(&directory.path().join("kill.pid"));
+        tree.kill();
+        child.wait().unwrap();
+        assert_ends(grandchild);
+    }
+
+    /// Windows: dropping the last handle closes the kill-on-close job, which is
+    /// also what happens to every worker tree when the host exits or crashes.
+    #[cfg(windows)]
+    #[test]
+    fn dropping_the_tree_ends_processes_the_worker_started() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut child, tree, grandchild) =
+            spawn_worker_with_grandchild(&directory.path().join("drop.pid"));
+        drop(tree);
+        child.wait().unwrap();
+        assert_ends(grandchild);
+    }
+
     #[tokio::test]
     async fn test_process_handle_creation() {
         let handle = ProcessHandle {
@@ -752,6 +928,7 @@ mod tests {
             started_at: Instant::now(),
             inner: Arc::new(Mutex::new(None)),
             execution_target: Arc::new(Mutex::new(None)),
+            tree: Arc::new(ProcessTree::default()),
         };
 
         assert_eq!(handle.id, 1234);
@@ -783,14 +960,14 @@ pub(crate) fn no_window_flag() -> Option<u32> {
     unsafe { GetConsoleWindow() }.is_null().then_some(0x0800_0000)
 }
 
-/// Python node workers on Windows live in one job object that kills its
-/// members when its last handle closes. This process holds that handle for
-/// its lifetime, so the workers (and whatever they start) end with it, even
-/// on a crash; the Linux equivalent is `PR_SET_PDEATHSIG` above.
+/// Each Python node worker on Windows is the only member of its own job object,
+/// which kills its members when its last handle closes. The worker's
+/// `ProcessTree` holds that handle, so the worker and whatever it starts end
+/// when it is terminated, when its handle is dropped, or when this process
+/// ends (even on a crash); the Linux equivalent is `PR_SET_PDEATHSIG` above.
 #[cfg(windows)]
 mod win_job {
     use std::os::windows::io::AsRawHandle;
-    use std::sync::OnceLock;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -798,47 +975,65 @@ mod win_job {
     };
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
     pub(super) const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
-    /// The job, created on first use; its handle is never closed (the OS
-    /// closes it when this process ends, which kills the members). `None`
-    /// if it could not be set up.
-    fn job() -> Option<HANDLE> {
-        static JOB: OnceLock<Option<isize>> = OnceLock::new();
-        JOB.get_or_init(|| unsafe {
-            let job = CreateJobObjectW(None, PCWSTR::null()).ok()?;
-            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if let Err(e) = SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const core::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) {
-                tracing::warn!("Python workers may outlive this process: job setup failed: {e}");
-                let _ = CloseHandle(job);
-                return None;
-            }
-            Some(job.0)
-        })
-        .map(HANDLE)
-    }
+    /// One worker's kill-on-close job. Dropping it closes the handle, which
+    /// kills any member still running.
+    pub(crate) struct Job(isize);
 
-    /// Put the (suspended) `child` in the job, then let it run.
-    pub(super) fn adopt_and_resume(child: &std::process::Child) {
-        if let Some(job) = job() {
-            let process = HANDLE(child.as_raw_handle() as isize);
-            // SAFETY: both handles are valid for the duration of the call.
-            if let Err(e) = unsafe { AssignProcessToJobObject(job, process) } {
-                tracing::warn!("Python worker {} may outlive this process: {e}", child.id());
+    impl Job {
+        /// Put the (suspended) `child` in a new job, then let it run. The
+        /// child is resumed even when containment fails, with a warning.
+        pub(crate) fn adopt_and_resume(child: &std::process::Child) -> Option<Self> {
+            let job = Self::create(child.id());
+            if let Some(job) = &job {
+                let process = HANDLE(child.as_raw_handle() as isize);
+                // SAFETY: both handles are valid for the duration of the call.
+                if let Err(e) = unsafe { AssignProcessToJobObject(HANDLE(job.0), process) } {
+                    tracing::warn!("Python worker {} may outlive its node: {e}", child.id());
+                }
+            }
+            resume(child.id());
+            job
+        }
+
+        fn create(pid: u32) -> Option<Self> {
+            // SAFETY: plain job-object calls on a handle owned by the result.
+            unsafe {
+                let job = CreateJobObjectW(None, PCWSTR::null()).ok()?;
+                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if let Err(e) = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) {
+                    tracing::warn!("Python worker {pid} may outlive its node: job setup failed: {e}");
+                    let _ = CloseHandle(job);
+                    return None;
+                }
+                Some(Self(job.0))
             }
         }
-        resume(child.id());
+
+        /// Kill every process in the job.
+        pub(crate) fn terminate(&self) {
+            // SAFETY: the handle stays valid until drop.
+            let _ = unsafe { TerminateJobObject(HANDLE(self.0), 1) };
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: closes the handle this value owns, exactly once.
+            let _ = unsafe { CloseHandle(HANDLE(self.0)) };
+        }
     }
 
     /// Resume every thread of `pid` (a CREATE_SUSPENDED process has one).
