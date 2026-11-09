@@ -526,6 +526,45 @@ pub fn output_device_formats(
     Ok((name, formats))
 }
 
+/// An input device's name, the formats it offers as `(channels, min_rate,
+/// max_rate)` ranges, and its own default `(channels, rate)`, without
+/// opening a stream. `selector` `None` is the host's default input device.
+pub fn input_device_formats(
+    selector: Option<&DeviceSelector>,
+    host_name: Option<&str>,
+) -> Result<InputDeviceFormats> {
+    let device = match selector {
+        Some(s) => find_input_device(s, host_name)?,
+        None => get_host(host_name)?
+            .default_input_device()
+            .ok_or_else(|| anyhow::anyhow!("No default input device available"))?,
+    };
+    let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+    let formats = device
+        .supported_input_configs()?
+        .map(|r| (r.channels(), r.min_sample_rate().0, r.max_sample_rate().0))
+        .collect();
+    let default = device
+        .default_input_config()
+        .ok()
+        .map(|c| (c.channels(), c.sample_rate().0));
+    Ok(InputDeviceFormats {
+        name,
+        formats,
+        default,
+    })
+}
+
+/// What [`input_device_formats`] reports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputDeviceFormats {
+    pub name: String,
+    /// `(channels, min_rate, max_rate)` per supported range.
+    pub formats: Vec<(u16, u32, u32)>,
+    /// The device's own `(channels, rate)` (its shared-mode format).
+    pub default: Option<(u16, u32)>,
+}
+
 /// Find an output device by selector
 pub fn find_output_device(selector: &DeviceSelector, host_name: Option<&str>) -> Result<Device> {
     let host = get_host(host_name)?;
