@@ -572,6 +572,45 @@ fn caps_kinds(c: &Option<Value>) -> Vec<String> {
     kinds
 }
 
+/// Data kinds (`audio`, `json`, `text`, ...) a node of `node_type` takes
+/// (`output == false`) or makes: the schema's `accepts` / `produces`, or
+/// else the media types of its declared capabilities. Empty when the node
+/// declares neither.
+pub fn data_kinds(
+    registry: &StreamingNodeRegistry,
+    node_type: &str,
+    params: &Value,
+    output: bool,
+) -> Vec<String> {
+    let schema = registry.get_factory(node_type).and_then(|f| f.schema());
+    let declared: Vec<String> = schema
+        .map(|s| if output { s.produces } else { s.accepts })
+        .unwrap_or_default()
+        .iter()
+        .map(|d| format!("{d:?}").to_lowercase())
+        .collect();
+    if !declared.is_empty() {
+        return declared;
+    }
+    let caps = caps_for(registry, node_type, params);
+    let (inputs, outputs) = caps_text(caps.as_ref());
+    caps_kinds(if output { &outputs } else { &inputs })
+}
+
+/// Whether data of kind `made` can be taken as kind `taken` (numpy arrays
+/// are tensors; images and video frames travel as the same frames).
+pub fn kinds_fit(made: &str, taken: &str) -> bool {
+    let norm = |k: &str| {
+        match k {
+            "numpy" => "tensor",
+            "image" => "video",
+            other => other,
+        }
+        .to_string()
+    };
+    norm(made) == norm(taken)
+}
+
 /// One catalog entry: `{type, category, description, role?, inputs,
 /// outputs, params, input_caps?, output_caps?, requires?, params_schema?}`.
 /// `role` is left out when `omit_transform_role` and the node is a
