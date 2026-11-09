@@ -1,30 +1,16 @@
-use super::state::State;
+use super::frame::{self, OUTPUT_PREFIX};
 use super::*;
+use remotemedia_types::{CopyEvent, CopyLedger};
 use std::io::Write;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 fn copies(boundary: &str) -> CopyContext {
     CopyContext::new(CopyPolicy::AllowCopies, boundary)
 }
-fn count(context: &CopyContext) -> CopyCounts {
-    context.counts()[CopyReason::PortableDeserialization as usize]
-}
-fn event(seq: u64, call: u64, event: WireCopy) -> Report {
-    Report {
-        seq,
-        call,
-        event: Event::Copy {
-            reason: CopyReason::PortableDeserialization,
-            event,
-        },
-    }
-}
-fn terminal(seq: u64, call: u64) -> Report {
-    Report {
-        seq,
-        call,
-        event: Event::Finished { error: None },
-    }
+fn count(context: &CopyContext, reason: CopyReason) -> CopyCounts {
+    context.counts()[reason as usize]
 }
 fn bootstrap(host: &Host) -> Bootstrap {
     let mut bytes = Vec::new();
@@ -37,124 +23,178 @@ fn connected() -> (Arc<Host>, Worker) {
     host.wait_ready(|| Ok(true)).unwrap();
     (host, worker)
 }
-
-#[test]
-fn reports_bind_exact_context_and_enforce_transitions() {
-    let mut state = State::default();
-    assert!(state
-        .begin(CopyContext::new(CopyPolicy::RequireZeroCopy, "strict"))
-        .is_err());
-    let a = copies("first");
-    let b = copies("second");
-    let call = state.begin(a.clone()).unwrap();
-    assert!(state.begin(b.clone()).is_err());
-    assert!(state.apply(event(2, call, WireCopy::Started)).is_err());
-    assert!(state.apply(event(1, call + 1, WireCopy::Started)).is_err());
-    assert!(state
-        .apply(event(1, call, WireCopy::Completed { bytes: 7 }))
-        .is_err());
-    state.apply(event(1, call, WireCopy::Started)).unwrap();
-    assert!(state.apply(event(1, call, WireCopy::Started)).is_err());
-    assert!(state.apply(event(2, call, WireCopy::Started)).is_err());
-    assert!(state.apply(terminal(2, call)).is_err());
-    state
-        .apply(event(2, call, WireCopy::Completed { bytes: 7 }))
-        .unwrap();
-    state.apply(terminal(3, call)).unwrap();
-    assert!(state.status(call).unwrap());
-    assert!(state.apply(event(4, call, WireCopy::Started)).is_err());
-    let next = state.begin(b.clone()).unwrap();
-    state.apply(event(4, next, WireCopy::Started)).unwrap();
-    state
-        .apply(event(5, next, WireCopy::Failed { bytes: 9 }))
-        .unwrap();
-    state
-        .apply(event(6, next, WireCopy::Rejected { bytes: 11 }))
-        .unwrap();
-    state.apply(terminal(7, next)).unwrap();
-    assert_eq!(count(&a).copied_bytes, 7);
-    assert_eq!(count(&a).failed, 0);
-    assert_eq!(count(&b).copied_bytes, 0);
-    assert_eq!(count(&b).failed_requested_bytes, 9);
-    assert_eq!(count(&b).rejected_bytes, 11);
-    assert_eq!(count(&b).in_flight, 0);
+fn input_frame(call: u64, boundary: &str, body: &[u8]) -> Vec<u8> {
+    let prefix = frame::input_prefix_len(boundary).unwrap();
+    let mut head = vec![MaybeUninit::uninit(); prefix];
+    frame::write_input(&mut head, call, boundary).unwrap();
+    // SAFETY: write_input initializes every byte of an exact-length prefix.
+    let mut bytes: Vec<u8> = head.into_iter().map(|b| unsafe { b.assume_init() }).collect();
+    bytes.extend_from_slice(body);
+    bytes
+}
+fn output_frame(call: u64, ok: bool, ledger: &CopyContext, body: &[u8]) -> Vec<u8> {
+    let mut head = vec![MaybeUninit::uninit(); OUTPUT_PREFIX];
+    frame::write_output(&mut head, call, ok, &ledger.counts()).unwrap();
+    // SAFETY: write_output initializes every byte of an exact-length prefix.
+    let mut bytes: Vec<u8> = head.into_iter().map(|b| unsafe { b.assume_init() }).collect();
+    bytes.extend_from_slice(body);
+    bytes
 }
 
 #[test]
-fn interrupted_reports_are_failed_not_completed_or_zero_copy_proof() {
-    let mut state = State::default();
-    let copies = copies("disconnect");
-    let call = state.begin(copies.clone()).unwrap();
-    state.apply(event(1, call, WireCopy::Started)).unwrap();
-    assert_eq!(count(&copies).in_flight, 1);
-    state.fail("disconnected");
-    state.fail("again");
-    assert!(state.status(call).is_err());
-    assert!(state.begin(copies.clone()).is_err());
-    let counts = count(&copies);
-    assert_eq!(counts.in_flight, 0);
+fn input_frames_carry_call_boundary_and_body() {
+    let bytes = input_frame(7, "session:a/node", b"payload");
+    let input = frame::parse_input(&bytes).unwrap();
+    assert_eq!(input.call, 7);
+    assert_eq!(input.boundary, "session:a/node");
+    assert_eq!(input.body, b"payload");
+    assert!(frame::parse_input(&bytes[..10]).is_err());
+    let mut legacy = bytes.clone();
+    legacy[0] = b'X';
+    assert!(frame::parse_input(&legacy).is_err());
+    assert!(frame::input_prefix_len(&"b".repeat(2000)).is_err());
+    let truncated_name = &bytes[..16];
+    assert!(frame::parse_input(truncated_name).is_err());
+}
+
+#[test]
+fn output_totals_replay_to_the_same_counts_as_direct_recording() {
+    // Worker-side ledger with completed, failed and rejected operations.
+    let worker = copies("worker");
+    for bytes in [17, 31] {
+        worker.record(CopyReason::PortableDeserialization, CopyEvent::Started);
+        worker.record(CopyReason::PortableDeserialization, CopyEvent::Completed(bytes));
+    }
+    worker.record(CopyReason::PortableSerialization, CopyEvent::Started);
+    worker.record(CopyReason::PortableSerialization, CopyEvent::Failed(9));
+    worker.record(CopyReason::VecMaterialization, CopyEvent::Rejected(11));
+    let bytes = output_frame(3, true, &worker, b"body");
+    let output = frame::parse_output(&bytes).unwrap();
+    assert_eq!((output.call, output.ok, output.body), (3, true, &b"body"[..]));
+    let host = copies("host");
+    frame::replay(&host, &output.totals);
+    assert_eq!(host.counts(), worker.counts());
+    assert_eq!(count(&host, CopyReason::PortableDeserialization).copied_bytes, 48);
+    assert_eq!(count(&host, CopyReason::PortableDeserialization).completed, 2);
+    assert!(host.counts().iter().all(|c| c.in_flight == 0));
+}
+
+#[test]
+fn malformed_or_incoherent_output_frames_are_rejected() {
+    let worker = copies("worker");
+    worker.record(CopyReason::PortableSerialization, CopyEvent::Started);
+    worker.record(CopyReason::PortableSerialization, CopyEvent::Completed(5));
+    let good = output_frame(1, false, &worker, b"handler failed");
+    let output = frame::parse_output(&good).unwrap();
+    assert!(!output.ok);
+    assert_eq!(output.body, b"handler failed");
+    assert!(frame::parse_output(&good[..OUTPUT_PREFIX - 1]).is_err());
+    let field = |reason: CopyReason, field: usize| 16 + (reason as usize * 6 + field) * 8;
+    for corrupt in [
+        |b: &mut Vec<u8>| b[0] = b'X',  // magic
+        |b: &mut Vec<u8>| b[12] = 2,    // status
+        |b: &mut Vec<u8>| b[13] += 1,   // reason count
+        |b: &mut Vec<u8>| b[14] = 1,    // reserved
+    ] {
+        let mut bytes = good.clone();
+        corrupt(&mut bytes);
+        assert!(frame::parse_output(&bytes).is_err());
+    }
+    // Bytes without operations, and unbounded operation counts.
+    let mut bytes = good.clone();
+    let at = field(CopyReason::VecMaterialization, 1);
+    bytes[at..at + 8].copy_from_slice(&3u64.to_le_bytes());
+    assert!(frame::parse_output(&bytes).is_err());
+    let mut bytes = good.clone();
+    let at = field(CopyReason::VecMaterialization, 0);
+    bytes[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(frame::parse_output(&bytes).is_err());
+    // A worker cannot report a terminal with copies still in flight.
+    worker.record(CopyReason::PortableSerialization, CopyEvent::Started);
+    let mut head = vec![MaybeUninit::uninit(); OUTPUT_PREFIX];
+    assert!(frame::write_output(&mut head, 2, true, &worker.counts()).is_err());
+}
+
+#[test]
+fn interrupted_calls_are_failed_not_completed_or_zero_copy_proof() {
+    let context = copies("disconnect");
+    frame::record_interrupted(&context);
+    let counts = count(&context, CopyReason::PortableDeserialization);
     assert_eq!(counts.failed, 1);
     assert_eq!(counts.completed, 0);
     assert_eq!(counts.copied_bytes, 0);
+    assert_eq!(counts.in_flight, 0);
 }
 
 #[test]
-fn acknowledged_reports_and_terminal_precede_success_and_next_call() {
+fn calls_are_granted_in_sequence_under_allow_copies_only() {
     let (host, mut worker) = connected();
-    for length in [17, 31, 7] {
-        let context = copies(&format!("call-{length}"));
-        let id = host.begin(context.clone()).unwrap();
-        let call = worker.next().unwrap();
-        assert_eq!(call.copies.boundary(), context.boundary());
-        assert!(!host.status(id).unwrap());
-        call.copies
-            .materialize(CopyReason::PortableDeserialization, length, || ())
-            .unwrap();
-        // Copy reports are pipelined; they are all applied, in order, before
-        // the call's completion becomes visible to the host.
-        call.finish(Ok(())).unwrap();
-        assert!(host.status(id).unwrap());
-        assert_eq!(count(&context).copied_bytes, length);
-        assert_eq!(count(&context).in_flight, 0);
+    assert!(host
+        .next_call(&CopyContext::new(CopyPolicy::RequireZeroCopy, "strict"))
+        .is_err());
+    for expected in 1..=3 {
+        let call = host.next_call(&copies("call")).unwrap();
+        assert_eq!(call, expected);
+        worker.accept(call).unwrap();
     }
-    let close_started = Instant::now();
-    host.close();
-    assert!(close_started.elapsed() < Duration::from_secs(1));
-    assert!(worker.next().is_err());
+    assert!(worker.accept(5).is_err());
+    assert!(worker.accept(3).is_err());
+    worker.accept(4).unwrap();
 }
 
 #[test]
-fn malformed_report_disconnect_closes_pending_accounting() {
-    let host = Host::start("node", "session").unwrap();
-    let hello = bootstrap(&host);
-    let mut peer = TcpStream::connect(&hello.address).unwrap();
-    peer.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
-    write_frame(&mut peer, &hello).unwrap();
-    assert!(matches!(
-        read_frame::<HostMessage>(&mut peer).unwrap(),
-        HostMessage::Ack { seq: 0 }
-    ));
-    host.wait_ready(|| Ok(true)).unwrap();
-    let context = copies("broken");
-    let id = host.begin(context.clone()).unwrap();
-    assert!(matches!(
-        read_frame::<HostMessage>(&mut peer).unwrap(),
-        HostMessage::Start { .. }
-    ));
-    write_frame(&mut peer, &event(1, id, WireCopy::Started)).unwrap();
-    assert!(matches!(
-        read_frame::<HostMessage>(&mut peer).unwrap(),
-        HostMessage::Ack { seq: 1 }
-    ));
-    peer.write_all(&0u32.to_be_bytes()).unwrap();
-    assert!(read_frame::<HostMessage>(&mut peer).is_err());
+fn doorbell_wakes_an_idle_worker_and_host_close_ends_its_wait() {
+    let (host, mut worker) = connected();
+    // No idle spin: the worker blocks on the doorbell immediately.
+    worker.idle_spin = Duration::ZERO;
+    let published = Arc::new(AtomicBool::new(false));
+    let flag = published.clone();
+    let waiter = std::thread::spawn(move || {
+        let value = worker.wait(|| Ok(flag.load(Ordering::Acquire).then_some(42)));
+        (worker, value)
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    // Publish, then ring: the order the host uses.
+    published.store(true, Ordering::Release);
+    host.ring().unwrap();
+    let (mut worker, value) = waiter.join().unwrap();
+    assert_eq!(value.unwrap(), 42);
+    // Rings while the worker is not waiting are drained, not mistaken for calls.
+    for _ in 0..3 {
+        host.ring().unwrap();
+    }
+    let closer = {
+        let host = host.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            host.close();
+        })
+    };
+    let started = Instant::now();
+    assert!(worker.wait(|| Ok(None::<()>)).is_err());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    closer.join().unwrap();
+}
+
+#[test]
+fn worker_exit_or_stray_bytes_fail_the_lane() {
+    let (host, worker) = connected();
+    host.check().unwrap();
+    drop(worker);
     let deadline = Instant::now() + IO_TIMEOUT;
-    while host.status(id).is_ok() && Instant::now() < deadline {
+    while host.check().is_ok() && Instant::now() < deadline {
         std::thread::yield_now();
     }
-    assert!(host.status(id).is_err());
-    assert_eq!(count(&context).failed, 1);
-    assert_eq!(count(&context).in_flight, 0);
+    assert!(host.check().unwrap_err().to_string().contains("disconnected"));
+    assert!(host.next_call(&copies("after")).is_err());
+
+    let (host, mut worker) = connected();
+    worker.stream.write_all(&[0]).unwrap();
+    let deadline = Instant::now() + IO_TIMEOUT;
+    while host.check().is_ok() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(host.check().is_err());
 }
 
 #[test]
@@ -177,27 +217,6 @@ fn wrong_capability_or_version_cannot_claim_reporting_channel() {
 }
 
 #[test]
-fn failed_terminal_is_preserved_after_worker_disconnect() {
-    let (host, mut worker) = connected();
-    let id = host.begin(copies("failed")).unwrap();
-    let call = worker.next().unwrap();
-    call.finish(Err("handler failed".into())).unwrap();
-    drop(call);
-    drop(worker);
-    assert!(host
-        .status(id)
-        .unwrap_err()
-        .to_string()
-        .contains("handler failed"));
-    host.close();
-    assert!(host
-        .status(id)
-        .unwrap_err()
-        .to_string()
-        .contains("handler failed"));
-}
-
-#[test]
 fn close_during_handshake_joins_reporter() {
     for _ in 0..12 {
         let host = Host::start("node", "session").unwrap();
@@ -209,22 +228,11 @@ fn close_during_handshake_joins_reporter() {
 }
 
 #[test]
-fn close_joins_with_partial_frame_and_open_peer() {
-    let host = Host::start("node", "session").unwrap();
-    let hello = bootstrap(&host);
-    let mut peer = TcpStream::connect(&hello.address).unwrap();
-    peer.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
-    write_frame(&mut peer, &hello).unwrap();
-    assert!(matches!(
-        read_frame::<HostMessage>(&mut peer).unwrap(),
-        HostMessage::Ack { seq: 0 }
-    ));
-    host.wait_ready(|| Ok(true)).unwrap();
-    peer.write_all(&[0, 0]).unwrap();
-    // Let the reader enter a partial frame before cancellation.
-    std::thread::sleep(Duration::from_millis(150));
+fn close_joins_while_the_worker_stays_connected() {
+    let (host, _worker) = connected();
     let start = Instant::now();
     host.close();
     assert!(start.elapsed() < Duration::from_secs(1));
-    assert!(read_frame::<HostMessage>(&mut peer).is_err());
+    assert!(host.check().is_err());
+    assert!(host.ring().is_err());
 }

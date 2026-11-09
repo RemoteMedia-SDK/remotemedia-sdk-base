@@ -35,21 +35,41 @@ pub fn publish_runtime_data_with_limit(
 pub(super) type EncodedSample =
     iceoryx2::sample_mut::SampleMut<iceoryx2::service::ipc::Service, [u8], ()>;
 
-/// Encode into an exact native loan without publishing it, so a caller can
-/// order other work (such as completion reporting) before `send()`.
+/// Encode into an exact native loan without publishing it.
 pub(super) fn encode_runtime_data(
     publisher: &iceoryx2::port::publisher::Publisher<iceoryx2::service::ipc::Service, [u8], ()>,
     data: &RuntimeData,
     copies: &CopyContext,
     limit: usize,
 ) -> Result<EncodedSample, String> {
-    let length = encoded_len(data, copies, limit)?;
+    encode_framed(publisher, data, copies, limit, 0, |_| Ok(()))
+}
+
+/// Encode into an exact native loan that starts with a `prefix`-byte frame
+/// header, without publishing it. `fill` runs after the body is encoded (so it
+/// can describe the encode itself) and must initialize every prefix byte.
+/// `limit` bounds the encoded body; the loan is `prefix` bytes longer.
+pub(super) fn encode_framed(
+    publisher: &iceoryx2::port::publisher::Publisher<iceoryx2::service::ipc::Service, [u8], ()>,
+    data: &RuntimeData,
+    copies: &CopyContext,
+    limit: usize,
+    prefix: usize,
+    fill: impl FnOnce(&mut [MaybeUninit<u8>]) -> Result<(), String>,
+) -> Result<EncodedSample, String> {
+    let body = encoded_len(data, copies, limit)?;
+    let length = prefix
+        .checked_add(body)
+        .ok_or("native frame length overflow")?;
     let mut sample = publisher
         .loan_slice_uninit(length)
         .map_err(|error| format!("loan: {error:?}"))?;
-    encode_into(sample.payload_mut(), data, copies)?;
-    // SAFETY: encode_into returns success only after every byte of this exact
-    // loan was written. Any codec/bounds/length failure drops the unpublished loan.
+    let (head, tail) = sample.payload_mut().split_at_mut(prefix);
+    encode_into(tail, data, copies)?;
+    fill(head)?;
+    // SAFETY: encode_into returns success only after every body byte of this
+    // exact loan was written, and `fill` initializes every prefix byte. Any
+    // failure drops the unpublished loan.
     Ok(unsafe { sample.assume_init() })
 }
 

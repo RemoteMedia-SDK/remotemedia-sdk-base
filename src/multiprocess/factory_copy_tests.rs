@@ -212,12 +212,16 @@ async fn native_compat_real_worker_attributes_each_call_and_drops_wire_snapshot(
 fn native_compat_stopped_round_does_not_access_input_or_transport() {
     struct Never;
     impl PublishApi for Never {
-        fn publish_data(&self, _: &RuntimeData, _: &CopyContext) -> Result<(), String> {
+        fn publish_call(&self, _: u64, _: &RuntimeData, _: &CopyContext) -> Result<(), String> {
             panic!("publish after stop")
         }
     }
     impl ReceiveApi for Never {
-        fn receive_data(&self, _: &CopyContext) -> Result<Option<RuntimeData>, String> {
+        fn receive_call(
+            &self,
+            _: u64,
+            _: &CopyContext,
+        ) -> Result<Option<Result<RuntimeData, String>>, String> {
             panic!("receive after stop")
         }
     }
@@ -243,7 +247,7 @@ async fn native_compat_drop_stops_pending_round_and_reaps_worker() {
     )
     .await
     .is_err());
-    assert!(!node.reporter.status(1).unwrap()); // Metadata-only call is still in progress.
+    node.reporter.check().unwrap(); // The stalled call is still in progress.
     let commands = node.cmd_tx.clone();
     let child = node.child.clone();
     drop(node);
@@ -280,6 +284,12 @@ async fn native_compat_worker_failure_closes_lane_and_reaps_child() {
             .entries
             .iter()
             .all(|(_, c)| c.in_flight == 0));
+        // A handler error returns its terminal frame (no worker copies for
+        // metadata-only text). A worker exit has none, so the call is recorded
+        // as interrupted rather than as zero copies.
+        let worker_side = counts(&copies, CopyReason::PortableDeserialization);
+        assert_eq!(worker_side.completed, 0);
+        assert_eq!(worker_side.failed, u64::from(message == "exit"));
     }
 }
 

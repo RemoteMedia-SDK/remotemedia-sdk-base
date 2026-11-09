@@ -20,9 +20,11 @@
 //!
 //! # Limitations of this prototype
 //!
-//! - The worker must negotiate copy reporting v1; rebuild older plugin binaries.
+//! - The worker must negotiate copy reporting v2 (in-band call frames); rebuild
+//!   older plugin binaries.
 //! - A hung handler can leave a call pending until node drop; crashes and
-//!   reporting failures terminate the command lane and reap the child.
+//!   protocol failures terminate the command lane, reap the child and record
+//!   the call as interrupted (one failed worker deserialization).
 //! - Strict contexts reject this copying protocol. Compatibility framework
 //!   copies on both sides use the caller ledger. Handler-internal copies are
 //!   outside this runner's instrumentation.
@@ -129,7 +131,7 @@ impl MultiprocessNativeNode {
         let child = command
             .env("RM_SESSION_ID", session_id)
             .env("RM_NODE_ID", node_id)
-            .env(PROTOCOL_ENV, "1")
+            .env(PROTOCOL_ENV, super::native_copy_reporting::VERSION.to_string())
             .stdin(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -368,6 +370,11 @@ fn spawn_ipc_thread(
     Ok(cmd_tx)
 }
 
+/// One serialized call. The input frame grants call `call` under the caller's
+/// ledger; the output frame returns the worker's copy totals for that call,
+/// which are applied before the output is decoded. Only a published call that
+/// never returns its frame (worker exit, protocol error, stop) is recorded as
+/// interrupted. Any error closes the lane, so call ids never skip.
 fn round_trip<P: PublishApi, S: ReceiveApi>(
     publisher: &P,
     subscriber: &S,
@@ -380,53 +387,105 @@ fn round_trip<P: PublishApi, S: ReceiveApi>(
         return Err("native compatibility IPC stopped".into());
     }
     let call = reporter
-        .begin(copies.clone())
+        .next_call(copies)
         .map_err(|error| error.to_string())?;
-    publisher.publish_data(data, copies)?;
-    let mut output = None;
-    loop {
-        if stopping.load(Ordering::Acquire) {
-            return Err("native compatibility IPC stopped".into());
-        }
-        let finished = reporter.status(call).map_err(|error| error.to_string())?;
-        if output.is_none() {
-            output = subscriber.receive_data(copies)?;
-        }
-        if finished {
-            if let Some(data) = output.take() {
-                return Ok(data);
+    publisher.publish_call(call, data, copies)?;
+    let terminal = (|| {
+        reporter.ring().map_err(|error| error.to_string())?;
+        loop {
+            if stopping.load(Ordering::Acquire) {
+                return Err("native compatibility IPC stopped".to_string());
             }
+            // Observe a lane failure before the final poll: a worker that
+            // publishes its terminal frame and then exits is still answered.
+            let failed = reporter.check().err();
+            if let Some(result) = subscriber.receive_call(call, copies)? {
+                return Ok(result);
+            }
+            if let Some(error) = failed {
+                return Err(error.to_string());
+            }
+            std::thread::yield_now();
         }
-        std::thread::yield_now();
+    })();
+    match terminal {
+        Ok(result) => result,
+        Err(error) => {
+            super::native_copy_reporting::frame::record_interrupted(copies);
+            Err(error)
+        }
     }
 }
 
 trait PublishApi {
-    fn publish_data(&self, data: &RuntimeData, copies: &CopyContext) -> Result<(), String>;
+    fn publish_call(&self, call: u64, data: &RuntimeData, copies: &CopyContext)
+        -> Result<(), String>;
 }
 trait ReceiveApi {
-    fn receive_data(&self, copies: &CopyContext) -> Result<Option<RuntimeData>, String>;
+    /// `Ok(None)`: nothing yet. `Ok(Some(result))`: the call's terminal frame,
+    /// with its copy totals already applied. `Err`: no valid terminal frame.
+    fn receive_call(
+        &self,
+        call: u64,
+        copies: &CopyContext,
+    ) -> Result<Option<Result<RuntimeData, String>>, String>;
 }
 
 impl PublishApi for super::runner::NativePublisher {
-    fn publish_data(&self, data: &RuntimeData, copies: &CopyContext) -> Result<(), String> {
-        super::runner::publish_runtime_data(self, data, copies)
+    fn publish_call(
+        &self,
+        call: u64,
+        data: &RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<(), String> {
+        use super::native_copy_reporting::frame;
+        let boundary = copies.boundary();
+        let prefix = frame::input_prefix_len(boundary)?;
+        super::native_wire::encode_framed(
+            self,
+            data,
+            copies,
+            super::data_transfer::MAX_SLICE_LEN - prefix,
+            prefix,
+            |head| frame::write_input(head, call, boundary),
+        )?
+        .send()
+        .map_err(|error| format!("send: {error:?}"))?;
+        Ok(())
     }
 }
 
 impl ReceiveApi for super::runner::NativeSubscriber {
-    fn receive_data(&self, copies: &CopyContext) -> Result<Option<RuntimeData>, String> {
-        match self
+    fn receive_call(
+        &self,
+        call: u64,
+        copies: &CopyContext,
+    ) -> Result<Option<Result<RuntimeData, String>>, String> {
+        use super::native_copy_reporting::frame;
+        let Some(sample) = self
             .receive()
             .map_err(|error| format!("receive: {error:?}"))?
-        {
-            // Decode while the native loan is alive, eliminating the private wire snapshot.
-            Some(sample) => {
-                super::data_transfer::from_bytes_with_copy_context(sample.payload(), copies)
-                    .map(Some)
-            }
-            None => Ok(None),
+        else {
+            return Ok(None);
+        };
+        let output = frame::parse_output(sample.payload())?;
+        if output.call != call {
+            return Err(format!(
+                "native worker answered call {}, expected {call}",
+                output.call
+            ));
         }
+        frame::replay(copies, &output.totals);
+        if !output.ok {
+            return Ok(Some(Err(
+                String::from_utf8_lossy(output.body).into_owned()
+            )));
+        }
+        // Decode while the native loan is alive, eliminating the private wire snapshot.
+        Ok(Some(super::data_transfer::from_bytes_with_copy_context(
+            output.body,
+            copies,
+        )))
     }
 }
 

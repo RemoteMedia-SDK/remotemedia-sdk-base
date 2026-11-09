@@ -7,8 +7,8 @@
 //!
 //! Replaces the hand-rolled iceoryx2 boilerplate every plugin binary
 //! would otherwise reinvent. Channel naming and wire format remain compatible.
-//! Factory-launched workers negotiate readiness and copy reporting separately;
-//! standalone workers retain the legacy READY log.
+//! Factory-launched workers negotiate copy reporting v2 (call ids and copy
+//! totals carried in the samples); standalone workers retain the legacy READY log.
 //!
 //! # Example
 //!
@@ -35,7 +35,7 @@
 
 pub(super) use super::native_wire::publish_runtime_data;
 use iceoryx2::prelude::*;
-use remotemedia_types::{CopyContext, RuntimeData};
+use remotemedia_types::{CopyContext, CopyLedger, CopyPolicy, RuntimeData};
 
 use super::data_transfer::MAX_SLICE_LEN;
 
@@ -78,7 +78,7 @@ impl Plugin {
     /// unrecoverable iceoryx2 error). `handler` is called once per
     /// input message and returns a single response.
     ///
-    /// With host reporting, errors are acknowledged by the host and stop the loop.
+    /// With host reporting, errors are returned to the host in-band and stop the loop.
     /// Standalone errors returned by `handler` are logged and the message is dropped — the loop continues. iceoryx2 errors abort
     /// the loop.
     ///
@@ -139,8 +139,11 @@ impl Plugin {
     }
 }
 
-/// One host grant covers decode, processing and publication. A reply is not
-/// successful until the host has acknowledged all accounting and its terminal.
+/// Copy reporting v2 call loop. Each input frame carries the call id and the
+/// host's ledger boundary; each output frame returns the call's per-reason copy
+/// totals with the output (or the error), so a call needs no control-channel
+/// round trip. A handler or framing error is returned to the host in-band and
+/// then ends the worker.
 fn run_reported<F>(
     publisher: &NativePublisher,
     subscriber: &NativeSubscriber,
@@ -150,51 +153,66 @@ fn run_reported<F>(
 where
     F: FnMut(RuntimeData) -> Result<RuntimeData, String>,
 {
+    use super::native_copy_reporting::frame;
     loop {
-        let call = worker.next().map_err(|error| error.to_string())?;
-        let result = (|| {
-            let input = loop {
-                match subscriber
-                    .receive()
-                    .map_err(|error| format!("subscriber receive: {error:?}"))?
-                {
-                    Some(sample) => {
-                        break super::data_transfer::from_bytes_with_copy_context(
-                            sample.payload(),
-                            &call.copies,
-                        )?
-                    }
-                    None => std::thread::yield_now(),
-                }
-            };
-            call.check().map_err(|error| error.to_string())?;
-            let output = handler(input)?;
-            call.check().map_err(|error| error.to_string())?;
-            // Encode (and report the encode copy) without publishing yet.
-            let sample = super::native_wire::encode_runtime_data(
+        let sample = worker.wait(|| {
+            subscriber
+                .receive()
+                .map_err(|error| format!("subscriber receive: {error:?}"))
+        })?;
+        // Decode while the input loan is alive, then release it. The worker's
+        // ledger for this call is named after the host's boundary.
+        let (call, copies, decoded) = {
+            let input = frame::parse_input(sample.payload())?;
+            worker.accept(input.call)?;
+            let copies = CopyContext::new(CopyPolicy::AllowCopies, input.boundary);
+            let decoded = super::data_transfer::from_bytes_with_copy_context(input.body, &copies);
+            (input.call, copies, decoded)
+        };
+        drop(sample);
+        let result = decoded.and_then(|data| {
+            let output = handler(data)?;
+            super::native_wire::encode_framed(
                 publisher,
                 &output,
-                &call.copies,
-                super::data_transfer::MAX_SLICE_LEN,
-            )?;
-            call.check().map_err(|error| error.to_string())?;
-            Ok::<_, String>(sample)
-        })();
+                &copies,
+                super::data_transfer::MAX_SLICE_LEN - frame::OUTPUT_PREFIX,
+                frame::OUTPUT_PREFIX,
+                |prefix| frame::write_output(prefix, call, true, &copies.counts()),
+            )
+        });
         match result {
-            Ok(sample) => {
-                // Completion goes first so the host applies it while the
-                // output travels over shared memory. If the send then fails,
-                // the worker exits and the host fails the call on disconnect.
-                call.complete(Ok(())).map_err(|error| error.to_string())?;
-                sample.send().map_err(|error| format!("send: {error:?}"))?;
-            }
+            Ok(output) => output.send().map_err(|error| format!("send: {error:?}"))?,
             Err(error) => {
-                call.finish(Err(error.clone()))
-                    .map_err(|error| error.to_string())?;
+                publish_error(publisher, call, &copies, &error)?;
                 return Err(error);
             }
-        }
+        };
     }
+}
+
+/// Return a failed call to the host with the copies it made before failing.
+fn publish_error(
+    publisher: &NativePublisher,
+    call: u64,
+    copies: &CopyContext,
+    error: &str,
+) -> Result<(), String> {
+    use super::native_copy_reporting::frame;
+    let message: String = error.chars().take(frame::MAX_ERROR_CHARS).collect();
+    let mut sample = publisher
+        .loan_slice_uninit(frame::OUTPUT_PREFIX + message.len())
+        .map_err(|error| format!("loan: {error:?}"))?;
+    let (head, tail) = sample.payload_mut().split_at_mut(frame::OUTPUT_PREFIX);
+    frame::write_output(head, call, false, &copies.counts())?;
+    for (out, byte) in tail.iter_mut().zip(message.as_bytes()) {
+        out.write(*byte);
+    }
+    // SAFETY: the prefix and every message byte were written above.
+    unsafe { sample.assume_init() }
+        .send()
+        .map_err(|error| format!("send: {error:?}"))?;
+    Ok(())
 }
 
 fn service_name(name: &str) -> Result<ServiceName, String> {
