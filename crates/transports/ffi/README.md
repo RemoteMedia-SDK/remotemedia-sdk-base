@@ -254,8 +254,9 @@ adds `session`, the aggregate core transport report. The historical `allow_copie
 key means calls with the flag omitted or False; inspect its `policy` field for
 the effective policy, which can be `require_zero_copy`. `require_zero_copy` means
 calls with the flag True. Both retain the originating session boundary identity.
-The aggregate includes these input events, other instrumented transport events,
-and all participants of the same core shared session. Do not sum it with the
+The aggregate includes these input events, native streaming output decoding,
+control-handle conversions, other instrumented transport events, and all
+participants of the same core shared session. Do not sum it with the
 per-selector reports. Compare reports after operations finish; snapshots across
 the ledgers are not atomic. Reports remain readable after close. Node, codec and
 uninstrumented backend work still require their own accounting and verification.
@@ -305,6 +306,19 @@ retain their full unsigned range, and Python buffer/ndarray objects inside contr
 metadata reject rather than being packed. Control headers and metadata are still
 serialized; the zero-copy guarantee concerns supported bulk payload storage.
 
+### Native in-process control handles
+
+`session.control()` binds `publish`, `publish_out` and intercept replacement
+conversion to the exact session policy. Mutable inputs require a counted snapshot
+in compatibility mode and reject before copying in strict mode. Published owning
+views can be forwarded without payload copies. Tap and intercept receives retain
+immutable owners; consuming legacy Vec audio promotes its storage without copying.
+Control handles and queued tap items retain their authority after session close.
+
+This applies to the native handles. The higher-level `remotemedia.control` client
+still routes publishes and replacements through protobuf DataBuffer construction;
+that adapter and explicit `Data.as_buffer()` serialization need separate migration.
+
 ### NumPy inside compatibility JSON
 
 With `native-numpy` enabled, nested arrays in compatibility JSON use a packed
@@ -323,8 +337,11 @@ Use an explicit `array.copy()` when writable independent output is needed.
 Rust `python_to_json_with_context` and `json_to_python_with_context` retain the
 supplied policy through nested containers. Strict conversion rejects nonempty
 array encoding/decoding and opaque pickle conversion. Existing context-free APIs
-use the process-local legacy ledger. Session input reports count only ingress;
-ordinary output decoding is attributed to the legacy ledger. Opaque compatibility
+use the process-local legacy ledger. Native streaming receives (async, polling
+and combined output), control taps and intercept receives use the originating
+core-session authority. Strict sessions reject nonempty compatibility decoding;
+allowed decodes and failures appear in `input_copy_report()["session"]`, outside
+the two input-selector subtotals. Opaque compatibility
 pickle internals, JSON string/container cloning elsewhere, and network/codec work
 are outside this codec's counters. JSON/base64 is not a zero-copy transport.
 

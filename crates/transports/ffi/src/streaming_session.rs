@@ -32,9 +32,9 @@ use remotemedia_core::transport::{
     SharedPipelineOutputReceivers, TransportData,
 };
 
-use crate::marshal::{python_to_runtime_data_with_context, runtime_data_into_python};
+use crate::marshal::{python_to_runtime_data_with_context, runtime_data_to_python_with_context};
 use crate::python::buffer_config::PipelineBufferConfig;
-use remotemedia_types::OutputAllocator;
+use remotemedia_types::{CopyContext, OutputAllocator};
 
 mod input_copies;
 use input_copies::InputCopies;
@@ -104,7 +104,8 @@ impl PyStreamingSession {
     /// Logical input-selector reports plus the core session's transport report.
     /// The historical `allow_copies` selector inherits session policy, including
     /// strict policy. `session` includes both selectors and other instrumented
-    /// transport operations; these overlapping reports must not be summed.
+    /// transport operations, including output decoding and control conversions;
+    /// these overlapping reports must not be summed.
     fn input_copy_report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let value = serde_json::json!({
             "allow_copies": self.input_copies.inherited.report(),
@@ -154,17 +155,29 @@ impl PyStreamingSession {
     /// shape `runtime_data_to_python` produces) or `None` when the channel
     /// closes.
     fn recv_audio<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        recv_kind_async(py, Arc::clone(&self.audio_rx))
+        recv_kind_async(
+            py,
+            Arc::clone(&self.audio_rx),
+            self.input_copies.session.clone(),
+        )
     }
 
     /// Await the next data-kind output (text / json / numpy / tensor / etc.).
     fn recv_data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        recv_kind_async(py, Arc::clone(&self.data_rx))
+        recv_kind_async(
+            py,
+            Arc::clone(&self.data_rx),
+            self.input_copies.session.clone(),
+        )
     }
 
     /// Await the next video-kind output.
     fn recv_video<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        recv_kind_async(py, Arc::clone(&self.video_rx))
+        recv_kind_async(
+            py,
+            Arc::clone(&self.video_rx),
+            self.input_copies.session.clone(),
+        )
     }
 
     /// Await the next output across all kinds. Resolves to `(kind, data)` or
@@ -174,6 +187,7 @@ impl PyStreamingSession {
         let audio = Arc::clone(&self.audio_rx);
         let video = Arc::clone(&self.video_rx);
         let data = Arc::clone(&self.data_rx);
+        let copies = self.input_copies.session.clone();
         future_into_py(py, async move {
             loop {
                 let mut a_guard = audio.lock().await;
@@ -235,7 +249,7 @@ impl PyStreamingSession {
                         *a_guard = a_taken;
                         *v_guard = v_taken;
                         *d_guard = d_taken;
-                        return Python::attach(|py| pack_kind(py, kind, rd));
+                        return Python::attach(|py| pack_kind(py, kind, rd, &copies));
                     }
                     Outcome::Closed("audio") => {
                         *a_guard = None;
@@ -261,15 +275,15 @@ impl PyStreamingSession {
     /// Non-blocking peek on audio. Returns the next frame, or `None` if
     /// the channel is empty / closed / locked.
     fn try_recv_audio(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        try_recv_kind_sync(py, &self.audio_rx)
+        try_recv_kind_sync(py, &self.audio_rx, &self.input_copies.session)
     }
 
     fn try_recv_data(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        try_recv_kind_sync(py, &self.data_rx)
+        try_recv_kind_sync(py, &self.data_rx, &self.input_copies.session)
     }
 
     fn try_recv_video(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        try_recv_kind_sync(py, &self.video_rx)
+        try_recv_kind_sync(py, &self.video_rx, &self.input_copies.session)
     }
 
     /// Signal end-of-input. After this, `send_input` raises. Outputs continue
@@ -317,7 +331,11 @@ impl PyStreamingSession {
     }
 }
 
-fn recv_kind_async(py: Python<'_>, rx_arc: RxSlot) -> PyResult<Bound<'_, PyAny>> {
+fn recv_kind_async(
+    py: Python<'_>,
+    rx_arc: RxSlot,
+    copies: CopyContext,
+) -> PyResult<Bound<'_, PyAny>> {
     future_into_py(py, async move {
         let mut guard = rx_arc.lock().await;
         let result = match guard.as_mut() {
@@ -329,13 +347,17 @@ fn recv_kind_async(py: Python<'_>, rx_arc: RxSlot) -> PyResult<Bound<'_, PyAny>>
         }
         drop(guard);
         Python::attach(|py| match result {
-            Some(rd) => Ok(runtime_data_into_python(py, rd)?),
+            Some(rd) => Ok(runtime_data_to_python_with_context(
+                py,
+                &rd.into_shared(),
+                &copies,
+            )?),
             None => Ok(py.None()),
         })
     })
 }
 
-fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot) -> PyResult<Py<PyAny>> {
+fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot, copies: &CopyContext) -> PyResult<Py<PyAny>> {
     let mut guard = match rx.try_lock() {
         Ok(g) => g,
         Err(_) => return Ok(py.None()),
@@ -346,7 +368,11 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot) -> PyResult<Py<PyAny>> {
         None => return Ok(py.None()),
     };
     match outcome {
-        Ok(rd) => Ok(runtime_data_into_python(py, rd)?),
+        Ok(rd) => Ok(runtime_data_to_python_with_context(
+            py,
+            &rd.into_shared(),
+            &copies,
+        )?),
         Err(TryRecvError::Empty) => Ok(py.None()),
         Err(TryRecvError::Disconnected) => {
             *guard = None;
@@ -355,8 +381,13 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot) -> PyResult<Py<PyAny>> {
     }
 }
 
-fn pack_kind(py: Python<'_>, kind: &str, rd: RuntimeData) -> PyResult<Py<PyAny>> {
-    let data_py = runtime_data_into_python(py, rd)?;
+fn pack_kind(
+    py: Python<'_>,
+    kind: &str,
+    rd: RuntimeData,
+    copies: &CopyContext,
+) -> PyResult<Py<PyAny>> {
+    let data_py = runtime_data_to_python_with_context(py, &rd.into_shared(), &copies)?;
     let kind_py = kind.into_py_any(py)?;
     let tuple = pyo3::types::PyTuple::new(py, &[kind_py, data_py])?;
     Ok(tuple.into_any().unbind())
