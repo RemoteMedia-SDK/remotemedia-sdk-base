@@ -7,16 +7,23 @@ use super::*;
 pub struct BufferPreflightResources {
     pub session_mapped: bool,
     pub mapped_input_policy: CopyPolicy,
+    /// Device domains with a registered in-process backend (e.g. `cuda:0`).
+    pub device_domains: Vec<String>,
 }
 impl Default for BufferPreflightResources {
     fn default() -> Self {
         Self {
             session_mapped: false,
             mapped_input_policy: CopyPolicy::RequireZeroCopy,
+            device_domains: Vec::new(),
         }
     }
 }
 impl BufferPreflightResources {
+    pub(super) fn device_available(&self, domain: &str) -> bool {
+        self.device_domains.iter().any(|d| d == domain)
+    }
+
     pub(super) fn mapped_available(&self) -> bool {
         cfg!(all(
             feature = "native-worker",

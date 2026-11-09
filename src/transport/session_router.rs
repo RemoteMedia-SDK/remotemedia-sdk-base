@@ -1559,6 +1559,10 @@ impl SessionRouter {
         completion: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> (JoinHandle<Result<()>>, JoinHandle<Result<()>>) {
         let (fan_tx, mut fan_rx) = mpsc::channel::<RuntimeData>(NODE_FANOUT_CAPACITY);
+        // Device tensors leaving the session or entering a host-only node are
+        // transferred under this node's copy policy (device_delivery).
+        let egress_copies = materialization.clone();
+        let device_copies = materialization.clone();
         let NodeTelemetryHandle {
             tel,
             idx: node_idx,
@@ -1640,6 +1644,32 @@ impl SessionRouter {
                                 desc
                             );
                         }
+                        // Client transports need host bytes.
+                        let kept = match super::device_delivery::host_unless_accepted(
+                            kept,
+                            |_| false,
+                            &egress_copies,
+                        )
+                        .await
+                        {
+                            Ok(kept) => kept,
+                            Err(error) => {
+                                crate::telemetry::publisher::record_node_error(
+                                    &tel,
+                                    Some(node_idx),
+                                    fan_control.as_deref(),
+                                    &fan_node_id,
+                                    &format!("session output needs a device transfer: {error}"),
+                                );
+                                tracing::error!(
+                                    "Session {}: sink '{}' output not delivered: {}",
+                                    fan_session_id,
+                                    fan_node_id,
+                                    error
+                                );
+                                continue;
+                            }
+                        };
                         let egress_start = std::time::Instant::now();
                         let edge = egress_edge.and_then(|e| tel.edge(e));
                         let res = match out_router.try_send(kept) {
@@ -2008,6 +2038,34 @@ impl SessionRouter {
                         describe_runtime_data(&input)
                     );
                 }
+                // Device tensors reach only nodes that accept their device;
+                // others receive a counted host transfer (strict: rejected).
+                let input = match super::device_delivery::host_unless_accepted(
+                    input,
+                    |device| node_ref.accepts_device(device),
+                    &device_copies,
+                )
+                .await
+                {
+                    Ok(input) => input,
+                    Err(error) => {
+                        let message = format!("input needs a device transfer: {error}");
+                        crate::telemetry::publisher::record_node_error(
+                            &tel,
+                            Some(node_idx),
+                            control.as_deref(),
+                            &main_node_id,
+                            &message,
+                        );
+                        tracing::error!(
+                            "Session {}: node '{}' {}",
+                            main_session_id,
+                            main_node_id,
+                            message
+                        );
+                        continue;
+                    }
+                };
                 // Barge-in dispatch. The filter task forwards barge
                 // envelopes here in addition to firing
                 // `cancel.notify_waiters()`. We route the envelope to

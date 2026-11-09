@@ -60,6 +60,8 @@ clap = { version = "4.5", features = ["derive", "env"], optional = true }
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.8"
+# Real CUDA owners for the device-transfer wire test (task 6.4).
+remotemedia-device-cuda = { path = "../../../../remotemedia-plugin-sdk/crates/device-cuda" }
 
 # Pulled in for the `control_bus_test_server` example so Python node
 # types (LFM2TextNode, KokoroTTSNode, ...) get inventory-registered

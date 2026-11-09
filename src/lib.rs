@@ -132,6 +132,11 @@ pub mod data {
     pub use remotemedia_types::{SharedBuffer, SharedBytes};
     // Copy authority for framework boundaries that must materialize payloads.
     pub use remotemedia_types::{CopyContext, CopyPolicy, CopyReason, CopyRejected};
+    // Device-resident tensors (task 6.4): owners, readiness and host transfer.
+    pub use remotemedia_types::{
+        Device, DeviceAllocation, DeviceBuffer, DeviceCompletion, DeviceKind, DeviceReady, DlDtype,
+        TransferError,
+    };
 }
 
 #[cfg(feature = "hf-download")]

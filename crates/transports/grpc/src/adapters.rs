@@ -89,6 +89,7 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             c_contiguous: *c_contiguous,
             f_contiguous: *f_contiguous,
         }),
+        RuntimeData::DeviceTensor { .. } => return legacy_device_buffer(data),
         RuntimeData::Json(value) => {
             let mut val = value.clone();
             if let Some(obj) = val.as_object_mut() {
@@ -198,18 +199,45 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
     }
 }
 
+/// A device tensor reaching the legacy (no copy authority) encoder: charge the
+/// host transfer to the legacy context. A failed transfer is reported in band
+/// as a JSON error rather than silently dropped.
+fn legacy_device_buffer(data: &RuntimeData) -> DataBuffer {
+    match data
+        .clone()
+        .device_to_host(remotemedia_core::data::CopyContext::legacy())
+    {
+        Ok(host) => runtime_data_to_data_buffer(&host),
+        Err(error) => {
+            tracing::error!(%error, "device tensor not encoded for gRPC");
+            runtime_data_to_data_buffer(&RuntimeData::Json(
+                serde_json::json!({ "error": format!("device tensor not encoded: {error}") }),
+            ))
+        }
+    }
+}
+
 /// Encode for the gRPC wire under an explicit copy authority. Protobuf fields
 /// own their bytes, so the visible bulk payload is a counted
-/// `PortableSerialization`; strict policy rejects before encoding.
+/// `PortableSerialization`; strict policy rejects before encoding. A device
+/// tensor first needs a counted `DeviceTransfer` to host, which strict policy
+/// also rejects.
 pub fn runtime_data_to_data_buffer_with_context(
     data: &RuntimeData,
     copies: &remotemedia_core::data::CopyContext,
-) -> Result<DataBuffer, remotemedia_core::data::CopyRejected> {
-    copies.materialize(
+) -> Result<DataBuffer, remotemedia_core::data::TransferError> {
+    let host;
+    let data = if data.is_device() {
+        host = data.clone().device_to_host(copies)?;
+        &host
+    } else {
+        data
+    };
+    Ok(copies.materialize(
         remotemedia_core::data::CopyReason::PortableSerialization,
         data.bulk_payload_bytes() as u64,
         || runtime_data_to_data_buffer(data),
-    )
+    )?)
 }
 
 /// Decode an owned DataBuffer under an explicit copy authority.
@@ -404,12 +432,17 @@ pub fn data_buffer_to_runtime_data_with_arrival(
 pub fn transport_data_to_data_buffer_with_context(
     data: &TransportData,
     copies: &remotemedia_core::data::CopyContext,
-) -> Result<DataBuffer, remotemedia_core::data::CopyRejected> {
-    copies.materialize(
+) -> Result<DataBuffer, remotemedia_core::data::TransferError> {
+    if data.data.is_device() {
+        let mut host = data.clone();
+        host.data = data.data.clone().device_to_host(copies)?;
+        return transport_data_to_data_buffer_with_context(&host, copies);
+    }
+    Ok(copies.materialize(
         remotemedia_core::data::CopyReason::PortableSerialization,
         data.data.bulk_payload_bytes() as u64,
         || transport_data_to_data_buffer(data),
-    )
+    )?)
 }
 
 /// Owning, counted variant of [`data_buffer_to_transport_data`]: bulk bytes move

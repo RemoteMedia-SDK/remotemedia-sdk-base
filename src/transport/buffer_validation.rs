@@ -264,6 +264,9 @@ impl StreamingNode for BufferCheckedNode {
     fn node_type(&self) -> &str {
         self.inner.node_type()
     }
+    fn accepts_device(&self, device: remotemedia_types::Device) -> bool {
+        self.inner.accepts_device(device)
+    }
     fn node_id(&self) -> &str {
         self.inner.node_id()
     }

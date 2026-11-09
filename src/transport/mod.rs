@@ -30,6 +30,7 @@ pub mod avatar_session;
 pub mod buffer_preflight;
 pub mod buffer_validation;
 pub mod cancel_gate;
+pub(crate) mod device_delivery;
 pub mod client;
 pub mod control_transport;
 pub mod data;

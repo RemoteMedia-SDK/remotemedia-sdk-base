@@ -56,6 +56,7 @@ impl<'a> PreparedRuntimeData<'a> {
                 samples,
                 header: audio_metadata(*sample_rate, *channels, samples.len(), metadata),
             },
+            RuntimeData::DeviceTensor { .. } => Payload::Other(device_data_buffer(data, copies)?),
             _ => Payload::Other(encode_data_buffer(data)),
         };
         Ok(Self {

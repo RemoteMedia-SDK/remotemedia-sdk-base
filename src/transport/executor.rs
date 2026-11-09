@@ -105,6 +105,11 @@ pub struct ExecutorConfig {
         any(windows, target_os = "linux")
     ))]
     pub mapped_python_plugins: Option<crate::loadable::mapped_python::MappedPythonPluginRuntime>,
+    /// Device memory domains (e.g. `cuda:0`) whose backend this host has
+    /// registered for in-process sharing. Strict preflight accepts a
+    /// `BufferDomain::Device` port only for these; any other device edge must
+    /// name its required `DeviceTransfer`. Empty by default.
+    pub device_domains: Vec<String>,
 }
 
 impl Default for ExecutorConfig {
@@ -120,6 +125,7 @@ impl Default for ExecutorConfig {
             enable_drift_metrics: true,
             session_id_prefix: "session".to_string(),
             manifest_base_dir: None,
+            device_domains: Vec::new(),
             #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
             mapped_pool: None,
             #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
@@ -731,11 +737,15 @@ impl PipelineExecutor {
             .as_ref()
             .map(|config| {
                 #[cfg(not(all(feature = "native-worker", any(windows, target_os = "linux"))))]
-                let resources = super::buffer_preflight::BufferPreflightResources::default();
+                let resources = super::buffer_preflight::BufferPreflightResources {
+                    device_domains: self.config.device_domains.clone(),
+                    ..Default::default()
+                };
                 #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
                 let resources = super::buffer_preflight::BufferPreflightResources {
                     session_mapped: self.config.mapped_pool.is_some(),
                     mapped_input_policy: self.config.mapped_input_policy,
+                    device_domains: self.config.device_domains.clone(),
                 };
                 let report = super::buffer_preflight::inspect_buffer_sharing_with_resources(
                     manifest,

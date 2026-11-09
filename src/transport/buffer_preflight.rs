@@ -198,7 +198,7 @@ fn inspect_edges(report: &mut BufferPreflightReport, manifest: &Manifest) {
             .and_then(|c| c.inputs.get(edge.to_port.as_deref().unwrap_or("")));
         let reason = match (output, input) {
             (Some(output), Some(input)) => incompatible_ports(output, input),
-            _ => Some("missing exact input/output port contract"),
+            _ => Some("missing exact input/output port contract".to_string()),
         };
         if let Some(reason) = reason {
             report.issue(boundary, reason);
@@ -236,15 +236,21 @@ fn inspect_ports(
         if let Err(reason) = port.validate_definition() {
             report.issue(format!("{}:{name}", node_id), reason);
         }
-        if port.domains.iter().any(|d| match d {
-            BufferDomain::Host => false,
-            BufferDomain::SessionMapped => !resources.mapped_available(),
-            BufferDomain::Device(_) => true,
-        }) {
-            report.issue(
-                format!("{}:{name}", node_id),
-                "mapped/device domain requires allocator/transport binding verification",
-            );
+        for domain in &port.domains {
+            match domain {
+                BufferDomain::Host => {}
+                BufferDomain::SessionMapped if !resources.mapped_available() => report.issue(
+                    format!("{}:{name}", node_id),
+                    "mapped domain requires allocator/transport binding verification",
+                ),
+                BufferDomain::SessionMapped => {}
+                BufferDomain::Device(device) if !resources.device_available(device) => report
+                    .issue(
+                        format!("{}:{name}", node_id),
+                        format!("device domain {device} has no registered in-process backend"),
+                    ),
+                BufferDomain::Device(_) => {}
+            }
         }
     }
 }
@@ -309,7 +315,20 @@ fn record_retention(report: &mut BufferPreflightReport, node_id: &str, contract:
     }
 }
 
-fn incompatible_ports(
+fn incompatible_ports(output: &BufferPortContract, input: &BufferPortContract) -> Option<String> {
+    if let Some(BufferDomain::Device(device)) = output
+        .domains
+        .iter()
+        .find(|domain| matches!(domain, BufferDomain::Device(_)) && !input.domains.contains(domain))
+    {
+        return Some(format!(
+            "producer tensors on {device} require a DeviceTransfer to the consumer's memory domain"
+        ));
+    }
+    incompatible_host_ports(output, input).map(str::to_string)
+}
+
+fn incompatible_host_ports(
     output: &BufferPortContract,
     input: &BufferPortContract,
 ) -> Option<&'static str> {

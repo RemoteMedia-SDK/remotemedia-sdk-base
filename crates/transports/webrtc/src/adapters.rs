@@ -82,6 +82,25 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
         .expect("legacy policy permits protobuf materialization")
 }
 
+/// Host encoding of a device tensor: a counted `DeviceTransfer` (strict policy
+/// rejects it before any device access), then the host tensor's encoding. A
+/// failed device copy is reported in band as a JSON error, never dropped.
+pub(crate) fn device_data_buffer(
+    data: &RuntimeData,
+    copies: &CopyContext,
+) -> Result<DataBuffer, CopyRejected> {
+    match data.clone().device_to_host(copies) {
+        Ok(host) => Ok(encode_data_buffer(&host)),
+        Err(remotemedia_types::TransferError::Rejected(rejected)) => Err(rejected),
+        Err(error) => {
+            tracing::error!(%error, "device tensor not encoded for WebRTC");
+            Ok(encode_data_buffer(&RuntimeData::Json(serde_json::json!({
+                "error": format!("device tensor not encoded: {error}")
+            }))))
+        }
+    }
+}
+
 /// Byte-backed protobuf fields retain runtime owners. Audio requires native-f32
 /// to little-endian byte conversion, authorized here. Encoding the resulting
 /// DataBuffer to wire bytes is a separate serialization boundary.
@@ -89,6 +108,9 @@ pub fn runtime_data_to_data_buffer_with_context(
     data: &RuntimeData,
     context: &CopyContext,
 ) -> Result<DataBuffer, CopyRejected> {
+    if data.is_device() {
+        return device_data_buffer(data, context);
+    }
     context.materialize(
         CopyReason::PortableSerialization,
         match data {
@@ -154,6 +176,12 @@ fn encode_data_buffer(data: &RuntimeData) -> DataBuffer {
                 dtype: *dtype,
                 layout: String::new(), // Empty layout - nodes document expected layout
             })
+        }
+        // Callers transfer device tensors first (`device_data_buffer`).
+        RuntimeData::DeviceTensor { .. } => {
+            return encode_data_buffer(&RuntimeData::Json(serde_json::json!({
+                "error": "device tensor reached the host encoder without a DeviceTransfer"
+            })))
         }
         RuntimeData::Json(value) => DataType::Json(JsonData {
             json_payload: serde_json::to_string(value).unwrap_or_default(),
