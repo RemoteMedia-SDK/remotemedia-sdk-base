@@ -223,15 +223,27 @@ impl VideoFrame {
 
 /// RuntimeData wrapper for Node.js with owning native storage
 #[napi]
+#[derive(Clone)]
 pub struct NapiRuntimeData {
     pub(crate) inner: RuntimeData,
+    copies: Option<remotemedia_types::CopyContext>,
 }
 
 impl NapiRuntimeData {
     pub(crate) fn from_runtime(inner: RuntimeData) -> Self {
         Self {
+            copies: None,
             inner: inner.into_shared(),
         }
+    }
+
+    pub(crate) fn from_runtime_with_context(
+        inner: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Self {
+        let mut output = Self::from_runtime(inner);
+        output.copies = Some(copies.clone());
+        output
     }
 
     /// Get a reference to the inner RuntimeData (for Rust-side access)
@@ -268,7 +280,9 @@ impl NapiRuntimeData {
         let slice = data
             .slice(start as usize..end as usize)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        Ok(Self::from_runtime(RuntimeData::Binary(slice)))
+        let mut output = Self::from_runtime(RuntimeData::Binary(slice));
+        output.copies = self.copies.clone();
+        Ok(output)
     }
 
     /// Inspect a byte without exporting a writable Buffer.
@@ -312,6 +326,7 @@ impl NapiRuntimeData {
             buffers::import_audio(samples_buffer.into_buffer()?.as_ref(), require_zero_copy)?;
 
         Ok(Self {
+            copies: None,
             inner: RuntimeData::Audio {
                 samples: samples.into(),
                 sample_rate,
@@ -355,6 +370,7 @@ impl NapiRuntimeData {
         });
 
         Ok(Self {
+            copies: None,
             inner: RuntimeData::Video {
                 pixel_data: buffers::import_bytes(
                     pixel_data.into_buffer()?.as_ref(),
@@ -377,6 +393,7 @@ impl NapiRuntimeData {
     #[napi(factory)]
     pub fn text(text: String) -> Self {
         Self {
+            copies: None,
             inner: RuntimeData::Text(text),
         }
     }
@@ -385,6 +402,7 @@ impl NapiRuntimeData {
     #[napi(factory)]
     pub fn binary(data: InputBuffer, require_zero_copy: Option<bool>) -> napi::Result<Self> {
         Ok(Self {
+            copies: None,
             inner: RuntimeData::Binary(buffers::import_bytes(
                 data.into_buffer()?.as_ref(),
                 require_zero_copy,
@@ -401,6 +419,7 @@ impl NapiRuntimeData {
         require_zero_copy: Option<bool>,
     ) -> napi::Result<Self> {
         Ok(Self {
+            copies: None,
             inner: RuntimeData::Tensor {
                 data: buffers::import_bytes(data.into_buffer()?.as_ref(), require_zero_copy)?,
                 shape,
@@ -416,6 +435,7 @@ impl NapiRuntimeData {
         let value: serde_json::Value = serde_json::from_str(&json_string)
             .map_err(|e| napi::Error::from_reason(format!("Invalid JSON: {}", e)))?;
         Ok(Self {
+            copies: None,
             inner: RuntimeData::Json(value),
         })
     }
@@ -444,6 +464,7 @@ impl NapiRuntimeData {
         stream_id: Option<String>,
     ) -> Self {
         Self {
+            copies: None,
             inner: RuntimeData::File {
                 path,
                 filename,
@@ -490,9 +511,12 @@ impl NapiRuntimeData {
         require_zero_copy: Option<bool>,
     ) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Audio { samples, .. } => {
-                buffers::export_audio(env, samples, require_zero_copy)
-            }
+            RuntimeData::Audio { samples, .. } => buffers::export_audio_with_context(
+                env,
+                samples,
+                require_zero_copy,
+                self.copies.as_ref(),
+            ),
             _ => Err(napi::Error::from_reason("Not audio data")),
         }
     }
@@ -534,9 +558,12 @@ impl NapiRuntimeData {
         require_zero_copy: Option<bool>,
     ) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Video { pixel_data, .. } => {
-                buffers::export_bytes(env, pixel_data, require_zero_copy)
-            }
+            RuntimeData::Video { pixel_data, .. } => buffers::export_bytes_with_context(
+                env,
+                pixel_data,
+                require_zero_copy,
+                self.copies.as_ref(),
+            ),
             _ => Err(napi::Error::from_reason("Not video data")),
         }
     }
@@ -574,7 +601,9 @@ impl NapiRuntimeData {
     #[napi]
     pub fn get_binary(&self, env: Env, require_zero_copy: Option<bool>) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Binary(b) => buffers::export_bytes(env, b, require_zero_copy),
+            RuntimeData::Binary(b) => {
+                buffers::export_bytes_with_context(env, b, require_zero_copy, self.copies.as_ref())
+            }
             _ => Err(napi::Error::from_reason("Not binary data")),
         }
     }
@@ -589,7 +618,12 @@ impl NapiRuntimeData {
         require_zero_copy: Option<bool>,
     ) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Tensor { data, .. } => buffers::export_bytes(env, data, require_zero_copy),
+            RuntimeData::Tensor { data, .. } => buffers::export_bytes_with_context(
+                env,
+                data,
+                require_zero_copy,
+                self.copies.as_ref(),
+            ),
             _ => Err(napi::Error::from_reason("Not tensor data")),
         }
     }
@@ -629,7 +663,12 @@ impl NapiRuntimeData {
         require_zero_copy: Option<bool>,
     ) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Text(s) => buffers::export_bytes(env, s.as_bytes(), require_zero_copy),
+            RuntimeData::Text(s) => buffers::export_bytes_with_context(
+                env,
+                s.as_bytes(),
+                require_zero_copy,
+                self.copies.as_ref(),
+            ),
             _ => Err(napi::Error::from_reason("Not text data")),
         }
     }
@@ -644,7 +683,12 @@ impl NapiRuntimeData {
         require_zero_copy: Option<bool>,
     ) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Numpy { data, .. } => buffers::export_bytes(env, data, require_zero_copy),
+            RuntimeData::Numpy { data, .. } => buffers::export_bytes_with_context(
+                env,
+                data,
+                require_zero_copy,
+                self.copies.as_ref(),
+            ),
             _ => Err(napi::Error::from_reason("Not numpy data")),
         }
     }
@@ -748,9 +792,9 @@ impl PipelineOutput {
     /// Get output for a specific node as NapiRuntimeData
     #[napi]
     pub fn get(&self, node_id: String) -> Option<NapiRuntimeData> {
-        self.outputs.get(&node_id).map(|data| NapiRuntimeData {
-            inner: data.clone(),
-        })
+        self.outputs
+            .get(&node_id)
+            .map(|data| NapiRuntimeData::from_runtime(data.clone()))
     }
 
     /// Check if output exists for node

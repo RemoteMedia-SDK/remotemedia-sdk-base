@@ -8,6 +8,7 @@ use std::sync::Arc;
 #[napi]
 pub struct NapiOutputAllocator {
     pub(crate) inner: Arc<dyn OutputAllocator>,
+    pub(crate) copies: remotemedia_types::CopyContext,
 }
 
 #[napi]
@@ -18,7 +19,10 @@ impl NapiOutputAllocator {
             .inner
             .allocate_bytes(length as usize)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(NapiByteLoan { loan: Some(loan) })
+        Ok(NapiByteLoan {
+            loan: Some(loan),
+            copies: self.copies.clone(),
+        })
     }
 
     #[napi]
@@ -38,6 +42,7 @@ impl NapiOutputAllocator {
             .allocate_audio(samples as usize)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiAudioLoan {
+            copies: self.copies.clone(),
             loan: Some(loan),
             sample_rate,
             channels,
@@ -62,6 +67,7 @@ fn set<T>(loan: &mut Option<BufferLoan<T>>, index: u32, value: T) -> Result<()> 
 /// Generates bytes directly in the selected provider. No JS Buffer is exported.
 #[napi]
 pub struct NapiByteLoan {
+    copies: remotemedia_types::CopyContext,
     loan: Option<BufferLoan<u8>>,
 }
 
@@ -86,15 +92,17 @@ impl NapiByteLoan {
     pub fn publish(&mut self) -> Result<NapiRuntimeData> {
         open(&mut self.loan)?;
         let loan = self.loan.take().expect("loan checked above");
-        Ok(NapiRuntimeData::from_runtime(RuntimeData::Binary(
-            loan.freeze(),
-        )))
+        Ok(NapiRuntimeData::from_runtime_with_context(
+            RuntimeData::Binary(loan.freeze()),
+            &self.copies,
+        ))
     }
 }
 
 /// Generates f32 samples directly in the selected provider.
 #[napi]
 pub struct NapiAudioLoan {
+    copies: remotemedia_types::CopyContext,
     loan: Option<BufferLoan<f32>>,
     sample_rate: u32,
     channels: u32,
@@ -117,15 +125,18 @@ impl NapiAudioLoan {
     pub fn publish(&mut self) -> Result<NapiRuntimeData> {
         open(&mut self.loan)?;
         let loan = self.loan.take().expect("loan checked above");
-        Ok(NapiRuntimeData::from_runtime(RuntimeData::Audio {
-            samples: loan.freeze().into(),
-            sample_rate: self.sample_rate,
-            channels: self.channels,
-            stream_id: None,
-            timestamp_us: None,
-            arrival_ts_us: None,
-            metadata: None,
-        }))
+        Ok(NapiRuntimeData::from_runtime_with_context(
+            RuntimeData::Audio {
+                samples: loan.freeze().into(),
+                sample_rate: self.sample_rate,
+                channels: self.channels,
+                stream_id: None,
+                timestamp_us: None,
+                arrival_ts_us: None,
+                metadata: None,
+            },
+            &self.copies,
+        ))
     }
 }
 
@@ -141,6 +152,7 @@ mod tests {
         (
             NapiOutputAllocator {
                 inner: Arc::new(inner),
+                copies: remotemedia_types::CopyContext::legacy().clone(),
             },
             budget,
         )

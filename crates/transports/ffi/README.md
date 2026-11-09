@@ -74,10 +74,13 @@ Loans use the session ingress provider and budget. They expose scalar `set` and
 `fill`, not a writable ArrayBuffer that could escape to another worker.
 This supports direct generation; scalar-call throughput is unbenchmarked, and
 arbitrary JavaScript/WASM typed-array output is not certified zero-copy.
-`nodejsBufferCopyReport()` returns JSON with process-wide strict/compatibility
-logical byte counters for this boundary only. It excludes legacy iceoryx
-publisher/subscriber staging, WebRTC, codecs and JavaScript's own copies.
-These APIs do not negotiate strict mode for the complete graph.
+`nodejsBufferCopyReport()` returns the process-wide strict/compatibility counters
+for unbound imports and compatibility handles. Owners returned by a core session,
+its allocator, tap or intercept instead charge snapshots and rejected attempts to
+that session's `copyReport()`. Native IPC `toBinary()`/`decode()` owners retain the
+IPC-session ledger. These reports count logical instrumented bytes, not arbitrary
+JavaScript, codec or kernel copies. Select core graph policy explicitly with
+`createStreamingSession(manifest, pipelineBuffers)`.
 
 ## Installation
 
@@ -762,9 +765,16 @@ contract or bound all process memory. The example requires session-mapped binary
 forwarding in its manifest. Retained owning outputs keep their allocation alive
 after session close, and finite ingress credits return only after final release.
 
-`copyReport()` observes core session boundaries. Standalone `NapiRuntimeData`
-constructors and mutable snapshot getters still use `nodejsBufferCopyReport()`
-and their explicit `requireZeroCopy` selector; this change does not yet propagate
-session authority to those getters. The legacy `createStreamSession` manifest
-loop and unary API remain separate. A strict configured core session is not a
-claim that arbitrary caller/backend operations are physically copy-free.
+`copyReport()` includes snapshots of owners returned by the session, its output
+allocator, control taps and intercepts. Event getters, binary slices and retained
+handles keep the same authority after close. Snapshot getters inherit that policy:
+omitting `requireZeroCopy` or passing `false` cannot relax a strict session;
+`true` strengthens a compatibility call and records rejection in its original
+ledger. No writable JavaScript alias to published storage is exposed.
+
+Standalone `NapiRuntimeData` constructors and unbound compatibility handles still
+use `nodejsBufferCopyReport()`. Copying a JS Buffer before sending the resulting
+owner belongs to that standalone boundary, not retroactively to the destination
+session. The legacy `createStreamSession` loop, unary paths and independent
+WebRTC wrappers remain separate. Strict core policy does not certify arbitrary
+caller/backend operations as physically copy-free.

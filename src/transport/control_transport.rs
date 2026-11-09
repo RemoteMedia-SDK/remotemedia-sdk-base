@@ -176,6 +176,12 @@ impl InProcControlTransport {
         Some(Self { control })
     }
 
+    /// Retain the authority of the exact control instance resolved at open.
+    /// A later bus lookup could refer to a different session with the same ID.
+    pub fn transport_copy_context(&self) -> remotemedia_types::CopyContext {
+        self.control.transport_copy_context()
+    }
+
     /// Session id this transport is bound to.
     pub fn session_id(&self) -> &str {
         self.control.session_id()

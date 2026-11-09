@@ -40,12 +40,37 @@ pub(super) fn materialize<T>(
     bytes: usize,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    contexts()[usize::from(strict.unwrap_or(false))]
+    materialize_with_context(None, strict, bytes, operation)
+}
+
+/// Unbound compatibility APIs keep their historical process selectors. Bound
+/// owners retain the originating ledger, including rejected/failed operations.
+fn materialize_with_context<T>(
+    copies: Option<&CopyContext>,
+    strict: Option<bool>,
+    bytes: usize,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let strengthened;
+    let selected = match copies {
+        Some(context) if strict == Some(true) && context.policy() == CopyPolicy::AllowCopies => {
+            strengthened = CopyContext::from_ledger(
+                CopyPolicy::RequireZeroCopy,
+                context.boundary(),
+                std::sync::Arc::new(context.clone()),
+            );
+            &strengthened
+        }
+        Some(context) => context,
+        None => &contexts()[usize::from(strict.unwrap_or(false))],
+    };
+    selected
         .materialize_result(CopyReason::BorrowedInput, bytes as u64, operation)
         .map_err(|e| Error::from_reason(e.to_string()))?
 }
 
-/// Process-wide logical copies at the NAPI pipeline buffer boundary only.
+/// Unattributed compatibility copies at the NAPI buffer boundary. Session-bound
+/// handles report to their originating session ledger instead.
 #[napi]
 pub fn nodejs_buffer_copy_report() -> Result<String> {
     serde_json::to_string(&serde_json::json!({
@@ -75,16 +100,34 @@ pub(super) fn import_audio(input: &[u8], strict: Option<bool>) -> Result<SharedB
 }
 
 pub(super) fn export_bytes(env: Env, input: &[u8], strict: Option<bool>) -> Result<JsBuffer> {
+    export_bytes_with_context(env, input, strict, None)
+}
+
+pub(super) fn export_bytes_with_context(
+    env: Env,
+    input: &[u8],
+    strict: Option<bool>,
+    copies: Option<&CopyContext>,
+) -> Result<JsBuffer> {
     if input.is_empty() {
         return empty_buffer(env);
     }
-    materialize(strict, input.len(), || {
+    materialize_with_context(copies, strict, input.len(), || {
         env.create_buffer_copy(input)
             .map(|buffer| buffer.into_raw())
     })
 }
 
 pub(super) fn export_audio(env: Env, input: &[f32], strict: Option<bool>) -> Result<JsBuffer> {
+    export_audio_with_context(env, input, strict, None)
+}
+
+pub(super) fn export_audio_with_context(
+    env: Env,
+    input: &[f32],
+    strict: Option<bool>,
+    copies: Option<&CopyContext>,
+) -> Result<JsBuffer> {
     if input.is_empty() {
         return empty_buffer(env);
     }
@@ -92,7 +135,7 @@ pub(super) fn export_audio(env: Env, input: &[f32], strict: Option<bool>) -> Res
         .len()
         .checked_mul(4)
         .ok_or_else(|| Error::from_reason("audio byte length overflow"))?;
-    materialize(strict, len, || {
+    materialize_with_context(copies, strict, len, || {
         let mut output = env.create_buffer(len)?;
         for (sample, bytes) in input.iter().zip(output.as_mut().chunks_exact_mut(4)) {
             bytes.copy_from_slice(&sample.to_le_bytes());
@@ -115,3 +158,6 @@ fn empty_buffer(env: Env) -> Result<JsBuffer> {
     // SAFETY: the successful Node-API call returned a Buffer in this environment.
     unsafe { JsBuffer::from_raw(env.raw(), value) }
 }
+
+#[cfg(test)]
+mod authority_tests;

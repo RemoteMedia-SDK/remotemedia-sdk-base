@@ -89,9 +89,10 @@ impl ReceivedSample {
     /// Owning handoff of raw bytes to the pipeline, without serialization/copying.
     #[napi]
     pub fn to_binary(&self) -> Result<NapiRuntimeData> {
-        Ok(NapiRuntimeData::from_runtime(RuntimeData::Binary(
-            self.bytes()?.clone(),
-        )))
+        Ok(NapiRuntimeData::from_runtime_with_context(
+            RuntimeData::Binary(self.bytes()?.clone()),
+            &self.copies,
+        ))
     }
     /// Parse legacy Python wire metadata directly; this does not decode MessagePack.
     #[napi]
@@ -120,7 +121,7 @@ impl ReceivedSample {
             self.bytes()?.as_slice(),
             &self.copies,
         )
-        .map(NapiRuntimeData::from_runtime)
+        .map(|data| NapiRuntimeData::from_runtime_with_context(data, &self.copies))
         .map_err(Error::from_reason)
     }
 }

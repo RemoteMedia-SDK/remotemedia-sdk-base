@@ -1,6 +1,6 @@
 import type { PipelineBufferConfig } from './index';
 
-/** Published native payloads are immutable owning handles, not writable JS views. */
+/** Immutable native owners. Bound snapshots inherit session policy, including after close; false cannot relax it. */
 export declare class NapiRuntimeData {
   private constructor();
   static audio(samples: Buffer, sampleRate: number, channels: number, requireZeroCopy?: boolean): NapiRuntimeData;
@@ -70,7 +70,7 @@ export declare class PipelineEvent {
 export declare class NapiStreamingSession {
   private constructor();
   readonly sessionId: string;
-  /** Core session ledger; standalone JS snapshots use nodejsBufferCopyReport. */
+  /** Core session and bound-owner snapshots; standalone imports use nodejsBufferCopyReport. */
   copyReport(): string;
   outputAllocator(): NapiOutputAllocator;
   sendInput(data: NapiRuntimeData): Promise<void>;
@@ -82,5 +82,5 @@ export declare class NapiStreamingSession {
   close(): Promise<void>;
 }
 export declare function createStreamingSession(manifestJson: string, pipelineBuffers?: PipelineBufferConfig): Promise<NapiStreamingSession>;
-/** JSON process-wide ledger for this buffer boundary only; excludes other adapters. */
+/** JSON ledger for unbound compatibility buffers; bound owners report to their session. */
 export declare function nodejsBufferCopyReport(): string;

@@ -80,9 +80,7 @@ impl PipelineEvent {
 
     #[napi(getter)]
     pub fn data(&self) -> NapiRuntimeData {
-        NapiRuntimeData {
-            inner: self.data.get_inner().clone(),
-        }
+        self.data.clone()
     }
 }
 
@@ -113,12 +111,11 @@ impl NapiStreamingSession {
         self.session_id.clone()
     }
 
-    /// Logical copies observed by the core session. Standalone JS snapshot
-    /// constructors/getters have their own nodejsBufferCopyReport ledger.
+    /// Logical copies observed by the core session, including snapshots of its
+    /// bound owners. Standalone imports/getters use nodejsBufferCopyReport.
     #[napi]
     pub fn copy_report(&self) -> Result<String> {
-        serde_json::to_string(&self.copies.report())
-            .map_err(|e| Error::from_reason(e.to_string()))
+        serde_json::to_string(&self.copies.report()).map_err(|e| Error::from_reason(e.to_string()))
     }
 
     /// Produce directly in the session ingress provider without escaped JS aliases.
@@ -126,6 +123,7 @@ impl NapiStreamingSession {
     pub fn output_allocator(&self) -> NapiOutputAllocator {
         NapiOutputAllocator {
             inner: self.output_allocator.clone(),
+            copies: self.copies.clone(),
         }
     }
 
@@ -151,19 +149,19 @@ impl NapiStreamingSession {
     /// `null` once the channel is closed.
     #[napi]
     pub async fn recv_audio(&self) -> Result<Option<NapiRuntimeData>> {
-        recv_kind(&self.audio_rx).await
+        recv_kind(&self.audio_rx, &self.copies).await
     }
 
     /// Await the next video-kind output.
     #[napi]
     pub async fn recv_video(&self) -> Result<Option<NapiRuntimeData>> {
-        recv_kind(&self.video_rx).await
+        recv_kind(&self.video_rx, &self.copies).await
     }
 
     /// Await the next data-kind output (text / json / tensor / etc.).
     #[napi]
     pub async fn recv_data(&self) -> Result<Option<NapiRuntimeData>> {
-        recv_kind(&self.data_rx).await
+        recv_kind(&self.data_rx, &self.copies).await
     }
 
     /// Await the next output across all kinds. Resolves to a
@@ -242,7 +240,7 @@ impl NapiStreamingSession {
                     *d_guard = d_taken;
                     return Ok(Some(PipelineEvent {
                         kind: kind.to_string(),
-                        data: NapiRuntimeData::from_runtime(rd),
+                        data: NapiRuntimeData::from_runtime_with_context(rd, &self.copies),
                     }));
                 }
                 Outcome::Closed("audio") => {
@@ -297,7 +295,10 @@ impl NapiStreamingSession {
     }
 }
 
-async fn recv_kind(rx_arc: &RxSlot) -> Result<Option<NapiRuntimeData>> {
+async fn recv_kind(
+    rx_arc: &RxSlot,
+    copies: &remotemedia_types::CopyContext,
+) -> Result<Option<NapiRuntimeData>> {
     let mut guard = rx_arc.lock().await;
     let result = match guard.as_mut() {
         Some(rx) => rx.recv().await,
@@ -306,7 +307,7 @@ async fn recv_kind(rx_arc: &RxSlot) -> Result<Option<NapiRuntimeData>> {
     if result.is_none() {
         *guard = None;
     }
-    Ok(result.map(|rd| NapiRuntimeData::from_runtime(rd)))
+    Ok(result.map(|rd| NapiRuntimeData::from_runtime_with_context(rd, copies)))
 }
 
 /// Create a long-lived streaming session for the given manifest.
