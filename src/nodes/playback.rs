@@ -102,6 +102,16 @@ pub struct SpeakerOutputStreamingNode {
     /// A format the device refused and why, so every chunk does not retry
     /// opening it (and repeats the full reason).
     refused: Mutex<Option<(u32, u16, String)>>,
+    /// Inputs that were not audio (nothing to play), for the warning.
+    ignored: std::sync::atomic::AtomicU64,
+}
+
+/// 1, 10, 100, ...
+fn is_power_of_ten(mut n: u64) -> bool {
+    while n >= 10 && n % 10 == 0 {
+        n /= 10;
+    }
+    n == 1
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -116,6 +126,25 @@ impl SpeakerOutputStreamingNode {
             playback: Mutex::new(None),
             accepts: Mutex::new(None),
             refused: Mutex::new(None),
+            ignored: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Warn that non-audio input reached the speaker: on the first one,
+    /// then at 10, 100, 1000, ... so the node logs (and the telemetry's log
+    /// counts) show it without a record per chunk.
+    fn note_ignored(&self, data: &RuntimeData) {
+        let n = self
+            .ignored
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if is_power_of_ten(n) {
+            tracing::warn!(
+                "SpeakerOutput '{}' received {} ({n} non-audio input(s) so far): nothing was \
+                 played. It plays audio only; connect it to a node that outputs audio.",
+                self.node_id,
+                data.data_type()
+            );
         }
     }
 
@@ -237,6 +266,8 @@ impl AsyncStreamingNode for SpeakerOutputStreamingNode {
                 pb.queue(samples);
             }
             tracing::trace!("Played {} samples to speaker", samples.len());
+        } else {
+            self.note_ignored(&data);
         }
         // Sink node returns the input unchanged (for pipeline passthrough)
         Ok(data)
@@ -353,6 +384,19 @@ mod tests {
             })
         );
         assert!(device_accepts(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn non_audio_input_is_counted_and_passed_on_without_opening_the_device() {
+        let n = SpeakerOutputStreamingNode::new("spkr".into(), SpeakerOutputConfig::default());
+        for _ in 0..3 {
+            let out = n.process(RuntimeData::Json(json!({"rms_db": -40.0}))).await;
+            assert!(matches!(out, Ok(RuntimeData::Json(_))));
+        }
+        assert_eq!(n.ignored.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert!(lock(&n.playback).is_none());
+        let warned: Vec<u64> = (1..=1000).filter(|i| is_power_of_ten(*i)).collect();
+        assert_eq!(warned, vec![1, 10, 100, 1000]);
     }
 }
 

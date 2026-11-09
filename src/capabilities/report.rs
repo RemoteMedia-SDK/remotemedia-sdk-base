@@ -60,6 +60,9 @@ pub mod codes {
     /// A node has params but publishes no schema, so they are not checked
     /// (warning).
     pub const PARAMS_UNCHECKED: &str = "params_unchecked";
+    /// A connection whose source makes no data kind its target takes (a
+    /// level meter's json into a speaker): nothing usable arrives (error).
+    pub const DATA_TYPE_MISMATCH: &str = "data_type_mismatch";
 }
 
 /// Result of validating one manifest.
@@ -365,6 +368,13 @@ pub fn validate_manifest_report(
             entry.ok = false;
             entry.mismatch = Some(first.into());
             entry.suggestion = mismatches.iter().find_map(|m| m.suggestion.clone());
+        } else if let Some(issue) = data_kind_mismatch(manifest, registry, conn) {
+            entry.ok = false;
+            entry.suggestion = issue.suggestion.clone();
+            // The resolver assumed the source passes its input on; it
+            // does not, so there is no resolved output to show.
+            entry.resolved = None;
+            report.push_error(issue);
         }
         report.connections.push(entry);
     }
@@ -374,6 +384,99 @@ pub fn validate_manifest_report(
 
     report.valid = report.errors.is_empty();
     report
+}
+
+/// The connection's source makes no data kind its target takes (both
+/// declare their kinds): e.g. `AudioLevelNode` (json) into `SpeakerOutput`
+/// (audio). The suggestion names an upstream node whose output fits, to
+/// feed the target from instead.
+fn data_kind_mismatch(
+    manifest: &Manifest,
+    registry: &StreamingNodeRegistry,
+    conn: &crate::manifest::Connection,
+) -> Option<ReportIssue> {
+    use super::hints::{data_kinds, kinds_fit};
+    let node = |id: &str| manifest.nodes.iter().find(|n| n.id == id);
+    let (from, to) = (node(&conn.from)?, node(&conn.to)?);
+    let makes = data_kinds(registry, &from.node_type, &from.params, true);
+    let takes = data_kinds(registry, &to.node_type, &to.params, false);
+    if makes.is_empty()
+        || takes.is_empty()
+        || makes.iter().any(|m| takes.iter().any(|t| kinds_fit(m, t)))
+    {
+        return None;
+    }
+    // Nearest upstream node (breadth-first) whose output the target takes.
+    let mut frontier = vec![conn.from.as_str()];
+    let mut seen: HashSet<&str> = frontier.iter().copied().collect();
+    let mut feed_from = None;
+    'search: while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for id in frontier {
+            for c in manifest.connections.iter().filter(|c| c.to == id) {
+                if !seen.insert(c.from.as_str()) {
+                    continue;
+                }
+                if let Some(n) = node(&c.from) {
+                    let kinds = data_kinds(registry, &n.node_type, &n.params, true);
+                    if kinds.iter().any(|m| takes.iter().any(|t| kinds_fit(m, t))) {
+                        feed_from = Some(c.from.clone());
+                        break 'search;
+                    }
+                }
+                next.push(c.from.as_str());
+            }
+        }
+        frontier = next;
+    }
+    let suggestion = match feed_from {
+        Some(up) => format!(
+            "'{}' ({}) does not pass its input on. Connect '{up}' → '{}' directly and keep \
+             '{up}' → '{}' as a side branch.",
+            from.id, from.node_type, to.id, from.id
+        ),
+        None => format!(
+            "Feed '{}' from a node that outputs {}, or put a node that converts {} to {} \
+             between them (rm_node_catalog lists inputs and outputs).",
+            to.id,
+            takes.join(" or "),
+            makes.join("/"),
+            takes.join("/")
+        ),
+    };
+    Some(ReportIssue {
+        from: Some(conn.from.clone()),
+        to: Some(conn.to.clone()),
+        suggestion: Some(suggestion),
+        ..ReportIssue::new(
+            codes::DATA_TYPE_MISMATCH,
+            format!(
+                "{} → {}: '{}' ({}) outputs {}, but '{}' ({}) takes {}",
+                conn.from,
+                conn.to,
+                from.id,
+                from.node_type,
+                makes.join(", "),
+                to.id,
+                to.node_type,
+                takes.join(", ")
+            ),
+        )
+    })
+}
+
+/// Every connection whose source makes no data kind its target takes (see
+/// [`codes::DATA_TYPE_MISMATCH`]): the check a session start makes before
+/// building a pipeline that cannot carry anything.
+pub fn data_kind_mismatches(
+    manifest: &Manifest,
+    registry: &StreamingNodeRegistry,
+) -> Vec<ReportIssue> {
+    manifest
+        .connections
+        .iter()
+        .filter_map(|c| data_kind_mismatch(manifest, registry, c))
+        .collect()
 }
 
 #[cfg(test)]
@@ -592,6 +695,69 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("FastResampleNode"));
+    }
+
+    /// A node type that declares the data kinds it takes and makes.
+    struct KindsFactory(
+        &'static str,
+        &'static [crate::nodes::schema::RuntimeDataType],
+        &'static [crate::nodes::schema::RuntimeDataType],
+    );
+
+    impl crate::nodes::StreamingNodeFactory for KindsFactory {
+        no_create!();
+        fn node_type(&self) -> &str {
+            self.0
+        }
+        fn schema(&self) -> Option<crate::nodes::schema::NodeSchema> {
+            Some(
+                crate::nodes::schema::NodeSchema::new(self.0)
+                    .accepts(self.1.iter().copied())
+                    .produces(self.2.iter().copied()),
+            )
+        }
+    }
+
+    #[test]
+    fn json_into_an_audio_sink_is_an_error_that_names_the_fan_out() {
+        use crate::nodes::schema::RuntimeDataType::{Audio, Json};
+        let mut reg = registry();
+        reg.register(Arc::new(KindsFactory("Level", &[Audio], &[Json])));
+        reg.register(Arc::new(KindsFactory("Speaker", &[Audio], &[Audio])));
+        let m = manifest(
+            &[
+                ("mic", "TestMic", json!({})),
+                ("lvl", "Level", json!({})),
+                ("spkr", "Speaker", json!({})),
+            ],
+            &[("mic", "lvl"), ("lvl", "spkr")],
+        );
+        let report = validate_manifest_report(&m, &reg, &[]);
+        assert!(!report.valid);
+        assert!(report.connections[0].ok);
+        let conn = &report.connections[1];
+        assert!(!conn.ok && conn.resolved.is_none(), "{conn:?}");
+        let e = &report.errors[0];
+        assert_eq!(e.code, codes::DATA_TYPE_MISMATCH);
+        assert_eq!(
+            e.message,
+            "lvl → spkr: 'lvl' (Level) outputs json, but 'spkr' (Speaker) takes audio"
+        );
+        let s = e.suggestion.as_deref().unwrap();
+        assert!(s.contains("Connect 'mic' → 'spkr' directly"), "{s}");
+        assert_eq!(data_kind_mismatches(&m, &reg).len(), 1);
+
+        // The fan-out is fine.
+        let fan = manifest(
+            &[
+                ("mic", "TestMic", json!({})),
+                ("lvl", "Level", json!({})),
+                ("spkr", "Speaker", json!({})),
+            ],
+            &[("mic", "lvl"), ("mic", "spkr")],
+        );
+        assert!(validate_manifest_report(&fan, &reg, &[]).valid);
+        assert!(data_kind_mismatches(&fan, &reg).is_empty());
     }
 
     #[test]
