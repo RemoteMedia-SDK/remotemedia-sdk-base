@@ -443,3 +443,29 @@ pub(crate) fn single_named_input(
         .next()
         .ok_or_else(|| Error::Execution("No input data provided".into()))
 }
+
+#[cfg(test)]
+mod single_input_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn several_named_inputs_reject_instead_of_dropping_all_but_one() {
+        let inputs = HashMap::from([
+            ("main".to_string(), RuntimeData::Text("a".into())),
+            ("context".to_string(), RuntimeData::Text("b".into())),
+        ]);
+        let error = single_named_input(inputs, "legacy Python node")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(r#"["context", "main"]"#), "{error}");
+        assert!(error.contains("mapped worker"), "{error}");
+
+        let one = HashMap::from([("main".to_string(), RuntimeData::Text("a".into()))]);
+        assert!(matches!(
+            single_named_input(one, "legacy Python node").unwrap(),
+            RuntimeData::Text(ref text) if text == "a"
+        ));
+        assert!(single_named_input(HashMap::new(), "legacy Python node").is_err());
+    }
+}
