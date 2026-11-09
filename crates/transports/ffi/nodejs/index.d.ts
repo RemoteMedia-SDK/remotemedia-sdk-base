@@ -432,15 +432,21 @@ export interface WebRtcSession {
   /**
    * Broadcast data to all peers in the session
    * @param data - Data to broadcast
+   * @param requireZeroCopy - Reject instead of snapshotting. The JS Buffer
+   *   stays mutable, so sending it is a counted copy
+   *   (see `nodejsBufferCopyReport`).
    */
-  broadcast(data: Buffer): Promise<void>;
+  broadcast(data: Buffer, requireZeroCopy?: boolean): Promise<void>;
 
   /**
    * Send data to a specific peer in the session
    * @param peerId - Target peer ID
    * @param data - Data to send
+   * @param requireZeroCopy - Reject instead of snapshotting. The JS Buffer
+   *   stays mutable, so sending it is a counted copy
+   *   (see `nodejsBufferCopyReport`).
    */
-  sendToPeer(peerId: string, data: Buffer): Promise<void>;
+  sendToPeer(peerId: string, data: Buffer, requireZeroCopy?: boolean): Promise<void>;
 
   /**
    * Add a peer to this session
@@ -495,14 +501,20 @@ export interface WebRtcServer {
    * Send data to a specific peer
    * @param peerId - Target peer ID
    * @param data - Data to send
+   * @param requireZeroCopy - Reject instead of snapshotting. The JS Buffer
+   *   stays mutable, so sending it is a counted copy
+   *   (see `nodejsBufferCopyReport`).
    */
-  sendToPeer(peerId: string, data: Buffer): Promise<void>;
+  sendToPeer(peerId: string, data: Buffer, requireZeroCopy?: boolean): Promise<void>;
 
   /**
    * Broadcast data to all connected peers
    * @param data - Data to broadcast
+   * @param requireZeroCopy - Reject instead of snapshotting. The JS Buffer
+   *   stays mutable, so sending it is a counted copy
+   *   (see `nodejsBufferCopyReport`).
    */
-  broadcast(data: Buffer): Promise<void>;
+  broadcast(data: Buffer, requireZeroCopy?: boolean): Promise<void>;
 
   /**
    * Disconnect a peer

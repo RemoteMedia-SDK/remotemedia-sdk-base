@@ -286,6 +286,16 @@ impl SessionHandle {
     /// rings, or call [`crate::nodes::process_sync`] directly on a
     /// [`crate::nodes::SyncStreamingNode`] to skip the executor entirely.
     pub async fn send_input(&self, data: TransportData) -> Result<()> {
+        self.send_packet(data, None).await
+    }
+
+    /// Send input to one named node instead of every source. The router
+    /// drops (with a warning) input addressed to an unknown node.
+    pub async fn send_input_to(&self, node_id: &str, data: TransportData) -> Result<()> {
+        self.send_packet(data, Some(node_id.to_string())).await
+    }
+
+    async fn send_packet(&self, data: TransportData, to_node: Option<String>) -> Result<()> {
         if !self.is_active {
             return Err(crate::Error::Execution("Session is closed".to_string()));
         }
@@ -293,7 +303,7 @@ impl SessionHandle {
         let packet = DataPacket {
             data: data.data,
             from_node: "client".to_string(),
-            to_node: None, // Route to sources
+            to_node, // None routes to sources
             session_id: self.session_id.clone(),
             sequence: data.sequence.unwrap_or(0),
             sub_sequence: data.sequence.unwrap_or(0),

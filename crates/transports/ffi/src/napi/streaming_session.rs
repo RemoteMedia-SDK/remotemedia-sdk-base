@@ -131,18 +131,25 @@ impl NapiStreamingSession {
     ///
     /// Returns a Promise resolving to `null`. Throws if the input channel is
     /// closed (i.e. `signalInputComplete` or `close` was already called).
-    #[napi]
-    pub async fn send_input(&self, data: &NapiRuntimeData) -> Result<()> {
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn send_input(&self, env: Env, data: &NapiRuntimeData) -> Result<napi::JsObject> {
+        // Take the owner on the JS thread: a borrowed handle must not be read
+        // inside the future, which runs after this call returns.
         let rd = data.get_inner().clone();
-        let guard = self.input_sender.lock().await;
-        let sender = guard.as_ref().ok_or_else(|| {
-            Error::from_reason("Input channel closed — sendInput after signalInputComplete/close")
-        })?;
-        sender
-            .send(TransportData::new(rd))
-            .await
-            .map_err(|e| Error::from_reason(format!("sendInput failed: {}", e)))?;
-        Ok(())
+        let slot = self.input_sender.clone();
+        env.spawn_future(async move {
+            let guard = slot.lock().await;
+            let sender = guard.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "Input channel closed — sendInput after signalInputComplete/close",
+                )
+            })?;
+            sender
+                .send(TransportData::new(rd))
+                .await
+                .map_err(|e| Error::from_reason(format!("sendInput failed: {}", e)))?;
+            Ok(())
+        })
     }
 
     /// Await the next audio-kind output. Resolves to a `NapiRuntimeData` or
@@ -331,11 +338,24 @@ pub async fn create_streaming_session(
     pipeline_buffers: Option<PipelineBufferConfig>,
 ) -> Result<NapiStreamingSession> {
     ensure_tracing_initialized();
-    let config = pipeline_buffers
-        .as_ref()
+    let executor = plugin_executor(pipeline_buffers.as_ref(), None).await?;
+    build_session(executor, manifest_json).await
+}
+
+/// An executor for `pipeline_buffers` (default policy when absent) with the
+/// loaded plugin factories registered. `session_prefix` names its sessions,
+/// which namespaces their IPC channels.
+pub(crate) async fn plugin_executor(
+    pipeline_buffers: Option<&PipelineBufferConfig>,
+    session_prefix: Option<String>,
+) -> Result<Arc<PipelineExecutor>> {
+    let mut config = pipeline_buffers
         .map(PipelineBufferConfig::to_executor_config)
         .transpose()?
         .unwrap_or_default();
+    if let Some(prefix) = session_prefix {
+        config.session_id_prefix = prefix;
+    }
     let executor = PipelineExecutor::with_config(config)
         .map_err(|e| Error::from_reason(format!("Failed to create executor: {}", e)))?;
     // Register every loaded plugin so the manifest can reference dynamic node
@@ -348,8 +368,7 @@ pub async fn create_streaming_session(
     for factory in crate::plugins::collect_registered_factories() {
         executor.register_factory(factory).await;
     }
-    let executor = Arc::new(executor);
-    build_session(executor, manifest_json).await
+    Ok(Arc::new(executor))
 }
 
 #[doc(hidden)]

@@ -144,17 +144,28 @@ impl NapiAttachedSession {
     /// Inject `data` at a node's input.
     ///
     /// `address` format: `"node_id.in[.port]"`.
-    #[napi]
-    pub async fn publish(&self, address: String, data: &NapiRuntimeData) -> Result<()> {
-        let addr = parse_address(&address)?;
-        if addr.direction != Direction::In {
-            return Err(control_address_error("publish requires an '.in' address"));
-        }
-        self.transport
-            .publish(&addr, data.get_inner().clone())
-            .await
-            .map_err(|e| Error::from_reason(format!("publish failed: {e}")))?;
-        Ok(())
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn publish(
+        &self,
+        env: Env,
+        address: String,
+        data: &NapiRuntimeData,
+    ) -> Result<napi::JsObject> {
+        // Take the owner on the JS thread: a borrowed handle must not be read
+        // inside the future, which runs after this call returns.
+        let data = data.get_inner().clone();
+        let transport = self.transport.clone();
+        env.spawn_future(async move {
+            let addr = parse_address(&address)?;
+            if addr.direction != Direction::In {
+                return Err(control_address_error("publish requires an '.in' address"));
+            }
+            transport
+                .publish(&addr, data)
+                .await
+                .map_err(|e| Error::from_reason(format!("publish failed: {e}")))?;
+            Ok(())
+        })
     }
 
     /// Set a node's execution state.

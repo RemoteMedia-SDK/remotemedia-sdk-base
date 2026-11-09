@@ -561,6 +561,15 @@ impl SessionTelemetry {
     pub(crate) fn last_error(&self, idx: usize) -> Option<ErrorInfo> {
         self.nodes[idx].last_error.lock().clone()
     }
+
+    /// The last error recorded for each node that reported one, by node id.
+    pub fn node_errors(&self) -> Vec<(String, ErrorInfo)> {
+        self.node_ids()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, id)| self.last_error(idx).map(|error| (id.clone(), error)))
+            .collect()
+    }
 }
 
 pub(crate) fn truncate(s: &str, max: usize) -> String {

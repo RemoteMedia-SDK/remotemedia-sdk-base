@@ -43,9 +43,6 @@ use napi::{Env, JsBuffer};
 use napi_derive::napi;
 use remotemedia_core::data::video::{PixelFormat, VideoCodec};
 use remotemedia_core::data::RuntimeData;
-use remotemedia_core::executor::Executor;
-use remotemedia_core::manifest;
-use remotemedia_core::nodes::NodeRuntimeContext;
 use std::collections::HashMap;
 
 use super::buffers::{self, InputBuffer};
@@ -491,6 +488,8 @@ impl NapiRuntimeData {
             RuntimeData::Binary(_) => 8,
             RuntimeData::File { .. } => 9,
             RuntimeData::Image { .. } => 10,
+            // Device-resident; sessions transfer these to host before output.
+            RuntimeData::DeviceTensor { .. } => 11,
         }
     }
 
@@ -775,10 +774,14 @@ impl NapiRuntimeData {
     }
 }
 
-/// Pipeline execution result with owning native output handles
+/// Pipeline execution result with owning native output handles. Outputs keep
+/// the session's copy authority: snapshots of them follow its policy and are
+/// charged to its ledger.
 #[napi]
 pub struct PipelineOutput {
     outputs: HashMap<String, RuntimeData>,
+    copies: remotemedia_types::CopyContext,
+    nodes: remotemedia_core::transport::NodeMaterializationCopies,
 }
 
 #[napi]
@@ -794,7 +797,22 @@ impl PipelineOutput {
     pub fn get(&self, node_id: String) -> Option<NapiRuntimeData> {
         self.outputs
             .get(&node_id)
-            .map(|data| NapiRuntimeData::from_runtime(data.clone()))
+            .map(|data| NapiRuntimeData::from_runtime_with_context(data.clone(), &self.copies))
+    }
+
+    /// Copies charged to the execution's transport ledger, including snapshots
+    /// of its outputs (JSON: boundary, policy and per-reason counts).
+    #[napi]
+    pub fn copy_report(&self) -> napi::Result<String> {
+        serde_json::to_string(&self.copies.report())
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Copies charged to each node's materialization ledger, by node id.
+    #[napi]
+    pub fn node_copy_reports(&self) -> napi::Result<String> {
+        serde_json::to_string(&self.nodes.reports())
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
     /// Check if output exists for node
@@ -820,12 +838,20 @@ impl PipelineOutput {
 /// # Returns
 ///
 /// PipelineOutput with owning native storage to results
-#[napi]
-pub async fn execute_pipeline(
+#[napi(ts_return_type = "Promise<PipelineOutput>")]
+pub fn execute_pipeline(
+    env: Env,
     manifest_json: String,
     inputs: HashMap<String, &NapiRuntimeData>,
-) -> napi::Result<PipelineOutput> {
-    execute_pipeline_internal(manifest_json, inputs, None).await
+    pipeline_buffers: Option<super::buffer_config::PipelineBufferConfig>,
+) -> napi::Result<napi::JsObject> {
+    let inputs = owned_inputs(inputs);
+    env.spawn_future(execute_pipeline_internal(
+        manifest_json,
+        inputs,
+        None,
+        pipeline_buffers,
+    ))
 }
 
 /// Execute a pipeline with session ID for multiprocess Python nodes
@@ -839,54 +865,52 @@ pub async fn execute_pipeline(
 /// # Returns
 ///
 /// PipelineOutput with owning native storage to results
-#[napi]
-pub async fn execute_pipeline_with_session(
+#[napi(ts_return_type = "Promise<PipelineOutput>")]
+pub fn execute_pipeline_with_session(
+    env: Env,
     manifest_json: String,
     inputs: HashMap<String, &NapiRuntimeData>,
     session_id: String,
-) -> napi::Result<PipelineOutput> {
-    execute_pipeline_internal(manifest_json, inputs, Some(session_id)).await
+    pipeline_buffers: Option<super::buffer_config::PipelineBufferConfig>,
+) -> napi::Result<napi::JsObject> {
+    let inputs = owned_inputs(inputs);
+    env.spawn_future(execute_pipeline_internal(
+        manifest_json,
+        inputs,
+        Some(session_id),
+        pipeline_buffers,
+    ))
 }
 
-/// Internal implementation
+/// Take shared owners of the inputs while still on the JS thread. Borrowed
+/// handles must not be read inside the future: it runs on a runtime thread
+/// after the call returns, when JS may already have collected them.
+fn owned_inputs(inputs: HashMap<String, &NapiRuntimeData>) -> HashMap<String, RuntimeData> {
+    inputs
+        .into_iter()
+        .map(|(node, data)| (node, data.inner.clone()))
+        .collect()
+}
+
+/// Run one unary execution on a real session (see `super::unary`). Inputs
+/// share their native owners; nothing is copied to send them.
 async fn execute_pipeline_internal(
     manifest_json: String,
-    inputs: HashMap<String, &NapiRuntimeData>,
+    inputs: HashMap<String, RuntimeData>,
     session_id: Option<String>,
+    pipeline_buffers: Option<super::buffer_config::PipelineBufferConfig>,
 ) -> napi::Result<PipelineOutput> {
-    // Parse manifest
-    let manifest = manifest::parse(&manifest_json)
-        .map_err(|e| napi::Error::from_reason(format!("Failed to parse manifest: {}", e)))?;
-
-    // Convert inputs to RuntimeData
-    let runtime_inputs: HashMap<String, RuntimeData> = inputs
-        .into_iter()
-        .map(|(k, v)| (k, v.inner.clone()))
-        .collect();
-
-    // Create executor
-    let executor = Executor::new();
-
-    // Execute pipeline
-    let outputs = match session_id {
-        Some(sid) => {
-            executor
-                .execute_with_runtime_data_and_session(&manifest, runtime_inputs, Some(sid))
-                .await
-        }
-        None => {
-            executor
-                .execute_with_runtime_data(&manifest, runtime_inputs)
-                .await
-        }
-    }
-    .map_err(|e| napi::Error::from_reason(format!("Pipeline execution failed: {}", e)))?;
-
+    let result = super::unary::execute(
+        &manifest_json,
+        inputs,
+        session_id,
+        pipeline_buffers.as_ref(),
+    )
+    .await?;
     Ok(PipelineOutput {
-        outputs: outputs
-            .into_iter()
-            .map(|(id, data)| (id, data.into_shared()))
-            .collect(),
+        outputs: result.outputs,
+        copies: result.transport,
+        nodes: result.nodes,
     })
 }
 
@@ -908,33 +932,28 @@ pub fn is_runtime_available() -> bool {
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 
-/// Streaming session for continuous input/output pipeline execution
+/// Streaming session for continuous input/output pipeline execution.
 ///
 /// Provides bidirectional streaming:
 /// - `sendInput()` streams data into the pipeline
 /// - `recvOutput()` receives processed outputs
 /// - `close()` gracefully terminates the session
+///
+/// Backed by the same `PipelineExecutor` session as `createStreamingSession`
+/// (whole-graph routing, node initialization, copy policy and ledgers); this
+/// is the older, smaller JavaScript surface over it.
 #[napi]
 pub struct NapiStreamSession {
-    /// Unique session identifier
     session_id: String,
-    /// Channel to send inputs to the pipeline.
-    ///
-    /// Bounded — `send_input` `.await`s, back-pressuring the JavaScript
-    /// caller when the pipeline is behind.
-    input_tx: mpsc::Sender<RuntimeData>,
-    /// Channel to receive outputs from the pipeline.
-    ///
-    /// Bounded — the pipeline session task `.await`s its send, so a
-    /// slow JavaScript consumer back-pressures the pipeline rather
-    /// than buffering unboundedly in Rust.
-    output_rx: Arc<Mutex<mpsc::Receiver<RuntimeData>>>,
-    /// Whether the session is still active
+    /// Clone of the session's bounded input (backpressure on `sendInput`).
+    input: std::sync::Mutex<Option<remotemedia_core::transport::SessionInputSender>>,
+    /// The session itself; taken on close to join it.
+    session: Mutex<Option<remotemedia_core::transport::SessionHandle>>,
+    /// The session's transport copy authority, retained by outputs.
+    copies: remotemedia_types::CopyContext,
     is_active: Arc<AtomicBool>,
-    /// Shutdown signal sender
-    shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
 #[napi]
@@ -951,67 +970,70 @@ impl NapiStreamSession {
         self.is_active.load(Ordering::SeqCst)
     }
 
-    /// Send input data to the pipeline
-    ///
-    /// The data will be processed by the pipeline nodes and outputs
-    /// will be available via `recvOutput()`.
-    #[napi]
-    pub async fn send_input(&self, data: &NapiRuntimeData) -> napi::Result<()> {
-        if !self.is_active() {
-            return Err(napi::Error::from_reason("Session is closed"));
-        }
-
-        // Bounded: .await blocks the JS-initiated call when the
-        // pipeline is saturated. This is the ingress backpressure
-        // surface for the FFI transport.
-        self.input_tx
-            .send(data.inner.clone())
-            .await
-            .map_err(|e| napi::Error::from_reason(format!("Failed to send input: {}", e)))?;
-
-        Ok(())
+    /// Send input to the pipeline's source nodes. Awaits when the pipeline is
+    /// saturated (ingress backpressure). The input's native owner is shared.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn send_input(&self, env: Env, data: &NapiRuntimeData) -> napi::Result<napi::JsObject> {
+        // Take the owner and the sender on the JS thread; see `owned_inputs`.
+        let data = data.inner.clone();
+        let input = self.input.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        env.spawn_future(async move {
+            let input = input.ok_or_else(|| napi::Error::from_reason("Session is closed"))?;
+            input
+                .send(remotemedia_core::transport::TransportData::new(data))
+                .await
+                .map_err(|e| napi::Error::from_reason(format!("Failed to send input: {}", e)))
+        })
     }
 
-    /// Receive output from the pipeline
-    ///
-    /// Returns the next available output, or null if the session is closed
-    /// and no more outputs are pending.
+    /// Receive the next output, or null once the session has closed and no
+    /// more outputs are pending.
     #[napi]
     pub async fn recv_output(&self) -> napi::Result<Option<NapiRuntimeData>> {
-        if !self.is_active() {
+        let mut session = self.session.lock().await;
+        let Some(session) = session.as_mut() else {
             return Ok(None);
-        }
-
-        let mut rx = self.output_rx.lock().await;
-
-        match rx.recv().await {
-            Some(data) => Ok(Some(NapiRuntimeData::from_runtime(data))),
+        };
+        match session
+            .recv_output()
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?
+        {
+            Some(output) => Ok(Some(NapiRuntimeData::from_runtime_with_context(
+                output.data,
+                &self.copies,
+            ))),
             None => {
-                // Channel closed
                 self.is_active.store(false, Ordering::SeqCst);
                 Ok(None)
             }
         }
     }
 
-    /// Close the session gracefully
-    ///
-    /// Signals the pipeline to finish processing pending inputs,
-    /// then terminates the session. After close(), `isActive` will be false.
+    /// Copies charged to the session's transport ledger (JSON report).
+    #[napi]
+    pub fn copy_report(&self) -> napi::Result<String> {
+        serde_json::to_string(&self.copies.report())
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Close the session and join it, so node cleanup has finished when this
+    /// resolves. After close(), `isActive` is false.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
-        if !self.is_active() {
-            return Ok(()); // Already closed
-        }
-
-        // Send shutdown signal
-        if let Some(ref shutdown_tx) = self.shutdown_tx {
-            let _ = shutdown_tx.send(()).await;
-        }
-
+        self.input.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.is_active.store(false, Ordering::SeqCst);
-        tracing::info!("StreamSession {} closed", self.session_id);
-
+        let session = self.session.lock().await.take();
+        if let Some(mut session) = session {
+            session
+                .close()
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            session
+                .wait()
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        }
         Ok(())
     }
 }
@@ -1021,6 +1043,7 @@ impl NapiStreamSession {
 /// # Arguments
 ///
 /// * `manifest_json` - Pipeline manifest as JSON string
+/// * `pipeline_buffers` - Optional copy policy and retention budget
 ///
 /// # Returns
 ///
@@ -1035,137 +1058,24 @@ impl NapiStreamSession {
 /// await session.close();
 /// ```
 #[napi]
-pub async fn create_stream_session(manifest_json: String) -> napi::Result<NapiStreamSession> {
-    // Parse manifest
-    let manifest = manifest::parse(&manifest_json)
+pub async fn create_stream_session(
+    manifest_json: String,
+    pipeline_buffers: Option<super::buffer_config::PipelineBufferConfig>,
+) -> napi::Result<NapiStreamSession> {
+    let manifest: remotemedia_core::manifest::Manifest = serde_json::from_str(&manifest_json)
         .map_err(|e| napi::Error::from_reason(format!("Failed to parse manifest: {}", e)))?;
-    let manifest = Arc::new(manifest);
-
-    // Generate unique session ID
-    static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let session_num = SESSION_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let session_id = format!("napi_session_{}", session_num);
-
-    // Create bounded channels for communication. Same sizing as the
-    // core router defaults — 8 slots ≈ 160 ms of headroom at 48 kHz /
-    // 20 ms frames. Override via
-    // `REMOTEMEDIA_FFI_INPUT_CAPACITY` / `REMOTEMEDIA_FFI_OUTPUT_CAPACITY`.
-    let input_capacity: usize = std::env::var("REMOTEMEDIA_FFI_INPUT_CAPACITY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &usize| n > 0)
-        .unwrap_or(8);
-    let output_capacity: usize = std::env::var("REMOTEMEDIA_FFI_OUTPUT_CAPACITY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &usize| n > 0)
-        .unwrap_or(8);
-    let (input_tx, mut input_rx) = mpsc::channel::<RuntimeData>(input_capacity);
-    let (output_tx, output_rx) = mpsc::channel::<RuntimeData>(output_capacity);
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-    let is_active = Arc::new(AtomicBool::new(true));
-    let is_active_clone = is_active.clone();
-    let session_id_clone = session_id.clone();
-    let manifest_clone = manifest.clone();
-
-    // Spawn the session processing task
-    tokio::spawn(async move {
-        tracing::info!("NapiStreamSession {} started", session_id_clone);
-
-        // Create streaming registry and nodes
-        use remotemedia_core::nodes::streaming_registry::create_default_streaming_registry;
-
-        let streaming_registry = create_default_streaming_registry();
-
-        // Cache nodes for the session (avoids recreating on each input)
-        let mut cached_nodes: HashMap<String, Box<dyn remotemedia_core::nodes::StreamingNode>> =
-            HashMap::new();
-
-        for node_def in &manifest_clone.nodes {
-            match streaming_registry.create_node(
-                &node_def.node_type,
-                node_def.id.clone(),
-                &node_def.params,
-                Some(session_id_clone.clone()),
-            ) {
-                Ok(node) => {
-                    cached_nodes.insert(node_def.id.clone(), node);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Session {}: Failed to create node {}: {:?}",
-                        session_id_clone,
-                        node_def.id,
-                        e
-                    );
-                }
-            }
-        }
-
-        // Find first node for routing
-        let first_node_id = manifest_clone
-            .nodes
-            .first()
-            .map(|n| n.id.clone())
-            .unwrap_or_default();
-
-        // Main processing loop
-        loop {
-            tokio::select! {
-                // Handle shutdown signal
-                _ = shutdown_rx.recv() => {
-                    tracing::info!("Session {} received shutdown signal", session_id_clone);
-                    break;
-                }
-
-                // Handle incoming input
-                Some(input_data) = input_rx.recv() => {
-                    // Process through first node (simple single-node routing for now)
-                    if let Some(node) = cached_nodes.get(&first_node_id) {
-                        let ctx = NodeRuntimeContext::for_test(
-                            session_id_clone.clone(),
-                            first_node_id.clone(),
-                        );
-                        match node.process_async(input_data, &ctx).await {
-                            Ok(output) => {
-                                // Bounded: .await applies backpressure to the
-                                // pipeline when the JS consumer falls behind.
-                                if output_tx.send(output).await.is_err() {
-                                    tracing::warn!("Session {}: Output channel closed", session_id_clone);
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Session {}: Node {} processing error: {:?}",
-                                    session_id_clone,
-                                    first_node_id,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Input channel closed
-                else => {
-                    tracing::info!("Session {} input channel closed", session_id_clone);
-                    break;
-                }
-            }
-        }
-
-        is_active_clone.store(false, Ordering::SeqCst);
-        tracing::info!("NapiStreamSession {} terminated", session_id_clone);
-    });
-
+    let executor =
+        super::streaming_session::plugin_executor(pipeline_buffers.as_ref(), None).await?;
+    let session = executor
+        .create_session(Arc::new(manifest))
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("Failed to create session: {}", e)))?;
     Ok(NapiStreamSession {
-        session_id,
-        input_tx,
-        output_rx: Arc::new(Mutex::new(output_rx)),
-        is_active,
-        shutdown_tx: Some(shutdown_tx),
+        session_id: session.session_id.clone(),
+        input: std::sync::Mutex::new(session.input_sender()),
+        copies: session.transport_copy_context(),
+        session: Mutex::new(Some(session)),
+        is_active: Arc::new(AtomicBool::new(true)),
     })
 }
 

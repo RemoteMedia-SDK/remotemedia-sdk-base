@@ -84,6 +84,12 @@ pub(super) fn import_bytes(input: &[u8], strict: Option<bool>) -> Result<SharedB
     materialize(strict, input.len(), || Ok(input.to_vec().into()))
 }
 
+/// Snapshot a mutable JS buffer into an owned Vec for a native API that takes
+/// one. Counted like every other import (strict rejects).
+pub(super) fn import_vec(input: &[u8], strict: Option<bool>) -> Result<Vec<u8>> {
+    materialize(strict, input.len(), || Ok(input.to_vec()))
+}
+
 pub(super) fn import_audio(input: &[u8], strict: Option<bool>) -> Result<SharedBuffer<f32>> {
     if input.len() % 4 != 0 {
         return Err(Error::from_reason(

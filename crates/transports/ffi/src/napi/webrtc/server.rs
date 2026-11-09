@@ -530,9 +530,16 @@ impl WebRtcServer {
     /// @param peer_id - Target peer ID
     /// @param data - Data to send (Buffer)
     #[napi]
-    pub async fn send_to_peer(&self, peer_id: String, data: Buffer) -> Result<()> {
+    pub async fn send_to_peer(
+        &self,
+        peer_id: String,
+        data: Buffer,
+        require_zero_copy: Option<bool>,
+    ) -> Result<()> {
+        // A JS Buffer stays mutable: this snapshot is a counted copy (strict rejects).
+        let data = crate::napi::buffers::import_vec(data.as_ref(), require_zero_copy)?;
         self.core
-            .send_to_peer(&peer_id, data.to_vec())
+            .send_to_peer(&peer_id, data)
             .await
             .map_err(|e| Error::from_reason(e.to_string()))
     }
@@ -541,9 +548,11 @@ impl WebRtcServer {
     ///
     /// @param data - Data to broadcast (Buffer)
     #[napi]
-    pub async fn broadcast(&self, data: Buffer) -> Result<()> {
+    pub async fn broadcast(&self, data: Buffer, require_zero_copy: Option<bool>) -> Result<()> {
+        // A JS Buffer stays mutable: this snapshot is a counted copy (strict rejects).
+        let data = crate::napi::buffers::import_vec(data.as_ref(), require_zero_copy)?;
         self.core
-            .broadcast(data.to_vec())
+            .broadcast(data)
             .await
             .map_err(|e| Error::from_reason(e.to_string()))
     }

@@ -27,6 +27,7 @@ pub mod session;
 pub mod streaming_session;
 pub mod subscriber;
 pub mod threadsafe;
+mod unary;
 
 // WebRTC bindings (only compiled with `napi-webrtc` feature)
 #[cfg(feature = "napi-webrtc")]
