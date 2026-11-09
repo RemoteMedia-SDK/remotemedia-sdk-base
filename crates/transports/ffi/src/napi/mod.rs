@@ -11,6 +11,7 @@
 //! Owning pipeline handoff and retained slices do not materialize payloads.
 //! Legacy public threadsafe helpers remain separate from the native receive path.
 
+pub mod buffer_config;
 mod buffers;
 mod output_loans;
 pub mod channel;

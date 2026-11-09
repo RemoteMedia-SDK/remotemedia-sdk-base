@@ -51,6 +51,7 @@ use remotemedia_core::transport::{
     PipelineExecutor, SessionHandle, SessionInputSender, TransportData,
 };
 
+use super::buffer_config::PipelineBufferConfig;
 use super::control_session::NapiAttachedSession;
 use super::output_loans::NapiOutputAllocator;
 use super::pipeline::NapiRuntimeData;
@@ -94,6 +95,7 @@ impl PipelineEvent {
 #[napi]
 pub struct NapiStreamingSession {
     session_id: String,
+    copies: remotemedia_types::CopyContext,
     input_sender: InputSlot,
     audio_rx: RxSlot,
     video_rx: RxSlot,
@@ -109,6 +111,14 @@ impl NapiStreamingSession {
     #[napi(getter)]
     pub fn session_id(&self) -> String {
         self.session_id.clone()
+    }
+
+    /// Logical copies observed by the core session. Standalone JS snapshot
+    /// constructors/getters have their own nodejsBufferCopyReport ledger.
+    #[napi]
+    pub fn copy_report(&self) -> Result<String> {
+        serde_json::to_string(&self.copies.report())
+            .map_err(|e| Error::from_reason(e.to_string()))
     }
 
     /// Produce directly in the session ingress provider without escaped JS aliases.
@@ -315,9 +325,17 @@ async fn recv_kind(rx_arc: &RxSlot) -> Result<Option<NapiRuntimeData>> {
 /// await sess.close();
 /// ```
 #[napi]
-pub async fn create_streaming_session(manifest_json: String) -> Result<NapiStreamingSession> {
+pub async fn create_streaming_session(
+    manifest_json: String,
+    pipeline_buffers: Option<PipelineBufferConfig>,
+) -> Result<NapiStreamingSession> {
     ensure_tracing_initialized();
-    let executor = PipelineExecutor::new()
+    let config = pipeline_buffers
+        .as_ref()
+        .map(PipelineBufferConfig::to_executor_config)
+        .transpose()?
+        .unwrap_or_default();
+    let executor = PipelineExecutor::with_config(config)
         .map_err(|e| Error::from_reason(format!("Failed to create executor: {}", e)))?;
     // Register every loaded plugin so the manifest can reference dynamic node
     // types. Mirrors `create_streaming_session` in the Python FFI. The
@@ -356,6 +374,7 @@ pub(crate) async fn build_session(
 
     Ok(NapiStreamingSession {
         output_allocator: handle.output_allocator(),
+        copies: handle.transport_copy_context(),
         session_id,
         input_sender: Arc::new(Mutex::new(Some(input_sender))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.audio_rx))),

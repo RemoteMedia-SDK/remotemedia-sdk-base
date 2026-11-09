@@ -1,3 +1,5 @@
+import type { PipelineBufferConfig } from './index';
+
 /** Published native payloads are immutable owning handles, not writable JS views. */
 export declare class NapiRuntimeData {
   private constructor();
@@ -68,6 +70,8 @@ export declare class PipelineEvent {
 export declare class NapiStreamingSession {
   private constructor();
   readonly sessionId: string;
+  /** Core session ledger; standalone JS snapshots use nodejsBufferCopyReport. */
+  copyReport(): string;
   outputAllocator(): NapiOutputAllocator;
   sendInput(data: NapiRuntimeData): Promise<void>;
   recvAudio(): Promise<NapiRuntimeData | null>;
@@ -77,6 +81,6 @@ export declare class NapiStreamingSession {
   signalInputComplete(): Promise<void>;
   close(): Promise<void>;
 }
-export declare function createStreamingSession(manifestJson: string): Promise<NapiStreamingSession>;
+export declare function createStreamingSession(manifestJson: string, pipelineBuffers?: PipelineBufferConfig): Promise<NapiStreamingSession>;
 /** JSON process-wide ledger for this buffer boundary only; excludes other adapters. */
 export declare function nodejsBufferCopyReport(): string;

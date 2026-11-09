@@ -734,3 +734,37 @@ server = await WebRtcServer.connect({
 - [Python Client](../../python-client/README.md) - Python SDK documentation
 - [Transport Decoupling Spec](../../specs/003-transport-decoupling/spec.md) - Architecture details
 - [WebRTC Spec](../../specs/016-ffi-webrtc-bindings/spec.md) - WebRTC FFI design specification
+
+### Node.js session buffer configuration
+
+The executor-backed `createStreamingSession(manifestJson, pipelineBuffers?)`
+accepts the same `PipelineBufferConfig` object as WebRTC and is available with
+just the `napi` feature. Omission keeps the compatibility default.
+
+```javascript
+const session = await runtime.createStreamingSession(manifestJson, {
+  policy: 'require_zero_copy',
+  nodeRetentionOwners: 16,
+  nodeRetentionBytes: 4096,
+  // Optional; needs the mapped-buffers feature on Windows/Linux:
+  mappedPool: {classes: [{bytes: 4096, slots: 4}], maxBytes: 16384, maxLeases: 64},
+});
+const loan = session.outputAllocator().allocateBytes(64);
+loan.fill(0);
+await session.sendInput(loan.publish());
+console.log(JSON.parse(session.copyReport()));
+```
+
+Limits must be nonnegative JavaScript safe integers; pool geometry also follows
+shared native validation. Bulk-capable nodes must declare matching port/domain
+and retention contracts. A session budget does not change a metadata-only node
+contract or bound all process memory. The example requires session-mapped binary
+forwarding in its manifest. Retained owning outputs keep their allocation alive
+after session close, and finite ingress credits return only after final release.
+
+`copyReport()` observes core session boundaries. Standalone `NapiRuntimeData`
+constructors and mutable snapshot getters still use `nodejsBufferCopyReport()`
+and their explicit `requireZeroCopy` selector; this change does not yet propagate
+session authority to those getters. The legacy `createStreamSession` manifest
+loop and unary API remain separate. A strict configured core session is not a
+claim that arbitrary caller/backend operations are physically copy-free.
