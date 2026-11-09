@@ -234,6 +234,24 @@ async fn legacy_named_input_fallback_preserves_the_callers_accounting() {
 }
 
 #[tokio::test]
+async fn several_named_inputs_reject_without_executing_python() {
+    let node = legacy("echo");
+    let (ctx, copies) = allowed("named-inputs");
+    let error = node
+        .process_multi_with_ctx(
+            [("left".into(), audio()), ("right".into(), audio())]
+                .into_iter()
+                .collect(),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(r#"["left", "right"]"#), "{error}");
+    check(&copies, 0, 0);
+}
+
+#[tokio::test]
 async fn real_session_reports_legacy_python_transfers_under_its_node_authority() {
     use remotemedia_core::transport::{ExecutorConfig, PipelineExecutor, TransportData};
     drop(legacy("echo")); // Install the real Python fixture before session startup.

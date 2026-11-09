@@ -275,3 +275,31 @@ fn strict_json_rejects_opaque_codecs_but_preserves_cached_identity() {
         );
     });
 }
+
+#[test]
+fn compatibility_pickle_round_trip_charges_encoded_bytes_both_ways() {
+    Python::attach(|py| {
+        let context = ledger(CopyPolicy::AllowCopies);
+        // No numeric/string conversion applies, so this object is pickled.
+        let value = py
+            .import("datetime")
+            .unwrap()
+            .getattr("date")
+            .unwrap()
+            .call1((2026, 11, 9))
+            .unwrap();
+        let encoded = python_to_json_with_context(py, &value, None, &context).unwrap();
+        assert_eq!(encoded["__pickled__"], true);
+        let serialized = counts(&context, CopyReason::PortableSerialization);
+        assert_eq!(serialized.completed, 1);
+        assert!(serialized.copied_bytes > 0);
+        let decoded = json_to_python_with_context(py, &encoded, None, &context).unwrap();
+        assert!(decoded.eq(&value).unwrap());
+        let deserialized = counts(&context, CopyReason::PortableDeserialization);
+        assert_eq!(
+            (deserialized.completed, deserialized.copied_bytes),
+            (1, serialized.copied_bytes),
+            "decode charges exactly the pickled bytes it consumed"
+        );
+    });
+}

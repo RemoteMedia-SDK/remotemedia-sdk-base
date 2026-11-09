@@ -262,7 +262,17 @@ impl AsyncStreamingNode for InProcessPythonNode {
         inputs: std::collections::HashMap<String, RuntimeData>,
         ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
-        // Preserve the trait's first-input fallback, but never discard authority.
+        // The Python call takes one payload: a single named input keeps the
+        // trait's fallback, while several reject instead of dropping all but
+        // an arbitrary one. Authority is never discarded.
+        if inputs.len() > 1 {
+            let mut ports: Vec<_> = inputs.keys().cloned().collect();
+            ports.sort();
+            return Err(Error::Execution(format!(
+                "in-process Python node '{}' accepts one input per call; received named inputs {ports:?}",
+                self.node_id
+            )));
+        }
         let (_, data) = inputs
             .into_iter()
             .next()

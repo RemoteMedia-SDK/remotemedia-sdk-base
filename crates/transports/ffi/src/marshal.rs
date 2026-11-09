@@ -238,6 +238,13 @@ pub fn python_to_json_with_context(
     };
 
     let bytes: &[u8] = pickled_bytes.extract()?;
+    // Opaque compatibility serialization: the pickled length is the exact
+    // payload this boundary materialized. Strict policy was rejected above.
+    record_opaque_copy(
+        context,
+        remotemedia_types::CopyReason::PortableSerialization,
+        bytes.len(),
+    )?;
 
     // Base64 encode the pickled bytes
     let base64_encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
@@ -256,6 +263,19 @@ pub fn python_to_json_with_context(
         obj.get_type().name()?
     );
     Ok(Value::Object(map))
+}
+
+/// Charge one completed opaque (pickle) conversion to the caller's ledger.
+/// Callers reject `RequireZeroCopy` before converting, so this records an
+/// already-authorized compatibility copy of exactly `bytes` encoded bytes.
+fn record_opaque_copy(
+    context: &remotemedia_types::CopyContext,
+    reason: remotemedia_types::CopyReason,
+    bytes: usize,
+) -> PyResult<()> {
+    context
+        .materialize(reason, bytes as u64, || ())
+        .map_err(|rejected| pyo3::exceptions::PyBufferError::new_err(rejected.to_string()))
 }
 
 /// Convert a JSON Value to a Python object
@@ -379,6 +399,11 @@ pub fn json_to_python_with_context<'py>(
                     let pickle = py.import("pickle")?;
                     let py_bytes = pyo3::types::PyBytes::new(py, &pickled_bytes);
                     let unpickled = pickle.call_method1("loads", (py_bytes,))?;
+                    record_opaque_copy(
+                        context,
+                        remotemedia_types::CopyReason::PortableDeserialization,
+                        pickled_bytes.len(),
+                    )?;
 
                     tracing::info!("Successfully unpickled object");
                     return Ok(unpickled);
