@@ -210,7 +210,21 @@ budget. Loans and retained published views keep their storage after session
 close. Publishing a loan with outstanding writable exports raises BufferError.
 `send_input(require_zero_copy=True)` rejects private mutable inputs and packing
 at the Python ingress boundary; it does not certify every node, codec, IPC or
-network edge. `session.input_copy_report()` reports the two input-policy ledgers.
+network edge. False or an omitted flag inherits the core session policy; it
+cannot weaken a strict session. Both ordinary and shared-session input conversions
+record their materializations, failures and rejections in that session's transport
+ledger.
+
+`session.input_copy_report()` preserves the two per-input-selector reports and
+adds `session`, the aggregate core transport report. The historical `allow_copies`
+key means calls with the flag omitted or False; inspect its `policy` field for
+the effective policy, which can be `require_zero_copy`. `require_zero_copy` means
+calls with the flag True. Both retain the originating session boundary identity.
+The aggregate includes these input events, other instrumented transport events,
+and all participants of the same core shared session. Do not sum it with the
+per-selector reports. Compare reports after operations finish; snapshots across
+the ledgers are not atomic. Reports remain readable after close. Node, codec and
+uninstrumented backend work still require their own accounting and verification.
 
 Owned exported views and immutable Python bytes can enter without payload copies.
 Private NumPy arrays are explicitly packed once in compatibility mode, with the

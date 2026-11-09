@@ -33,11 +33,17 @@ use remotemedia_core::transport::{
 };
 
 use crate::marshal::{python_to_runtime_data_with_context, runtime_data_into_python};
-use remotemedia_types::{CopyContext, CopyPolicy, OutputAllocator};
+use remotemedia_types::OutputAllocator;
+
+mod input_copies;
+use input_copies::InputCopies;
 
 type InputSlot = Arc<Mutex<Option<InputSender>>>;
 type RxSlot = Arc<Mutex<Option<mpsc::Receiver<RuntimeData>>>>;
 type HandleSlot = Arc<Mutex<Option<SessionHandle>>>;
+
+#[cfg(test)]
+mod input_policy_tests;
 
 enum InputSender {
     Raw(SessionInputSender),
@@ -77,8 +83,7 @@ pub struct PyStreamingSession {
     /// holding the executor here is a defensive cheap guarantee.
     _executor: Arc<PipelineExecutor>,
     output_allocator: Arc<dyn OutputAllocator>,
-    input_copies: CopyContext,
-    strict_input_copies: CopyContext,
+    input_copies: InputCopies,
 }
 
 #[pymethods]
@@ -95,12 +100,15 @@ impl PyStreamingSession {
         _remotemedia_buffers::OutputAllocator::new(self.output_allocator.clone())
     }
 
-    /// Logical copies performed while converting send_input payloads. This is
-    /// separate from the pipeline's node, codec and network copy accounting.
+    /// Logical input-selector reports plus the core session's transport report.
+    /// The historical `allow_copies` selector inherits session policy, including
+    /// strict policy. `session` includes both selectors and other instrumented
+    /// transport operations; these overlapping reports must not be summed.
     fn input_copy_report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let value = serde_json::json!({
-            "allow_copies": self.input_copies.report(),
-            "require_zero_copy": self.strict_input_copies.report(),
+            "allow_copies": self.input_copies.inherited.report(),
+            "require_zero_copy": self.input_copies.strict.report(),
+            "session": self.input_copies.session.report(),
         });
         Ok(crate::marshal::json_to_python(py, &value)?.unbind())
     }
@@ -111,6 +119,7 @@ impl PyStreamingSession {
     ///
     /// Returns a coroutine resolving to `None`. Raises `RuntimeError` if the
     /// input channel is closed.
+    /// `require_zero_copy=True` strengthens session policy; False inherits it.
     #[pyo3(signature = (data, *, require_zero_copy=false))]
     fn send_input<'py>(
         &self,
@@ -119,9 +128,9 @@ impl PyStreamingSession {
         require_zero_copy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let context = if require_zero_copy {
-            &self.strict_input_copies
+            &self.input_copies.strict
         } else {
-            &self.input_copies
+            &self.input_copies.inherited
         };
         let rd = python_to_runtime_data_with_context(py, &data, context)?;
         let input_sender = Arc::clone(&self.input_sender);
@@ -474,8 +483,7 @@ pub(crate) async fn build_session(
 
     Ok(PyStreamingSession {
         output_allocator: handle.output_allocator(),
-        input_copies: CopyContext::new(CopyPolicy::AllowCopies, "python-ffi-input"),
-        strict_input_copies: CopyContext::new(CopyPolicy::RequireZeroCopy, "python-ffi-input"),
+        input_copies: InputCopies::new(handle.transport_copy_context()),
         session_id,
         input_sender: Arc::new(Mutex::new(Some(InputSender::Raw(input_sender)))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.audio_rx))),
@@ -521,8 +529,7 @@ pub(crate) async fn build_shared_session(
 
     Ok(PyStreamingSession {
         output_allocator: shared.output_allocator().await,
-        input_copies: CopyContext::new(CopyPolicy::AllowCopies, "python-ffi-input"),
-        strict_input_copies: CopyContext::new(CopyPolicy::RequireZeroCopy, "python-ffi-input"),
+        input_copies: InputCopies::new(shared.transport_copy_context().await),
         session_id: shared.session_id().to_string(),
         input_sender: Arc::new(Mutex::new(Some(InputSender::Participant(participant)))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.0))),
