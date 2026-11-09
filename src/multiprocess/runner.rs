@@ -187,11 +187,49 @@ fn service_name(name: &str) -> Result<ServiceName, String> {
 pub(super) type NativePublisher = iceoryx2::port::publisher::Publisher<ipc::Service, [u8], ()>;
 pub(super) type NativeSubscriber = iceoryx2::port::subscriber::Subscriber<ipc::Service, [u8], ()>;
 
+/// iceoryx2 config for nodes opened by native compatibility workers and their
+/// host IPC threads, with dead-node sweeps off.
+///
+/// By default every iceoryx2 node scans all nodes on the machine and removes
+/// the ones it judges dead, when it is created and when it is dropped. On
+/// Windows that liveness check emulates F_GETLK by briefly taking an exclusive
+/// lock, so processes checking the same node at once can judge a live node dead
+/// and iceoryx2 fatal-panics ("the Node is still alive"); every sweep also
+/// rescans all stale node directories, slowing startup. The host sweeps once,
+/// serialized, before each spawn instead ([`sweep_dead_nodes_before_spawn`]).
+/// Returns a copy; the process-wide global config is unchanged.
+pub(super) fn node_config_without_dead_node_sweeps() -> iceoryx2::config::Config {
+    let mut config = iceoryx2::config::Config::global_config().clone();
+    config.global.node.cleanup_dead_nodes_on_creation = false;
+    config.global.node.cleanup_dead_nodes_on_destruction = false;
+    config
+}
+
+/// Host-side replacement for the per-node sweeps: remove dead iceoryx2 nodes
+/// before spawning a worker, one sweep at a time per process.
+pub(super) fn sweep_dead_nodes_before_spawn() {
+    static SWEEP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serialized = SWEEP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = iceoryx2::node::Node::<ipc::Service>::try_cleanup_dead_nodes(
+        iceoryx2::config::Config::global_config(),
+    );
+    if state.cleanups + state.failed_cleanups > 0 {
+        tracing::info!(
+            "iceoryx2: removed {} dead node(s), {} could not be removed",
+            state.cleanups,
+            state.failed_cleanups
+        );
+    }
+}
+
 pub(super) fn open_channels(
     publish_name: &str,
     subscribe_name: &str,
 ) -> Result<(NativePublisher, NativeSubscriber), String> {
     let node = NodeBuilder::new()
+        .config(&node_config_without_dead_node_sweeps())
         .create::<ipc::Service>()
         .map_err(|e| format!("iceoryx2 node create: {e:?}"))?;
     let publish_service = node

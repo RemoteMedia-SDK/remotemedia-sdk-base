@@ -110,10 +110,12 @@ fn acknowledged_reports_and_terminal_precede_success_and_next_call() {
         call.copies
             .materialize(CopyReason::PortableDeserialization, length, || ())
             .unwrap();
-        assert_eq!(count(&context).copied_bytes, length);
-        assert_eq!(count(&context).in_flight, 0);
+        // Copy reports are pipelined; they are all applied, in order, before
+        // the call's completion becomes visible to the host.
         call.finish(Ok(())).unwrap();
         assert!(host.status(id).unwrap());
+        assert_eq!(count(&context).copied_bytes, length);
+        assert_eq!(count(&context).in_flight, 0);
     }
     let close_started = Instant::now();
     host.close();

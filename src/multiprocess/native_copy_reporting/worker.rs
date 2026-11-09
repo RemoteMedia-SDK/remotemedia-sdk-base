@@ -1,13 +1,24 @@
 use super::*;
 
+/// Copy events never carry a host decision (policy is applied locally), so they
+/// are pipelined: written without waiting for their ACK. ACKs are drained in
+/// order before a call's completion is acknowledged, so every ACK still precedes
+/// the host's next call grant and a lost connection still fails the call.
+const MAX_UNACKED: u64 = 64;
+
 struct Client {
     stream: TcpStream,
     seq: u64,
+    acked: u64,
     failed: Option<String>,
 }
 impl Client {
-    fn report(&mut self, call: u64, event: Event) -> io::Result<()> {
+    /// Send one report without waiting for its acknowledgement.
+    fn send(&mut self, call: u64, event: Event) -> io::Result<()> {
         self.check()?;
+        if self.seq - self.acked >= MAX_UNACKED {
+            self.drain()?;
+        }
         self.seq = self
             .seq
             .checked_add(1)
@@ -19,12 +30,26 @@ impl Client {
                 call,
                 event,
             },
-        )?;
-        match read_frame::<HostMessage>(&mut self.stream)? {
-            HostMessage::Ack { seq } if seq == self.seq => Ok(()),
-            _ => Err(invalid("native copy acknowledgement mismatch")),
-        }
+        )
     }
+
+    /// Send one report and wait until it and all earlier reports are acknowledged.
+    fn report(&mut self, call: u64, event: Event) -> io::Result<()> {
+        self.send(call, event)?;
+        self.drain()
+    }
+
+    /// Read acknowledgements, in order, for every report sent so far.
+    fn drain(&mut self) -> io::Result<()> {
+        while self.acked < self.seq {
+            match read_frame::<HostMessage>(&mut self.stream)? {
+                HostMessage::Ack { seq } if seq == self.acked + 1 => self.acked = seq,
+                _ => return Err(invalid("native copy acknowledgement mismatch")),
+            }
+        }
+        Ok(())
+    }
+
     fn check(&self) -> io::Result<()> {
         match &self.failed {
             Some(error) => Err(io::Error::other(error.clone())),
@@ -84,6 +109,7 @@ impl Worker {
             client: Arc::new(Mutex::new(Client {
                 stream,
                 seq: 0,
+                acked: 0,
                 failed: None,
             })),
             last_call: 0,
@@ -123,6 +149,8 @@ impl Call {
     pub(in crate::multiprocess) fn finish(&self, result: Result<(), String>) -> io::Result<()> {
         let error = result.err().map(|error| error.chars().take(256).collect());
         let mut client = self.client.lock().unwrap();
+        // Completion waits for every outstanding acknowledgement, so pipelined
+        // copy reports are confirmed before the call returns.
         if let Err(error) = client.report(self.call, Event::Finished { error }) {
             client.fail(&error);
             return Err(error);
@@ -143,7 +171,8 @@ impl CopyLedger for RemoteLedger {
     fn record(&self, reason: CopyReason, event: CopyEvent) {
         self.local.record(reason, event);
         let mut client = self.client.lock().unwrap();
-        if let Err(error) = client.report(
+        // Pipelined: acknowledged with the call's completion report.
+        if let Err(error) = client.send(
             self.call,
             Event::Copy {
                 reason,
