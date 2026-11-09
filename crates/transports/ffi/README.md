@@ -834,6 +834,33 @@ With `enable_metrics=True`, the result contains `outputs`, the existing `metrics
 placeholder, and `copy_report`, the session's instrumented transport ledger after
 output conversion. It does not report arbitrary model/device internals or replace
 node materialization reports. Without metrics, the result remains the output
-value. Inline Python node execution and `execute_pipeline_with_instances` still
+value. Inline Python node execution and the Rust instance compatibility adapter still
 have separate legacy conversion boundaries; strict preflight does not certify
 those paths. Loaded plugin factories are registered before unary session creation.
+### Direct Python instance ownership
+
+`execute_pipeline_with_instances` forwards owning Python references between
+synchronous instances. It does not pack arrays, encode dictionaries, or convert
+values through RuntimeData. Strided arrays and arbitrary Python objects retain
+object identity. Private mutable objects keep their existing Python mutability;
+callers and node code remain responsible for mutation. Published native views
+keep their immutable owner and can outlive the invocation.
+
+All methods are validated before initialization. Initialize is now called, and
+cleanup is attempted once per initialized or partially initialized node, in
+reverse order, including on failure. Cleanup continues after another cleanup
+fails; the original processing/initialization error wins. On success, cleanup
+errors are surfaced. Nodes not initialized are not cleaned up. Async methods,
+generators and dynamically returned awaitables are explicitly unsupported on this
+synchronous lane. Registered inline nodes are the separate async/streaming path.
+
+The public `remotemedia.execute_pipeline*` wrappers forward `pipeline_buffers`
+to manifest execution. The direct-instance path rejects non-None configuration
+before initialization because it has no core session, mapped pool or node-budget
+binding. This must not silently turn a configured call into an unrestricted one.
+The no-input public instance wrapper now awaits the native call fully; one await
+returns the result. Existing metrics output retains its outputs/metrics shape.
+The Rust `InstanceExecutor::process(RuntimeData)` compatibility adapter still has
+legacy conversions; it is no longer used by direct Python instance execution.
+Core-session integration, cancellation and arbitrary node-internal copies remain
+separate work; these ownership checks are not a latency or model-quality claim.

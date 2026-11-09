@@ -6,7 +6,6 @@
 //! Uses PipelineExecutor from core for transport-agnostic execution.
 //! (Migrated from PipelineRunner per spec 026)
 
-use super::marshal::{python_to_runtime_data, runtime_data_into_python};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 use remotemedia_core::{
@@ -187,86 +186,73 @@ pub fn execute_pipeline_with_input<'py>(
 /// # Returns
 /// Python coroutine that resolves to execution results
 #[pyfunction]
+#[pyo3(signature = (node_instances, input_data=None, enable_metrics=None, *, pipeline_buffers=None))]
 pub fn execute_pipeline_with_instances<'py>(
     py: Python<'py>,
     node_instances: Vec<Bound<'py, PyAny>>,
     input_data: Option<Bound<'py, PyAny>>,
     enable_metrics: Option<bool>,
+    pipeline_buffers: Option<crate::python::buffer_config::PipelineBufferConfig>,
 ) -> PyResult<Bound<'py, PyAny>> {
     use super::instance_handler::InstanceExecutor;
-    use super::marshal::{python_to_runtime_data, runtime_data_into_python};
-
-    // Convert to Py<PyAny> before async block (Bound is not Send)
-    let node_refs: Vec<Py<PyAny>> = node_instances
-        .into_iter()
-        .map(|node| node.unbind())
-        .collect();
-
-    let input_ref: Option<RuntimeData> = if let Some(input) = input_data {
-        Some(python_to_runtime_data(py, &input)?)
-    } else {
-        None
-    };
-
+    if pipeline_buffers.is_some() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "Direct instance execution has no core session; pipeline_buffers requires manifest-based execution",
+        ));
+    }
+    let node_refs: Vec<Py<PyAny>> = node_instances.into_iter().map(Bound::unbind).collect();
+    let input = input_data
+        .map(Bound::unbind)
+        .unwrap_or_else(|| pyo3::types::PyString::new(py, "").into_any().unbind());
     future_into_py(py, async move {
-        // Convert node instances to InstanceExecutor wrappers
-        let executors: Vec<InstanceExecutor> = node_refs
+        let executors = node_refs
             .into_iter()
             .enumerate()
-            .map(|(i, node)| {
-                let node_id = format!("instance_{}", i);
-                InstanceExecutor::new(node, node_id)
-            })
+            .map(|(i, node)| InstanceExecutor::new(node, format!("instance_{}", i)))
             .collect::<PyResult<Vec<_>>>()?;
-
         if executors.is_empty() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            return Err(pyo3::exceptions::PyValueError::new_err(
                 "Cannot execute empty pipeline",
             ));
         }
-
-        // Initialize all nodes
-        for executor in &executors {
-            executor.initialize()?;
-        }
-
-        // Get initial input data
-        let mut current_data = input_ref.unwrap_or(RuntimeData::Text(String::new()));
-
-        // Execute nodes in sequence
-        for executor in &executors {
-            let outputs = executor.process(current_data)?;
-
-            // Take first output as input for next node
-            current_data = outputs.into_iter().next().ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Node '{}' produced no output",
-                    executor.node_id()
-                ))
-            })?;
-        }
-
-        // Cleanup all nodes
-        for executor in &executors {
-            executor.cleanup()?;
-        }
-
-        // Convert final output to Python
-        Python::attach(|py| {
-            let py_output = runtime_data_into_python(py, current_data)?;
-
-            if enable_metrics.unwrap_or(false) {
-                let dict = pyo3::types::PyDict::new(py);
-                dict.set_item("outputs", py_output)?;
-                dict.set_item("metrics", "{}")?;
-                Ok(dict.into())
-            } else {
-                Ok(py_output)
+        let result = (|| {
+            for executor in &executors {
+                executor.initialize()?;
             }
+            let mut value = input;
+            for executor in &executors {
+                value = executor.process_python(value)?.ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Node '{}' produced no output",
+                        executor.node_id()
+                    ))
+                })?;
+            }
+            Ok::<_, PyErr>(value)
+        })();
+        // Visit every initialized node, even when processing or another cleanup
+        // fails. Drop sees the cleared cleanup claim and cannot call it twice.
+        let mut cleanup_error = None;
+        for executor in executors.iter().rev() {
+            if let Err(error) = executor.cleanup() {
+                cleanup_error.get_or_insert(error);
+            }
+        }
+        let output = result?;
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
+        Python::attach(|py| {
+            if !enable_metrics.unwrap_or(false) {
+                return Ok(output);
+            }
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("outputs", output)?;
+            dict.set_item("metrics", "{}")?;
+            Ok(dict.into_any().unbind())
         })
     })
 }
-
 /// Get runtime version information
 #[pyfunction]
 pub fn get_runtime_version() -> String {
