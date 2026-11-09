@@ -606,6 +606,10 @@ pub struct MultiprocessExecutor {
     /// Canonical identity survives cleanup so the bound ledger cannot migrate.
     initial_scope: Option<(String, String)>,
 
+    /// Managed environment lease, held for this executor's worker lifetime so
+    /// the cache cannot evict or replace the venv while the worker uses it.
+    env_lease: Option<crate::python::env_manager::LeasedVenvInfo>,
+
     /// Docker support
     #[cfg(feature = "docker")]
     docker_support: Option<Arc<DockerSupport>>,
@@ -997,6 +1001,7 @@ impl MultiprocessExecutor {
             current_context: None,
             initial_copies: None,
             initial_scope: None,
+            env_lease: None,
             #[cfg(feature = "docker")]
             docker_support,
             env_manager,
@@ -1199,7 +1204,9 @@ impl MultiprocessExecutor {
 import ast, json, os, sys, traceback
 from pathlib import Path
 
-NODE_TYPE = "{node_type}"
+# Passed out-of-band: interpolating the node type into this source would let
+# a crafted node_type execute arbitrary code in the probe interpreter.
+NODE_TYPE = os.environ["REMOTEMEDIA_DEPS_PROBE_NODE_TYPE"]
 RESULT = {{"deps": [], "error": None, "source_file": None, "roots_searched": []}}
 
 def _candidate_roots():
@@ -1380,6 +1387,7 @@ sys.stdout.flush()
 
         let mut cmd = tokio::process::Command::new(python);
         cmd.args(["-c", &script]);
+        cmd.env("REMOTEMEDIA_DEPS_PROBE_NODE_TYPE", node_type);
         #[cfg(windows)]
         if let Some(flags) = super::process_manager::no_window_flag() {
             cmd.creation_flags(flags);
@@ -2779,6 +2787,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
 
+            let mut acquired_lease = None;
             let env_result = if let Some(explicit) = explicit_venv {
                 let raw = std::path::PathBuf::from(explicit);
                 // Accept either the venv root or the python binary inside it.
@@ -2808,8 +2817,18 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                     cache_key: "embedded-explicit-venv".to_string(),
                 })
             } else {
-                env_mgr.ensure_env_scoped(&merged, scope_context).await
+                env_mgr
+                    .ensure_env_scoped_leased(&merged, scope_context)
+                    .await
+                    .map(|leased| {
+                        let info = (*leased).clone();
+                        acquired_lease = Some(leased);
+                        info
+                    })
             };
+            if acquired_lease.is_some() {
+                self.env_lease = acquired_lease;
+            }
 
             match env_result {
                 Ok(venv_info) => {

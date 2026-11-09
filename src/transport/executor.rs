@@ -1118,6 +1118,15 @@ impl PipelineExecutor {
                     node.node_type, node.id
                 )));
             }
+            // Manifest Docker placement is not wired to any session launcher:
+            // accepting it ran the node natively without notice.
+            #[cfg(feature = "docker")]
+            if node.docker.is_some() {
+                return Err(crate::Error::ConfigError(format!(
+                    "node '{}': manifest `docker` placement is unsupported for session nodes; remove it to run the node natively",
+                    node.id
+                )));
+            }
         }
 
         Ok(())

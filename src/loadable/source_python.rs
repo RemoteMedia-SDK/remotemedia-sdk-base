@@ -181,6 +181,7 @@ impl StreamingNodeFactory for SourcePythonFactory {
             session_id,
             cmd_tx,
             _child: child,
+            _env_lease: provisioning.venv.clone(),
         }))
     }
 }
@@ -195,7 +196,7 @@ async fn provision_source_plugin_env(
     let env_mgr =
         PythonEnvManager::new(env_config).map_err(|e| format!("PythonEnvManager::new: {e}"))?;
     let venv = env_mgr
-        .ensure_env_scoped(&deps, scope_context.as_deref())
+        .ensure_env_scoped_leased(&deps, scope_context.as_deref())
         .await
         .map_err(|e| format!("PythonEnvManager::ensure_env({deps:?}): {e}"))?;
 
@@ -217,6 +218,9 @@ struct SourcePythonNode {
     cmd_tx: mpsc::Sender<IpcCommand>,
     /// Held so the subprocess is killed on drop.
     _child: Arc<std::sync::Mutex<std::process::Child>>,
+    /// Environment cache lease. Fields drop after `Drop::drop`, so this is
+    /// released only after the runner has been terminated.
+    _env_lease: remotemedia_py_env::LeasedVenvInfo,
 }
 
 impl Drop for SourcePythonNode {
