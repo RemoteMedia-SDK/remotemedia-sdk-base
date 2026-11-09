@@ -74,6 +74,7 @@ async fn execute_unary_python(
         .await
         .map_err(map_runtime_error)?;
     let copies = session.transport_copy_context();
+    let node_copies = session.node_materialization_copies();
     let result = async {
         let inputs = Python::attach(|py| {
             input_data
@@ -123,6 +124,12 @@ async fn execute_unary_python(
         let report = serde_json::to_value(copies.report())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         dict.set_item("copy_report", crate::marshal::json_to_python(py, &report)?)?;
+        let nodes = serde_json::to_value(node_copies.reports())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        dict.set_item(
+            "node_copy_reports",
+            crate::marshal::json_to_python(py, &nodes)?,
+        )?;
         Ok(dict.into_any().unbind())
     })
 }
@@ -286,7 +293,7 @@ pub fn is_available() -> bool {
 #[pyfunction]
 #[pyo3(signature = (cls, node_type=None, multi_output=false,
                     description=None, category=None,
-                    accepts=None, produces=None))]
+                    accepts=None, produces=None, *, buffer_contract_json=None))]
 pub fn register_inline_node_class(
     cls: Bound<'_, PyAny>,
     node_type: Option<String>,
@@ -295,6 +302,7 @@ pub fn register_inline_node_class(
     category: Option<String>,
     accepts: Option<Vec<String>>,
     produces: Option<Vec<String>>,
+    buffer_contract_json: Option<String>,
 ) -> PyResult<String> {
     let resolved_type = match node_type {
         Some(t) => t,
@@ -302,6 +310,10 @@ pub fn register_inline_node_class(
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("cls has no __name__: {}", e))
         })?,
     };
+    let buffer_contract = buffer_contract_json
+        .as_deref()
+        .map(|json| super::inline_python_node::parse_buffer_contract(&cls, json))
+        .transpose()?;
     let config = super::inline_python_node::InlineNodeConfig {
         node_type: resolved_type.clone(),
         cls: cls.unbind(),
@@ -310,6 +322,7 @@ pub fn register_inline_node_class(
         category,
         accepts: accepts.unwrap_or_default(),
         produces: produces.unwrap_or_default(),
+        buffer_contract,
     };
     super::inline_python_node::register_inline_node(config);
     Ok(resolved_type)

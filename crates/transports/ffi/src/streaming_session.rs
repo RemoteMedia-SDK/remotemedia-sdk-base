@@ -85,6 +85,7 @@ pub struct PyStreamingSession {
     _executor: Arc<PipelineExecutor>,
     output_allocator: Arc<dyn OutputAllocator>,
     input_copies: InputCopies,
+    node_copies: remotemedia_core::transport::NodeMaterializationCopies,
 }
 
 #[pymethods]
@@ -112,6 +113,14 @@ impl PyStreamingSession {
             "require_zero_copy": self.input_copies.strict.report(),
             "session": self.input_copies.session.report(),
         });
+        Ok(crate::marshal::json_to_python(py, &value)?.unbind())
+    }
+
+    /// Per-node materialization ledgers, distinct from transport reports.
+    /// The retained ledgers remain readable after close.
+    fn node_copy_reports(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = serde_json::to_value(self.node_copies.reports())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(crate::marshal::json_to_python(py, &value)?.unbind())
     }
 
@@ -531,6 +540,7 @@ pub(crate) async fn build_session(
     Ok(PyStreamingSession {
         output_allocator: handle.output_allocator(),
         input_copies: InputCopies::new(handle.transport_copy_context()),
+        node_copies: handle.node_materialization_copies(),
         session_id,
         input_sender: Arc::new(Mutex::new(Some(InputSender::Raw(input_sender)))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.audio_rx))),
@@ -577,6 +587,7 @@ pub(crate) async fn build_shared_session(
     Ok(PyStreamingSession {
         output_allocator: shared.output_allocator().await,
         input_copies: InputCopies::new(shared.transport_copy_context().await),
+        node_copies: shared.node_materialization_copies().await,
         session_id: shared.session_id().to_string(),
         input_sender: Arc::new(Mutex::new(Some(InputSender::Participant(participant)))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.0))),

@@ -864,3 +864,40 @@ The Rust `InstanceExecutor::process(RuntimeData)` compatibility adapter still ha
 legacy conversions; it is no longer used by direct Python instance execution.
 Core-session integration, cancellation and arbitrary node-internal copies remain
 separate work; these ownership checks are not a latency or model-quality claim.
+### Registered inline Python nodes
+
+`register_inline_node_class(..., buffer_contract_json=...)` accepts an explicit
+version 1 buffer contract with protocol `{"in_process_python":{"buffers":1}}`.
+Only the default input/output port is implemented. Missing declarations remain
+unknown and cannot pass strict admission. The declaration promises the node's
+layouts, memory domains, production behavior and retention bounds; it does not
+prove that arbitrary Python/model code avoids internal copies.
+
+All inline constructor-parameter, input and output conversions use the core
+node's copy policy and ledger, including coroutine results and async-generator
+yields. Immutable owning views retain their storage. Private mutable output or
+encoded-array decoding is counted in compatibility mode and rejected in strict
+mode. A private producer must declare `private_storage`; claiming `forward_input`
+does not authorize returning unrelated storage.
+
+For new output, implement `process_shared(data, ctx)` and declare
+`output_allocator` or `forward_or_output_allocator`. `ctx` is the existing owning
+buffer `OutputAllocator`, bound to the actual node's selected heap or mapped
+allocator, with `session_id` and `node_id`. Fill a loan from `ctx.allocate_bytes`
+or `ctx.allocate_audio`, release writable views, and return `loan.publish()`
+(using the usual audio metadata dictionary for audio). The method can be sync,
+a coroutine, or an async generator. Without this method, inline nodes use
+`process(data)`; a declared allocator producer lacking it fails registration.
+No heap allocator is silently substituted when a runtime context is absent.
+
+Optional async `initialize()` is awaited before processing. Async generators
+are closed after exhaustion or conversion/delivery failure so their `finally`
+blocks run. This does not certify cancellation of blocking Python code or
+concurrent sessions on independent asyncio loops; the existing loop-capture
+mechanism remains process-global.
+
+`session.node_copy_reports()` returns distinct per-node ledgers and remains
+readable after close. Unary metrics also include `node_copy_reports`, separate
+from the transport `copy_report`. A node rejection can be logged while the
+receive channel stays open; do not rely on `recv_data()` returning `None` as
+an error notification. Explicit receive deadlines and close are still needed.

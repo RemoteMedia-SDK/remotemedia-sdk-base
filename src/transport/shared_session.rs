@@ -205,6 +205,14 @@ impl SharedPipelineSession {
         self.session_handle.lock().await.transport_copy_context()
     }
 
+    /// Retain the exact node materialization ledgers across participant close.
+    pub async fn node_materialization_copies(&self) -> super::NodeMaterializationCopies {
+        self.session_handle
+            .lock()
+            .await
+            .node_materialization_copies()
+    }
+
     pub fn participant_handle(&self, participant: Participant) -> ParticipantSessionHandle {
         ParticipantSessionHandle::new(self.input_sender(), participant)
     }
