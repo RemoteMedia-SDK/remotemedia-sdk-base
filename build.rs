@@ -80,33 +80,48 @@ fn setup_ffmpeg() {
         .map(|v| v == "static")
         .unwrap_or(false)
     {
-        // Static FFmpeg requires zlib, lzma, and other compression libraries
-        println!("cargo:rustc-link-lib=z");
-        println!("cargo:rustc-link-lib=lzma");
-        println!("cargo:rustc-link-lib=bz2");
-        // OpenSSL for RTMPS/HTTPS network protocols.
-        // Windows MSVC openssl-src / conda-forge ship `libssl.lib` /
-        // `libcrypto.lib`; non-MSVC toolchains use the unprefixed names.
-        #[cfg(target_env = "msvc")]
-        {
-            println!("cargo:rustc-link-lib=libssl");
-            println!("cargo:rustc-link-lib=libcrypto");
-        }
-        #[cfg(not(target_env = "msvc"))]
-        {
-            println!("cargo:rustc-link-lib=ssl");
-            println!("cargo:rustc-link-lib=crypto");
-        }
-        // Additional network protocol dependencies
-        #[cfg(target_os = "linux")]
-        {
-            // GnuTLS alternative (if FFmpeg was built with GnuTLS instead of OpenSSL)
-            // Uncomment if needed:
-            // println!("cargo:rustc-link-lib=gnutls");
+        // The system libraries the static FFmpeg build links against.
+        // setup-ffmpeg.ps1 writes FFMPEG_EXTRA_LIBS from FFmpeg's own
+        // ffbuild/config.mak (its Windows build uses no zlib, lzma, bz2
+        // or OpenSSL, so the defaults below fail there with LNK1181);
+        // unset, the defaults match setup-ffmpeg.sh's Linux build.
+        println!("cargo:rerun-if-env-changed=FFMPEG_EXTRA_LIBS");
+        if let Ok(extra) = env::var("FFMPEG_EXTRA_LIBS") {
+            for lib in extra
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|l| !l.is_empty())
+            {
+                println!("cargo:rustc-link-lib={lib}");
+            }
+        } else {
+            // Static FFmpeg requires zlib, lzma, and other compression libraries
+            println!("cargo:rustc-link-lib=z");
+            println!("cargo:rustc-link-lib=lzma");
+            println!("cargo:rustc-link-lib=bz2");
+            // OpenSSL for RTMPS/HTTPS network protocols.
+            // Windows MSVC openssl-src / conda-forge ship `libssl.lib` /
+            // `libcrypto.lib`; non-MSVC toolchains use the unprefixed names.
+            #[cfg(target_env = "msvc")]
+            {
+                println!("cargo:rustc-link-lib=libssl");
+                println!("cargo:rustc-link-lib=libcrypto");
+            }
+            #[cfg(not(target_env = "msvc"))]
+            {
+                println!("cargo:rustc-link-lib=ssl");
+                println!("cargo:rustc-link-lib=crypto");
+            }
+            // Additional network protocol dependencies
+            #[cfg(target_os = "linux")]
+            {
+                // GnuTLS alternative (if FFmpeg was built with GnuTLS instead of OpenSSL)
+                // Uncomment if needed:
+                // println!("cargo:rustc-link-lib=gnutls");
 
-            // librtmp for native RTMP support (if FFmpeg was built with librtmp)
-            // Uncomment if needed:
-            // println!("cargo:rustc-link-lib=rtmp");
+                // librtmp for native RTMP support (if FFmpeg was built with librtmp)
+                // Uncomment if needed:
+                // println!("cargo:rustc-link-lib=rtmp");
+            }
         }
 
         // External codec libs that FFmpeg's configure was opted into via
