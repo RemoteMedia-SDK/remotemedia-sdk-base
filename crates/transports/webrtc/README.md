@@ -185,6 +185,35 @@ cargo build --release --features full
 - `h264` - Enable H.264 codec (requires native libraries)
 - `full` - Enable all features
 
+## Protobuf bindings
+
+The generated protobuf/tonic code in `src/generated/` is committed. A normal
+build uses it as-is: no protoc, no `protobuf-src`, nothing written to `src/`.
+`src/generated/protos.stamp` records a hash of each `.proto` input; the build
+warns, and the `proto_stamp_tests` unit test fails, when a `.proto` file no
+longer matches it.
+
+After editing `proto/*.proto` (repo root), regenerate. The `regen-protos`
+feature builds protoc from source via `protobuf-src`, so it needs CMake and a
+C++ compiler:
+
+```bash
+# from the sdk-base workspace root
+REMOTEMEDIA_REGEN_PROTOS=1 cargo check -p remotemedia-webrtc --features regen-protos
+# PowerShell: $env:REMOTEMEDIA_REGEN_PROTOS=1; cargo check -p remotemedia-webrtc --features regen-protos
+```
+
+Without the env var the same command only checks: it regenerates into
+`OUT_DIR`, compares byte for byte (line endings normalized) with
+`src/generated/`, and fails on any difference. Use that in CI:
+
+```bash
+cargo check -p remotemedia-webrtc --features regen-protos
+```
+
+`remotemedia-grpc` and `remotemedia-webrtc` each keep their own copy of the
+bindings; regenerate both when a shared `.proto` changes.
+
 ## API Reference
 
 ### Transport Configuration

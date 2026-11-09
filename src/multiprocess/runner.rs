@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use remotemedia_core::multiprocess::runner::Plugin;
+//! use remotemedia_sdk_base::multiprocess::runner::Plugin;
 //! use remotemedia_types::RuntimeData;
 //!
 //! fn main() -> Result<(), String> {

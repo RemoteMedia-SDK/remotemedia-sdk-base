@@ -3,8 +3,8 @@
 //! The schema types moved out of core in Task A4 so plugin authors can
 //! return `NodeSchema` from `StreamingNodeFactory::schema()` without
 //! depending on the heavy host crate. Core re-exports them here to keep
-//! the historical `use remotemedia_core::nodes::schema::NodeSchema` and
-//! `remotemedia_core::nodes::schema::RegisteredNodeConfig` paths
+//! the historical `use remotemedia_sdk_base::nodes::schema::NodeSchema` and
+//! `remotemedia_sdk_base::nodes::schema::RegisteredNodeConfig` paths
 //! working unchanged. The `core-derive` macro emits these paths.
 
 pub use remotemedia_traits::schema::{

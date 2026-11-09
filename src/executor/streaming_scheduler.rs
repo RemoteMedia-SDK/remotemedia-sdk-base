@@ -44,7 +44,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use remotemedia_core::executor::streaming_scheduler::{
+//! use remotemedia_sdk_base::executor::streaming_scheduler::{
 //!     StreamingScheduler, SchedulerConfig
 //! };
 //!

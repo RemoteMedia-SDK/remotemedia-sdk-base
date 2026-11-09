@@ -38,10 +38,10 @@
 //! # Example
 //!
 //! ```ignore
-//! use remotemedia_core::executor::sync_executor::{
+//! use remotemedia_sdk_base::executor::sync_executor::{
 //!     SyncPipelineExecutor, SyncStreamingNodeRegistry,
 //! };
-//! use remotemedia_core::manifest::Manifest;
+//! use remotemedia_sdk_base::manifest::Manifest;
 //!
 //! // Build a manifest (usually parsed from YAML/JSON):
 //! let yaml = r#"

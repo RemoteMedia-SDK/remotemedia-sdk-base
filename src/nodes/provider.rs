@@ -8,7 +8,7 @@
 //! Node crates implement `NodeProvider` and use `inventory::submit!` to register:
 //!
 //! ```ignore
-//! use remotemedia_core::nodes::{NodeProvider, StreamingNodeRegistry};
+//! use remotemedia_sdk_base::nodes::{NodeProvider, StreamingNodeRegistry};
 //!
 //! struct MyNodesProvider;
 //!

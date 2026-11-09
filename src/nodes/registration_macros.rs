@@ -34,8 +34,8 @@
 //! # Example (Compile-time)
 //!
 //! ```
-//! use remotemedia_core::nodes::registry::NodeRegistry;
-//! use remotemedia_core::register_python_node;
+//! use remotemedia_sdk_base::nodes::registry::NodeRegistry;
+//! use remotemedia_sdk_base::register_python_node;
 //!
 //! let mut registry = NodeRegistry::new();
 //! register_python_node!(registry, "OmniASRNode");
@@ -58,8 +58,8 @@
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::nodes::registry::NodeRegistry;
-/// use remotemedia_core::register_python_node;
+/// use remotemedia_sdk_base::nodes::registry::NodeRegistry;
+/// use remotemedia_sdk_base::register_python_node;
 ///
 /// let mut registry = NodeRegistry::new();
 /// register_python_node!(registry, "OmniASRNode");
@@ -115,8 +115,8 @@ macro_rules! register_python_node {
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::nodes::registry::NodeRegistry;
-/// use remotemedia_core::register_python_nodes;
+/// use remotemedia_sdk_base::nodes::registry::NodeRegistry;
+/// use remotemedia_sdk_base::register_python_nodes;
 ///
 /// let mut registry = NodeRegistry::new();
 /// register_python_nodes!(registry, [
