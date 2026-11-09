@@ -170,12 +170,30 @@ where
             call.check().map_err(|error| error.to_string())?;
             let output = handler(input)?;
             call.check().map_err(|error| error.to_string())?;
-            publish_runtime_data(publisher, &output, &call.copies)?;
-            call.check().map_err(|error| error.to_string())
+            // Encode (and report the encode copy) without publishing yet.
+            let sample = super::native_wire::encode_runtime_data(
+                publisher,
+                &output,
+                &call.copies,
+                super::data_transfer::MAX_SLICE_LEN,
+            )?;
+            call.check().map_err(|error| error.to_string())?;
+            Ok::<_, String>(sample)
         })();
-        call.finish(result.clone())
-            .map_err(|error| error.to_string())?;
-        result?;
+        match result {
+            Ok(sample) => {
+                // Completion goes first so the host applies it while the
+                // output travels over shared memory. If the send then fails,
+                // the worker exits and the host fails the call on disconnect.
+                call.complete(Ok(())).map_err(|error| error.to_string())?;
+                sample.send().map_err(|error| format!("send: {error:?}"))?;
+            }
+            Err(error) => {
+                call.finish(Err(error.clone()))
+                    .map_err(|error| error.to_string())?;
+                return Err(error);
+            }
+        }
     }
 }
 
@@ -196,7 +214,7 @@ pub(super) type NativeSubscriber = iceoryx2::port::subscriber::Subscriber<ipc::S
 /// lock, so processes checking the same node at once can judge a live node dead
 /// and iceoryx2 fatal-panics ("the Node is still alive"); every sweep also
 /// rescans all stale node directories, slowing startup. The host sweeps once,
-/// serialized, before each spawn instead ([`sweep_dead_nodes_before_spawn`]).
+/// per process, before its first spawn, instead ([`sweep_dead_nodes_once`]).
 /// Returns a copy; the process-wide global config is unchanged.
 pub(super) fn node_config_without_dead_node_sweeps() -> iceoryx2::config::Config {
     let mut config = iceoryx2::config::Config::global_config().clone();
@@ -206,12 +224,15 @@ pub(super) fn node_config_without_dead_node_sweeps() -> iceoryx2::config::Config
 }
 
 /// Host-side replacement for the per-node sweeps: remove dead iceoryx2 nodes
-/// before spawning a worker, one sweep at a time per process.
-pub(super) fn sweep_dead_nodes_before_spawn() {
-    static SWEEP: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _serialized = SWEEP
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+/// once per process, before the first worker spawn. Concurrent first spawns
+/// wait for that single sweep. A sweep per spawn would rescan, serially, every
+/// node directory that iceoryx2 cannot delete on Windows.
+pub(super) fn sweep_dead_nodes_once() {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(sweep_dead_nodes);
+}
+
+fn sweep_dead_nodes() {
     let state = iceoryx2::node::Node::<ipc::Service>::try_cleanup_dead_nodes(
         iceoryx2::config::Config::global_config(),
     );

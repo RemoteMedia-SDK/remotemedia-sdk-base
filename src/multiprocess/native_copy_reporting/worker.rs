@@ -119,6 +119,12 @@ impl Worker {
     pub(in crate::multiprocess) fn next(&mut self) -> io::Result<Call> {
         let mut client = self.client.lock().unwrap();
         client.check()?;
+        // Acknowledgements of a call completed with `complete` are drained
+        // here, before the next grant, which they always precede.
+        if let Err(error) = client.drain() {
+            client.fail(&error);
+            return Err(error);
+        }
         client.stream.set_read_timeout(None)?;
         let message: HostMessage = read_frame(&mut client.stream)?;
         client.stream.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -152,6 +158,19 @@ impl Call {
         // Completion waits for every outstanding acknowledgement, so pipelined
         // copy reports are confirmed before the call returns.
         if let Err(error) = client.report(self.call, Event::Finished { error }) {
+            client.fail(&error);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Report completion without waiting for its acknowledgement, so the
+    /// caller can publish the call's output while the host applies it. Every
+    /// acknowledgement is drained before the next call grant is read.
+    pub(in crate::multiprocess) fn complete(&self, result: Result<(), String>) -> io::Result<()> {
+        let error = result.err().map(|error| error.chars().take(256).collect());
+        let mut client = self.client.lock().unwrap();
+        if let Err(error) = client.send(self.call, Event::Finished { error }) {
             client.fail(&error);
             return Err(error);
         }

@@ -25,6 +25,24 @@ pub fn publish_runtime_data_with_limit(
     copies: &CopyContext,
     limit: usize,
 ) -> Result<(), String> {
+    encode_runtime_data(publisher, data, copies, limit)?
+        .send()
+        .map_err(|error| format!("send: {error:?}"))?;
+    Ok(())
+}
+
+/// An encoded, not yet published, native sample.
+pub(super) type EncodedSample =
+    iceoryx2::sample_mut::SampleMut<iceoryx2::service::ipc::Service, [u8], ()>;
+
+/// Encode into an exact native loan without publishing it, so a caller can
+/// order other work (such as completion reporting) before `send()`.
+pub(super) fn encode_runtime_data(
+    publisher: &iceoryx2::port::publisher::Publisher<iceoryx2::service::ipc::Service, [u8], ()>,
+    data: &RuntimeData,
+    copies: &CopyContext,
+    limit: usize,
+) -> Result<EncodedSample, String> {
     let length = encoded_len(data, copies, limit)?;
     let mut sample = publisher
         .loan_slice_uninit(length)
@@ -32,9 +50,7 @@ pub fn publish_runtime_data_with_limit(
     encode_into(sample.payload_mut(), data, copies)?;
     // SAFETY: encode_into returns success only after every byte of this exact
     // loan was written. Any codec/bounds/length failure drops the unpublished loan.
-    let sample = unsafe { sample.assume_init() };
-    sample.send().map_err(|error| format!("send: {error:?}"))?;
-    Ok(())
+    Ok(unsafe { sample.assume_init() })
 }
 
 fn encoded_len(data: &RuntimeData, copies: &CopyContext, limit: usize) -> Result<usize, String> {

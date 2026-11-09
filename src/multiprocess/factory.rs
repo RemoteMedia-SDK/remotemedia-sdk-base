@@ -124,8 +124,8 @@ impl MultiprocessNativeNode {
         let reporter = Host::start(node_id, session_id)
             .map_err(|error| Error::IpcError(format!("native copy reporter: {error}")))?;
         // Workers and these host IPC threads open nodes without dead-node
-        // sweeps; the host sweeps once here, serialized, before spawning.
-        super::runner::sweep_dead_nodes_before_spawn();
+        // sweeps; the host sweeps once per process before its first spawn.
+        super::runner::sweep_dead_nodes_once();
         let child = command
             .env("RM_SESSION_ID", session_id)
             .env("RM_NODE_ID", node_id)
