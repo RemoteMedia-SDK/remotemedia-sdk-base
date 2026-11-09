@@ -742,7 +742,7 @@ impl LoadableNodeAdapter {
             0 => Ok(false),
             BUFFER_ABI_VERSION => Ok(true),
             other => Err(Error::Execution(format!(
-                "plugin '{}' (id={}): unsupported buffer protocol {other}; rebuild it                  against the current plugin SDK (shared buffer protocol {BUFFER_ABI_VERSION})",
+                "plugin '{}' (id={}): unsupported buffer protocol {other}; rebuild it against the current plugin SDK (shared buffer protocol {BUFFER_ABI_VERSION})",
                 self.node_type, self.node_id
             ))),
         }
