@@ -315,9 +315,24 @@ views can be forwarded without payload copies. Tap and intercept receives retain
 immutable owners; consuming legacy Vec audio promotes its storage without copying.
 Control handles and queued tap items retain their authority after session close.
 
-This applies to the native handles. The higher-level `remotemedia.control` client
-still routes publishes and replacements through protobuf DataBuffer construction;
-that adapter and explicit `Data.as_buffer()` serialization need separate migration.
+The higher-level `attach_inproc` client also passes owning Data directly for
+publishes and intercept replacements. `Data.from_bytes` / `Data.from_buffer`
+retain a buffer; `Data.from_audio_numpy` retains its array without eager packing.
+Mutable inputs are borrowed until publish and snapshot only under the native
+session policy: edits before publish are visible, while edits after an allowed
+publish cannot alter the published snapshot. Strict sessions reject that snapshot.
+`Data.as_runtime_data()` exposes the retained representation for forwarding/views.
+
+The transport interface now separates `publish_data(address, data)` from protobuf
+control headers. gRPC materializes payloads at that network boundary and retains
+its wire format. Intercept requests use transport-specific replies. Closed or
+replaced in-process intercept slots reject stale replies; conversion errors are
+raised by public tap/intercept iterators.
+
+Explicit `Data.as_buffer()`/text conversions, protobuf-backed Data compatibility
+decoding, network serialization and independent backend operations remain separate
+copy-accounting work. Unsupported DataBuffer export kinds raise rather than silently
+returning an empty payload. This API does not certify a zero-copy network path.
 
 ### NumPy inside compatibility JSON
 
