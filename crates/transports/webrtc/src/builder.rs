@@ -223,6 +223,7 @@ mod grpc_builder {
         max_peers: Option<u32>,
         enable_data_channel: Option<bool>,
         jitter_buffer_ms: Option<u32>,
+        shared_session_key: Option<String>,
     }
 
     impl WebRtcSignalingServerBuilder {
@@ -236,6 +237,7 @@ mod grpc_builder {
                 max_peers: None,
                 enable_data_channel: None,
                 jitter_buffer_ms: None,
+                shared_session_key: None,
             }
         }
 
@@ -315,6 +317,13 @@ mod grpc_builder {
             self
         }
 
+        /// Name the shared session every peer of this server joins (each
+        /// peer is a participant of it). Defaults to `"default"`.
+        pub fn shared_session_key(mut self, key: impl Into<String>) -> Self {
+            self.shared_session_key = Some(key.into());
+            self
+        }
+
         /// Build and validate the server configuration.
         ///
         /// Returns an error if `executor` or `manifest` has not been set, or
@@ -344,6 +353,7 @@ mod grpc_builder {
             if let Some(jb) = self.jitter_buffer_ms {
                 config.jitter_buffer_size_ms = jb;
             }
+            config.shared_session_key = self.shared_session_key;
 
             config.validate()?;
 

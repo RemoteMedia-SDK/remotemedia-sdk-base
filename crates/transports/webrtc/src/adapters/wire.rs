@@ -21,6 +21,19 @@ pub fn encode_runtime_data_with_context(
     Ok(wire.into())
 }
 
+/// [`encode_runtime_data_with_context`] plus the output's metadata (e.g. the
+/// `participant.*` fields that attribute it to a speaker) in
+/// `DataBuffer.metadata`.
+pub fn encode_transport_data_with_context(
+    data: &remotemedia_core::transport::TransportData,
+    copies: &CopyContext,
+) -> Result<Bytes, CopyRejected> {
+    let prepared = PreparedRuntimeData::new(&data.data, copies)?.with_metadata(&data.metadata);
+    let mut wire = Vec::with_capacity(prepared.encoded_len());
+    prepared.append_to(&mut wire)?;
+    Ok(wire.into())
+}
+
 enum Payload<'a> {
     Audio {
         samples: &'a AudioSamples,
@@ -36,6 +49,9 @@ pub(crate) struct PreparedRuntimeData<'a> {
     payload: Payload<'a>,
     copies: &'a CopyContext,
     bytes: usize,
+    /// `DataBuffer.metadata` entries, written after the payload (protobuf
+    /// merges repeated map fields, so this is the same as one message).
+    metadata: Option<DataBuffer>,
 }
 
 impl<'a> PreparedRuntimeData<'a> {
@@ -63,14 +79,25 @@ impl<'a> PreparedRuntimeData<'a> {
             payload,
             copies,
             bytes,
+            metadata: None,
         })
     }
 
+    /// Also write `metadata` into `DataBuffer.metadata` (no-op when empty).
+    pub(crate) fn with_metadata(mut self, metadata: &std::collections::HashMap<String, String>) -> Self {
+        self.metadata = (!metadata.is_empty()).then(|| DataBuffer {
+            data_type: None,
+            metadata: metadata.clone(),
+        });
+        self
+    }
+
     pub(crate) fn encoded_len(&self) -> usize {
-        match &self.payload {
+        let payload = match &self.payload {
             Payload::Audio { header, .. } => field_len(audio_len(self.bytes, header)),
             Payload::Other(buffer) => buffer.encoded_len(),
-        }
+        };
+        payload + self.metadata.as_ref().map_or(0, Message::encoded_len)
     }
 
     pub(crate) fn append_to(&self, wire: &mut Vec<u8>) -> Result<(), CopyRejected> {
@@ -100,6 +127,9 @@ impl<'a> PreparedRuntimeData<'a> {
                     Payload::Other(buffer) => {
                         buffer.encode(wire).expect("sized DataBuffer destination")
                     }
+                }
+                if let Some(metadata) = &self.metadata {
+                    metadata.encode(wire).expect("sized DataBuffer metadata destination");
                 }
             })
     }

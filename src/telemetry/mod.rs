@@ -567,6 +567,13 @@ impl SessionTelemetry {
         out
     }
 
+    /// Live per-participant instances of `node_id` (0 for shared nodes and
+    /// unknown ids).
+    pub fn live_instances(&self, node_id: &str) -> u32 {
+        self.node_index(node_id)
+            .map_or(0, |i| self.nodes[i].instances.load(Relaxed))
+    }
+
     /// Set the number of live per-participant instances of node `idx`.
     pub fn set_instances(&self, idx: usize, count: usize) {
         if let Some(cell) = self.nodes.get(idx) {
