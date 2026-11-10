@@ -5,8 +5,7 @@
 // Public API types - fields and methods used by library consumers, not internally
 #![allow(dead_code)]
 
-use crate::channels::{DataChannelMessage, DataChannelSplitter, MAX_CHUNK_SIZE};
-use crate::media::tracks::rtp_to_runtime_data;
+mod wire_output;
 use crate::peer::PeerManager;
 use crate::session::{Session, SessionId};
 use crate::sync::RtpHeader;
@@ -466,6 +465,8 @@ impl SessionMetrics {
 /// Note: This router does NOT run the pipeline directly - it's a routing
 /// layer between WebRTC peers and the application (which uses PipelineTransport).
 pub struct SessionRouter {
+    copies: remotemedia_types::CopyContext,
+    output_allocator: Arc<dyn remotemedia_types::OutputAllocator>,
     /// Session ID
     session_id: SessionId,
 
@@ -516,6 +517,21 @@ pub struct SessionRouter {
 }
 
 impl SessionRouter {
+    /// Bind media and wire materialization to the pipeline's transport authority.
+    pub fn with_copy_context(mut self, copies: remotemedia_types::CopyContext) -> Self {
+        self.copies = copies;
+        self
+    }
+
+    /// Select storage for decoded media before sharing this router with callers.
+    pub fn with_output_allocator(
+        mut self,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Self {
+        self.output_allocator = allocator;
+        self
+    }
+
     /// Create a new session router
     ///
     /// # Arguments
@@ -534,6 +550,8 @@ impl SessionRouter {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         Ok(Self {
+            copies: remotemedia_types::CopyContext::legacy().clone(),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
             session_id,
             session,
             peer_manager,
@@ -603,7 +621,7 @@ impl SessionRouter {
     /// # Arguments
     ///
     /// * `peer_id` - Peer ID that sent the data
-    /// * `payload` - RTP payload (encoded audio or video)
+    /// * `payload` - Opus payload or complete depacketized video sample
     /// * `is_audio` - True for audio, false for video
     pub async fn route_incoming(
         &self,
@@ -641,12 +659,20 @@ impl SessionRouter {
                 let audio_track = peer.audio_track().await.ok_or_else(|| {
                     Error::MediaTrackError("No audio track configured".to_string())
                 })?;
-                rtp_to_runtime_data(payload, true, Some(&audio_track), None).await?
+                crate::media::tracks::audio_rtp_to_runtime_data(
+                    payload, &audio_track, self.output_allocator.as_ref(),
+                ).await?
             } else {
                 let video_track = peer.video_track().await.ok_or_else(|| {
                     Error::MediaTrackError("No video track configured".to_string())
                 })?;
-                rtp_to_runtime_data(payload, false, None, Some(&video_track)).await?
+                video_track
+                    .decode_rtp_payload_with_context(
+                        payload,
+                        &self.copies,
+                        self.output_allocator.clone(),
+                    )
+                    .await?
             };
 
         // Record metrics
@@ -663,12 +689,35 @@ impl SessionRouter {
         Ok(runtime_data)
     }
 
+    /// Receive a complete depacketized video sample without a borrowed-input snapshot.
+    /// Codec-required transfers still use this router's authority and output provider.
+    pub async fn route_incoming_video_owned(
+        &self,
+        peer_id: &str,
+        payload: remotemedia_types::SharedBytes,
+    ) -> Result<RuntimeData> {
+        let start = Instant::now();
+        let bytes = payload.len();
+        let peer = self.peer_manager.get_peer(peer_id).await?;
+        let video_track = peer.video_track().await.ok_or_else(|| {
+            Error::MediaTrackError("No video track configured".to_string())
+        })?;
+        let frame = video_track
+            .decode_owned_payload_with_context(payload, &self.copies, self.output_allocator.clone())
+            .await?;
+        let mut metrics = self.metrics.write().await;
+        metrics.record_video_in(bytes);
+        metrics.record_latency(start.elapsed().as_micros() as u64);
+        Ok(frame)
+    }
+
     /// Route outgoing data to peers (T127)
     ///
     /// # Arguments
     ///
     /// * `data` - RuntimeData to send
     async fn route_outgoing(&self, data: RuntimeData) -> Result<()> {
+        let data = data.into_shared();
         debug!("Routing outgoing data (session: {})", self.session_id);
 
         // Get all peers in this session
@@ -706,12 +755,8 @@ impl SessionRouter {
                     Error::MediaTrackError("No audio track configured".to_string())
                 })?;
 
-                // Send audio directly (handles encoding + RTP transmission).
-                // Use sample rate from RuntimeData. `send_audio` takes
-                // `Arc<Vec<f32>>`; materialize via `to_vec` — same cost
-                // as the previous `samples.clone()` on a `Vec<f32>`.
                 audio_track
-                    .send_audio(Arc::new(samples.to_vec()), *sample_rate)
+                    .send_audio_with_context(samples.clone().into_shared(), *sample_rate, &self.copies)
                     .await?;
 
                 // Record outgoing audio metrics
@@ -756,7 +801,9 @@ impl SessionRouter {
                 };
 
                 // Send video directly (handles encoding + RTP transmission)
-                video_track.send_video(&frame).await?;
+                video_track
+                    .send_video_runtime_data_with_context(frame.as_runtime_data(), &self.copies)
+                    .await?;
 
                 // Record outgoing video metrics
                 self.metrics
@@ -767,69 +814,16 @@ impl SessionRouter {
             }
             _ => {
                 // Route non-media RuntimeData through the data channel.
-                use crate::adapters::runtime_data_to_data_buffer;
-                use prost::Message;
+                let encoded = crate::adapters::encode_runtime_data_with_context(data, &self.copies)
+                    .map_err(|e| Error::Other(e.into()))?;
 
-                // Serialize to protobuf DataBuffer
-                let buffer = runtime_data_to_data_buffer(data);
-                let encoded = buffer.encode_to_vec();
-
-                if encoded.len() > MAX_CHUNK_SIZE {
-                    // Large payload: split into chunks
-                    self.send_data_channel_chunks(&peer, &encoded).await
-                } else {
-                    // Small payload: single RuntimeData message
-                    self.send_data_channel_message(&peer, &encoded).await
+                let limit = wire_output::message_size_limit(&peer).await?;
+                for message in wire_output::prepare_messages(encoded, &self.session_id, limit)? {
+                    peer.send_data_channel_message_with_context(&message, &self.copies).await?;
                 }
+                Ok(())
             }
         }
-    }
-
-    /// Send a single RuntimeData message over the data channel.
-    async fn send_data_channel_message(
-        &self,
-        peer: &crate::peer::PeerConnection,
-        encoded: &[u8],
-    ) -> Result<()> {
-        let msg = DataChannelMessage::runtime_data(encoded.to_vec());
-        peer.send_data_channel_message(&msg).await
-    }
-
-    /// Send a large payload as chunked messages over the data channel.
-    async fn send_data_channel_chunks(
-        &self,
-        peer: &crate::peer::PeerConnection,
-        encoded: &[u8],
-    ) -> Result<()> {
-        use uuid::Uuid;
-
-        let stream_id = self.session_id.clone();
-        let message_id = Uuid::new_v4().to_string();
-        let splitter = DataChannelSplitter::new(&stream_id, &message_id);
-        let chunks = splitter.split(encoded);
-        let num_chunks = chunks.len();
-
-        trace!(
-            stream_id = %stream_id,
-            message_id = %message_id,
-            chunks = num_chunks,
-            total_bytes = encoded.len(),
-            "Sending chunked data channel message"
-        );
-
-        for chunk_info in chunks {
-            let msg = DataChannelMessage::chunk(chunk_info);
-            peer.send_data_channel_message(&msg).await?;
-        }
-
-        debug!(
-            stream_id = %stream_id,
-            message_id = %message_id,
-            chunks = num_chunks,
-            "Completed sending chunked message"
-        );
-
-        Ok(())
     }
 
     /// Send data to output channel (T128).
@@ -1194,6 +1188,7 @@ impl SessionRouter {
         output_id: &str,
         data: RuntimeData,
     ) -> Result<Vec<String>> {
+        let data = data.into_shared();
         let policy = *self.routing_policy.read().await;
         let mut sent_to = Vec::new();
 
@@ -1351,6 +1346,14 @@ impl SessionRouter {
         self.peer_bitrate_states.read().await.clone()
     }
 }
+
+#[cfg(test)]
+#[path = "router_wire_tests.rs"]
+mod wire_tests;
+
+#[cfg(all(test, feature = "video"))]
+#[path = "router_video_copy_tests.rs"]
+mod video_copy_tests;
 
 #[cfg(test)]
 mod tests {

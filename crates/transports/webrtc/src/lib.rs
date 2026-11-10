@@ -143,6 +143,10 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod test_support;
+
+mod json_payload;
 /// Guards the committed protobuf bindings in `src/generated/`: fails when a
 /// `.proto` input changed without regenerating them (see `build.rs`). Cheap:
 /// hashes the `.proto` files, does not run protoc.

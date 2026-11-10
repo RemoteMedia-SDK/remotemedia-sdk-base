@@ -178,9 +178,16 @@ impl WebRtcServerCore {
         let manifest = Arc::new(manifest);
 
         // Create PipelineExecutor
-        let runner = Arc::new(PipelineExecutor::new().map_err(|e| {
-            WebRtcError::Internal(format!("Failed to create PipelineExecutor: {}", e))
-        })?);
+        let runner = Arc::new(
+            PipelineExecutor::with_config(
+                self.config
+                    .to_executor_config()
+                    .map_err(|e| WebRtcError::config(e.to_string()))?,
+            )
+            .map_err(|e| {
+                WebRtcError::Internal(format!("Failed to create PipelineExecutor: {}", e))
+            })?,
+        );
 
         // Build WebRTC transport configuration using the conversion helper
         let transport_config = Arc::new(self.config.to_webrtc_config());
@@ -867,7 +874,11 @@ impl WebRtcServerCore {
     }
 }
 
-/// Convert a bridge event from the WebRTC signaling layer to an FFI event
+#[cfg(test)]
+#[path = "observer_tests.rs"]
+mod observer_tests;
+
+/// Convert a bridge event from the WebRTC signaling layer to an FFI event.
 fn convert_bridge_to_ffi_event(bridge_event: &WebRtcEventBridge) -> WebRtcEvent {
     match bridge_event {
         WebRtcEventBridge::PeerConnected {
@@ -900,29 +911,25 @@ fn convert_bridge_to_ffi_event(bridge_event: &WebRtcEventBridge) -> WebRtcEvent 
         }
         WebRtcEventBridge::PipelineOutput {
             peer_id,
-            data_json,
+            data,
             timestamp_ns,
-        } => {
-            // Deserialize RuntimeData from JSON
-            let runtime_data = serde_json::from_str(data_json).unwrap_or_else(|e| {
-                tracing::warn!("Failed to deserialize pipeline output RuntimeData: {}", e);
-                remotemedia_core::data::RuntimeData::Text(format!("Error deserializing: {}", e))
-            });
-
-            WebRtcEvent::PipelineOutput(PipelineOutputEvent {
-                peer_id: peer_id.clone(),
-                data: runtime_data,
-                timestamp: *timestamp_ns,
-            })
-        }
+            copies,
+        } => WebRtcEvent::PipelineOutput(PipelineOutputEvent {
+            peer_id: peer_id.clone(),
+            data: data.clone(),
+            timestamp: *timestamp_ns,
+            copies: copies.clone(),
+        }),
         WebRtcEventBridge::DataReceived {
             peer_id,
             data,
             timestamp_ns,
+            copies,
         } => WebRtcEvent::DataReceived(DataReceivedEvent {
             peer_id: peer_id.clone(),
             data: data.clone(),
             timestamp: *timestamp_ns,
+            copies: copies.clone(),
         }),
         WebRtcEventBridge::Error {
             code,

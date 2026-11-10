@@ -47,7 +47,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::adapters::{
-    data_buffer_to_transport_data, transport_data_to_data_buffer,
+    data_buffer_into_transport_data_with_context, transport_data_to_data_buffer_with_context,
 };
 use crate::generated::{
     execute_response::Outcome, pipeline_execution_service_client::PipelineExecutionServiceClient,
@@ -75,6 +75,10 @@ pub struct GrpcPipelineClient {
 
     /// gRPC channel (created lazily)
     channel: tokio::sync::Mutex<Option<tonic::transport::Channel>>,
+
+    /// Copy ledger for wire encode/decode of payloads this client sends and
+    /// receives. Defaults to an attributed compatibility ledger.
+    copies: remotemedia_core::data::CopyContext,
 }
 
 impl GrpcPipelineClient {
@@ -109,11 +113,28 @@ impl GrpcPipelineClient {
             ));
         }
 
+        let copies = remotemedia_core::data::CopyContext::new(
+            remotemedia_core::data::CopyPolicy::AllowCopies,
+            format!("grpc/client/{endpoint}/transport/materialization"),
+        );
         Ok(Self {
             endpoint,
             auth_token,
             channel: tokio::sync::Mutex::new(None),
+            copies,
         })
+    }
+
+    /// Charge this client's wire copies to the caller's ledger (for example a
+    /// command- or session-scoped context). Strict ledgers reject them.
+    pub fn with_copy_context(mut self, copies: remotemedia_core::data::CopyContext) -> Self {
+        self.copies = copies;
+        self
+    }
+
+    /// The ledger charged with this client's wire encode/decode copies.
+    pub fn copy_context(&self) -> remotemedia_core::data::CopyContext {
+        self.copies.clone()
     }
 
     /// Get or create gRPC channel
@@ -221,7 +242,11 @@ impl PipelineClient for GrpcPipelineClient {
         let input_node = Self::input_node_id(&manifest)?;
 
         let mut data_inputs = std::collections::HashMap::new();
-        data_inputs.insert(input_node, transport_data_to_data_buffer(&input));
+        data_inputs.insert(
+            input_node,
+            transport_data_to_data_buffer_with_context(&input, &self.copies)
+                .map_err(|rejected| Error::Transport(rejected.to_string()))?,
+        );
 
         let mut embedded = Vec::with_capacity(embedded_plugins.len());
         for (digest, content) in embedded_plugins {
@@ -275,7 +300,7 @@ impl PipelineClient for GrpcPipelineClient {
             .into_inner();
 
         match response.outcome {
-            Some(Outcome::Result(result)) => map_execution_result(result),
+            Some(Outcome::Result(result)) => map_execution_result(result, &self.copies),
             Some(Outcome::Error(err)) => Err(server_error_to_core(
                 err,
                 "ExecutePipeline returned an error outcome",
@@ -358,7 +383,12 @@ impl PipelineClient for GrpcPipelineClient {
             .await
             .map_err(|s| Error::Transport(format!("StreamPipeline RPC failed: {}", s)))?;
 
-        let session = GrpcStreamSession::new(input_node, tx, response_stream.into_inner());
+        let session = GrpcStreamSession::new(
+            input_node,
+            tx,
+            response_stream.into_inner(),
+            self.copies.clone(),
+        );
         Ok(Box::new(session))
     }
 
@@ -396,6 +426,8 @@ pub struct GrpcStreamSession {
     closed: bool,
     /// Session id negotiated via `StreamReady` (for diagnostics).
     session_id: String,
+    /// The owning client's wire copy ledger.
+    copies: remotemedia_core::data::CopyContext,
 }
 
 impl GrpcStreamSession {
@@ -406,6 +438,7 @@ impl GrpcStreamSession {
         input_node: String,
         outbound: mpsc::Sender<StreamRequest>,
         inbound: tonic::codec::Streaming<StreamResponse>,
+        copies: remotemedia_core::data::CopyContext,
     ) -> Self {
         Self {
             input_node,
@@ -415,6 +448,7 @@ impl GrpcStreamSession {
             active: true,
             closed: false,
             session_id: String::new(),
+            copies,
         }
     }
 }
@@ -430,7 +464,8 @@ impl ClientStreamSession for GrpcStreamSession {
             return Err(Error::Transport("Session is closed".to_string()));
         }
 
-        let buffer = transport_data_to_data_buffer(&data);
+        let buffer = transport_data_to_data_buffer_with_context(&data, &self.copies)
+            .map_err(|rejected| Error::Transport(rejected.to_string()))?;
         let sequence = self.sequence;
         self.sequence += 1;
 
@@ -471,7 +506,7 @@ impl ClientStreamSession for GrpcStreamSession {
                     continue;
                 }
                 Some(StreamResponseKind::Result(result)) => {
-                    if let Some(data) = map_chunk_result(result) {
+                    if let Some(data) = map_chunk_result(result, &self.copies) {
                         return Ok(Some(data));
                     }
                     continue;
@@ -519,7 +554,8 @@ impl ClientStreamSession for GrpcStreamSession {
 /// Convert an `ExecutionResult` (server output is keyed under "output") into
 /// a [`TransportData`].
 fn map_execution_result(
-    result: crate::generated::ExecutionResult,
+    mut result: crate::generated::ExecutionResult,
+    copies: &remotemedia_core::data::CopyContext,
 ) -> Result<TransportData> {
     if result.status != ExecutionStatus::Success as i32 {
         return Err(Error::RemoteExecutionFailed(format!(
@@ -529,8 +565,11 @@ fn map_execution_result(
     }
     result
         .data_outputs
-        .get("output")
-        .and_then(data_buffer_to_transport_data)
+        .remove("output")
+        .map(|buffer| data_buffer_into_transport_data_with_context(buffer, copies))
+        .transpose()
+        .map_err(|rejected| Error::Transport(rejected.to_string()))?
+        .flatten()
         .ok_or_else(|| {
             Error::Transport(
                 "ExecutePipeline returned no \"output\" entry in data_outputs".to_string(),
@@ -541,11 +580,15 @@ fn map_execution_result(
 /// Convert a streaming `ChunkResult` (server may key outputs under the sink
 /// node id, an `is_output_node`, or a `__tap__.*` key) into a
 /// [`TransportData`]. The first convertible buffer is returned.
-fn map_chunk_result(result: crate::generated::ChunkResult) -> Option<TransportData> {
-    result
-        .data_outputs
-        .into_values()
-        .find_map(|buffer| data_buffer_to_transport_data(&buffer))
+fn map_chunk_result(
+    result: crate::generated::ChunkResult,
+    copies: &remotemedia_core::data::CopyContext,
+) -> Option<TransportData> {
+    result.data_outputs.into_values().find_map(|buffer| {
+        data_buffer_into_transport_data_with_context(buffer, copies)
+            .ok()
+            .flatten()
+    })
 }
 
 /// Map a server [`ErrorResponse`] (and its surrounding context) into a core

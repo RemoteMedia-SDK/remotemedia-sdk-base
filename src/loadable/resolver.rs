@@ -111,6 +111,8 @@ const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Errors surfacing during plugin resolution.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolverError {
+    #[error("[rust.mapped] requires a local prebuilt package; remote mapped worker distribution is unsupported")]
+    MappedNativeRequiresLocal,
     #[error("plugin spec is empty (no value)")]
     EmptySpec,
 
@@ -236,6 +238,11 @@ pub enum ResolverError {
 /// `node_types` entry.
 #[derive(Debug, Clone)]
 pub enum ResolvedPlugin {
+    /// Local native worker package; requires explicit host authorization.
+    MappedNative {
+        plugin_toml: PluginToml,
+        package_root: PathBuf,
+    },
     /// Native cdylib (or direct URL pointing at one). Path is the
     /// fully-cached local file ready for `LoadableNodeBundle::load`.
     Cdylib { path: PathBuf },
@@ -369,8 +376,8 @@ impl PluginResolver {
     }
 
     /// Async variant of [`Self::resolve`]. Returns the full
-    /// `ResolvedPlugin` enum so the caller can dispatch on cdylib vs.
-    /// source-python paths.
+    /// `ResolvedPlugin` enum so the caller can dispatch on cdylib, source Python
+    /// or explicitly declared local mapped native packages.
     pub async fn resolve_async(&self, spec: &PluginSpec) -> Result<ResolvedPlugin, ResolverError> {
         let parsed = parse_spec(spec)?;
         match parsed {
@@ -408,8 +415,8 @@ impl PluginResolver {
 
     /// Dispatch a GitHub-shaped spec: fetch `plugin.toml` first to see
     /// if this is a Python source plugin. If so, route through the
-    /// source-load path. Otherwise (404 on plugin.toml or
-    /// language=rust) fall back to the release-load path.
+    /// source-load path. Rust mapped declarations fail explicitly until remote
+    /// distribution is implemented; other Rust plugins use release loading.
     async fn resolve_github_dispatched(
         &self,
         owner: &str,
@@ -447,6 +454,13 @@ impl PluginResolver {
                     });
                 }
                 PluginLanguage::Rust => {
+                    if plugin_toml
+                        .rust
+                        .as_ref()
+                        .is_some_and(|rust| rust.mapped.is_some())
+                    {
+                        return Err(ResolverError::MappedNativeRequiresLocal);
+                    }
                     // Fall through to release-load path. plugin.toml
                     // for Rust plugins is informational; the cdylib's
                     // factory list is authoritative.
@@ -810,8 +824,8 @@ impl PluginResolver {
     }
 
     /// Local-path dispatch: if `raw` resolves to a directory containing
-    /// a `plugin.toml`, treat as a source-load Python plugin; otherwise
-    /// the path is a cdylib to dlopen. Lets the example layout work
+    /// a `plugin.toml`, dispatch its language and mapped declaration; otherwise
+    /// a file path is a cdylib to dlopen. Lets the example layout work
     /// without going through GitHub (`"plugins": ["./examples/python-source-plugin"]`).
     fn resolve_local_path_dispatched(&self, raw: &str) -> Result<ResolvedPlugin, ResolverError> {
         let path = self.resolve_local_path(raw)?;
@@ -832,6 +846,22 @@ impl PluginResolver {
                 // same venv across runs (PEP 723 deps determine the
                 // contents, so this is safe).
                 let canonical = path.canonicalize().unwrap_or(path.clone());
+                if plugin_toml.plugin.language == PluginLanguage::Rust {
+                    if plugin_toml
+                        .rust
+                        .as_ref()
+                        .is_some_and(|rust| rust.mapped.is_some())
+                    {
+                        return Ok(ResolvedPlugin::MappedNative {
+                            plugin_toml,
+                            package_root: canonical,
+                        });
+                    }
+                    return Err(ResolverError::BadPluginToml {
+                        url: plugin_toml_path.display().to_string(),
+                        source: crate::loadable::plugin_toml::PluginTomlError::RustPluginWrongPath,
+                    });
+                }
                 let hash = sha256_hex(canonical.display().to_string().as_bytes());
                 return Ok(ResolvedPlugin::SourcePython {
                     plugin_toml,
@@ -926,6 +956,7 @@ fn parse_shorthand(s: &str) -> Result<ParsedSpec, ResolverError> {
         || s.starts_with("./")
         || s.starts_with("../")
         || s.starts_with('/')
+        || std::path::Path::new(s).is_absolute()
         || looks_like_plugin_file(s)
     {
         return Ok(ParsedSpec::LocalPath(s.to_string()));
@@ -1142,7 +1173,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn file_sha256(path: &Path) -> Result<String, ResolverError> {
+pub(crate) fn file_sha256(path: &Path) -> Result<String, ResolverError> {
     let bytes = std::fs::read(path).map_err(|e| ResolverError::CacheIo { source: e })?;
     Ok(sha256_hex(&bytes))
 }

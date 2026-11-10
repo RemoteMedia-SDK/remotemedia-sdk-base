@@ -135,6 +135,7 @@ impl NapiAttachedSession {
             .await
             .map_err(|e| Error::from_reason(format!("subscribe failed: {e}")))?;
         Ok(NapiSubscription {
+            copies: self.transport.transport_copy_context(),
             rpc: addr.port.as_deref() == Some("__reply__"),
             rx: Arc::new(Mutex::new(rx)),
         })
@@ -143,17 +144,28 @@ impl NapiAttachedSession {
     /// Inject `data` at a node's input.
     ///
     /// `address` format: `"node_id.in[.port]"`.
-    #[napi]
-    pub async fn publish(&self, address: String, data: &NapiRuntimeData) -> Result<()> {
-        let addr = parse_address(&address)?;
-        if addr.direction != Direction::In {
-            return Err(control_address_error("publish requires an '.in' address"));
-        }
-        self.transport
-            .publish(&addr, data.get_inner().clone())
-            .await
-            .map_err(|e| Error::from_reason(format!("publish failed: {e}")))?;
-        Ok(())
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn publish(
+        &self,
+        env: Env,
+        address: String,
+        data: &NapiRuntimeData,
+    ) -> Result<napi::JsObject> {
+        // Take the owner on the JS thread: a borrowed handle must not be read
+        // inside the future, which runs after this call returns.
+        let data = data.get_inner().clone();
+        let transport = self.transport.clone();
+        env.spawn_future(async move {
+            let addr = parse_address(&address)?;
+            if addr.direction != Direction::In {
+                return Err(control_address_error("publish requires an '.in' address"));
+            }
+            transport
+                .publish(&addr, data)
+                .await
+                .map_err(|e| Error::from_reason(format!("publish failed: {e}")))?;
+            Ok(())
+        })
     }
 
     /// Set a node's execution state.
@@ -199,6 +211,7 @@ impl NapiAttachedSession {
             .map_err(|e| Error::from_reason(format!("intercept failed: {e}")))?;
         let reply = sess.reply.clone();
         Ok(NapiInterceptSession {
+            copies: self.transport.transport_copy_context(),
             inner: Arc::new(Mutex::new(sess)),
             reply,
         })
@@ -215,6 +228,7 @@ impl NapiAttachedSession {
 /// - Throws when the upstream channel closes (session ended).
 #[napi]
 pub struct NapiSubscription {
+    copies: remotemedia_types::CopyContext,
     rpc: bool,
     rx: Arc<Mutex<broadcast::Receiver<RuntimeData>>>,
 }
@@ -230,7 +244,7 @@ impl NapiSubscription {
             guard.recv().await
         };
         match result {
-            Ok(rd) => Ok(Some(NapiRuntimeData { inner: rd })),
+            Ok(rd) => Ok(Some(NapiRuntimeData::from_runtime_with_context(rd, &self.copies))),
             Err(RecvError::Lagged(count)) if self.rpc => Err(Error::from_reason(format!(
                 "RPC reply subscription lagged by {count} frames; pending calls cannot complete reliably"
             ))),
@@ -266,9 +280,7 @@ impl InterceptItem {
     /// The data frame the node emitted; inspect or replace it.
     #[napi(getter)]
     pub fn data(&self) -> NapiRuntimeData {
-        NapiRuntimeData {
-            inner: self.data.get_inner().clone(),
-        }
+        self.data.clone()
     }
 }
 
@@ -292,6 +304,7 @@ impl InterceptItem {
 /// inner `InterceptSession`'s `Drop` impl).
 #[napi]
 pub struct NapiInterceptSession {
+    copies: remotemedia_types::CopyContext,
     inner: Arc<Mutex<InterceptSession>>,
     reply: InterceptReplyHandle,
 }
@@ -307,7 +320,7 @@ impl NapiInterceptSession {
         };
         Ok(result.map(|req| InterceptItem {
             correlation_id: req.correlation_id,
-            data: NapiRuntimeData { inner: req.data },
+            data: NapiRuntimeData::from_runtime_with_context(req.data, &self.copies),
         }))
     }
 
@@ -335,8 +348,10 @@ impl NapiInterceptSession {
                 )));
             }
         };
-        self.reply.complete(cid, decision).await;
-        Ok(())
+        self.reply
+            .complete(cid, decision)
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))
     }
 }
 

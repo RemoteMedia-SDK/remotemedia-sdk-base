@@ -8,7 +8,7 @@
 //! - **InstanceExecutor**: Wraps a Python Node instance (Py<PyAny>) and provides
 //!   a Rust-friendly execution interface
 //! - **Lifecycle Management**: Calls Python's initialize(), process(), cleanup() methods
-//! - **GIL Management**: Uses Python::with_gil() for all Python method calls
+//! - **GIL Management**: Uses Python::attach() for all Python method calls
 //! - **Memory Safety**: Py<PyAny> handles reference counting automatically
 //!
 //! # Usage
@@ -18,7 +18,7 @@
 //! use pyo3::ffi::c_str;
 //! use remotemedia_ffi::instance_handler::InstanceExecutor;
 //!
-//! Python::with_gil(|py| {
+//! Python::attach(|py| {
 //!     // InstanceExecutor wraps a Python Node instance for lifecycle management
 //!     // Create a node class and instance:
 //!     let code = c_str!(r#"
@@ -35,6 +35,7 @@
 
 use pyo3::prelude::*;
 use remotemedia_core::data::RuntimeData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, warn};
 
 /// Wrapper for executing Python Node instances from Rust
@@ -47,7 +48,7 @@ use tracing::{debug, error, warn};
 ///
 /// `Py<PyAny>` implements `Send`, making this struct safe to pass between
 /// async tasks. However, all Python method calls must acquire the GIL via
-/// `Python::with_gil()`.
+/// `Python::attach()`.
 pub struct InstanceExecutor {
     /// Python Node instance reference (GIL-independent)
     node_instance: Py<PyAny>,
@@ -57,6 +58,8 @@ pub struct InstanceExecutor {
 
     /// Whether this node supports streaming execution
     is_streaming: bool,
+    /// Claim cleanup before attempting initialization; never retry cleanup on drop.
+    cleanup_pending: AtomicBool,
 }
 
 impl InstanceExecutor {
@@ -84,7 +87,7 @@ impl InstanceExecutor {
     /// use pyo3::ffi::c_str;
     /// use remotemedia_ffi::instance_handler::InstanceExecutor;
     ///
-    /// Python::with_gil(|py| {
+    /// Python::attach(|py| {
     ///     // Create a Python node with required methods
     ///     let code = c_str!(r#"
     /// class TestNode:
@@ -102,18 +105,26 @@ impl InstanceExecutor {
         Python::attach(|py| {
             let node_ref = node_instance.bind(py);
 
-            // Check for process method
-            if !node_ref.hasattr("process")? {
-                return Err(PyErr::new::<pyo3::exceptions::PyAttributeError, _>(
-                    format!("Node '{}' missing required process() method", node_id),
-                ));
-            }
-
-            // Check for initialize method
-            if !node_ref.hasattr("initialize")? {
-                return Err(PyErr::new::<pyo3::exceptions::PyAttributeError, _>(
-                    format!("Node '{}' missing required initialize() method", node_id),
-                ));
+            let inspect = py.import("inspect")?;
+            for name in ["initialize", "process", "cleanup"] {
+                let method = node_ref.getattr(name)?;
+                if !method.is_callable() {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "Node '{}' {} must be callable",
+                        node_id, name
+                    )));
+                }
+                for kind in [
+                    "iscoroutinefunction",
+                    "isasyncgenfunction",
+                    "isgeneratorfunction",
+                ] {
+                    if inspect.call_method1(kind, (&method,))?.is_truthy()? {
+                        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                            "Direct instance execution supports synchronous methods; use registered inline nodes for async or streaming execution",
+                        ));
+                    }
+                }
             }
 
             // Detect is_streaming attribute (optional)
@@ -132,6 +143,7 @@ impl InstanceExecutor {
                 node_instance,
                 node_id,
                 is_streaming,
+                cleanup_pending: AtomicBool::new(false),
             })
         })
     }
@@ -148,17 +160,29 @@ impl InstanceExecutor {
     ///
     /// Returns PyErr if Python initialize() method raises an exception
     pub fn initialize(&self) -> PyResult<()> {
-        // TODO: Implement (T015)
-        // Python::with_gil(|py| {
-        //     self.node_instance.call_method0(py, "initialize")?;
-        //     Ok(())
-        // })
+        if self.cleanup_pending.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        Python::attach(|py| {
+            let result = self.node_instance.call_method0(py, "initialize")?;
+            require_sync_result(py, result)?;
+            Ok(())
+        })
+    }
 
-        debug!(
-            "InstanceExecutor::initialize() stub for node: {}",
-            self.node_id
-        );
-        Ok(())
+    /// Forward an owning Python reference without packing, serialization, or a
+    /// RuntimeData conversion. Private arrays retain their Python mutability;
+    /// this sequential lane is not an immutable core-session transport.
+    pub fn process_python(&self, input: Py<PyAny>) -> PyResult<Option<Py<PyAny>>> {
+        Python::attach(|py| {
+            let result = self.node_instance.call_method1(py, "process", (input,))?;
+            let result = require_sync_result(py, result)?;
+            Ok(if result.is_none(py) {
+                None
+            } else {
+                Some(result)
+            })
+        })
     }
 
     /// Process input data through the Python Node instance
@@ -180,7 +204,7 @@ impl InstanceExecutor {
         // T006, T016: Python::attach() method calling pattern for process()
         Python::attach(|py| {
             // Convert RuntimeData to Python object (requires T007)
-            let py_input = super::marshal::runtime_data_to_python(py, &input)?;
+            let py_input = super::marshal::runtime_data_into_python(py, input)?;
 
             // Call process method
             let result = self
@@ -216,14 +240,19 @@ impl InstanceExecutor {
     ///
     /// Returns PyErr if Python cleanup() method raises an exception
     pub fn cleanup(&self) -> PyResult<()> {
+        if !self.cleanup_pending.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
         // T006, T017: Python::attach() method calling pattern for cleanup()
         Python::attach(|py| {
-            self.node_instance
+            let result = self
+                .node_instance
                 .call_method0(py, "cleanup")
                 .map_err(|e| {
                     warn!("Failed to cleanup node '{}': {}", self.node_id, e);
                     e
                 })?;
+            require_sync_result(py, result)?;
 
             debug!("Cleaned up node: {}", self.node_id);
             Ok(())
@@ -239,6 +268,28 @@ impl InstanceExecutor {
     pub fn is_streaming(&self) -> bool {
         self.is_streaming
     }
+}
+
+/// Catch dynamically returned async work as well as async methods found at construction.
+fn require_sync_result(py: Python<'_>, result: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let inspect = py.import("inspect")?;
+    for kind in ["isawaitable", "isasyncgen", "isgenerator"] {
+        if inspect
+            .call_method1(kind, (result.bind(py),))?
+            .is_truthy()?
+        {
+            if inspect
+                .call_method1("iscoroutine", (result.bind(py),))?
+                .is_truthy()?
+            {
+                result.call_method0(py, "close")?;
+            }
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "Direct instance execution requires synchronous results; async and generator results are unsupported",
+            ));
+        }
+    }
+    Ok(result)
 }
 
 impl Drop for InstanceExecutor {

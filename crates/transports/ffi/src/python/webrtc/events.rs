@@ -3,9 +3,16 @@
 //! Provides Python-accessible event types for the decorator-based callback pattern.
 
 use super::config::PeerCapabilities;
+use crate::marshal::buffers::storage;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use remotemedia_core::data::RuntimeData;
+use remotemedia_types::{CopyContext, CopyReason, PayloadStorage, SharedBytes};
 use std::collections::HashMap;
+
+#[cfg(test)]
+#[path = "event_owner_tests.rs"]
+mod owner_tests;
 
 /// Event fired when a peer connects
 #[pyclass(get_all)]
@@ -90,73 +97,111 @@ impl From<crate::webrtc::events::PeerDisconnectedEvent> for PeerDisconnectedEven
     }
 }
 
-/// Event fired when pipeline produces output
+/// Event fired when pipeline produces output.
+/// `runtime_data` exports retained read-only bulk views; `data` is the
+/// compatibility JSON-bytes materialization, performed only when requested.
 #[pyclass]
 #[derive(Clone, Debug)]
 pub struct PipelineOutputEvent {
-    /// Peer ID that triggered this output
     #[pyo3(get)]
     pub peer_id: String,
-    /// Output data as bytes
-    data_bytes: Vec<u8>,
-    /// Unix timestamp in milliseconds
+    runtime_data: RuntimeData,
+    serialized: std::sync::Arc<std::sync::OnceLock<Vec<u8>>>,
+    /// Existing timestamp value, preserved from the event bridge.
     #[pyo3(get)]
     pub timestamp: u64,
+    copies: CopyContext,
 }
 
 #[pymethods]
 impl PipelineOutputEvent {
-    /// Get data as Python bytes
     #[getter]
-    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.data_bytes)
+    fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.data_with_context(py, &self.copies)
+    }
+
+    /// Canonical Python runtime value with owning read-only bulk views.
+    #[getter]
+    fn runtime_data(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::marshal::runtime_data_to_python_with_context(py, &self.runtime_data, &self.copies)
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "PipelineOutputEvent(peer_id='{}', data_len={}, timestamp={})",
+            "PipelineOutputEvent(peer_id='{}', data_type='{}', timestamp={})",
             self.peer_id,
-            self.data_bytes.len(),
+            self.runtime_data.data_type(),
             self.timestamp
+        )
+    }
+}
+
+impl PipelineOutputEvent {
+    fn data_with_context<'py>(
+        &self,
+        py: Python<'py>,
+        copies: &CopyContext,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        if self.serialized.get().is_none() {
+            let encoded = storage::materialize(
+                copies,
+                CopyReason::PortableSerialization,
+                self.runtime_data.bulk_payload_bytes(),
+                || {
+                    serde_json::to_vec(&self.runtime_data)
+                        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+                },
+            )?;
+            // Racing callers may each serialize (and each is counted), but the
+            // cache is immutable and shared by event clones once initialized.
+            let _ = self.serialized.set(encoded);
+        }
+        let encoded = self.serialized.get().expect("initialized JSON cache");
+        storage::materialize(
+            copies,
+            CopyReason::VecMaterialization,
+            encoded.len(),
+            || Ok(PyBytes::new(py, &encoded)),
         )
     }
 }
 
 impl From<crate::webrtc::events::PipelineOutputEvent> for PipelineOutputEvent {
     fn from(e: crate::webrtc::events::PipelineOutputEvent) -> Self {
-        // Serialize RuntimeData to bytes for Python consumption
-        let data_bytes = match serde_json::to_vec(&e.data) {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
-        };
         Self {
             peer_id: e.peer_id,
-            data_bytes,
+            runtime_data: e.data.into_shared(),
+            serialized: Default::default(),
             timestamp: e.timestamp,
+            copies: e.copies,
         }
     }
 }
 
-/// Event fired when raw data is received from a peer
+/// Event fired when raw data is received from a peer.
+/// `view` retains the immutable receive owner. `data` explicitly copies to bytes.
 #[pyclass]
 #[derive(Clone, Debug)]
 pub struct DataReceivedEvent {
-    /// Peer ID that sent the data
     #[pyo3(get)]
     pub peer_id: String,
-    /// Raw data bytes
-    data_bytes: Vec<u8>,
-    /// Unix timestamp in milliseconds
+    data_bytes: SharedBytes,
     #[pyo3(get)]
     pub timestamp: u64,
+    copies: CopyContext,
 }
 
 #[pymethods]
 impl DataReceivedEvent {
-    /// Get data as Python bytes
     #[getter]
-    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.data_bytes)
+    fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.data_with_context(py, &self.copies)
+    }
+
+    /// Read-only memoryview retaining the original receive allocation.
+    #[getter]
+    fn view(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        storage::view(py, PayloadStorage::Bytes(self.data_bytes.clone()))
     }
 
     fn __repr__(&self) -> String {
@@ -169,12 +214,28 @@ impl DataReceivedEvent {
     }
 }
 
+impl DataReceivedEvent {
+    fn data_with_context<'py>(
+        &self,
+        py: Python<'py>,
+        copies: &CopyContext,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        storage::materialize(
+            copies,
+            CopyReason::VecMaterialization,
+            self.data_bytes.len(),
+            || Ok(PyBytes::new(py, &self.data_bytes)),
+        )
+    }
+}
+
 impl From<crate::webrtc::events::DataReceivedEvent> for DataReceivedEvent {
     fn from(e: crate::webrtc::events::DataReceivedEvent) -> Self {
         Self {
             peer_id: e.peer_id,
             data_bytes: e.data,
             timestamp: e.timestamp,
+            copies: e.copies,
         }
     }
 }

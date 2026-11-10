@@ -225,7 +225,7 @@ impl AvatarNode {
         // mode so downstream tests can assert which path was taken.
         // Real renders will populate this with raw or encoded frames.
         RuntimeData::Video {
-            pixel_data: vec![mode.sentinel_byte()],
+            pixel_data: vec![mode.sentinel_byte()].into(),
             width: self.config.width,
             height: self.config.height,
             format: PixelFormat::Rgb24,
@@ -504,7 +504,7 @@ mod tests {
         else {
             panic!("expected Video, got {:?}", out[0]);
         };
-        assert_eq!(pixel_data, &[0xAA]);
+        assert_eq!(pixel_data.as_ref(), &[0xAA]);
         assert_eq!(*timestamp_us, 5_000);
     }
 
@@ -558,7 +558,7 @@ mod tests {
         let RuntimeData::Video { pixel_data, .. } = &out[0] else {
             panic!("expected Video");
         };
-        assert_eq!(pixel_data, &[0xBB]);
+        assert_eq!(pixel_data.as_ref(), &[0xBB]);
     }
 
     #[tokio::test]
@@ -590,6 +590,6 @@ mod tests {
         let RuntimeData::Video { pixel_data, .. } = &out[0] else {
             panic!("expected Video");
         };
-        assert_eq!(pixel_data, &[0x00]);
+        assert_eq!(pixel_data.as_ref(), &[0x00]);
     }
 }

@@ -21,6 +21,8 @@ pub fn approx_payload_bytes(data: &RuntimeData) -> u64 {
         RuntimeData::Json(v) => approx_json(v),
         RuntimeData::ControlMessage { .. } => 32,
         RuntimeData::File { length, size, .. } => length.or(*size).unwrap_or(0) as usize,
+        // Bytes moved on the edge, in device memory.
+        RuntimeData::DeviceTensor { .. } => data.size_bytes(),
     };
     n as u64
 }

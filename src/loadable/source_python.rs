@@ -181,6 +181,7 @@ impl StreamingNodeFactory for SourcePythonFactory {
             session_id,
             cmd_tx,
             _child: child,
+            _env_lease: provisioning.venv.clone(),
         }))
     }
 }
@@ -195,7 +196,7 @@ async fn provision_source_plugin_env(
     let env_mgr =
         PythonEnvManager::new(env_config).map_err(|e| format!("PythonEnvManager::new: {e}"))?;
     let venv = env_mgr
-        .ensure_env_scoped(&deps, scope_context.as_deref())
+        .ensure_env_scoped_leased(&deps, scope_context.as_deref())
         .await
         .map_err(|e| format!("PythonEnvManager::ensure_env({deps:?}): {e}"))?;
 
@@ -217,6 +218,41 @@ struct SourcePythonNode {
     cmd_tx: mpsc::Sender<IpcCommand>,
     /// Held so the subprocess is killed on drop.
     _child: Arc<std::sync::Mutex<std::process::Child>>,
+    /// Environment cache lease. Fields drop after `Drop::drop`, so this is
+    /// released only after the runner has been terminated.
+    _env_lease: remotemedia_py_env::LeasedVenvInfo,
+}
+
+impl Drop for SourcePythonNode {
+    fn drop(&mut self) {
+        remotemedia_plugin_sdk::python_ipc::terminate_runner(&self._child);
+    }
+}
+
+impl SourcePythonNode {
+    fn wire_copies(
+        &self,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<remotemedia_types::CopyContext, Error> {
+        wire_copies(&self.node_type, ctx)
+    }
+}
+
+/// Source-loaded Python exchanges the copying legacy wire. Charge its bulk
+/// encode/decode to the caller's explicit compatibility ledger; strict or
+/// unattributed calls reject before any copy.
+fn wire_copies(
+    node_type: &str,
+    ctx: &dyn NodeRuntimeContextRead,
+) -> Result<remotemedia_types::CopyContext, Error> {
+    match ctx.copy_context() {
+        Some(copies) if copies.policy() == remotemedia_types::CopyPolicy::AllowCopies => {
+            Ok(copies)
+        }
+        _ => Err(Error::Execution(format!(
+            "source-python plugin '{node_type}' uses the copying legacy wire and requires an explicit allow_copies context; declare [python.mapped] for strict buffer policy"
+        ))),
+    }
 }
 
 #[async_trait]
@@ -263,9 +299,10 @@ impl StreamingNode for SourcePythonNode {
     async fn process_async(
         &self,
         data: RuntimeData,
-        _ctx: &dyn NodeRuntimeContextRead,
+        ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
-        let req_bytes = encode_input(&data, &self.session_id)?;
+        let copies = self.wire_copies(ctx)?;
+        let req_bytes = encode_input(&data, &self.session_id, &copies)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(IpcCommand::Round {
@@ -278,7 +315,7 @@ impl StreamingNode for SourcePythonNode {
             .await
             .map_err(|e| Error::Execution(format!("ipc reply recv: {e}")))?
             .map_err(|e| Error::Execution(format!("ipc reply: {e}")))?;
-        decode_output(&resp_bytes)
+        decode_output(&resp_bytes, &copies)
     }
 
     async fn process_multi_async(
@@ -299,10 +336,11 @@ impl StreamingNode for SourcePythonNode {
     async fn process_streaming_async(
         &self,
         data: RuntimeData,
-        _ctx: &dyn NodeRuntimeContextRead,
+        ctx: &dyn NodeRuntimeContextRead,
         mut callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
     ) -> Result<usize, Error> {
-        let req_bytes = encode_input(&data, &self.session_id)?;
+        let copies = self.wire_copies(ctx)?;
+        let req_bytes = encode_input(&data, &self.session_id, &copies)?;
         // Per-frame streaming: the IPC thread forwards each yield onto
         // `frame_rx` as it arrives, instead of accumulating into a Vec
         // and returning at EndOfInput. Capacity 32 is plenty for any
@@ -322,7 +360,7 @@ impl StreamingNode for SourcePythonNode {
 
         let mut count = 0usize;
         while let Some(frame) = frame_rx.recv().await {
-            let runtime_data = decode_output(&frame)?;
+            let runtime_data = decode_output(&frame, &copies)?;
             callback(runtime_data)?;
             count += 1;
         }
@@ -344,7 +382,21 @@ impl StreamingNode for SourcePythonNode {
 /// Audio, Tensor, Video, ControlMessage, plus Json → Text for aux
 /// ports). Other variants surface a precise error so misroutes fail
 /// loud at the boundary.
-fn encode_input(data: &RuntimeData, session_id: &str) -> Result<Vec<u8>, Error> {
+fn encode_input(
+    data: &RuntimeData,
+    session_id: &str,
+    copies: &remotemedia_types::CopyContext,
+) -> Result<Vec<u8>, Error> {
+    copies
+        .materialize_result(
+            remotemedia_types::CopyReason::PortableSerialization,
+            data.bulk_payload_bytes() as u64,
+            || encode_wire(data, session_id),
+        )
+        .map_err(|rejected| Error::Execution(rejected.to_string()))?
+}
+
+fn encode_wire(data: &RuntimeData, session_id: &str) -> Result<Vec<u8>, Error> {
     let wire = match data {
         RuntimeData::Text(t) => WireRuntimeData::now_text(t, session_id),
         RuntimeData::Audio {
@@ -409,9 +461,26 @@ fn encode_input(data: &RuntimeData, session_id: &str) -> Result<Vec<u8>, Error> 
 }
 
 /// Decode wire bytes from the Python runner → public RuntimeData.
-fn decode_output(bytes: &[u8]) -> Result<RuntimeData, Error> {
+fn decode_output(
+    bytes: &[u8],
+    copies: &remotemedia_types::CopyContext,
+) -> Result<RuntimeData, Error> {
     let wire = WireRuntimeData::from_bytes(bytes)
         .map_err(|e| Error::Execution(format!("wire decode: {e}")))?;
+    let output = decode_wire(wire)?;
+    // Callers bind an AllowCopies ledger (`wire_copies`), so this records the
+    // exact reconstructed element bytes, excluding wire headers and metadata.
+    copies
+        .materialize(
+            remotemedia_types::CopyReason::PortableDeserialization,
+            output.bulk_payload_bytes() as u64,
+            || (),
+        )
+        .map_err(|rejected| Error::Execution(rejected.to_string()))?;
+    Ok(output)
+}
+
+fn decode_wire(wire: WireRuntimeData) -> Result<RuntimeData, Error> {
     match wire.data_type {
         WireDataType::Text => {
             let text = String::from_utf8_lossy(&wire.payload).into_owned();
@@ -440,7 +509,7 @@ fn decode_output(bytes: &[u8]) -> Result<RuntimeData, Error> {
                 other => Some(other),
             };
             Ok(RuntimeData::Tensor {
-                data,
+                data: data.into(),
                 shape: shape.into_iter().map(|d| d as i32).collect(),
                 dtype: dtype as i32,
                 metadata,
@@ -449,5 +518,73 @@ fn decode_output(bytes: &[u8]) -> Result<RuntimeData, Error> {
         other => Err(Error::Execution(format!(
             "SourcePythonNode decodes only Text/Audio/Tensor output (got {other:?})"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod wire_copy_tests {
+    use super::*;
+    use crate::nodes::NodeRuntimeContext;
+    use remotemedia_types::{CopyContext, CopyPolicy, CopyReason};
+
+    fn counts(copies: &CopyContext, reason: CopyReason) -> remotemedia_types::CopyCounts {
+        copies
+            .report()
+            .entries
+            .into_iter()
+            .find(|(entry, _)| *entry == reason)
+            .map(|(_, counts)| counts)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn strict_and_unattributed_contexts_reject_before_any_copy() {
+        let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "source-python-strict");
+        let ctx = NodeRuntimeContext::for_test("s", "n").with_copy_context(strict.clone());
+        let error = wire_copies("Echo", &ctx).unwrap_err().to_string();
+        assert!(error.contains("[python.mapped]"), "{error}");
+        assert_eq!(
+            counts(&strict, CopyReason::PortableSerialization).rejected,
+            0
+        );
+        let allowed = CopyContext::new(CopyPolicy::AllowCopies, "source-python-allowed");
+        let ctx = NodeRuntimeContext::for_test("s", "n").with_copy_context(allowed.clone());
+        assert!(wire_copies("Echo", &ctx).unwrap().same_authority(&allowed));
+    }
+
+    #[test]
+    fn legacy_wire_round_trip_charges_bulk_bytes_to_the_call_ledger() {
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "source-python-call");
+        let audio = RuntimeData::Audio {
+            samples: vec![0.25_f32; 10].into(),
+            sample_rate: 16_000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: None,
+        };
+        let bytes = encode_input(&audio, "s", &copies).unwrap();
+        let encoded = counts(&copies, CopyReason::PortableSerialization);
+        assert_eq!((encoded.completed, encoded.copied_bytes), (1, 40));
+        let decoded = decode_output(&bytes, &copies).unwrap();
+        let RuntimeData::Audio { samples, .. } = &decoded else {
+            panic!("expected audio")
+        };
+        assert_eq!(samples.len(), 10);
+        assert!(samples.iter().all(|value| *value == 0.25));
+        let decoded = counts(&copies, CopyReason::PortableDeserialization);
+        assert_eq!((decoded.completed, decoded.copied_bytes), (1, 40));
+        // Metadata-only payloads stay unattributed: no bulk bytes move.
+        let text = encode_input(&RuntimeData::Text("hi".into()), "s", &copies).unwrap();
+        decode_output(&text, &copies).unwrap();
+        assert_eq!(
+            counts(&copies, CopyReason::PortableSerialization).completed,
+            1
+        );
+        assert_eq!(
+            counts(&copies, CopyReason::PortableDeserialization).completed,
+            1
+        );
     }
 }

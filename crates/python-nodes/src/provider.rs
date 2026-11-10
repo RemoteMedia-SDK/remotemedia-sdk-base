@@ -36,6 +36,14 @@ impl StreamingNodeFactory for DynamicPythonNodeFactory {
         params: &Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
+        if self.config.shared_buffer_contract.is_some()
+            || self.config.shared_source_rate_hz.is_some()
+        {
+            return Err(Error::ConfigError(
+                "in-process shared buffer declarations cannot use the legacy multiprocess factory"
+                    .into(),
+            ));
+        }
         let node = if let Some(sid) = session_id {
             remotemedia_core::nodes::python_streaming::PythonStreamingNode::with_session(
                 node_id,
@@ -158,6 +166,10 @@ impl NodeProvider for PythonNodesProvider {
 
             #[cfg(feature = "multiprocess")]
             {
+                if config.execution_mode == crate::registry::PythonExecutionMode::InProcessShared {
+                    tracing::warn!(node_type = %node_type, "Shared-buffer Python requires the inprocess feature; refusing multiprocess fallback");
+                    continue;
+                }
                 registry.register(Arc::new(DynamicPythonNodeFactory::new(config)));
                 tracing::debug!(node_type = %node_type, "Registered dynamic MULTIPROCESS Python node factory");
                 continue;
@@ -202,6 +214,7 @@ mod tests {
 
         register_python_node(
             PythonNodeConfig::new("TestDynamicNode")
+                .with_inprocess(cfg!(feature = "inprocess"))
                 .with_python_class("test.TestDynamicNode")
                 .with_multi_output(true)
                 .with_description("A test node")

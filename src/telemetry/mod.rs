@@ -319,7 +319,7 @@ impl EdgeCell {
         self.end_stall(us);
     }
 
-    /// Count one frame dropped because the receiver had closed.
+    /// Count a frame rejected by a closed receiver or failed queue admission.
     #[inline]
     pub fn record_drop(&self) {
         self.drops.fetch_add(1, Relaxed);
@@ -573,6 +573,15 @@ impl SessionTelemetry {
 
     pub(crate) fn last_error(&self, idx: usize) -> Option<ErrorInfo> {
         self.nodes[idx].last_error.lock().clone()
+    }
+
+    /// The last error recorded for each node that reported one, by node id.
+    pub fn node_errors(&self) -> Vec<(String, ErrorInfo)> {
+        self.node_ids()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, id)| self.last_error(idx).map(|error| (id.clone(), error)))
+            .collect()
     }
 }
 

@@ -6,6 +6,7 @@ use crate::capabilities::{
 };
 use crate::nodes::calculator::CalculatorNode;
 use crate::nodes::passthrough::PassThroughNode;
+use remotemedia_traits::buffer_contract::BufferLayout;
 use remotemedia_traits::runtime_context::InitializeContextRead;
 // Temporarily disabled - incomplete implementation
 // use crate::nodes::sync_av::SynchronizedAudioVideoNode;
@@ -282,12 +283,20 @@ impl StreamingNodeFactory for SynchronizedAudioVideoNodeFactory {
 
 pub(crate) struct PassThroughNodeFactory;
 impl StreamingNodeFactory for PassThroughNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        super::media_buffer_contract::metadata_or_forwarding(params).map(Some)
+    }
+
     fn create(
         &self,
         node_id: String,
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
+        self.try_buffer_contract(params)?;
         let params_str = params.to_string();
         let node = PassThroughNode::new(node_id, &params_str)?;
         Ok(Box::new(SyncNodeWrapper(node)))
@@ -305,6 +314,13 @@ impl StreamingNodeFactory for PassThroughNodeFactory {
                     "Passes input through unchanged — useful for testing and pipeline wiring",
                 )
                 .category("utility")
+                .config_schema(serde_json::json!({
+                    "type":"object",
+                    "properties":{
+                        "buffer_limits": super::media_buffer_contract::schema(),
+                        "passthrough_layouts": super::media_buffer_contract::passthrough_schema()
+                    }
+                }))
                 .accepts([
                     RuntimeDataType::Audio,
                     RuntimeDataType::Text,
@@ -451,6 +467,13 @@ impl StreamingNodeFactory for SpeculativeAudioCommitNodeFactory {
 
 pub(crate) struct TextCollectorNodeFactory;
 impl StreamingNodeFactory for TextCollectorNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        super::media_buffer_contract::metadata_or_forwarding(params).map(Some)
+    }
+
     fn create(
         &self,
         _node_id: String,
@@ -459,6 +482,7 @@ impl StreamingNodeFactory for TextCollectorNodeFactory {
     ) -> Result<Box<dyn StreamingNode>, Error> {
         use crate::nodes::text_collector::{TextCollectorConfig, TextCollectorNode};
         use crate::nodes::SyncNodeWrapper;
+        self.try_buffer_contract(params)?;
         let config: TextCollectorConfig =
             serde_json::from_value(params.clone()).unwrap_or_default();
         let node = TextCollectorNode::with_config(config);
@@ -476,14 +500,18 @@ impl StreamingNodeFactory for TextCollectorNodeFactory {
     fn schema(&self) -> Option<crate::nodes::schema::NodeSchema> {
         use crate::nodes::schema::{NodeSchema, RuntimeDataType};
         use crate::nodes::text_collector::TextCollectorConfig;
-        Some(
-            NodeSchema::new("TextCollectorNode")
-                .description("Accumulates streaming text tokens and yields complete sentences")
-                .category("text")
-                .accepts([RuntimeDataType::Text])
-                .produces([RuntimeDataType::Text])
-                .config_schema_from::<TextCollectorConfig>(),
-        )
+        let mut schema = NodeSchema::new("TextCollectorNode")
+            .description("Accumulates streaming text tokens and yields complete sentences")
+            .category("text")
+            .accepts([RuntimeDataType::Text])
+            .produces([RuntimeDataType::Text])
+            .config_schema_from::<TextCollectorConfig>();
+        if let Some(config) = schema.config_schema.as_mut() {
+            config["properties"]["buffer_limits"] = super::media_buffer_contract::schema();
+            config["properties"]["passthrough_layouts"] =
+                super::media_buffer_contract::passthrough_schema();
+        }
+        Some(schema)
     }
 }
 
@@ -645,6 +673,23 @@ impl StreamingNodeFactory for SyntheticLipSyncNodeFactory {
 pub(crate) struct AudioFileWriterNodeFactory;
 
 impl StreamingNodeFactory for AudioFileWriterNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        let Some(contract) =
+            super::media_buffer_contract::forwarding(params, BufferLayout::AudioInterleavedF32)?
+        else {
+            return Ok(None);
+        };
+        if !cfg!(target_endian = "little") {
+            return Err(Error::ConfigError(
+                "AudioFileWriterNode direct WAV output requires little-endian samples".into(),
+            ));
+        }
+        Ok(Some(contract))
+    }
+
     fn create(
         &self,
         _node_id: String,
@@ -653,6 +698,7 @@ impl StreamingNodeFactory for AudioFileWriterNodeFactory {
     ) -> Result<Box<dyn StreamingNode>, Error> {
         use crate::nodes::file_sink::{AudioFileWriterConfig, AudioFileWriterNode};
         use std::path::PathBuf;
+        self.try_buffer_contract(params)?;
         let output_path = params
             .get("output_path")
             .and_then(|v| v.as_str())
@@ -686,6 +732,14 @@ impl StreamingNodeFactory for AudioFileWriterNodeFactory {
                 .category("io")
                 .accepts([RuntimeDataType::Audio])
                 .produces([RuntimeDataType::Audio])
+                .config_schema(serde_json::json!({
+                    "type": "object",
+                    "required": ["output_path"],
+                    "properties": {
+                        "output_path": {"type": "string", "description": "Target WAV file; created on first audio input."},
+                        "buffer_limits": super::media_buffer_contract::schema()
+                    }
+                }))
                 .capabilities(NodeCapabilitiesSchema {
                     parallelizable: false,
                     batch_aware: false,
@@ -891,6 +945,13 @@ impl StreamingNodeFactory for EnvelopeDebugLogNodeFactory {
 pub(crate) struct VideoFileWriterNodeFactory;
 
 impl StreamingNodeFactory for VideoFileWriterNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        super::media_buffer_contract::forwarding(params, BufferLayout::VideoBytes)
+    }
+
     fn create(
         &self,
         _node_id: String,
@@ -898,24 +959,13 @@ impl StreamingNodeFactory for VideoFileWriterNodeFactory {
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
         use crate::nodes::file_sink::{VideoFileWriterConfig, VideoFileWriterNode};
-        use std::path::PathBuf;
-        let output_path = params
-            .get("output_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                Error::Execution(
-                    "VideoFileWriterNode requires 'output_path' (target .y4m file)".into(),
-                )
-            })?;
-        let fps = params
-            .get("fps")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(30);
-        let node = VideoFileWriterNode::new(VideoFileWriterConfig {
-            output_path: PathBuf::from(output_path),
-            fps,
-        });
+        self.try_buffer_contract(params)?;
+        let config: VideoFileWriterConfig = serde_json::from_value(params.clone())
+            .map_err(|error| Error::ConfigError(format!("VideoFileWriterNode: {error}")))?;
+        if config.fps == 0 {
+            return Err(Error::ConfigError("Y4M frame rate must be positive".into()));
+        }
+        let node = VideoFileWriterNode::new(config);
         Ok(Box::new(AsyncNodeWrapper(Arc::new(node))))
     }
 
@@ -930,14 +980,22 @@ impl StreamingNodeFactory for VideoFileWriterNodeFactory {
         Some(
             NodeSchema::new("VideoFileWriterNode")
                 .description(
-                    "Writes RuntimeData::Video (RGB24) frames to a Y4M file on \
-                     disk. RGB→YUV420p conversion happens per frame; output is \
+                    "Writes RuntimeData::Video (RGB24/YUV420p/I420) frames to a Y4M file on \
+                     disk. RGB conversion fills a context-selected loan; output is \
                      ffmpeg-compatible. Pass-through: emits the input unchanged \
                      so it can sit on a tap edge.",
                 )
                 .category("io")
                 .accepts([RuntimeDataType::Video])
                 .produces([RuntimeDataType::Video])
+                .config_schema(serde_json::json!({
+                    "type":"object", "required":["output_path"],
+                    "properties":{
+                        "output_path":{"type":"string"},
+                        "fps":{"type":"integer","minimum":1,"maximum":u32::MAX,"default":30},
+                        "buffer_limits":super::media_buffer_contract::schema()
+                    }
+                }))
                 .capabilities(NodeCapabilitiesSchema {
                     parallelizable: false,
                     batch_aware: false,
@@ -1179,6 +1237,13 @@ impl StreamingNodeFactory for AudioChunkerNodeFactory {
 
 pub(crate) struct FastResampleNodeFactory;
 impl StreamingNodeFactory for FastResampleNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        super::media_buffer_contract::from_params(params, BufferLayout::AudioInterleavedF32)
+    }
+
     fn create(
         &self,
         node_id: String,
@@ -1189,6 +1254,7 @@ impl StreamingNodeFactory for FastResampleNodeFactory {
         use crate::nodes::audio_resample_streaming::{
             AutoResampleConfig, AutoResampleStreamingNode, ResampleStreamingNode,
         };
+        self.try_buffer_contract(params)?;
 
         // Parse optional source_rate (can be "auto" or omitted for auto-detection)
         let source_rate = params
@@ -1296,6 +1362,7 @@ impl StreamingNodeFactory for FastResampleNodeFactory {
                             ],
                             "description": "Source sample rate in Hz. Use 'auto' or omit to detect from incoming audio."
                         },
+                        "buffer_limits": super::media_buffer_contract::schema(),
                         "target_rate": {
                             "oneOf": [
                                 { "type": "integer", "minimum": 8000, "maximum": 192000 },

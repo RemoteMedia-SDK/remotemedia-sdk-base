@@ -150,11 +150,22 @@ impl VideoEncoderNode {
     /// - Encoding operation fails (codec error, buffer issues, etc.)
     /// - Task cannot be spawned on the blocking thread pool
     pub async fn encode_frame(&self, input: RuntimeData) -> Result<RuntimeData, CodecError> {
+        self.encode_frame_with_copy_context(input, remotemedia_types::CopyContext::legacy())
+            .await
+    }
+
+    /// Encode using the caller's authority for transfers into backend storage.
+    pub async fn encode_frame_with_copy_context(
+        &self,
+        input: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<RuntimeData, CodecError> {
         let encoder = Arc::clone(&self.encoder);
+        let copies = copies.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut enc = encoder.lock().unwrap();
-            enc.encode(input)
+            enc.encode_with_copy_context(input, &copies)
         })
         .await
         .map_err(|e| CodecError::EncodingFailed(e.to_string()))?
@@ -192,6 +203,45 @@ impl VideoEncoderNode {
 impl AsyncStreamingNode for VideoEncoderNode {
     fn node_type(&self) -> &str {
         "VideoEncoder"
+    }
+
+    async fn process_with_ctx(
+        &self,
+        input: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let copies = ctx.copy_context().ok_or_else(|| {
+            Error::Execution("VideoEncoder requires context copy authority".into())
+        })?;
+        self.encode_frame_with_copy_context(input, &copies)
+            .await
+            .map_err(|e| Error::Execution(format!("Encoding failed: {e}")))
+    }
+
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: HashMap<String, RuntimeData>,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        let input = inputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Execution("No input data provided".into()))?
+            .1;
+        self.process_with_ctx(input, ctx).await
+    }
+
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        input: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+        mut callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        callback(self.process_with_ctx(input, ctx).await?)?;
+        Ok(1)
     }
 
     async fn process(&self, input: RuntimeData) -> Result<RuntimeData, Error> {

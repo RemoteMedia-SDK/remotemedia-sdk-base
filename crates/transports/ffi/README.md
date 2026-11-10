@@ -8,14 +8,14 @@ This crate provides bindings to the `remotemedia-runtime-core` for multiple lang
 
 ### Python FFI
 - **Fast execution**: Native Rust performance for media processing
-- **Zero-copy**: Direct numpy array integration for audio/video data
+- **Owning buffers**: Read-only Python views retain published runtime allocations
 - **Async support**: Full Python asyncio integration via PyO3
 - **Independent deployment**: Can be updated without touching runtime-core
 
 ### Node.js FFI (N-API)
 - **Native performance**: Rust-powered media processing in Node.js
 - **Async/Promise support**: Full async/await integration
-- **Buffer handling**: Zero-copy Buffer operations
+- **Buffer handling**: Buffer APIs; Node.js copy accounting and ownership migration remain in progress
 - **WebRTC support**: Built-in WebRTC transport layer
 
 ### WebRTC Transport (both languages)
@@ -41,6 +41,46 @@ This crate provides bindings to the `remotemedia-runtime-core` for multiple lang
 │  └─ Audio/video processing                          │
 └─────────────────────────────────────────────────────┘
 ```
+
+## Node.js owning handles and explicit copies
+
+The pipeline NAPI API retains immutable native payloads in `NapiRuntimeData`.
+Forward these handles to `sendInput()` without exporting their bytes. Binary
+slices retain the original owner, and `sharesBufferWith()` compares storage
+identity without exposing a writable pointer.
+
+`getBinary()`, `getAudioSamples()`, video/tensor/NumPy getters and the
+`AudioBuffer`/`VideoFrame` getters return independent writable snapshots.
+They are safe after the native handle is collected. Their previous borrowed
+pointer behavior did not retain an owner and allowed mutation of shared Rust
+storage. Pass `true` as the final `requireZeroCopy` argument to reject nonempty
+snapshot imports/exports. Existing JS buffers remain compatibility inputs and
+are copied once. SharedArrayBuffer-backed inputs reject before borrowing bytes;
+explicitly snapshot those in JavaScript first.
+
+```js
+const session = await runtime.createStreamingSession(manifestJson);
+const loan = session.outputAllocator().allocateAudio(480, 48000, 1);
+for (let i = 0; i < 480; i++) loan.set(i, Math.sin(i / 10));
+const input = loan.publish(); // later set/fill/publish calls throw
+await session.sendInput(input);
+const output = await session.recvAudio();
+console.log(input.sharesBufferWith(output)); // true for a pass-through graph
+console.log(output.readAudioSample(0));       // scalar access, no bulk copy
+await session.close();
+```
+
+Loans use the session ingress provider and budget. They expose scalar `set` and
+`fill`, not a writable ArrayBuffer that could escape to another worker.
+This supports direct generation; scalar-call throughput is unbenchmarked, and
+arbitrary JavaScript/WASM typed-array output is not certified zero-copy.
+`nodejsBufferCopyReport()` returns the process-wide strict/compatibility counters
+for unbound imports and compatibility handles. Owners returned by a core session,
+its allocator, tap or intercept instead charge snapshots and rejected attempts to
+that session's `copyReport()`. Native IPC `toBinary()`/`decode()` owners retain the
+IPC-session ledger. These reports count logical instrumented bytes, not arbitrary
+JavaScript, codec or kernel copies. Select core graph policy explicitly with
+`createStreamingSession(manifest, pipelineBuffers)`.
 
 ## Installation
 
@@ -70,7 +110,7 @@ The `dev-install.sh` script:
 pip install python-client/
 
 # Install Rust runtime from wheel
-pip install remotemedia_ffi-0.4.0-cp310-abi3-macosx_11_0_arm64.whl
+pip install /path/to/the/matching/remotemedia_ffi-cp311-abi3-platform.whl
 ```
 
 Or build the wheel yourself:
@@ -147,19 +187,178 @@ if isinstance(result, np.ndarray):
     print(f"Received numpy array: {result.shape}")
 ```
 
-**How it works (zero-copy architecture):**
+## Owning Python buffers (Python 3.11+)
 
-1. **Python → Rust FFI**: `python_to_runtime_data` detects numpy arrays and wraps them in `RuntimeData::Numpy` (zero-copy via buffer protocol)
-2. **Rust Pipeline**: `RuntimeData::Numpy` flows through pipeline without conversion
-3. **IPC Boundary**: `to_ipc_runtime_data` serializes **once** to iceoryx2 shared memory format
-4. **Multiprocess Node**: Python receives data via zero-copy iceoryx2
-5. **Return Path**: `from_ipc_runtime_data` deserializes back to `RuntimeData::Numpy`
-6. **Rust → Python FFI**: `runtime_data_to_python` converts back to numpy array
+Select the unified copy policy and explicit retention budgets when creating an
+ordinary or shared Python session:
 
-**Performance for streaming audio:**
-- **Before**: Serialize on every FFI call (50+ times/sec for 20ms frames) = ~50ms total overhead
-- **After**: Serialize **once** at IPC boundary = ~1ms total overhead
-- **Speedup**: ~50x reduction in serialization overhead for streaming pipelines!
+```python
+import remotemedia.runtime as rt
+
+buffers = rt.PipelineBufferConfig(
+    "require_zero_copy", node_retention_owners=64, node_retention_bytes=4 * 1024 * 1024,
+)
+session = await rt.create_streaming_session(manifest_json, pipeline_buffers=buffers)
+```
+
+The same keyword is accepted by `create_shared_streaming_session`. Omitting it
+preserves the default compatibility configuration. Strict configuration applies
+to core preflight and instrumented node, transport and mapped-worker boundaries;
+an undeclared or incompatible factory rejects before execution. It is not proof
+that arbitrary node or backend code never copies. The explicit node-retention
+budget also supplies the core ingress-owner budget; it is not a total process
+memory limit or a replacement for other queue and provider limits.
+Factories still need matching per-node layout, domain and retention declarations.
+For example, PassThrough is metadata-only until its parameters declare bounded
+bulk forwarding; a session-wide budget does not change that factory contract.
+
+These immutable configuration classes are available with the `python` feature,
+without WebRTC. Existing `runtime.webrtc` class names remain aliases when that
+feature is enabled. Optional `mapped_pool=rt.MappedPoolConfig(classes, max_bytes,
+max_leases)` selects bounded per-session mapped storage; each class is
+`rt.MappedSizeClass(bytes, slots)`. This requires `mapped-buffers` on Windows or
+Linux and rejects explicitly when unavailable. It never silently selects heap
+storage for a requested mapped pool.
+
+The native Python binding uses PyO3 0.28 and the Python 3.11 stable buffer ABI.
+The network-only Python client keeps its separate interpreter requirements.
+Runtime audio, binary, video, image, tensor and NumPy output retains immutable
+Rust owners. Binary and audio samples are read-only memoryviews; NumPy output is
+a read-only ndarray. Existing code that needs writable private storage must
+explicitly copy or produce into an output loan.
+
+```python
+allocator = session.output_allocator()
+loan = allocator.allocate_audio(960)
+samples = np.frombuffer(loan, dtype=np.float32)
+samples.fill(0.0)  # A producer can write its actual output here.
+del samples       # Every writable export must release before publish().
+await session.send_input({
+    "type": "audio", "samples": np.asarray(loan.publish()),
+    "sample_rate": 48000, "channels": 1,
+}, require_zero_copy=True)
+```
+
+Both ordinary and shared sessions expose their existing ingress allocator and
+budget. Loans and retained published views keep their storage after session
+close. Publishing a loan with outstanding writable exports raises BufferError.
+`send_input(require_zero_copy=True)` rejects private mutable inputs and packing
+at the Python ingress boundary; it does not certify every node, codec, IPC or
+network edge. False or an omitted flag inherits the core session policy; it
+cannot weaken a strict session. Both ordinary and shared-session input conversions
+record their materializations, failures and rejections in that session's transport
+ledger.
+
+`session.input_copy_report()` preserves the two per-input-selector reports and
+adds `session`, the aggregate core transport report. The historical `allow_copies`
+key means calls with the flag omitted or False; inspect its `policy` field for
+the effective policy, which can be `require_zero_copy`. `require_zero_copy` means
+calls with the flag True. Both retain the originating session boundary identity.
+The aggregate includes these input events, native streaming output decoding,
+control-handle conversions, other instrumented transport events, and all
+participants of the same core shared session. Do not sum it with the
+per-selector reports. Compare reports after operations finish; snapshots across
+the ledgers are not atomic. Reports remain readable after close. Node, codec and
+uninstrumented backend work still require their own accounting and verification.
+
+Owned exported views and immutable Python bytes can enter without payload copies.
+Private NumPy arrays are explicitly packed once in compatibility mode, with the
+resulting C-order strides recorded correctly. Object and non-native-endian
+arrays require explicit conversion. Contiguous C/F arrays backed by an exported
+byte owner can return without copying. A view with a different backing element
+kind or a non-contiguous slice needs an explicit copy or rejects in strict mode.
+
+Video/image/tensor dictionaries carry their full metadata and owning byte views.
+Video `format` and image `format` use the RuntimeData enum strings; tensor dtype
+codes use the runtime convention (0=f32, 1=i32), not protobuf/Python IPC codes.
+Strict JSON metadata rejects embedded ndarray/buffer objects instead of hiding
+a payload conversion. Metadata, third-party operations and legacy NumPy helper
+copies are separate from the input bulk-copy report.
+
+The SDK FFI default build retains its desktop core features. For non-codec
+binding checks use `--no-default-features --features python`; its benchmark
+library dependency no longer silently re-enables core defaults. Optional codec
+features still need their normal FFmpeg/toolchain setup.
+
+### Control messages and literal metadata
+
+Python FFI accepts and returns canonical control dictionaries, for example:
+
+```python
+control = {
+    "type": "control_message",
+    "message_type": {"type": "CancelSpeculation", "from_timestamp": 10, "to_timestamp": 20},
+    "segment_id": "segment-1",
+    "timestamp_ms": 123,
+    "metadata": {"reason": "replacement"},
+}
+await session.send_input(control, require_zero_copy=True)
+```
+
+`BatchHint` carries `suggested_batch_size`; `DeadlineWarning` carries `deadline_us`.
+The shared metadata schema validates fields and integer ranges; malformed controls
+raise errors instead of becoming ordinary JSON data. Inline node declarations can
+use `"control_message"` in their accepted/produced types.
+
+Control and media metadata remain plain JSON, including literal `__numpy__` and
+`__pickled__` keys. They never invoke compatibility payload codecs. Integer fields
+retain their full unsigned range, and Python buffer/ndarray objects inside control
+metadata reject rather than being packed. Control headers and metadata are still
+serialized; the zero-copy guarantee concerns supported bulk payload storage.
+
+### Native in-process control handles
+
+`session.control()` binds `publish`, `publish_out` and intercept replacement
+conversion to the exact session policy. Mutable inputs require a counted snapshot
+in compatibility mode and reject before copying in strict mode. Published owning
+views can be forwarded without payload copies. Tap and intercept receives retain
+immutable owners; consuming legacy Vec audio promotes its storage without copying.
+Control handles and queued tap items retain their authority after session close.
+
+The higher-level `attach_inproc` client also passes owning Data directly for
+publishes and intercept replacements. `Data.from_bytes` / `Data.from_buffer`
+retain a buffer; `Data.from_audio_numpy` retains its array without eager packing.
+Mutable inputs are borrowed until publish and snapshot only under the native
+session policy: edits before publish are visible, while edits after an allowed
+publish cannot alter the published snapshot. Strict sessions reject that snapshot.
+`Data.as_runtime_data()` exposes the retained representation for forwarding/views.
+
+The transport interface now separates `publish_data(address, data)` from protobuf
+control headers. gRPC materializes payloads at that network boundary and retains
+its wire format. Intercept requests use transport-specific replies. Closed or
+replaced in-process intercept slots reject stale replies; conversion errors are
+raised by public tap/intercept iterators.
+
+Explicit `Data.as_buffer()`/text conversions, protobuf-backed Data compatibility
+decoding, network serialization and independent backend operations remain separate
+copy-accounting work. Unsupported DataBuffer export kinds raise rather than silently
+returning an empty payload. This API does not certify a zero-copy network path.
+
+### NumPy inside compatibility JSON
+
+With `native-numpy` enabled, nested arrays in compatibility JSON use a packed
+base64 codec. Private/strided packing and encoding each count the array's logical
+payload bytes; published C-contiguous byte owners skip the packing step. Base64
+encoding remains a counted materialization. On input,
+decoding counts one reconstruction and moves that allocation into an owning,
+read-only NumPy view. A decoded native-endian view can then enter the ordinary
+buffer path without copying. Array slices retain this storage after session close.
+
+The codec preserves plain dtype byte order and datetime units, normalizes layout
+to C order, and validates shape/size/encoded length before allocating decoded
+payload storage. Object, structured, subarray and zero-size dtypes are unsupported.
+Use an explicit `array.copy()` when writable independent output is needed.
+
+Rust `python_to_json_with_context` and `json_to_python_with_context` retain the
+supplied policy through nested containers. Strict conversion rejects nonempty
+array encoding/decoding and opaque pickle conversion. Existing context-free APIs
+use the process-local legacy ledger. Native streaming receives (async, polling
+and combined output), control taps and intercept receives use the originating
+core-session authority. Strict sessions reject nonempty compatibility decoding;
+allowed decodes and failures appear in `input_copy_report()["session"]`, outside
+the two input-selector subtotals. Opaque compatibility
+pickle internals, JSON string/container cloning elsewhere, and network/codec work
+are outside this codec's counters. JSON/base64 is not a zero-copy transport.
 
 ## API Reference
 
@@ -290,7 +489,7 @@ Compared to pure Python execution:
 - **Audio processing**: 2-16x faster (depending on operation)
 - **VAD (Voice Activity Detection)**: 8-12x faster
 - **Resampling**: 4-6x faster
-- **Zero-copy**: No data copying between Python and Rust
+- **Shared payload handoffs**: Published owning views avoid copies at supported boundaries; private storage may require counted materialization
 
 ## Migration from v0.3
 
@@ -570,3 +769,135 @@ server = await WebRtcServer.connect({
 - [Python Client](../../python-client/README.md) - Python SDK documentation
 - [Transport Decoupling Spec](../../specs/003-transport-decoupling/spec.md) - Architecture details
 - [WebRTC Spec](../../specs/016-ffi-webrtc-bindings/spec.md) - WebRTC FFI design specification
+
+### Node.js session buffer configuration
+
+The executor-backed `createStreamingSession(manifestJson, pipelineBuffers?)`
+accepts the same `PipelineBufferConfig` object as WebRTC and is available with
+just the `napi` feature. Omission keeps the compatibility default.
+
+```javascript
+const session = await runtime.createStreamingSession(manifestJson, {
+  policy: 'require_zero_copy',
+  nodeRetentionOwners: 16,
+  nodeRetentionBytes: 4096,
+  // Optional; needs the mapped-buffers feature on Windows/Linux:
+  mappedPool: {classes: [{bytes: 4096, slots: 4}], maxBytes: 16384, maxLeases: 64},
+});
+const loan = session.outputAllocator().allocateBytes(64);
+loan.fill(0);
+await session.sendInput(loan.publish());
+console.log(JSON.parse(session.copyReport()));
+```
+
+Limits must be nonnegative JavaScript safe integers; pool geometry also follows
+shared native validation. Bulk-capable nodes must declare matching port/domain
+and retention contracts. A session budget does not change a metadata-only node
+contract or bound all process memory. The example requires session-mapped binary
+forwarding in its manifest. Retained owning outputs keep their allocation alive
+after session close, and finite ingress credits return only after final release.
+
+`copyReport()` includes snapshots of owners returned by the session, its output
+allocator, control taps and intercepts. Event getters, binary slices and retained
+handles keep the same authority after close. Snapshot getters inherit that policy:
+omitting `requireZeroCopy` or passing `false` cannot relax a strict session;
+`true` strengthens a compatibility call and records rejection in its original
+ledger. No writable JavaScript alias to published storage is exposed.
+
+Standalone `NapiRuntimeData` constructors and unbound compatibility handles still
+use `nodejsBufferCopyReport()`. Copying a JS Buffer before sending the resulting
+owner belongs to that standalone boundary, not retroactively to the destination
+session. The legacy `createStreamSession` loop, unary paths and independent
+WebRTC wrappers remain separate. Strict core policy does not certify arbitrary
+caller/backend operations as physically copy-free.
+
+### Python unary buffer policy
+
+`execute_pipeline(manifest_json, enable_metrics=None, *, pipeline_buffers=None)`
+and `execute_pipeline_with_input(manifest_json, input_data, enable_metrics=None,
+*, pipeline_buffers=None)` accept the same `PipelineBufferConfig` as streaming.
+They create the actual core session before conversion and use its transport copy
+context for both input and output. Immutable bytes and published native buffers
+retain their owners; private mutable input requires an accounted compatibility
+copy or raises `BufferError` under strict policy. Input conversion now occurs
+asynchronously during execution; keep mutable inputs unchanged until submission
+completes. Output views retain storage after unary shutdown.
+
+The existing list behavior is preserved: all items are validated, and only the
+first item is executed (empty input uses empty text). Compatibility copies for
+all validated items are counted. Prefer a one-element list for unary work and a
+streaming session for multiple requests. Input completion is signalled, and
+ordinary success/conversion/execution errors close and join the session before
+returning. Cancellation and arbitrary blocked nodes still require lifecycle work.
+
+With `enable_metrics=True`, the result contains `outputs`, the existing `metrics`
+placeholder, and `copy_report`, the session's instrumented transport ledger after
+output conversion. It does not report arbitrary model/device internals or replace
+node materialization reports. Without metrics, the result remains the output
+value. Inline Python node execution and the Rust instance compatibility adapter still
+have separate legacy conversion boundaries; strict preflight does not certify
+those paths. Loaded plugin factories are registered before unary session creation.
+### Direct Python instance ownership
+
+`execute_pipeline_with_instances` forwards owning Python references between
+synchronous instances. It does not pack arrays, encode dictionaries, or convert
+values through RuntimeData. Strided arrays and arbitrary Python objects retain
+object identity. Private mutable objects keep their existing Python mutability;
+callers and node code remain responsible for mutation. Published native views
+keep their immutable owner and can outlive the invocation.
+
+All methods are validated before initialization. Initialize is now called, and
+cleanup is attempted once per initialized or partially initialized node, in
+reverse order, including on failure. Cleanup continues after another cleanup
+fails; the original processing/initialization error wins. On success, cleanup
+errors are surfaced. Nodes not initialized are not cleaned up. Async methods,
+generators and dynamically returned awaitables are explicitly unsupported on this
+synchronous lane. Registered inline nodes are the separate async/streaming path.
+
+The public `remotemedia.execute_pipeline*` wrappers forward `pipeline_buffers`
+to manifest execution. The direct-instance path rejects non-None configuration
+before initialization because it has no core session, mapped pool or node-budget
+binding. This must not silently turn a configured call into an unrestricted one.
+The no-input public instance wrapper now awaits the native call fully; one await
+returns the result. Existing metrics output retains its outputs/metrics shape.
+The Rust `InstanceExecutor::process(RuntimeData)` compatibility adapter still has
+legacy conversions; it is no longer used by direct Python instance execution.
+Core-session integration, cancellation and arbitrary node-internal copies remain
+separate work; these ownership checks are not a latency or model-quality claim.
+### Registered inline Python nodes
+
+`register_inline_node_class(..., buffer_contract_json=...)` accepts an explicit
+version 1 buffer contract with protocol `{"in_process_python":{"buffers":1}}`.
+Only the default input/output port is implemented. Missing declarations remain
+unknown and cannot pass strict admission. The declaration promises the node's
+layouts, memory domains, production behavior and retention bounds; it does not
+prove that arbitrary Python/model code avoids internal copies.
+
+All inline constructor-parameter, input and output conversions use the core
+node's copy policy and ledger, including coroutine results and async-generator
+yields. Immutable owning views retain their storage. Private mutable output or
+encoded-array decoding is counted in compatibility mode and rejected in strict
+mode. A private producer must declare `private_storage`; claiming `forward_input`
+does not authorize returning unrelated storage.
+
+For new output, implement `process_shared(data, ctx)` and declare
+`output_allocator` or `forward_or_output_allocator`. `ctx` is the existing owning
+buffer `OutputAllocator`, bound to the actual node's selected heap or mapped
+allocator, with `session_id` and `node_id`. Fill a loan from `ctx.allocate_bytes`
+or `ctx.allocate_audio`, release writable views, and return `loan.publish()`
+(using the usual audio metadata dictionary for audio). The method can be sync,
+a coroutine, or an async generator. Without this method, inline nodes use
+`process(data)`; a declared allocator producer lacking it fails registration.
+No heap allocator is silently substituted when a runtime context is absent.
+
+Optional async `initialize()` is awaited before processing. Async generators
+are closed after exhaustion or conversion/delivery failure so their `finally`
+blocks run. This does not certify cancellation of blocking Python code or
+concurrent sessions on independent asyncio loops; the existing loop-capture
+mechanism remains process-global.
+
+`session.node_copy_reports()` returns distinct per-node ledgers and remains
+readable after close. Unary metrics also include `node_copy_reports`, separate
+from the transport `copy_report`. A node rejection can be logged while the
+receive channel stays open; do not rely on `recv_data()` returning `None` as
+an error notification. Explicit receive deadlines and close are still needed.

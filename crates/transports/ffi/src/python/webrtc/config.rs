@@ -48,6 +48,8 @@ impl From<&TurnServer> for crate::webrtc::config::TurnServerConfig {
     }
 }
 
+pub use crate::python::buffer_config::{MappedPoolConfig, MappedSizeClass, PipelineBufferConfig};
+
 /// WebRTC server configuration for Python
 #[pyclass]
 #[derive(Clone, Debug)]
@@ -81,12 +83,20 @@ pub struct WebRtcServerConfig {
     /// Video codec ('vp8', 'vp9', 'h264')
     #[pyo3(get, set)]
     pub video_codec: String,
+
+    /// Instrumented transport policy: allow_copies or require_zero_copy.
+    #[pyo3(get, set)]
+    pub transport_materialization_policy: String,
+
+    /// Optional unified core policy and explicit retention budgets.
+    #[pyo3(get, set)]
+    pub pipeline_buffers: Option<PipelineBufferConfig>,
 }
 
 #[pymethods]
 impl WebRtcServerConfig {
     #[new]
-    #[pyo3(signature = (port=None, signaling_url=None, manifest=None, stun_servers=None, turn_servers=None, max_peers=10, audio_codec="opus", video_codec="vp9"))]
+    #[pyo3(signature = (port=None, signaling_url=None, manifest=None, stun_servers=None, turn_servers=None, max_peers=10, audio_codec="opus", video_codec="vp9", transport_materialization_policy="allow_copies", pipeline_buffers=None))]
     fn new(
         py: Python<'_>,
         port: Option<u16>,
@@ -97,7 +107,11 @@ impl WebRtcServerConfig {
         max_peers: Option<u32>,
         audio_codec: Option<&str>,
         video_codec: Option<&str>,
+        transport_materialization_policy: &str,
+        pipeline_buffers: Option<PipelineBufferConfig>,
     ) -> PyResult<Self> {
+        crate::webrtc::config::parse_transport_copy_policy(transport_materialization_policy)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         // Convert manifest to JSON string
         let manifest_json = if let Some(m) = manifest {
             python_dict_to_json_string(py, &m)?
@@ -118,6 +132,8 @@ impl WebRtcServerConfig {
             max_peers: max_peers.unwrap_or(10),
             audio_codec: audio_codec.unwrap_or("opus").to_string(),
             video_codec: video_codec.unwrap_or("vp9").to_string(),
+            transport_materialization_policy: transport_materialization_policy.to_owned(),
+            pipeline_buffers,
         })
     }
 
@@ -195,6 +211,15 @@ impl WebRtcServerConfig {
             audio_codec: crate::webrtc::config::AudioCodec::Opus,
             video_codec,
             reconnect: crate::webrtc::config::ReconnectConfig::default(),
+            transport_materialization_policy: crate::webrtc::config::parse_transport_copy_policy(
+                &self.transport_materialization_policy,
+            )
+            .map_err(pyo3::exceptions::PyValueError::new_err)?,
+            pipeline_buffers: self
+                .pipeline_buffers
+                .as_ref()
+                .map(PipelineBufferConfig::to_core_config)
+                .transpose()?,
         };
 
         // Validate the config

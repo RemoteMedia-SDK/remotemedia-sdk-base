@@ -252,8 +252,12 @@ impl VideoScalerNode {
         // Resizing a large frame takes milliseconds: keep it off the runtime.
         let (pixel_data, width, height) = tokio::task::spawn_blocking(move || {
             let mut r = resizer.lock().unwrap_or_else(|p| p.into_inner());
-            scale_pixels(&config, &mut r, &pixel_data, format, width, height)
-                .map(|s| s.unwrap_or((pixel_data, width, height)))
+            // Reads the input in place; an unchanged size forwards the same owner,
+            // and a new size is computed into a fresh frame (no input copy).
+            scale_pixels(&config, &mut r, &pixel_data, format, width, height).map(|s| match s {
+                Some((scaled, w, h)) => (scaled.into(), w, h),
+                None => (pixel_data, width, height),
+            })
         })
         .await
         .map_err(|e| format!("scaler task failed: {e}"))??;
@@ -305,7 +309,7 @@ mod tests {
 
     fn video(w: u32, h: u32, format: PixelFormat, data: Vec<u8>) -> RuntimeData {
         RuntimeData::Video {
-            pixel_data: data,
+            pixel_data: data.into(),
             width: w,
             height: h,
             format,
@@ -368,7 +372,7 @@ mod tests {
             panic!("video out")
         };
         assert_eq!((width, height, format), (4, 1, PixelFormat::Rgb24));
-        assert_eq!(pixel_data, [255u8, 0, 0].repeat(4));
+        assert_eq!(&pixel_data[..], &[255u8, 0, 0].repeat(4)[..]);
         assert_eq!((stream_id.as_deref(), frame_number), (Some("screen"), 7));
     }
 

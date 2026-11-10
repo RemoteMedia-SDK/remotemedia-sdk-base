@@ -277,6 +277,22 @@ fn probe(slot: &std::sync::OnceLock<Box<dyn super::QueueProbe>>) -> u32 {
         .unwrap_or(0)
 }
 
+/// Count a dispatch or admission error and publish a rate-limited node event.
+pub fn record_node_error(
+    telemetry: &SessionTelemetry,
+    index: Option<usize>,
+    control: Option<&SessionControl>,
+    node_id: &str,
+    message: &str,
+) {
+    let Some(index) = index else { return };
+    if let Some(event) = telemetry.record_error(index, message) {
+        if let Some(control) = control {
+            publish_node_error(control, node_id, &event.message, event.count);
+        }
+    }
+}
+
 /// Publish a (non-retained) `node_error` event on `__system__`.
 pub fn publish_node_error(ctrl: &SessionControl, node_id: &str, message: &str, count: u64) {
     ctrl.publish_system_ephemeral(RuntimeData::Json(serde_json::json!({

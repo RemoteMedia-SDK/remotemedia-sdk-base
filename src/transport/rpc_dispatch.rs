@@ -215,11 +215,3 @@ async fn dispatch(
     }
     node.call_rpc(request, ctx, replies).await
 }
-
-/// Abort-on-drop prevents a cancelled main node task detaching its RPC lane.
-pub(super) struct RpcTask(pub tokio::task::JoinHandle<()>);
-impl Drop for RpcTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}

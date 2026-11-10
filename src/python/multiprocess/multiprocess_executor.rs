@@ -1,7 +1,8 @@
 //! Multiprocess executor for Python nodes
 //!
 //! Implements NodeExecutor trait to manage Python nodes running in separate processes
-//! with iceoryx2 shared memory IPC for zero-copy data transfer.
+//! with legacy iceoryx2 wire IPC. Native staging is counted compatibility work;
+//! mapped descriptor workers provide strict zero-copy bulk transport.
 
 use crate::executor::node_executor::{
     NodeContext as ExecutorNodeContext, NodeExecutor as ExecutorNodeExecutor,
@@ -15,13 +16,15 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
 #[cfg(feature = "multiprocess")]
-use super::data_transfer::{from_python_wire, to_python_wire};
+use super::data_transfer::to_python_wire;
 #[cfg(feature = "multiprocess")]
 use super::health_monitor::{HealthMonitor, ProcessEvent};
 #[cfg(feature = "multiprocess")]
 use super::ipc_channel::{ChannelHandle, ChannelRegistry};
 #[cfg(feature = "multiprocess")]
 use super::process_manager::{ExitReason, ProcessHandle, ProcessManager};
+#[cfg(feature = "multiprocess")]
+use remotemedia_types::{CopyContext, SharedBytes};
 
 #[cfg(feature = "docker")]
 use super::docker_support::DockerSupport;
@@ -75,7 +78,7 @@ fn global_sessions(
 #[cfg(feature = "multiprocess")]
 enum IpcCommand {
     /// Send data to the node's input channel (serialized Python wire bytes)
-    SendData { bytes: Vec<u8> },
+    SendData { bytes: Vec<u8>, copies: CopyContext },
     /// Publish to the node's input channel WITHOUT an `IpcResponse` ack.
     ///
     /// Used for out-of-band frames (endpoint-call `__call_reply__`
@@ -89,7 +92,8 @@ enum IpcCommand {
     /// will back-pressure the iceoryx2 subscriber loop — which in turn back-
     /// pressures the Python process via iceoryx2's own publisher limits.
     RegisterOutputCallback {
-        callback_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        callback_tx: tokio::sync::mpsc::Sender<SharedBytes>,
+        copies: CopyContext,
     },
     /// Request graceful shutdown of the IPC thread
     Shutdown,
@@ -97,13 +101,30 @@ enum IpcCommand {
 
 /// Responses from the dedicated IPC thread
 #[cfg(feature = "multiprocess")]
-enum IpcResponse {
+pub(super) enum IpcResponse {
     /// Data received from the node's output channel (serialized Python wire bytes)
-    OutputData(Vec<u8>),
+    OutputData(SharedBytes),
     /// Acknowledgment that data was sent successfully
     SendComplete,
     /// Error occurred during IPC operation
     Error(String),
+}
+
+/// Retain one wire owner in each bounded delivery lane. Preserve callback-first
+/// blocking/backpressure and response delivery even when the callback closes.
+#[cfg(feature = "multiprocess")]
+fn deliver_ipc_output(
+    output: SharedBytes,
+    callback: &mut Option<tokio::sync::mpsc::Sender<SharedBytes>>,
+    response: &tokio::sync::mpsc::Sender<IpcResponse>,
+) {
+    if let Some(sender) = callback {
+        if sender.blocking_send(output.clone()).is_err() {
+            tracing::debug!("Legacy IPC output callback closed");
+            *callback = None;
+        }
+    }
+    let _ = response.blocking_send(IpcResponse::OutputData(output));
 }
 
 /// Handle a single runtime control message read from a Python node's
@@ -269,6 +290,8 @@ pub struct NodeIpcThread {
     command_tx: tokio::sync::mpsc::Sender<IpcCommand>,
     /// Channel to receive responses from the IPC thread
     response_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<IpcResponse>>>,
+    /// Turns that ended before their EndOfInput; their responses are still queued.
+    abandoned: Arc<super::legacy_call::AbandonedTurns>,
     /// Handle to the OS thread (for cleanup)
     thread_handle: Option<std::thread::JoinHandle<()>>,
     /// Node ID this thread serves
@@ -589,6 +612,15 @@ pub struct MultiprocessExecutor {
     /// Current node context
     current_context: Option<ExecutorNodeContext>,
 
+    /// Fixed before initialization; owns startup and background-output accounting.
+    initial_copies: Option<remotemedia_types::CopyContext>,
+    /// Canonical identity survives cleanup so the bound ledger cannot migrate.
+    initial_scope: Option<(String, String)>,
+
+    /// Managed environment lease, held for this executor's worker lifetime so
+    /// the cache cannot evict or replace the venv while the worker uses it.
+    env_lease: Option<crate::python::env_manager::LeasedVenvInfo>,
+
     /// Docker support
     #[cfg(feature = "docker")]
     docker_support: Option<Arc<DockerSupport>>,
@@ -609,11 +641,38 @@ impl MultiprocessExecutor {
         &self, // Changed from &mut self - all state is behind Arc/RwLock
         input: crate::data::RuntimeData,
         session_id: Option<String>,
-        mut callback: F,
+        callback: F,
     ) -> Result<usize>
     where
         F: FnMut(crate::data::RuntimeData) -> Result<()> + Send,
     {
+        self.process_runtime_data_streaming_with_copy_context(
+            input,
+            session_id,
+            callback,
+            remotemedia_types::CopyContext::legacy(),
+        )
+        .await
+    }
+
+    /// Legacy execution requires copying; carry the caller's ledger through both codecs.
+    /// Python serialization and iceoryx staging remain distinct boundaries.
+    #[cfg(feature = "multiprocess")]
+    pub async fn process_runtime_data_streaming_with_copy_context<F>(
+        &self,
+        input: crate::data::RuntimeData,
+        session_id: Option<String>,
+        mut callback: F,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<usize>
+    where
+        F: FnMut(crate::data::RuntimeData) -> Result<()> + Send,
+    {
+        if copies.policy() != remotemedia_types::CopyPolicy::AllowCopies {
+            return Err(Error::Execution(
+                "Legacy Python execution requires allow_copies; use mapped execution".into(),
+            ));
+        }
         let ctx = self
             .current_context
             .as_ref()
@@ -630,7 +689,12 @@ impl MultiprocessExecutor {
         );
 
         // Convert input to Python IPC wire bytes
-        let ipc_data = Self::to_ipc_runtime_data(&input, &session_id);
+        let ipc_data = crate::multiprocess::data_transfer::to_python_wire_with_copy_context(
+            &input,
+            &session_id,
+            copies,
+        )
+        .map_err(Error::Execution)?;
 
         tracing::debug!(
             "[Multiprocess] Converted input data for node '{}': {} bytes",
@@ -644,160 +708,51 @@ impl MultiprocessExecutor {
             .get(&session_id)
             .ok_or_else(|| Error::Execution(format!("Session {} not found", session_id)))?;
 
-        let ipc_thread_cmd_tx = session
-            .ipc_threads
-            .get(&ctx.node_id)
-            .ok_or_else(|| {
-                Error::Execution(format!("IPC thread not found for node {}", ctx.node_id))
-            })?
-            .command_tx
-            .clone();
-
-        let ipc_thread_resp_rx = session
-            .ipc_threads
-            .get(&ctx.node_id)
-            .ok_or_else(|| {
-                Error::Execution(format!("IPC thread not found for node {}", ctx.node_id))
-            })?
-            .response_rx
-            .clone();
+        let thread = session.ipc_threads.get(&ctx.node_id).ok_or_else(|| {
+            Error::Execution(format!("IPC thread not found for node {}", ctx.node_id))
+        })?;
+        let ipc_thread_cmd_tx = thread.command_tx.clone();
+        let ipc_thread_resp_rx = thread.response_rx.clone();
+        let abandoned = thread.abandoned.clone();
 
         drop(sessions); // Release read lock
 
-        // Send data to IPC thread (fast, no blocking!)
-        tracing::debug!(
-            "[Multiprocess] Sending data to IPC thread for node '{}'",
-            ctx.node_id
-        );
-        ipc_thread_cmd_tx
-            .send(IpcCommand::SendData { bytes: ipc_data })
-            .await
-            .map_err(|e| Error::Execution(format!("Failed to send to IPC thread: {}", e)))?;
-
-        // Wait for send acknowledgment
+        // Hold the node's response lane for the whole turn, including the send,
+        // so concurrent turns cannot interleave their outputs.
         let mut resp_rx = ipc_thread_resp_rx.lock().await;
-        match tokio::time::timeout(std::time::Duration::from_secs(5), resp_rx.recv()).await {
-            Ok(Some(IpcResponse::SendComplete)) => {
-                tracing::debug!("Data sent successfully to node: {}", ctx.node_id);
-            }
-            Ok(Some(IpcResponse::Error(e))) => {
-                return Err(Error::Execution(format!("IPC send error: {}", e)));
-            }
-            Ok(None) | Err(_) => {
-                return Err(Error::Execution(format!(
-                    "Timeout waiting for send confirmation"
-                )));
-            }
-            _ => {}
-        }
-
-        // Collect outputs from IPC thread continuously
-        // The callback will control when to stop (e.g., based on end markers)
-        let mut output_count = 0;
-
-        tracing::debug!(
-            "[Multiprocess] Continuously collecting output from node '{}'",
-            ctx.node_id
-        );
-
-        // Upper bound only. The hot path is the `EndOfInput` sentinel — Python
-        // emits it after each `process()` call, so we return immediately.
-        // This fallback fires only if the Python node crashes or never signals
-        // completion (e.g. an older client without the sentinel).
-        let hard_timeout = std::time::Duration::from_secs(300);
-
-        loop {
-            tracing::debug!(
-                "[Multiprocess] Waiting for response from IPC thread for node '{}'",
-                ctx.node_id
-            );
-
-            match tokio::time::timeout(hard_timeout, resp_rx.recv()).await {
-                Err(_) => {
-                    // Timeout — no more outputs from the node for this input
-                    tracing::debug!(
-                        "[Multiprocess] Output receive timeout for node '{}' after {} outputs",
-                        ctx.node_id,
-                        output_count
-                    );
-                    return Ok(output_count);
-                }
-                Ok(recv_result) => match recv_result {
-                    Some(IpcResponse::OutputData(ipc_output)) => {
-                        // EndOfInput is the Python side's "done for this input"
-                        // signal. Check the first byte (wire data type) directly.
-                        // WireDataType::EndOfInput = 8
-                        if !ipc_output.is_empty() && ipc_output[0] == 8 {
-                            tracing::debug!(
-                            "[Multiprocess] Received EndOfInput from node '{}' after {} outputs",
-                            ctx.node_id,
-                            output_count
-                        );
-                            return Ok(output_count);
-                        }
-
-                        tracing::debug!(
-                            "[Multiprocess] Received OutputData from node '{}': {} bytes",
-                            ctx.node_id,
-                            ipc_output.len()
-                        );
-
-                        let output_data = Self::from_ipc_runtime_data(ipc_output)?;
-
-                        tracing::debug!(
-                        "[Multiprocess] Converted to RuntimeData, invoking callback for node '{}'",
-                        ctx.node_id
-                    );
-
-                        // Forward all outputs - the callback decides when to stop
-                        match callback(output_data) {
-                            Ok(_) => {
-                                output_count += 1;
-                                tracing::debug!("[Multiprocess] Callback succeeded for node '{}', total outputs: {}", ctx.node_id, output_count);
-                            }
-                            Err(e) => {
-                                // Callback returned error - stop collecting
-                                tracing::debug!(
-                                    "Callback stopped collection for node {} after {} outputs: {}",
-                                    ctx.node_id,
-                                    output_count,
-                                    e
-                                );
-                                return Ok(output_count);
-                            }
-                        }
-                    }
-                    Some(IpcResponse::SendComplete) => {
-                        tracing::debug!("[Multiprocess] Received SendComplete from node '{}', continuing to poll for outputs", ctx.node_id);
-                        // Acknowledgment - ignore and continue polling for outputs
-                        continue;
-                    }
-                    Some(IpcResponse::Error(e)) => {
-                        tracing::error!(
-                            "[Multiprocess] IPC error from node '{}': {}",
-                            ctx.node_id,
-                            e
-                        );
-                        return Err(Error::Execution(format!("IPC error: {}", e)));
-                    }
-                    None => {
-                        // IPC thread disconnected
-                        tracing::debug!(
-                            "IPC thread disconnected for node {} after {} outputs",
-                            ctx.node_id,
-                            output_count
-                        );
-                        return Ok(output_count);
-                    }
-                }, // match recv_result
-            } // match timeout
-        }
+        let node_id = ctx.node_id.clone();
+        let send = async {
+            ipc_thread_cmd_tx
+                .send(IpcCommand::SendData {
+                    bytes: ipc_data,
+                    copies: copies.clone(),
+                })
+                .await
+                .map_err(|e| Error::Execution(format!("Failed to send to IPC thread: {}", e)))
+        };
+        super::legacy_call::run(
+            &mut resp_rx,
+            &abandoned,
+            super::legacy_call::Timeouts::default(),
+            &node_id,
+            send,
+            |frame| {
+                crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(
+                    frame, copies,
+                )
+                .map_err(Error::Execution)
+            },
+            &mut callback,
+        )
+        .await
     }
 
     /// Register a bounded callback channel for continuous output forwarding
     /// from a node's IPC thread. The callback will receive ALL outputs from
     /// the node, independent of any input processing.
     ///
+    /// Callback messages retain a SharedBytes wire owner. Consumers needing a
+    /// mutable Vec must explicitly materialize it under their copy policy.
     /// The sender is bounded — the caller chooses the capacity. The IPC
     /// thread uses `blocking_send`, so a full receiver applies real
     /// backpressure all the way back to the Python process.
@@ -806,8 +761,34 @@ impl MultiprocessExecutor {
         &self,
         node_id: &str,
         session_id: &str,
-        callback_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        callback_tx: tokio::sync::mpsc::Sender<SharedBytes>,
     ) -> Result<()> {
+        self.register_output_callback_with_copy_context(
+            node_id,
+            session_id,
+            callback_tx,
+            CopyContext::legacy(),
+        )
+        .await
+    }
+
+    /// Supply output authority for an executor without initialization authority.
+    /// An initialization binding takes precedence and cannot be replaced by a
+    /// callback or input request. Otherwise registration applies only to later
+    /// receives, not frames already copied before the command arrives.
+    #[cfg(feature = "multiprocess")]
+    pub async fn register_output_callback_with_copy_context(
+        &self,
+        node_id: &str,
+        session_id: &str,
+        callback_tx: tokio::sync::mpsc::Sender<SharedBytes>,
+        copies: &CopyContext,
+    ) -> Result<()> {
+        if copies.policy() != remotemedia_types::CopyPolicy::AllowCopies {
+            return Err(Error::Execution(
+                "Legacy Python output requires allow_copies; use mapped execution".into(),
+            ));
+        }
         // Get the IPC thread from global sessions storage
         let global_sessions = global_sessions();
         let sessions = global_sessions.read().await;
@@ -825,7 +806,10 @@ impl MultiprocessExecutor {
 
         // Send register command to IPC thread
         ipc_thread_cmd_tx
-            .send(IpcCommand::RegisterOutputCallback { callback_tx })
+            .send(IpcCommand::RegisterOutputCallback {
+                callback_tx,
+                copies: copies.clone(),
+            })
             .await
             .map_err(|e| {
                 Error::Execution(format!(
@@ -851,74 +835,21 @@ impl MultiprocessExecutor {
         session_id: &str,
         input: crate::data::RuntimeData,
     ) -> Result<()> {
-        tracing::info!(
-            "[send_data_to_node] START: node_id='{}', session_id='{}'",
-            node_id,
-            session_id
-        );
-
-        // Convert input to Python IPC wire bytes
-        let ipc_data = Self::to_ipc_runtime_data(&input, session_id);
-
-        tracing::info!(
-            "[send_data_to_node] Converted RuntimeData to IPC wire: {} bytes",
-            ipc_data.len()
-        );
-
-        // Get the IPC thread from global sessions storage
-        let global_sessions = global_sessions();
-        let sessions = global_sessions.read().await;
-
-        let session = sessions.get(session_id).ok_or_else(|| {
-            let available: Vec<_> = sessions.keys().collect();
-            Error::Execution(format!(
-                "Session {} not found. Available: {:?}",
-                session_id, available
-            ))
-        })?;
-
-        let ipc_thread_cmd_tx = session
-            .get(node_id)
-            .ok_or_else(|| {
-                let available: Vec<_> = session.keys().collect();
-                Error::Execution(format!(
-                    "IPC thread not found for node {}. Available: {:?}",
-                    node_id, available
-                ))
-            })?
-            .clone();
-
-        drop(sessions);
-
-        // Send data to IPC thread (no waiting for outputs)
-        tracing::info!(
-            "[send_data_to_node] Queuing data to IPC thread for node '{}'",
-            node_id
-        );
-
-        match ipc_thread_cmd_tx
-            .send(IpcCommand::SendData { bytes: ipc_data })
+        self.send_to_node_async_with_copy_context(node_id, session_id, input, CopyContext::legacy())
             .await
-        {
-            Ok(_) => {
-                tracing::info!(
-                    "[send_data_to_node] Successfully queued data to IPC thread for node '{}'",
-                    node_id
-                );
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!(
-                    "[send_data_to_node] Failed to send to IPC thread for node '{}': {}",
-                    node_id,
-                    e
-                );
-                Err(Error::Execution(format!(
-                    "Failed to send to IPC thread for node {}: {}",
-                    node_id, e
-                )))
-            }
-        }
+    }
+
+    /// Queue input with explicit authority retained through native publication.
+    #[cfg(feature = "multiprocess")]
+    pub async fn send_data_to_node_with_copy_context(
+        &self,
+        node_id: &str,
+        session_id: &str,
+        input: crate::data::RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<()> {
+        self.send_to_node_async_with_copy_context(node_id, session_id, input, copies)
+            .await
     }
 
     /// Fire-and-forget, out-of-band send to a node's Python process: the
@@ -935,7 +866,7 @@ impl MultiprocessExecutor {
         node_id: &str,
         data: crate::data::RuntimeData,
     ) -> Result<()> {
-        let bytes = Self::to_ipc_runtime_data(&data, session_id);
+        let bytes = Self::to_ipc_runtime_data(&data, session_id)?;
         let tx = {
             let global_sessions = global_sessions();
             let sessions = global_sessions.read().await;
@@ -963,8 +894,30 @@ impl MultiprocessExecutor {
         session_id: &str,
         data: crate::data::RuntimeData,
     ) -> Result<()> {
+        self.send_to_node_async_with_copy_context(node_id, session_id, data, CopyContext::legacy())
+            .await
+    }
+
+    /// Legacy asynchronous ingress requires allow_copies even for metadata: a
+    /// Python invocation may emit bulk data. Success means queued, not sent.
+    #[cfg(feature = "multiprocess")]
+    pub async fn send_to_node_async_with_copy_context(
+        &self,
+        node_id: &str,
+        session_id: &str,
+        data: crate::data::RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<()> {
+        if copies.policy() != remotemedia_types::CopyPolicy::AllowCopies {
+            return Err(Error::Execution(
+                "Legacy Python execution requires allow_copies; use mapped execution".into(),
+            ));
+        }
         // Convert to Python IPC wire bytes
-        let ipc_data = Self::to_ipc_runtime_data(&data, session_id);
+        let ipc_data = crate::multiprocess::data_transfer::to_python_wire_with_copy_context(
+            &data, session_id, copies,
+        )
+        .map_err(Error::Execution)?;
 
         // Get the IPC thread from global sessions storage
         let global_sessions = global_sessions();
@@ -998,7 +951,10 @@ impl MultiprocessExecutor {
             session_id
         );
         ipc_thread_cmd_tx
-            .send(IpcCommand::SendData { bytes: ipc_data })
+            .send(IpcCommand::SendData {
+                bytes: ipc_data,
+                copies: copies.clone(),
+            })
             .await
             .map_err(|e| {
                 Error::Execution(format!(
@@ -1012,15 +968,32 @@ impl MultiprocessExecutor {
 
     /// Convert main RuntimeData to Python IPC wire bytes
     #[cfg(feature = "multiprocess")]
-    pub fn to_ipc_runtime_data(data: &crate::data::RuntimeData, session_id: &str) -> Vec<u8> {
-        to_python_wire(data, session_id)
+    pub fn to_ipc_runtime_data(
+        data: &crate::data::RuntimeData,
+        session_id: &str,
+    ) -> Result<Vec<u8>> {
+        to_python_wire(data, session_id).map_err(Error::Execution)
     }
 
     /// Convert Python IPC wire bytes back to main RuntimeData
     #[cfg(feature = "multiprocess")]
-    pub fn from_ipc_runtime_data(bytes: Vec<u8>) -> Result<crate::data::RuntimeData> {
-        from_python_wire(&bytes)
-            .map_err(|e| Error::Execution(format!("Invalid IPC wire data: {e}")))
+    pub fn from_ipc_runtime_data(
+        bytes: impl Into<SharedBytes>,
+    ) -> Result<crate::data::RuntimeData> {
+        Self::from_ipc_runtime_data_with_copy_context(bytes, CopyContext::legacy())
+    }
+
+    /// Retain an owned wire frame; charge required decoding to the given ledger.
+    #[cfg(feature = "multiprocess")]
+    pub fn from_ipc_runtime_data_with_copy_context(
+        bytes: impl Into<SharedBytes>,
+        copies: &CopyContext,
+    ) -> Result<crate::data::RuntimeData> {
+        crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(
+            bytes.into(),
+            copies,
+        )
+        .map_err(|e| Error::Execution(format!("Invalid IPC wire data: {e}")))
     }
 
     /// Create a new multiprocess executor
@@ -1070,6 +1043,9 @@ impl MultiprocessExecutor {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
             current_context: None,
+            initial_copies: None,
+            initial_scope: None,
+            env_lease: None,
             #[cfg(feature = "docker")]
             docker_support,
             env_manager,
@@ -1081,6 +1057,51 @@ impl MultiprocessExecutor {
         executor.setup_failure_handling();
 
         executor
+    }
+
+    /// A lifetime-bound executor cannot be reassigned to another node/session.
+    pub(crate) fn validate_initialization_scope(&self, node: &str, session: &str) -> Result<()> {
+        if self
+            .initial_scope
+            .as_ref()
+            .is_some_and(|(prior_node, prior_session)| {
+                prior_node != node || prior_session != session
+            })
+        {
+            return Err(Error::Execution(
+                "A bound legacy executor cannot initialize another node/session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bind lifetime output accounting before initialization. A clone of the
+    /// same authority may reassert the binding; labels alone cannot rebind it.
+    pub fn bind_initial_copy_context(
+        &mut self,
+        copies: remotemedia_types::CopyContext,
+    ) -> Result<()> {
+        if copies.policy() != remotemedia_types::CopyPolicy::AllowCopies {
+            return Err(Error::Execution(
+                "Legacy Python initialization requires allow_copies; use mapped execution".into(),
+            ));
+        }
+        if let Some(bound) = &self.initial_copies {
+            return if bound.same_authority(&copies) {
+                Ok(())
+            } else {
+                Err(Error::Execution(
+                    "Legacy Python initialization copy authority is already bound".into(),
+                ))
+            };
+        }
+        if self.current_context.is_some() {
+            return Err(Error::Execution(
+                "Cannot attribute an already initialized legacy Python worker retroactively".into(),
+            ));
+        }
+        self.initial_copies = Some(copies);
+        Ok(())
     }
 
     /// Set the control bus handle for forwarding progress events from
@@ -1227,7 +1248,9 @@ impl MultiprocessExecutor {
 import ast, json, os, sys, traceback
 from pathlib import Path
 
-NODE_TYPE = "{node_type}"
+# Passed out-of-band: interpolating the node type into this source would let
+# a crafted node_type execute arbitrary code in the probe interpreter.
+NODE_TYPE = os.environ["REMOTEMEDIA_DEPS_PROBE_NODE_TYPE"]
 RESULT = {{"deps": [], "error": None, "source_file": None, "roots_searched": []}}
 
 def _candidate_roots():
@@ -1408,6 +1431,7 @@ sys.stdout.flush()
 
         let mut cmd = tokio::process::Command::new(python);
         cmd.args(["-c", &script]);
+        cmd.env("REMOTEMEDIA_DEPS_PROBE_NODE_TYPE", node_type);
         #[cfg(windows)]
         if let Some(flags) = super::process_manager::no_window_flag() {
             cmd.creation_flags(flags);
@@ -1961,7 +1985,10 @@ sys.stdout.flush()
         let node_id_clone = node_id.to_string();
         let session_id_clone = session_id.to_string();
         let control = self.get_control();
-        let process = self.sessions.read().await
+        let process = self
+            .sessions
+            .read()
+            .await
             .get(session_id)
             .and_then(|session| session.node_processes.get(node_id))
             .cloned()
@@ -2125,6 +2152,7 @@ sys.stdout.flush()
         let session_id_clone = session_id.to_string();
 
         // Spawn dedicated OS thread (logging in the caller's node span).
+        let initial_copies = self.initial_copies.clone();
         let span = tracing::Span::current();
         let handle = std::thread::spawn(move || {
             let _span = span.entered();
@@ -2193,13 +2221,16 @@ sys.stdout.flush()
             // Optional bounded callback for continuous output forwarding.
             // Uses blocking_send from this sync OS thread so a full queue
             // naturally stalls the iceoryx2 subscriber loop below.
-            let mut output_callback: Option<tokio::sync::mpsc::Sender<Vec<u8>>> = None;
+            let mut output_callback: Option<tokio::sync::mpsc::Sender<SharedBytes>> = None;
+            // Bind before the first receive. Callback contexts are a compatibility
+            // fallback only for executors created without initialization authority.
+            let mut callback_copies = CopyContext::legacy().clone();
 
             // Main loop: process commands using persistent publishers/subscribers
             loop {
                 // Check for commands (non-blocking poll)
                 match cmd_rx.try_recv() {
-                    Ok(IpcCommand::SendData { bytes }) => {
+                    Ok(IpcCommand::SendData { bytes, copies }) => {
                         // Per-frame hot path: keep tracing at trace!/debug! to avoid
                         // allocating a format-args record per audio frame. Use
                         // `RUST_LOG=remotemedia_core::python::multiprocess=trace` to
@@ -2210,7 +2241,7 @@ sys.stdout.flush()
                             bytes.len()
                         );
 
-                        match publisher.send(&bytes) {
+                        match publisher.send_with_copy_context(&bytes, &copies) {
                             Ok(_) => {
                                 tracing::trace!(
                                     "[IPC Thread] Node '{}': Successfully published data to iceoryx2",
@@ -2247,12 +2278,16 @@ sys.stdout.flush()
                             );
                         }
                     }
-                    Ok(IpcCommand::RegisterOutputCallback { callback_tx }) => {
+                    Ok(IpcCommand::RegisterOutputCallback {
+                        callback_tx,
+                        copies,
+                    }) => {
                         tracing::debug!(
                             "IPC thread registered output callback for node: {}",
                             node_id_clone
                         );
                         output_callback = Some(callback_tx);
+                        callback_copies = copies;
                     }
                     Ok(IpcCommand::Shutdown) => {
                         tracing::debug!("IPC thread shutting down for node: {}", node_id_clone);
@@ -2289,26 +2324,11 @@ sys.stdout.flush()
 
                         // No command, poll subscriber for incoming data
                         // Use receive_bytes() for Python IPC — the wire format is not bincode
-                        match subscriber.receive_bytes() {
+                        match subscriber.receive_shared_bytes_with_copy_context(
+                            initial_copies.as_ref().unwrap_or(&callback_copies),
+                        ) {
                             Ok(Some(output_data)) => {
-                                // If we have a registered callback, use it (for continuous forwarding).
-                                // blocking_send applies backpressure: when the downstream
-                                // consumer is slow the send blocks this IPC thread, which
-                                // stalls `subscriber.receive()` below, which back-pressures
-                                // the Python publisher via iceoryx2.
-                                if let Some(ref cb) = output_callback {
-                                    if let Err(e) = cb.blocking_send(output_data.clone()) {
-                                        tracing::error!(
-                                            "Failed to send output via callback for node {}: {}",
-                                            node_id_clone,
-                                            e
-                                        );
-                                        // Callback channel closed, clear it
-                                        output_callback = None;
-                                    }
-                                }
-                                // Also send via response channel (for backwards compat)
-                                let _ = resp_tx.blocking_send(IpcResponse::OutputData(output_data));
+                                deliver_ipc_output(output_data, &mut output_callback, &resp_tx);
                             }
                             Ok(None) => {
                                 // No data, yield to scheduler (avoids 100% CPU but minimal latency)
@@ -2332,6 +2352,7 @@ sys.stdout.flush()
         Ok(NodeIpcThread {
             command_tx: cmd_tx,
             response_rx: Arc::new(tokio::sync::Mutex::new(resp_rx)),
+            abandoned: Arc::default(),
             thread_handle: Some(handle),
             node_id: node_id.to_string(),
         })
@@ -2571,20 +2592,20 @@ sys.stdout.flush()
 #[async_trait]
 impl ExecutorNodeExecutor for MultiprocessExecutor {
     async fn initialize(&mut self, ctx: &ExecutorNodeContext) -> Result<()> {
+        let session_id = ctx
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("default_{}", ctx.node_id));
+        self.validate_initialization_scope(&ctx.node_id, &session_id)?;
+        if self.initial_copies.is_some() && self.initial_scope.is_none() {
+            self.initial_scope = Some((ctx.node_id.clone(), session_id.clone()));
+        }
         tracing::debug!(
             "Initializing multiprocess node: {} ({})",
             ctx.node_id,
             ctx.node_type
         );
-
-        // Store context for later use
         self.current_context = Some(ctx.clone());
-
-        // Get or create session
-        let session_id = ctx
-            .session_id
-            .clone()
-            .unwrap_or_else(|| format!("default_{}", ctx.node_id));
 
         // Ensure session exists
         if !self.sessions.read().await.contains_key(&session_id) {
@@ -2825,6 +2846,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
 
+            let mut acquired_lease = None;
             let env_result = if let Some(explicit) = explicit_venv {
                 let raw = std::path::PathBuf::from(explicit);
                 // Accept either the venv root or the python binary inside it.
@@ -2854,8 +2876,18 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                     cache_key: "embedded-explicit-venv".to_string(),
                 })
             } else {
-                env_mgr.ensure_env_scoped(&merged, scope_context).await
+                env_mgr
+                    .ensure_env_scoped_leased(&merged, scope_context)
+                    .await
+                    .map(|leased| {
+                        let info = (*leased).clone();
+                        acquired_lease = Some(leased);
+                        info
+                    })
             };
+            if acquired_lease.is_some() {
+                self.env_lease = acquired_lease;
+            }
 
             match env_result {
                 Ok(venv_info) => {
@@ -2962,6 +2994,9 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                         let should_use_docker = self.should_use_docker(&ctx.node_id).await?;
 
                         if should_use_docker {
+                            if self.initial_copies.is_some() {
+                                return Err(Error::Execution("Attributed legacy Docker execution has no copy-authority transport; use mapped placement or explicit unbound compatibility".into()));
+                            }
                             // Docker is available, proceed with container spawn
                             let docker_support = self.docker_support.as_ref().expect(
                                 "Docker support should be Some when should_use_docker returns true",
@@ -3000,13 +3035,13 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                                 ctx.node_id
                             );
                             self.process_manager
-                                .spawn_node(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id)
+                                .spawn_node_with_copy_context(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id, self.initial_copies.clone())
                                 .await?
                         }
                     } else {
                         // Regular multiprocess execution (Docker not requested)
                         self.process_manager
-                            .spawn_node(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id)
+                            .spawn_node_with_copy_context(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id, self.initial_copies.clone())
                             .await?
                     }
                 }
@@ -3014,7 +3049,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 {
                     // Regular multiprocess execution (Docker feature not enabled)
                     self.process_manager
-                        .spawn_node(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id)
+                        .spawn_node_with_copy_context(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id, self.initial_copies.clone())
                         .await?
                 }
             };
@@ -3122,18 +3157,13 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 .as_ref()
                 .ok_or_else(|| Error::Execution("Node not initialized".to_string()))?;
 
-            let _session_id = ctx
-                .session_id
-                .clone()
-                .unwrap_or_else(|| format!("default_{}", ctx.node_id));
-
-            // Send input to node process via IPC
-            // TODO: Use session_id for IPC channel routing
-            // This is a placeholder - actual IPC implementation will be in ipc_channel.rs
-            tracing::debug!("Processing input in multiprocess node: {}", ctx.node_id);
-
-            // For now, just pass through
-            Ok(vec![input])
+            // The JSON NodeExecutor surface never reached the worker; returning
+            // the input unchanged silently skipped the node. Reject explicitly.
+            let _ = input;
+            Err(Error::Execution(format!(
+                "multiprocess node '{}' does not support JSON NodeExecutor::process; run it through a streaming session (PythonStreamingNode)",
+                ctx.node_id
+            )))
         }
 
         #[cfg(not(feature = "multiprocess"))]
@@ -3492,3 +3522,7 @@ except Exception as e:
         );
     }
 }
+
+#[cfg(all(test, feature = "multiprocess"))]
+#[path = "legacy_ipc_tests.rs"]
+mod legacy_ipc_tests;

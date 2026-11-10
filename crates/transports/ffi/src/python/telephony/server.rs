@@ -236,7 +236,7 @@ impl TelephonyServer {
                                                                         ParticipantRole::User,
                                                                         accepted.codec_map.clone(),
                                                                         4, // Jitter target packets
-                                                                    );
+                                                                    ).with_copy_context(accepted.copies.clone());
 
                                                                     let outbound_media = RtpOutboundMediaSession::new(
                                                                         accepted.negotiated_audio.codec,
@@ -248,7 +248,7 @@ impl TelephonyServer {
                                                                     ).unwrap_or_else(|_| {
                                                                         RtpOutboundMediaSession::new(AudioCodec::Pcmu, 0, 0xABCDEF01, 1, 0, 20)
                                                                             .expect("SSRC build fallback failed")
-                                                                    });
+                                                                    }).with_copy_context(accepted.copies.clone());
 
                                                                     let rtp_socket = Arc::new(accepted.rtp_socket);
                                                                     let local_rtp_addr = accepted.local_rtp_addr;
@@ -478,7 +478,7 @@ impl TelephonyServer {
                                                                             ParticipantRole::User,
                                                                             accepted.codec_map.clone(),
                                                                             4,
-                                                                        );
+                                                                        ).with_copy_context(accepted.copies.clone());
 
                                                                         let outbound_media = RtpOutboundMediaSession::new(
                                                                             accepted.negotiated_audio.codec,
@@ -490,7 +490,7 @@ impl TelephonyServer {
                                                                         ).unwrap_or_else(|_| {
                                                                             RtpOutboundMediaSession::new(AudioCodec::Pcmu, 0, 0xABCDEF01, 1, 0, 20)
                                                                                 .expect("SSRC build fallback failed")
-                                                                        });
+                                                                        }).with_copy_context(accepted.copies.clone());
 
                                                                         let rtp_socket = Arc::new(accepted.rtp_socket);
                                                                         let local_rtp_addr = accepted.local_rtp_addr;
@@ -639,8 +639,7 @@ fn spawn_media_loop(
     let active_sessions_clone = active_sessions.clone();
     tokio::spawn(async move {
         let mut session = session;
-        let mut buf = [0u8; 1500];
-        let mut pending_samples: Vec<f32> = Vec::new();
+        let mut buf = vec![0u8; 1500];
 
         let mut latched = false;
         let mut remote_rtp_addr = session.remote_rtp_addr;
@@ -654,8 +653,8 @@ fn spawn_media_loop(
             remote_rtp_addr
         );
         for _ in 0..5 {
-            if let Ok(rtp_packet) = session.outbound_media.packetize_audio_frame(&silence_frame) {
-                let rtp_bytes = rtp_packet.write();
+            if let Ok(rtp_bytes) = session.outbound_media.packetize_audio_datagram(&silence_frame)
+                .map_err(|error| warn!("RTP silence output rejected for call {}: {}", call_id, error)) {
                 let _ = session
                     .rtp_socket
                     .send_to(&rtp_bytes, remote_rtp_addr)
@@ -673,8 +672,9 @@ fn spawn_media_loop(
                 }
                 recv_res = session.rtp_socket.recv_from(&mut buf) => {
                     match recv_res {
-                        Ok((mut len, mut src)) => {
-                            let mut packet_buf = buf.to_vec();
+                        Ok((len, mut src)) => {
+                            let mut packet_buf = std::mem::replace(&mut buf, vec![0; 1500]);
+                            packet_buf.truncate(len);
                             loop {
                                 if !latched {
                                     info!("RTP Latching: Latched Call-ID: {} to actual remote RTP source: {}", call_id, src);
@@ -683,7 +683,7 @@ fn spawn_media_loop(
                                 }
 
                                 if src.ip() == remote_rtp_addr.ip() {
-                                    if let Ok(frames) = session.inbound_media.receive_datagram(&packet_buf[..len]) {
+                                    if let Ok(frames) = session.inbound_media.receive_owned_datagram(packet_buf.into()) {
                                         for frame in frames {
                                             if session.stream.send_input(frame).await.is_err() {
                                                 break;
@@ -693,12 +693,11 @@ fn spawn_media_loop(
                                 }
 
                                 // Try to receive next pending packet non-blocking to prevent queue backup
-                                let mut temp_buf = [0u8; 1500];
-                                match session.rtp_socket.try_recv_from(&mut temp_buf) {
+                                match session.rtp_socket.try_recv_from(&mut buf) {
                                     Ok((next_len, next_src)) => {
-                                        len = next_len;
                                         src = next_src;
-                                        packet_buf = temp_buf.to_vec();
+                                        packet_buf = std::mem::replace(&mut buf, vec![0; 1500]);
+                                        packet_buf.truncate(next_len);
                                     }
                                     Err(_) => {
                                         break;
@@ -720,46 +719,27 @@ fn spawn_media_loop(
                                 sample_rate,
                                 channels,
                                 ..
-                            } = &output_data.data
+                            } = output_data.data
                             {
-                                let samples_slice = samples.as_slice();
-                                let mono_samples = if *channels > 1 && !samples_slice.is_empty() {
-                                    let mut out = Vec::with_capacity(samples_slice.len() / *channels as usize);
-                                    for i in (0..samples_slice.len()).step_by(*channels as usize) {
-                                        let chunk = &samples_slice[i..i.min(i + *channels as usize)];
-                                        let sum: f32 = chunk.iter().sum();
-                                        out.push(sum / chunk.len() as f32);
-                                    }
-                                    out
+                                let queued = session.outbound_media.queue_audio(
+                                    samples.into_shared(), sample_rate, channels,
+                                );
+                                if let Err(error) = queued {
+                                    warn!("RTP PCM input rejected for call {}: {}", call_id, error);
+                                    session.outbound_media.clear_pending_audio();
                                 } else {
-                                    samples_slice.to_vec()
-                                };
-
-                                let target_rate = session.negotiated_audio.clock_rate_hz;
-                                let resampled = if *sample_rate != target_rate {
-                                    let ratio = *sample_rate as f64 / target_rate as f64;
-                                    let mut out = Vec::new();
-                                    let mut pos = 0.0f64;
-                                    for _ in 0..(mono_samples.len() as f64 / ratio) as usize {
-                                        let idx = pos as usize;
-                                        if idx < mono_samples.len() {
-                                            out.push(mono_samples[idx]);
+                                    loop {
+                                        match session.outbound_media.next_audio_datagram() {
+                                            Ok(Some(packet)) => {
+                                                let _ = session.rtp_socket.send_to(&packet, remote_rtp_addr).await;
+                                            }
+                                            Ok(None) => break,
+                                            Err(error) => {
+                                                warn!("RTP output rejected for call {}: {}", call_id, error);
+                                                session.outbound_media.clear_pending_audio();
+                                                break;
+                                            }
                                         }
-                                        pos += ratio;
-                                    }
-                                    out
-                                } else {
-                                    mono_samples
-                                };
-
-                                let samples_per_frame = (target_rate / 1000) * u32::from(session.negotiated_audio.ptime_ms);
-                                let samples_per_frame = samples_per_frame as usize;
-                                pending_samples.extend(resampled);
-
-                                while pending_samples.len() >= samples_per_frame {
-                                    let frame: Vec<f32> = pending_samples.drain(..samples_per_frame).collect();
-                                    if let Ok(packet) = session.outbound_media.packetize_audio_frame(&frame) {
-                                        let _ = session.rtp_socket.send_to(&packet.write(), remote_rtp_addr).await;
                                     }
                                 }
                             }

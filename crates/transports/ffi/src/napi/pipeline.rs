@@ -1,7 +1,7 @@
-//! Zero-copy pipeline execution for Node.js
+//! Owning pipeline handles and explicit JavaScript buffer snapshots.
 //!
-//! Provides functions to execute pipelines via napi FFI with zero-copy
-//! data transfer using the RuntimeData binary wire format.
+//! Native handles retain immutable payload owners. Mutable JS Buffer access
+//! explicitly materializes a snapshot and can be rejected under strict policy.
 //!
 //! # Wire Format
 //!
@@ -37,23 +37,16 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 
-use napi::bindgen_prelude::*;
+#[cfg(test)]
+use napi::bindgen_prelude::Buffer;
 use napi::{Env, JsBuffer};
 use napi_derive::napi;
 use remotemedia_core::data::video::{PixelFormat, VideoCodec};
-use remotemedia_core::data::AudioSamples;
 use remotemedia_core::data::RuntimeData;
-use remotemedia_core::executor::Executor;
-use remotemedia_core::manifest;
-use remotemedia_core::nodes::NodeRuntimeContext;
 use std::collections::HashMap;
 
-/// No-op finalizer for borrowed buffers.
-/// The data is owned by the Rust struct, not the JS buffer.
-fn noop_release<T>(_hint: T, _env: Env) {
-    // Data lifetime is managed by the owning Rust struct.
-    // This callback is required but does nothing.
-}
+use super::buffers::{self, InputBuffer};
+use remotemedia_types::SharedBuffer;
 
 /// Data type discriminants matching Rust RuntimeData enum
 #[napi]
@@ -68,10 +61,9 @@ pub enum RuntimeDataType {
     Binary = 8,
 }
 
-/// Audio buffer with zero-copy access
+/// Audio buffer with owning native storage
 ///
-/// The buffer is stored as Vec<f32> internally and exposed as a zero-copy
-/// view to JavaScript. Use Float32Array to access samples:
+/// Runtime storage is immutable. JavaScript receives an independent snapshot. Use Float32Array to access samples:
 /// ```js
 /// const buf = audioBuffer.getBuffer();
 /// const samples = new Float32Array(buf.buffer, buf.byteOffset, audioBuffer.numSamples);
@@ -79,7 +71,7 @@ pub enum RuntimeDataType {
 #[napi]
 pub struct AudioBuffer {
     /// Audio samples as f32 (4 bytes per sample, little-endian)
-    samples: Vec<f32>,
+    samples: SharedBuffer<f32>,
     /// Sample rate in Hz
     sample_rate: u32,
     /// Number of channels
@@ -90,18 +82,14 @@ pub struct AudioBuffer {
 impl AudioBuffer {
     /// Create a new audio buffer from raw f32 samples (as bytes, little-endian)
     #[napi(constructor)]
-    pub fn new(samples_buffer: Buffer, sample_rate: u32, channels: u32) -> napi::Result<Self> {
-        let bytes = samples_buffer.as_ref();
-        if bytes.len() % 4 != 0 {
-            return Err(napi::Error::from_reason(
-                "Buffer length must be multiple of 4 (f32 samples)",
-            ));
-        }
-
-        let samples: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
+    pub fn new(
+        samples_buffer: InputBuffer,
+        sample_rate: u32,
+        channels: u32,
+        require_zero_copy: Option<bool>,
+    ) -> napi::Result<Self> {
+        let samples =
+            buffers::import_audio(samples_buffer.into_buffer()?.as_ref(), require_zero_copy)?;
 
         Ok(Self {
             samples,
@@ -110,24 +98,19 @@ impl AudioBuffer {
         })
     }
 
-    /// Get the raw sample buffer as zero-copy view into Rust memory.
+    /// Get the raw sample buffer as an independent mutable JavaScript snapshot.
     ///
-    /// Returns a Buffer pointing directly at the Vec<f32> memory.
+    /// Returns a counted copy; strict mode rejects nonempty buffer exports.
     /// Use Float32Array to interpret the samples:
     /// ```js
     /// const buf = audioBuffer.getBuffer();
     /// const samples = new Float32Array(buf.buffer, buf.byteOffset, audioBuffer.numSamples);
     /// ```
     ///
-    /// SAFETY: The returned buffer is valid as long as this AudioBuffer exists.
-    /// Do not use the buffer after the AudioBuffer is garbage collected.
+    /// The returned buffer owns its storage and may outlive this handle.
     #[napi]
-    pub fn get_buffer(&self, env: Env) -> napi::Result<JsBuffer> {
-        let ptr = self.samples.as_ptr() as *mut u8;
-        let len = self.samples.len() * std::mem::size_of::<f32>();
-
-        unsafe { env.create_buffer_with_borrowed_data(ptr, len, (), noop_release) }
-            .map(|b| b.into_raw())
+    pub fn get_buffer(&self, env: Env, require_zero_copy: Option<bool>) -> napi::Result<JsBuffer> {
+        buffers::export_audio(env, &self.samples, require_zero_copy)
     }
 
     /// Get sample rate
@@ -149,11 +132,11 @@ impl AudioBuffer {
     }
 }
 
-/// Video frame with zero-copy access
+/// Video frame with owning native storage
 #[napi]
 pub struct VideoFrame {
     /// Pixel data
-    pixel_data: Vec<u8>,
+    pixel_data: remotemedia_types::SharedBytes,
     /// Frame width
     width: u32,
     /// Frame height
@@ -173,36 +156,35 @@ impl VideoFrame {
     /// Create a new video frame
     #[napi(constructor)]
     pub fn new(
-        pixel_data: Buffer,
+        pixel_data: InputBuffer,
         width: u32,
         height: u32,
         format: u8,
         codec: u8,
         frame_number: i64,
         is_keyframe: bool,
-    ) -> Self {
-        Self {
-            pixel_data: pixel_data.to_vec(),
+        require_zero_copy: Option<bool>,
+    ) -> napi::Result<Self> {
+        Ok(Self {
+            pixel_data: buffers::import_bytes(
+                pixel_data.into_buffer()?.as_ref(),
+                require_zero_copy,
+            )?,
             width,
             height,
             format,
             codec,
             frame_number: frame_number as u64,
             is_keyframe,
-        }
+        })
     }
 
-    /// Get pixel data buffer as zero-copy view into Rust memory.
+    /// Get pixel data buffer as an independent mutable JavaScript snapshot.
     ///
-    /// SAFETY: The returned buffer is valid as long as this VideoFrame exists.
-    /// Do not use the buffer after the VideoFrame is garbage collected.
+    /// The returned buffer owns its storage and may outlive this handle.
     #[napi]
-    pub fn get_buffer(&self, env: Env) -> napi::Result<JsBuffer> {
-        let ptr = self.pixel_data.as_ptr() as *mut u8;
-        let len = self.pixel_data.len();
-
-        unsafe { env.create_buffer_with_borrowed_data(ptr, len, (), noop_release) }
-            .map(|b| b.into_raw())
+    pub fn get_buffer(&self, env: Env, require_zero_copy: Option<bool>) -> napi::Result<JsBuffer> {
+        buffers::export_bytes(env, &self.pixel_data, require_zero_copy)
     }
 
     #[napi(getter)]
@@ -236,13 +218,31 @@ impl VideoFrame {
     }
 }
 
-/// RuntimeData wrapper for Node.js with zero-copy access
+/// RuntimeData wrapper for Node.js with owning native storage
 #[napi]
+#[derive(Clone)]
 pub struct NapiRuntimeData {
     pub(crate) inner: RuntimeData,
+    copies: Option<remotemedia_types::CopyContext>,
 }
 
 impl NapiRuntimeData {
+    pub(crate) fn from_runtime(inner: RuntimeData) -> Self {
+        Self {
+            copies: None,
+            inner: inner.into_shared(),
+        }
+    }
+
+    pub(crate) fn from_runtime_with_context(
+        inner: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Self {
+        let mut output = Self::from_runtime(inner);
+        output.copies = Some(copies.clone());
+        output
+    }
+
     /// Get a reference to the inner RuntimeData (for Rust-side access)
     pub fn get_inner(&self) -> &RuntimeData {
         &self.inner
@@ -251,24 +251,81 @@ impl NapiRuntimeData {
 
 #[napi]
 impl NapiRuntimeData {
+    /// Compare backing storage without exposing mutable aliases or addresses.
+    #[napi]
+    pub fn shares_buffer_with(&self, other: &NapiRuntimeData) -> napi::Result<bool> {
+        use remotemedia_types::{PayloadStorage, TensorEncoding};
+        let parts = |data: &RuntimeData| {
+            data.clone()
+                .into_shared_parts(TensorEncoding::Runtime)
+                .map(|(_, payload)| payload)
+                .map_err(|e| napi::Error::from_reason(e.to_string()))
+        };
+        Ok(match (parts(&self.inner)?, parts(&other.inner)?) {
+            (PayloadStorage::Bytes(a), PayloadStorage::Bytes(b)) => a.shares_storage(&b),
+            (PayloadStorage::Audio(a), PayloadStorage::Audio(b)) => a.shares_storage(&b),
+            _ => false,
+        })
+    }
+
+    /// Retain a binary subrange without materializing it.
+    #[napi]
+    pub fn slice_binary(&self, start: u32, end: u32) -> napi::Result<Self> {
+        let RuntimeData::Binary(data) = &self.inner else {
+            return Err(napi::Error::from_reason("Not binary data"));
+        };
+        let slice = data
+            .slice(start as usize..end as usize)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let mut output = Self::from_runtime(RuntimeData::Binary(slice));
+        output.copies = self.copies.clone();
+        Ok(output)
+    }
+
+    /// Inspect a byte without exporting a writable Buffer.
+    #[napi]
+    pub fn read_byte(&self, index: u32) -> napi::Result<u32> {
+        let data = match &self.inner {
+            RuntimeData::Binary(data)
+            | RuntimeData::Tensor { data, .. }
+            | RuntimeData::Image { data, .. }
+            | RuntimeData::Numpy { data, .. } => data,
+            RuntimeData::Video { pixel_data, .. } => pixel_data,
+            _ => return Err(napi::Error::from_reason("Not byte-backed data")),
+        };
+        data.get(index as usize)
+            .copied()
+            .map(u32::from)
+            .ok_or_else(|| napi::Error::from_reason("byte index out of range"))
+    }
+
+    #[napi]
+    pub fn read_audio_sample(&self, index: u32) -> napi::Result<f64> {
+        let RuntimeData::Audio { samples, .. } = &self.inner else {
+            return Err(napi::Error::from_reason("Not audio data"));
+        };
+        samples
+            .get(index as usize)
+            .copied()
+            .map(f64::from)
+            .ok_or_else(|| napi::Error::from_reason("sample index out of range"))
+    }
+
     /// Create audio data
     #[napi(factory)]
-    pub fn audio(samples_buffer: Buffer, sample_rate: u32, channels: u32) -> napi::Result<Self> {
-        let bytes = samples_buffer.as_ref();
-        if bytes.len() % 4 != 0 {
-            return Err(napi::Error::from_reason(
-                "Buffer length must be multiple of 4 (f32 samples)",
-            ));
-        }
-
-        let samples: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
+    pub fn audio(
+        samples_buffer: InputBuffer,
+        sample_rate: u32,
+        channels: u32,
+        require_zero_copy: Option<bool>,
+    ) -> napi::Result<Self> {
+        let samples =
+            buffers::import_audio(samples_buffer.into_buffer()?.as_ref(), require_zero_copy)?;
 
         Ok(Self {
+            copies: None,
             inner: RuntimeData::Audio {
-                samples: AudioSamples::from(samples),
+                samples: samples.into(),
                 sample_rate,
                 channels,
                 stream_id: None,
@@ -282,13 +339,14 @@ impl NapiRuntimeData {
     /// Create video data
     #[napi(factory)]
     pub fn video(
-        pixel_data: Buffer,
+        pixel_data: InputBuffer,
         width: u32,
         height: u32,
         format: u8,
         codec: Option<u8>,
         frame_number: i64,
         is_keyframe: bool,
+        require_zero_copy: Option<bool>,
     ) -> napi::Result<Self> {
         let pixel_format = match format {
             0 => PixelFormat::Unspecified,
@@ -309,8 +367,12 @@ impl NapiRuntimeData {
         });
 
         Ok(Self {
+            copies: None,
             inner: RuntimeData::Video {
-                pixel_data: pixel_data.to_vec(),
+                pixel_data: buffers::import_bytes(
+                    pixel_data.into_buffer()?.as_ref(),
+                    require_zero_copy,
+                )?,
                 width,
                 height,
                 format: pixel_format,
@@ -328,29 +390,40 @@ impl NapiRuntimeData {
     #[napi(factory)]
     pub fn text(text: String) -> Self {
         Self {
+            copies: None,
             inner: RuntimeData::Text(text),
         }
     }
 
     /// Create binary data
     #[napi(factory)]
-    pub fn binary(data: Buffer) -> Self {
-        Self {
-            inner: RuntimeData::Binary(data.to_vec()),
-        }
+    pub fn binary(data: InputBuffer, require_zero_copy: Option<bool>) -> napi::Result<Self> {
+        Ok(Self {
+            copies: None,
+            inner: RuntimeData::Binary(buffers::import_bytes(
+                data.into_buffer()?.as_ref(),
+                require_zero_copy,
+            )?),
+        })
     }
 
     /// Create tensor data
     #[napi(factory)]
-    pub fn tensor(data: Buffer, shape: Vec<i32>, dtype: i32) -> Self {
-        Self {
+    pub fn tensor(
+        data: InputBuffer,
+        shape: Vec<i32>,
+        dtype: i32,
+        require_zero_copy: Option<bool>,
+    ) -> napi::Result<Self> {
+        Ok(Self {
+            copies: None,
             inner: RuntimeData::Tensor {
-                data: data.to_vec(),
+                data: buffers::import_bytes(data.into_buffer()?.as_ref(), require_zero_copy)?,
                 shape,
                 dtype,
                 metadata: None,
             },
-        }
+        })
     }
 
     /// Create JSON data from a JavaScript object serialized to string
@@ -359,6 +432,7 @@ impl NapiRuntimeData {
         let value: serde_json::Value = serde_json::from_str(&json_string)
             .map_err(|e| napi::Error::from_reason(format!("Invalid JSON: {}", e)))?;
         Ok(Self {
+            copies: None,
             inner: RuntimeData::Json(value),
         })
     }
@@ -387,6 +461,7 @@ impl NapiRuntimeData {
         stream_id: Option<String>,
     ) -> Self {
         Self {
+            copies: None,
             inner: RuntimeData::File {
                 path,
                 filename,
@@ -413,29 +488,34 @@ impl NapiRuntimeData {
             RuntimeData::Binary(_) => 8,
             RuntimeData::File { .. } => 9,
             RuntimeData::Image { .. } => 10,
+            // Device-resident; sessions transfer these to host before output.
+            RuntimeData::DeviceTensor { .. } => 11,
         }
     }
 
-    /// Get audio samples as zero-copy buffer.
+    /// Get audio samples as an independent mutable JavaScript snapshot.
     ///
-    /// Returns a Buffer pointing directly at the Vec<f32> memory.
+    /// Returns a counted copy; strict mode rejects nonempty buffer exports.
     /// Use Float32Array to interpret the samples:
     /// ```js
     /// const buf = data.getAudioSamples();
     /// const samples = new Float32Array(buf.buffer, buf.byteOffset, data.getAudioNumSamples());
     /// ```
     ///
-    /// SAFETY: The returned buffer is valid as long as this NapiRuntimeData exists.
+    /// The returned buffer owns its storage and may outlive this handle.
     #[napi]
-    pub fn get_audio_samples(&self, env: Env) -> napi::Result<JsBuffer> {
+    pub fn get_audio_samples(
+        &self,
+        env: Env,
+        require_zero_copy: Option<bool>,
+    ) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Audio { samples, .. } => {
-                let ptr = samples.as_ptr() as *mut u8;
-                let len = samples.len() * std::mem::size_of::<f32>();
-
-                unsafe { env.create_buffer_with_borrowed_data(ptr, len, (), noop_release) }
-                    .map(|b| b.into_raw())
-            }
+            RuntimeData::Audio { samples, .. } => buffers::export_audio_with_context(
+                env,
+                samples,
+                require_zero_copy,
+                self.copies.as_ref(),
+            ),
             _ => Err(napi::Error::from_reason("Not audio data")),
         }
     }
@@ -467,19 +547,22 @@ impl NapiRuntimeData {
         }
     }
 
-    /// Get video pixel data as zero-copy buffer.
+    /// Get video pixel data as an independent mutable JavaScript snapshot.
     ///
-    /// SAFETY: The returned buffer is valid as long as this NapiRuntimeData exists.
+    /// The returned buffer owns its storage and may outlive this handle.
     #[napi]
-    pub fn get_video_pixels(&self, env: Env) -> napi::Result<JsBuffer> {
+    pub fn get_video_pixels(
+        &self,
+        env: Env,
+        require_zero_copy: Option<bool>,
+    ) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Video { pixel_data, .. } => {
-                let ptr = pixel_data.as_ptr() as *mut u8;
-                let len = pixel_data.len();
-
-                unsafe { env.create_buffer_with_borrowed_data(ptr, len, (), noop_release) }
-                    .map(|b| b.into_raw())
-            }
+            RuntimeData::Video { pixel_data, .. } => buffers::export_bytes_with_context(
+                env,
+                pixel_data,
+                require_zero_copy,
+                self.copies.as_ref(),
+            ),
             _ => Err(napi::Error::from_reason("Not video data")),
         }
     }
@@ -511,36 +594,35 @@ impl NapiRuntimeData {
         }
     }
 
-    /// Get binary data as zero-copy buffer.
+    /// Get binary data as an independent mutable JavaScript snapshot.
     ///
-    /// SAFETY: The returned buffer is valid as long as this NapiRuntimeData exists.
+    /// The returned buffer owns its storage and may outlive this handle.
     #[napi]
-    pub fn get_binary(&self, env: Env) -> napi::Result<JsBuffer> {
+    pub fn get_binary(&self, env: Env, require_zero_copy: Option<bool>) -> napi::Result<JsBuffer> {
         match &self.inner {
             RuntimeData::Binary(b) => {
-                let ptr = b.as_ptr() as *mut u8;
-                let len = b.len();
-
-                unsafe { env.create_buffer_with_borrowed_data(ptr, len, (), noop_release) }
-                    .map(|b| b.into_raw())
+                buffers::export_bytes_with_context(env, b, require_zero_copy, self.copies.as_ref())
             }
             _ => Err(napi::Error::from_reason("Not binary data")),
         }
     }
 
-    /// Get tensor data as zero-copy buffer.
+    /// Get tensor data as an independent mutable JavaScript snapshot.
     ///
-    /// SAFETY: The returned buffer is valid as long as this NapiRuntimeData exists.
+    /// The returned buffer owns its storage and may outlive this handle.
     #[napi]
-    pub fn get_tensor_data(&self, env: Env) -> napi::Result<JsBuffer> {
+    pub fn get_tensor_data(
+        &self,
+        env: Env,
+        require_zero_copy: Option<bool>,
+    ) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Tensor { data, .. } => {
-                let ptr = data.as_ptr() as *mut u8;
-                let len = data.len();
-
-                unsafe { env.create_buffer_with_borrowed_data(ptr, len, (), noop_release) }
-                    .map(|b| b.into_raw())
-            }
+            RuntimeData::Tensor { data, .. } => buffers::export_bytes_with_context(
+                env,
+                data,
+                require_zero_copy,
+                self.copies.as_ref(),
+            ),
             _ => Err(napi::Error::from_reason("Not tensor data")),
         }
     }
@@ -564,7 +646,7 @@ impl NapiRuntimeData {
         }
     }
 
-    /// Get text as zero-copy UTF-8 bytes buffer.
+    /// Get text as an independent mutable UTF-8 snapshot.
     ///
     /// Use TextDecoder to convert to string if needed:
     /// ```js
@@ -572,35 +654,40 @@ impl NapiRuntimeData {
     /// const text = new TextDecoder().decode(buf);
     /// ```
     ///
-    /// SAFETY: The returned buffer is valid as long as this NapiRuntimeData exists.
+    /// The returned buffer owns its storage and may outlive this handle.
     #[napi]
-    pub fn get_text_buffer(&self, env: Env) -> napi::Result<JsBuffer> {
+    pub fn get_text_buffer(
+        &self,
+        env: Env,
+        require_zero_copy: Option<bool>,
+    ) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Text(s) => {
-                let bytes = s.as_bytes();
-                let ptr = bytes.as_ptr() as *mut u8;
-                let len = bytes.len();
-
-                unsafe { env.create_buffer_with_borrowed_data(ptr, len, (), noop_release) }
-                    .map(|b| b.into_raw())
-            }
+            RuntimeData::Text(s) => buffers::export_bytes_with_context(
+                env,
+                s.as_bytes(),
+                require_zero_copy,
+                self.copies.as_ref(),
+            ),
             _ => Err(napi::Error::from_reason("Not text data")),
         }
     }
 
-    /// Get numpy array data as zero-copy buffer.
+    /// Get numpy array data as an independent mutable JavaScript snapshot.
     ///
-    /// SAFETY: The returned buffer is valid as long as this NapiRuntimeData exists.
+    /// The returned buffer owns its storage and may outlive this handle.
     #[napi]
-    pub fn get_numpy_data(&self, env: Env) -> napi::Result<JsBuffer> {
+    pub fn get_numpy_data(
+        &self,
+        env: Env,
+        require_zero_copy: Option<bool>,
+    ) -> napi::Result<JsBuffer> {
         match &self.inner {
-            RuntimeData::Numpy { data, .. } => {
-                let ptr = data.as_ptr() as *mut u8;
-                let len = data.len();
-
-                unsafe { env.create_buffer_with_borrowed_data(ptr, len, (), noop_release) }
-                    .map(|b| b.into_raw())
-            }
+            RuntimeData::Numpy { data, .. } => buffers::export_bytes_with_context(
+                env,
+                data,
+                require_zero_copy,
+                self.copies.as_ref(),
+            ),
             _ => Err(napi::Error::from_reason("Not numpy data")),
         }
     }
@@ -687,10 +774,14 @@ impl NapiRuntimeData {
     }
 }
 
-/// Pipeline execution result with zero-copy output access
+/// Pipeline execution result with owning native output handles. Outputs keep
+/// the session's copy authority: snapshots of them follow its policy and are
+/// charged to its ledger.
 #[napi]
 pub struct PipelineOutput {
     outputs: HashMap<String, RuntimeData>,
+    copies: remotemedia_types::CopyContext,
+    nodes: remotemedia_core::transport::NodeMaterializationCopies,
 }
 
 #[napi]
@@ -704,9 +795,24 @@ impl PipelineOutput {
     /// Get output for a specific node as NapiRuntimeData
     #[napi]
     pub fn get(&self, node_id: String) -> Option<NapiRuntimeData> {
-        self.outputs.get(&node_id).map(|data| NapiRuntimeData {
-            inner: data.clone(),
-        })
+        self.outputs
+            .get(&node_id)
+            .map(|data| NapiRuntimeData::from_runtime_with_context(data.clone(), &self.copies))
+    }
+
+    /// Copies charged to the execution's transport ledger, including snapshots
+    /// of its outputs (JSON: boundary, policy and per-reason counts).
+    #[napi]
+    pub fn copy_report(&self) -> napi::Result<String> {
+        serde_json::to_string(&self.copies.report())
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Copies charged to each node's materialization ledger, by node id.
+    #[napi]
+    pub fn node_copy_reports(&self) -> napi::Result<String> {
+        serde_json::to_string(&self.nodes.reports())
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
     /// Check if output exists for node
@@ -731,13 +837,21 @@ impl PipelineOutput {
 ///
 /// # Returns
 ///
-/// PipelineOutput with zero-copy access to results
-#[napi]
-pub async fn execute_pipeline(
+/// PipelineOutput with owning native storage to results
+#[napi(ts_return_type = "Promise<PipelineOutput>")]
+pub fn execute_pipeline(
+    env: Env,
     manifest_json: String,
     inputs: HashMap<String, &NapiRuntimeData>,
-) -> napi::Result<PipelineOutput> {
-    execute_pipeline_internal(manifest_json, inputs, None).await
+    pipeline_buffers: Option<super::buffer_config::PipelineBufferConfig>,
+) -> napi::Result<napi::JsObject> {
+    let inputs = owned_inputs(inputs);
+    env.spawn_future(execute_pipeline_internal(
+        manifest_json,
+        inputs,
+        None,
+        pipeline_buffers,
+    ))
 }
 
 /// Execute a pipeline with session ID for multiprocess Python nodes
@@ -750,51 +864,54 @@ pub async fn execute_pipeline(
 ///
 /// # Returns
 ///
-/// PipelineOutput with zero-copy access to results
-#[napi]
-pub async fn execute_pipeline_with_session(
+/// PipelineOutput with owning native storage to results
+#[napi(ts_return_type = "Promise<PipelineOutput>")]
+pub fn execute_pipeline_with_session(
+    env: Env,
     manifest_json: String,
     inputs: HashMap<String, &NapiRuntimeData>,
     session_id: String,
-) -> napi::Result<PipelineOutput> {
-    execute_pipeline_internal(manifest_json, inputs, Some(session_id)).await
+    pipeline_buffers: Option<super::buffer_config::PipelineBufferConfig>,
+) -> napi::Result<napi::JsObject> {
+    let inputs = owned_inputs(inputs);
+    env.spawn_future(execute_pipeline_internal(
+        manifest_json,
+        inputs,
+        Some(session_id),
+        pipeline_buffers,
+    ))
 }
 
-/// Internal implementation
+/// Take shared owners of the inputs while still on the JS thread. Borrowed
+/// handles must not be read inside the future: it runs on a runtime thread
+/// after the call returns, when JS may already have collected them.
+fn owned_inputs(inputs: HashMap<String, &NapiRuntimeData>) -> HashMap<String, RuntimeData> {
+    inputs
+        .into_iter()
+        .map(|(node, data)| (node, data.inner.clone()))
+        .collect()
+}
+
+/// Run one unary execution on a real session (see `super::unary`). Inputs
+/// share their native owners; nothing is copied to send them.
 async fn execute_pipeline_internal(
     manifest_json: String,
-    inputs: HashMap<String, &NapiRuntimeData>,
+    inputs: HashMap<String, RuntimeData>,
     session_id: Option<String>,
+    pipeline_buffers: Option<super::buffer_config::PipelineBufferConfig>,
 ) -> napi::Result<PipelineOutput> {
-    // Parse manifest
-    let manifest = manifest::parse(&manifest_json)
-        .map_err(|e| napi::Error::from_reason(format!("Failed to parse manifest: {}", e)))?;
-
-    // Convert inputs to RuntimeData
-    let runtime_inputs: HashMap<String, RuntimeData> = inputs
-        .into_iter()
-        .map(|(k, v)| (k, v.inner.clone()))
-        .collect();
-
-    // Create executor
-    let executor = Executor::new();
-
-    // Execute pipeline
-    let outputs = match session_id {
-        Some(sid) => {
-            executor
-                .execute_with_runtime_data_and_session(&manifest, runtime_inputs, Some(sid))
-                .await
-        }
-        None => {
-            executor
-                .execute_with_runtime_data(&manifest, runtime_inputs)
-                .await
-        }
-    }
-    .map_err(|e| napi::Error::from_reason(format!("Pipeline execution failed: {}", e)))?;
-
-    Ok(PipelineOutput { outputs })
+    let result = super::unary::execute(
+        &manifest_json,
+        inputs,
+        session_id,
+        pipeline_buffers.as_ref(),
+    )
+    .await?;
+    Ok(PipelineOutput {
+        outputs: result.outputs,
+        copies: result.transport,
+        nodes: result.nodes,
+    })
 }
 
 /// Get the runtime version
@@ -815,33 +932,28 @@ pub fn is_runtime_available() -> bool {
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 
-/// Streaming session for continuous input/output pipeline execution
+/// Streaming session for continuous input/output pipeline execution.
 ///
 /// Provides bidirectional streaming:
 /// - `sendInput()` streams data into the pipeline
 /// - `recvOutput()` receives processed outputs
 /// - `close()` gracefully terminates the session
+///
+/// Backed by the same `PipelineExecutor` session as `createStreamingSession`
+/// (whole-graph routing, node initialization, copy policy and ledgers); this
+/// is the older, smaller JavaScript surface over it.
 #[napi]
 pub struct NapiStreamSession {
-    /// Unique session identifier
     session_id: String,
-    /// Channel to send inputs to the pipeline.
-    ///
-    /// Bounded — `send_input` `.await`s, back-pressuring the JavaScript
-    /// caller when the pipeline is behind.
-    input_tx: mpsc::Sender<RuntimeData>,
-    /// Channel to receive outputs from the pipeline.
-    ///
-    /// Bounded — the pipeline session task `.await`s its send, so a
-    /// slow JavaScript consumer back-pressures the pipeline rather
-    /// than buffering unboundedly in Rust.
-    output_rx: Arc<Mutex<mpsc::Receiver<RuntimeData>>>,
-    /// Whether the session is still active
+    /// Clone of the session's bounded input (backpressure on `sendInput`).
+    input: std::sync::Mutex<Option<remotemedia_core::transport::SessionInputSender>>,
+    /// The session itself; taken on close to join it.
+    session: Mutex<Option<remotemedia_core::transport::SessionHandle>>,
+    /// The session's transport copy authority, retained by outputs.
+    copies: remotemedia_types::CopyContext,
     is_active: Arc<AtomicBool>,
-    /// Shutdown signal sender
-    shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
 #[napi]
@@ -858,67 +970,70 @@ impl NapiStreamSession {
         self.is_active.load(Ordering::SeqCst)
     }
 
-    /// Send input data to the pipeline
-    ///
-    /// The data will be processed by the pipeline nodes and outputs
-    /// will be available via `recvOutput()`.
-    #[napi]
-    pub async fn send_input(&self, data: &NapiRuntimeData) -> napi::Result<()> {
-        if !self.is_active() {
-            return Err(napi::Error::from_reason("Session is closed"));
-        }
-
-        // Bounded: .await blocks the JS-initiated call when the
-        // pipeline is saturated. This is the ingress backpressure
-        // surface for the FFI transport.
-        self.input_tx
-            .send(data.inner.clone())
-            .await
-            .map_err(|e| napi::Error::from_reason(format!("Failed to send input: {}", e)))?;
-
-        Ok(())
+    /// Send input to the pipeline's source nodes. Awaits when the pipeline is
+    /// saturated (ingress backpressure). The input's native owner is shared.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn send_input(&self, env: Env, data: &NapiRuntimeData) -> napi::Result<napi::JsObject> {
+        // Take the owner and the sender on the JS thread; see `owned_inputs`.
+        let data = data.inner.clone();
+        let input = self.input.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        env.spawn_future(async move {
+            let input = input.ok_or_else(|| napi::Error::from_reason("Session is closed"))?;
+            input
+                .send(remotemedia_core::transport::TransportData::new(data))
+                .await
+                .map_err(|e| napi::Error::from_reason(format!("Failed to send input: {}", e)))
+        })
     }
 
-    /// Receive output from the pipeline
-    ///
-    /// Returns the next available output, or null if the session is closed
-    /// and no more outputs are pending.
+    /// Receive the next output, or null once the session has closed and no
+    /// more outputs are pending.
     #[napi]
     pub async fn recv_output(&self) -> napi::Result<Option<NapiRuntimeData>> {
-        if !self.is_active() {
+        let mut session = self.session.lock().await;
+        let Some(session) = session.as_mut() else {
             return Ok(None);
-        }
-
-        let mut rx = self.output_rx.lock().await;
-
-        match rx.recv().await {
-            Some(data) => Ok(Some(NapiRuntimeData { inner: data })),
+        };
+        match session
+            .recv_output()
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?
+        {
+            Some(output) => Ok(Some(NapiRuntimeData::from_runtime_with_context(
+                output.data,
+                &self.copies,
+            ))),
             None => {
-                // Channel closed
                 self.is_active.store(false, Ordering::SeqCst);
                 Ok(None)
             }
         }
     }
 
-    /// Close the session gracefully
-    ///
-    /// Signals the pipeline to finish processing pending inputs,
-    /// then terminates the session. After close(), `isActive` will be false.
+    /// Copies charged to the session's transport ledger (JSON report).
+    #[napi]
+    pub fn copy_report(&self) -> napi::Result<String> {
+        serde_json::to_string(&self.copies.report())
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Close the session and join it, so node cleanup has finished when this
+    /// resolves. After close(), `isActive` is false.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
-        if !self.is_active() {
-            return Ok(()); // Already closed
-        }
-
-        // Send shutdown signal
-        if let Some(ref shutdown_tx) = self.shutdown_tx {
-            let _ = shutdown_tx.send(()).await;
-        }
-
+        self.input.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.is_active.store(false, Ordering::SeqCst);
-        tracing::info!("StreamSession {} closed", self.session_id);
-
+        let session = self.session.lock().await.take();
+        if let Some(mut session) = session {
+            session
+                .close()
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+            session
+                .wait()
+                .await
+                .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        }
         Ok(())
     }
 }
@@ -928,6 +1043,7 @@ impl NapiStreamSession {
 /// # Arguments
 ///
 /// * `manifest_json` - Pipeline manifest as JSON string
+/// * `pipeline_buffers` - Optional copy policy and retention budget
 ///
 /// # Returns
 ///
@@ -942,137 +1058,24 @@ impl NapiStreamSession {
 /// await session.close();
 /// ```
 #[napi]
-pub async fn create_stream_session(manifest_json: String) -> napi::Result<NapiStreamSession> {
-    // Parse manifest
-    let manifest = manifest::parse(&manifest_json)
+pub async fn create_stream_session(
+    manifest_json: String,
+    pipeline_buffers: Option<super::buffer_config::PipelineBufferConfig>,
+) -> napi::Result<NapiStreamSession> {
+    let manifest: remotemedia_core::manifest::Manifest = serde_json::from_str(&manifest_json)
         .map_err(|e| napi::Error::from_reason(format!("Failed to parse manifest: {}", e)))?;
-    let manifest = Arc::new(manifest);
-
-    // Generate unique session ID
-    static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let session_num = SESSION_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let session_id = format!("napi_session_{}", session_num);
-
-    // Create bounded channels for communication. Same sizing as the
-    // core router defaults — 8 slots ≈ 160 ms of headroom at 48 kHz /
-    // 20 ms frames. Override via
-    // `REMOTEMEDIA_FFI_INPUT_CAPACITY` / `REMOTEMEDIA_FFI_OUTPUT_CAPACITY`.
-    let input_capacity: usize = std::env::var("REMOTEMEDIA_FFI_INPUT_CAPACITY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &usize| n > 0)
-        .unwrap_or(8);
-    let output_capacity: usize = std::env::var("REMOTEMEDIA_FFI_OUTPUT_CAPACITY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n: &usize| n > 0)
-        .unwrap_or(8);
-    let (input_tx, mut input_rx) = mpsc::channel::<RuntimeData>(input_capacity);
-    let (output_tx, output_rx) = mpsc::channel::<RuntimeData>(output_capacity);
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-    let is_active = Arc::new(AtomicBool::new(true));
-    let is_active_clone = is_active.clone();
-    let session_id_clone = session_id.clone();
-    let manifest_clone = manifest.clone();
-
-    // Spawn the session processing task
-    tokio::spawn(async move {
-        tracing::info!("NapiStreamSession {} started", session_id_clone);
-
-        // Create streaming registry and nodes
-        use remotemedia_core::nodes::streaming_registry::create_default_streaming_registry;
-
-        let streaming_registry = create_default_streaming_registry();
-
-        // Cache nodes for the session (avoids recreating on each input)
-        let mut cached_nodes: HashMap<String, Box<dyn remotemedia_core::nodes::StreamingNode>> =
-            HashMap::new();
-
-        for node_def in &manifest_clone.nodes {
-            match streaming_registry.create_node(
-                &node_def.node_type,
-                node_def.id.clone(),
-                &node_def.params,
-                Some(session_id_clone.clone()),
-            ) {
-                Ok(node) => {
-                    cached_nodes.insert(node_def.id.clone(), node);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Session {}: Failed to create node {}: {:?}",
-                        session_id_clone,
-                        node_def.id,
-                        e
-                    );
-                }
-            }
-        }
-
-        // Find first node for routing
-        let first_node_id = manifest_clone
-            .nodes
-            .first()
-            .map(|n| n.id.clone())
-            .unwrap_or_default();
-
-        // Main processing loop
-        loop {
-            tokio::select! {
-                // Handle shutdown signal
-                _ = shutdown_rx.recv() => {
-                    tracing::info!("Session {} received shutdown signal", session_id_clone);
-                    break;
-                }
-
-                // Handle incoming input
-                Some(input_data) = input_rx.recv() => {
-                    // Process through first node (simple single-node routing for now)
-                    if let Some(node) = cached_nodes.get(&first_node_id) {
-                        let ctx = NodeRuntimeContext::for_test(
-                            session_id_clone.clone(),
-                            first_node_id.clone(),
-                        );
-                        match node.process_async(input_data, &ctx).await {
-                            Ok(output) => {
-                                // Bounded: .await applies backpressure to the
-                                // pipeline when the JS consumer falls behind.
-                                if output_tx.send(output).await.is_err() {
-                                    tracing::warn!("Session {}: Output channel closed", session_id_clone);
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Session {}: Node {} processing error: {:?}",
-                                    session_id_clone,
-                                    first_node_id,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Input channel closed
-                else => {
-                    tracing::info!("Session {} input channel closed", session_id_clone);
-                    break;
-                }
-            }
-        }
-
-        is_active_clone.store(false, Ordering::SeqCst);
-        tracing::info!("NapiStreamSession {} terminated", session_id_clone);
-    });
-
+    let executor =
+        super::streaming_session::plugin_executor(pipeline_buffers.as_ref(), None).await?;
+    let session = executor
+        .create_session(Arc::new(manifest))
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("Failed to create session: {}", e)))?;
     Ok(NapiStreamSession {
-        session_id,
-        input_tx,
-        output_rx: Arc::new(Mutex::new(output_rx)),
-        is_active,
-        shutdown_tx: Some(shutdown_tx),
+        session_id: session.session_id.clone(),
+        input: std::sync::Mutex::new(session.input_sender()),
+        copies: session.transport_copy_context(),
+        session: Mutex::new(Some(session)),
+        is_active: Arc::new(AtomicBool::new(true)),
     })
 }
 
@@ -1086,7 +1089,7 @@ mod tests {
         let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         let buffer = Buffer::from(bytes);
 
-        let audio = AudioBuffer::new(buffer, 48000, 1).unwrap();
+        let audio = AudioBuffer::new(buffer.into(), 48000, 1, None).unwrap();
         assert_eq!(audio.sample_rate(), 48000);
         assert_eq!(audio.channels(), 1);
         assert_eq!(audio.num_samples(), 4);
@@ -1098,7 +1101,7 @@ mod tests {
         let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         let buffer = Buffer::from(bytes);
 
-        let data = NapiRuntimeData::audio(buffer, 16000, 1).unwrap();
+        let data = NapiRuntimeData::audio(buffer.into(), 16000, 1, None).unwrap();
         assert_eq!(data.data_type(), 1); // Audio
         assert_eq!(data.get_audio_sample_rate().unwrap(), 16000);
         assert_eq!(data.get_audio_channels().unwrap(), 1);

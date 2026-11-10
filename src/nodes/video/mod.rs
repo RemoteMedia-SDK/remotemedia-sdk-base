@@ -6,6 +6,12 @@
 //! See spec 012: Video Codec Support (AV1/VP8/AVC)
 
 pub mod codec;
+#[cfg(feature = "video")]
+mod decoded_frames;
+#[cfg(feature = "video")]
+mod frames;
+#[cfg(feature = "video")]
+mod packets;
 pub mod decoder;
 pub mod encoder;
 pub mod format_converter;

@@ -16,7 +16,9 @@
 //! - `RuntimeData::Audio` / `RuntimeData::Video` → RTP media tracks
 //! - All other variants → WebRTC Data Channel (this module)
 
+use bytes::Bytes;
 use prost::Message;
+use remotemedia_types::{CopyContext, CopyReason, CopyRejected};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -26,6 +28,20 @@ use crate::generated::webrtc::{
     BinaryFrame, ChunkFrame, ControlJsonFrame, DataChannelEnvelope, FrameKind, RuntimeDataFrame,
     TextFrame,
 };
+
+#[cfg(test)]
+#[path = "message_ownership_tests.rs"]
+mod ownership_tests;
+
+#[cfg(test)]
+#[path = "message_borrowed_tests.rs"]
+mod borrowed_tests;
+
+#[path = "message_legacy.rs"]
+mod legacy;
+
+#[path = "message_borrowed.rs"]
+mod borrowed;
 
 /// Maximum message size for data channels (16 MB).
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
@@ -51,7 +67,7 @@ pub struct ChunkInfo {
     /// Optional type hint for the reassembled payload.
     pub data_type_hint: Option<String>,
     /// Chunk payload bytes.
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 impl ChunkInfo {
@@ -62,7 +78,7 @@ impl ChunkInfo {
         chunk_index: u32,
         total_chunks: Option<u32>,
         is_final: bool,
-        data: Vec<u8>,
+        data: impl Into<Bytes>,
     ) -> Self {
         Self {
             stream_id: stream_id.into(),
@@ -72,7 +88,7 @@ impl ChunkInfo {
             is_final,
             content_type: None,
             data_type_hint: None,
-            data,
+            data: data.into(),
         }
     }
 
@@ -109,13 +125,13 @@ pub enum DataChannelMessage {
     Binary {
         action: String,
         headers: BTreeMap<String, String>,
-        data: Vec<u8>,
+        data: Bytes,
     },
 
     RuntimeData {
         action: String,
         headers: BTreeMap<String, String>,
-        data_buffer: Vec<u8>,
+        data_buffer: Bytes,
     },
 
     Chunk {
@@ -127,6 +143,8 @@ pub enum DataChannelMessage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataChannelEncodeError {
+    #[error(transparent)]
+    CopyRejected(#[from] CopyRejected),
     #[error("failed to serialize control message json: {0}")]
     Json(#[from] serde_json::Error),
 
@@ -136,6 +154,15 @@ pub enum DataChannelEncodeError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataChannelDecodeError {
+    #[error(transparent)]
+    CopyRejected(#[from] CopyRejected),
+
+    #[error(transparent)]
+    CopyCompletion(#[from] remotemedia_types::CopyCompletionError),
+
+    #[error("legacy base64 decode error: {0}")]
+    Base64(#[from] base64::DecodeError),
+
     #[error("protobuf decode error: {0}")]
     Protobuf(#[from] prost::DecodeError),
 
@@ -164,11 +191,11 @@ impl DataChannelMessage {
     }
 
     /// Create a new binary message
-    pub fn binary(data: Vec<u8>) -> Self {
+    pub fn binary(data: impl Into<Bytes>) -> Self {
         DataChannelMessage::Binary {
             action: "binary".to_string(),
             headers: BTreeMap::new(),
-            data,
+            data: data.into(),
         }
     }
 
@@ -182,11 +209,11 @@ impl DataChannelMessage {
     }
 
     /// Create a new RuntimeData message from protobuf-encoded bytes.
-    pub fn runtime_data(data_buffer: Vec<u8>) -> Self {
+    pub fn runtime_data(data_buffer: impl Into<Bytes>) -> Self {
         DataChannelMessage::RuntimeData {
             action: "node_output".to_string(),
             headers: BTreeMap::new(),
-            data_buffer,
+            data_buffer: data_buffer.into(),
         }
     }
 
@@ -217,6 +244,39 @@ impl DataChannelMessage {
 
     /// Serialize message to binary protobuf envelope
     pub fn encode(&self) -> Result<Vec<u8>, DataChannelEncodeError> {
+        self.encode_with_context(CopyContext::legacy())
+    }
+
+    /// Authorize the single bulk-to-wire materialization. Metadata/framing and
+    /// native network work are excluded from this logical payload byte count.
+    pub fn encode_with_context(
+        &self,
+        copies: &CopyContext,
+    ) -> Result<Vec<u8>, DataChannelEncodeError> {
+        let bytes = match self {
+            Self::Binary { data, .. } => data.len(),
+            Self::RuntimeData { data_buffer, .. } => data_buffer.len(),
+            Self::Chunk { chunk, .. } => chunk.data.len(),
+            Self::Control { .. } | Self::Text { .. } => 0,
+        };
+        copies.materialize_result(CopyReason::PortableSerialization, bytes as u64, || {
+            self.encode_envelope()
+        })?
+    }
+
+    /// Encoded envelope length without materializing bulk payload bytes.
+    pub fn encoded_len(&self) -> Result<usize, DataChannelEncodeError> {
+        Ok(self.as_envelope()?.encoded_len())
+    }
+
+    fn encode_envelope(&self) -> Result<Vec<u8>, DataChannelEncodeError> {
+        let envelope = self.as_envelope()?;
+        let mut buf = Vec::with_capacity(envelope.encoded_len());
+        envelope.encode(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn as_envelope(&self) -> Result<DataChannelEnvelope, DataChannelEncodeError> {
         let mut envelope = DataChannelEnvelope {
             version: 1,
             kind: 0,
@@ -317,104 +377,48 @@ impl DataChannelMessage {
             }
         }
 
-        let mut buf = Vec::new();
-        envelope.encode(&mut buf)?;
-        Ok(buf)
+        Ok(envelope)
     }
 
     /// Deserialize message from binary protobuf envelope (with deprecated JSON fallback)
     pub fn decode(bytes: &[u8]) -> Result<Self, DataChannelDecodeError> {
-        let envelope = match DataChannelEnvelope::decode(bytes) {
+        Self::decode_with_context(bytes, CopyContext::legacy())
+    }
+
+    /// Decode borrowed wire, authorizing a snapshot of the final bulk field.
+    /// Prefer `decode_owned_with_context` to retain the original wire instead.
+    /// Metadata and overwritten bulk fields do not incur payload copy charges.
+    pub fn decode_with_context(
+        bytes: &[u8],
+        copies: &CopyContext,
+    ) -> Result<Self, DataChannelDecodeError> {
+        borrowed::decode(bytes, copies)
+    }
+
+    /// Decode a protobuf envelope while retaining its bulk byte ranges. Metadata
+    /// still allocates; legacy payload decoding uses the unattributed ledger.
+    pub fn decode_owned(bytes: Bytes) -> Result<Self, DataChannelDecodeError> {
+        Self::decode_owned_with_context(bytes, CopyContext::legacy())
+    }
+
+    /// Retain modern bulk ranges and authorize legacy payload materializations
+    /// before they start. Metadata parsing and native/network buffers are separate.
+    pub fn decode_owned_with_context(
+        bytes: Bytes,
+        copies: &CopyContext,
+    ) -> Result<Self, DataChannelDecodeError> {
+        let envelope = match DataChannelEnvelope::decode(bytes.clone()) {
             Ok(env) => env,
             Err(pb_err) => {
-                // Fallback to legacy JSON/base64 decoding
-                #[derive(serde::Deserialize)]
-                #[serde(tag = "type", content = "payload")]
-                enum LegacyMessage {
-                    Json(serde_json::Value),
-                    Binary(String),
-                    Text(String),
-                    RuntimeData(String),
-                    Chunk(LegacyChunkInfo),
-                }
-
-                #[derive(serde::Deserialize)]
-                struct LegacyChunkInfo {
-                    stream_id: String,
-                    message_id: String,
-                    chunk_index: u32,
-                    total_chunks: Option<u32>,
-                    is_final: bool,
-                    content_type: Option<String>,
-                    data_type_hint: Option<String>,
-                    data: String,
-                }
-
-                if let Ok(legacy) = serde_json::from_slice::<LegacyMessage>(bytes) {
-                    tracing::warn!("Decoded legacy JSON/base64 DataChannelMessage (deprecated!)");
-                    use base64::{engine::general_purpose::STANDARD, Engine};
-                    match legacy {
-                        LegacyMessage::Json(json) => {
-                            let action = json
-                                .get("action")
-                                .and_then(|a| a.as_str())
-                                .unwrap_or("control")
-                                .to_string();
-                            return Ok(DataChannelMessage::Control {
-                                action,
-                                headers: Default::default(),
-                                json,
-                            });
-                        }
-                        LegacyMessage::Binary(b64) => {
-                            if let Ok(data) = STANDARD.decode(&b64) {
-                                return Ok(DataChannelMessage::Binary {
-                                    action: "binary".to_string(),
-                                    headers: Default::default(),
-                                    data,
-                                });
-                            }
-                        }
-                        LegacyMessage::Text(text) => {
-                            return Ok(DataChannelMessage::Text {
-                                action: "text".to_string(),
-                                headers: Default::default(),
-                                text,
-                            });
-                        }
-                        LegacyMessage::RuntimeData(b64) => {
-                            if let Ok(data_buffer) = STANDARD.decode(&b64) {
-                                return Ok(DataChannelMessage::RuntimeData {
-                                    action: "node_output".to_string(),
-                                    headers: Default::default(),
-                                    data_buffer,
-                                });
-                            }
-                        }
-                        LegacyMessage::Chunk(chunk) => {
-                            if let Ok(data) = STANDARD.decode(&chunk.data) {
-                                return Ok(DataChannelMessage::Chunk {
-                                    action: "runtime_data_chunk".to_string(),
-                                    headers: Default::default(),
-                                    chunk: ChunkInfo {
-                                        stream_id: chunk.stream_id,
-                                        message_id: chunk.message_id,
-                                        chunk_index: chunk.chunk_index,
-                                        total_chunks: chunk.total_chunks,
-                                        is_final: chunk.is_final,
-                                        content_type: chunk.content_type,
-                                        data_type_hint: chunk.data_type_hint,
-                                        data,
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
-                return Err(DataChannelDecodeError::Protobuf(pb_err));
+                return legacy::decode(bytes.as_ref(), copies)?
+                    .ok_or(DataChannelDecodeError::Protobuf(pb_err));
             }
         };
 
+        Self::from_envelope(envelope)
+    }
+
+    fn from_envelope(envelope: DataChannelEnvelope) -> Result<Self, DataChannelDecodeError> {
         let kind = FrameKind::try_from(envelope.kind)
             .map_err(|_| DataChannelDecodeError::InvalidKind(envelope.kind))?;
 
@@ -808,7 +812,7 @@ mod tests {
         let msg = DataChannelMessage::Binary {
             action: "model_weights".to_string(),
             headers: Default::default(),
-            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
         };
 
         let encoded = msg.encode().unwrap();

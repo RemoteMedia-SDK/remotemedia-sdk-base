@@ -182,7 +182,7 @@ mod tests {
 
     fn mk_video(stream_id: &str, frame_number: u64, fill: u8) -> RuntimeData {
         RuntimeData::Video {
-            pixel_data: vec![fill; 4 * 4 * 3],
+            pixel_data: vec![fill; 4 * 4 * 3].into(),
             width: 4,
             height: 4,
             format: PixelFormat::Rgb24,

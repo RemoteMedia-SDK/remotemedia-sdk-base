@@ -23,10 +23,9 @@
 //! - **Not zero-copy to the downstream protobuf / IPC boundary.** That
 //!   conversion still happens at the transport edge. The pool's
 //!   job is to kill the per-frame allocation between nodes.
-//! - **Not part of `RuntimeData` yet.** `RuntimeData::Audio` still owns
-//!   a raw `Vec<f32>`. Wiring a pooled buffer through the enum requires
-//!   a follow-up; for now nodes can use the pool internally for scratch
-//!   buffers and return a raw `Vec<f32>` at the boundary.
+//! - **Shared downstream ownership.** Converting a pooled buffer into
+//!   `AudioSamples` retains its pool-return owner. Preparing a `BufferLoan`
+//!   allocates an owner header before publication; do this outside RT callbacks.
 //!
 //! # Example
 //!
@@ -114,7 +113,8 @@ impl AudioBufferPool {
 ///
 /// Derefs to `Vec<f32>`; returns itself to the pool on drop. Use
 /// [`PooledAudioBuf::into_inner`] to detach the buffer (no pool return)
-/// when you need to hand ownership to a sink (e.g. into `RuntimeData::Audio`).
+/// only when the recipient needs an owned Vec. Converting into AudioSamples
+/// retains this loan and returns it to the pool after the final shared view drops.
 #[derive(Debug)]
 pub struct PooledAudioBuf {
     inner: Option<Vec<f32>>,
@@ -139,6 +139,18 @@ impl Deref for PooledAudioBuf {
 impl DerefMut for PooledAudioBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner.as_mut().expect("buffer taken")
+    }
+}
+
+impl AsRef<[f32]> for PooledAudioBuf {
+    fn as_ref(&self) -> &[f32] {
+        self.as_slice()
+    }
+}
+
+impl AsMut<[f32]> for PooledAudioBuf {
+    fn as_mut(&mut self) -> &mut [f32] {
+        self.as_mut_slice()
     }
 }
 

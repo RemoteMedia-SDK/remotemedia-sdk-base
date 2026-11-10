@@ -1,21 +1,26 @@
-//! In-process channel for Python nodes (Android, and opt-in on Linux/macOS)
+//! Public in-process compatibility channel, available with `inprocess-python`.
 //!
-//! Provides a simple in-memory channel using `Arc<Mutex<Vec<u8>>>` for data exchange
-//! between Rust host and Python nodes running in the same process. This replaces
-//! the iceoryx2-based IPC when running on Android or when in-process execution
-//! is explicitly requested via `REMOTEMEDIA_EXECUTION_STRATEGY=inprocess`.
+//! Each send is one immutable frame. Typed publish/receive uses counted portable
+//! MessagePack; `send_owned`/`receive_owned_bytes` transfer existing SharedBytes
+//! owners without payload copies. This API is not the main Python node runner.
+//!
+//! Capacity counts retained frames. With backpressure, a full queue rejects new
+//! frames; without it, the oldest frame is evicted and lagging readers receive an
+//! explicit error before resuming. Active readers release history once all have
+//! consumed it. Before any reader attaches, bounded history supports late readers.
 
 use crate::{Error, Result};
+use remotemedia_types::{CopyContext, CopyPolicy, CopyReason, RuntimeData, SharedBytes};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
-use remotemedia_types::RuntimeData;
+mod state;
+use state::Channel;
 
-/// Global shared channel registry instance
 static GLOBAL_REGISTRY: OnceLock<Arc<InProcessChannelRegistry>> = OnceLock::new();
 
-/// Channel statistics
+/// Best-effort diagnostic counters; CopyContext is the authoritative copy ledger.
 #[derive(Debug, Default, Clone)]
 pub struct ChannelStats {
     pub messages_sent: u64,
@@ -24,366 +29,256 @@ pub struct ChannelStats {
     pub last_activity: Option<std::time::Instant>,
 }
 
-/// Handle to an in-process channel
 #[derive(Debug, Clone)]
 pub struct ChannelHandle {
-    /// Unique channel name
     pub name: String,
-
-    /// Maximum buffer capacity
+    /// Maximum number of retained frames, not a payload byte limit.
     pub capacity: usize,
-
-    /// Channel statistics
     pub stats: Arc<RwLock<ChannelStats>>,
-
-    /// Backpressure enabled flag
     pub backpressure_enabled: bool,
 }
 
-/// In-process channel registry
 pub struct InProcessChannelRegistry {
-    /// Active channels - each channel is a simple MPSC channel
-    channels: Arc<RwLock<HashMap<String, Arc<Mutex<Vec<u8>>>>>>,
-
-    /// Channel handles
-    handles: Arc<RwLock<HashMap<String, ChannelHandle>>>,
+    channels: RwLock<HashMap<String, Arc<Channel>>>,
 }
 
 impl InProcessChannelRegistry {
-    /// Get or create the global shared channel registry
     pub fn global() -> Arc<Self> {
         GLOBAL_REGISTRY
             .get_or_init(|| Arc::new(Self::new_internal()))
             .clone()
     }
 
-    /// Create a new channel registry (internal use only)
     fn new_internal() -> Self {
         Self {
-            channels: Arc::new(RwLock::new(HashMap::new())),
-            handles: Arc::new(RwLock::new(HashMap::new())),
+            channels: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Initialize the registry (no-op for in-process, kept for API compatibility)
     pub async fn ensure_initialized(&self) -> Result<()> {
         Ok(())
     }
 
-    /// Create a new in-process channel
+    /// Create a compatibility channel with its own AllowCopies ledger.
     pub async fn create_channel(
         &self,
         name: &str,
         capacity: usize,
         backpressure: bool,
     ) -> Result<ChannelHandle> {
-        // Create the in-memory buffer
-        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let copies = CopyContext::new(
+            CopyPolicy::AllowCopies,
+            format!("inprocess/channel/{name}/{}", uuid::Uuid::new_v4()),
+        );
+        self.create_channel_with_copy_context(name, capacity, backpressure, copies)
+            .await
+    }
 
-        // Store the channel buffer
+    /// Bind one immutable authority for all publishers and subscribers. Reopening
+    /// a live name is rejected, so another caller cannot replace its policy.
+    pub async fn create_channel_with_copy_context(
+        &self,
+        name: &str,
+        capacity: usize,
+        backpressure: bool,
+        copies: CopyContext,
+    ) -> Result<ChannelHandle> {
+        if capacity == 0 {
+            return Err(ipc_error("channel capacity must be nonzero"));
+        }
         let mut channels = self.channels.write().await;
-        channels.insert(name.to_string(), buffer);
-
-        // Create channel handle
+        if channels.contains_key(name) {
+            return Err(ipc_error("channel already exists"));
+        }
+        let channel = Arc::new(Channel::new(capacity, backpressure, copies));
         let handle = ChannelHandle {
-            name: name.to_string(),
+            name: name.into(),
             capacity,
-            stats: Arc::new(RwLock::new(ChannelStats::default())),
+            stats: channel.stats.clone(),
             backpressure_enabled: backpressure,
         };
-
-        let mut handles = self.handles.write().await;
-        handles.insert(name.to_string(), handle.clone());
-
-        tracing::info!(
-            "Created in-process channel: {} (capacity: {})",
-            name,
-            capacity
-        );
+        channels.insert(name.into(), channel);
         Ok(handle)
     }
 
-    /// Destroy a channel and cleanup resources
-    pub async fn destroy_channel(&self, channel: ChannelHandle) -> Result<()> {
-        let channel_name = channel.name.clone();
-
-        // Remove the channel buffer
+    /// Close old handles and release queued owners. A stale handle cannot destroy
+    /// a replacement channel with the same name. Previously received owners live on.
+    pub async fn destroy_channel(&self, handle: ChannelHandle) -> Result<()> {
         let mut channels = self.channels.write().await;
-        channels.remove(&channel_name);
-
-        // Remove the channel handle
-        let mut handles = self.handles.write().await;
-        handles.remove(&channel_name);
-
-        tracing::info!("Destroyed in-process channel: {}", channel_name);
+        if let Some(channel) = channels.get(&handle.name) {
+            if !Arc::ptr_eq(&channel.stats, &handle.stats) {
+                return Err(ipc_error("stale channel handle"));
+            }
+            channel.close()?;
+            channels.remove(&handle.name);
+        }
         Ok(())
     }
 
-    /// Drain all pending messages from a channel
-    pub async fn drain_channel(&self, channel_name: &str) -> Result<usize> {
-        let mut channels = self.channels.write().await;
-        if let Some(buffer) = channels.get_mut(channel_name) {
-            let mut buf = buffer.lock().unwrap();
-            let count = buf.len();
-            buf.clear();
-            Ok(count)
-        } else {
-            Ok(0)
-        }
-    }
-
-    /// Get the internal buffer for a channel (for Publisher/Subscriber)
-    async fn get_buffer(&self, channel_name: &str) -> Result<Arc<Mutex<Vec<u8>>>> {
+    /// Discard queued frames and return their total wire bytes. Readers that had
+    /// not consumed those frames observe explicit lag, then can read new frames.
+    pub async fn drain_channel(&self, name: &str) -> Result<usize> {
         let channels = self.channels.read().await;
         channels
-            .get(channel_name)
+            .get(name)
+            .map(|channel| channel.drain())
+            .transpose()
+            .map(|n| n.unwrap_or(0))
+    }
+
+    async fn channel(&self, name: &str) -> Result<Arc<Channel>> {
+        self.channels
+            .read()
+            .await
+            .get(name)
             .cloned()
-            .ok_or_else(|| Error::IpcError(format!("Channel not found: {}", channel_name)))
+            .ok_or_else(|| ipc_error(format!("Channel not found: {name}")))
     }
 
-    /// Create a publisher for a channel
-    pub async fn create_publisher(&self, channel_name: &str) -> Result<InProcessPublisher> {
-        let buffer = self.get_buffer(channel_name).await?;
-
-        let handles = self.handles.read().await;
-        let handle = handles.get(channel_name).ok_or_else(|| {
-            Error::IpcError(format!("Channel handle not found: {}", channel_name))
-        })?;
-
+    pub async fn create_publisher(&self, name: &str) -> Result<InProcessPublisher> {
         Ok(InProcessPublisher {
-            channel_name: channel_name.to_string(),
-            buffer,
-            stats: handle.stats.clone(),
-            backpressure: handle.backpressure_enabled,
+            channel: self.channel(name).await?,
         })
     }
 
-    /// Create a subscriber for a channel
-    pub async fn create_subscriber(&self, channel_name: &str) -> Result<InProcessSubscriber> {
-        let buffer = self.get_buffer(channel_name).await?;
-
-        let handles = self.handles.read().await;
-        let handle = handles.get(channel_name).ok_or_else(|| {
-            Error::IpcError(format!("Channel handle not found: {}", channel_name))
-        })?;
-
-        // In-process: we don't have history, but we can at least get current messages
-        Ok(InProcessSubscriber {
-            channel_name: channel_name.to_string(),
-            buffer,
-            stats: handle.stats.clone(),
-            cursor: 0, // Track read position for simple history
-        })
+    /// Replay retained history. Frames already consumed by all prior readers
+    /// have been released and are not replayed.
+    pub async fn create_subscriber(&self, name: &str) -> Result<InProcessSubscriber> {
+        self.subscriber(name, false).await
     }
 
-    /// Create a subscriber and immediately drain any stale messages
-    pub async fn create_subscriber_fresh(&self, channel_name: &str) -> Result<InProcessSubscriber> {
-        let mut subscriber = self.create_subscriber(channel_name).await?;
-        // Reset cursor to end of buffer to skip stale messages
-        if let Ok(mut buf) = subscriber.buffer.lock() {
-            subscriber.cursor = buf.len();
-        }
-        Ok(subscriber)
+    /// Start at the current end without discarding another reader's backlog.
+    pub async fn create_subscriber_fresh(&self, name: &str) -> Result<InProcessSubscriber> {
+        self.subscriber(name, true).await
+    }
+
+    async fn subscriber(&self, name: &str, fresh: bool) -> Result<InProcessSubscriber> {
+        let channel = self.channel(name).await?;
+        let reader = channel.subscribe(fresh)?;
+        Ok(InProcessSubscriber { channel, reader })
     }
 }
 
-/// In-process publisher for sending data to a channel
 pub struct InProcessPublisher {
-    channel_name: String,
-    buffer: Arc<Mutex<Vec<u8>>>,
-    stats: Arc<RwLock<ChannelStats>>,
-    backpressure: bool,
+    channel: Arc<Channel>,
 }
 
 impl InProcessPublisher {
-    /// Publish data to the channel
+    pub fn copy_context(&self) -> CopyContext {
+        self.channel.copies.clone()
+    }
+
+    /// Encode directly into the final frame owner; there is no shared-Vec append.
     pub fn publish(&self, data: &RuntimeData) -> Result<()> {
-        // Serialize RuntimeData to bytes via msgpack
-        let bytes = super::data_transfer::to_bytes(data)
-            .map_err(|e| Error::IpcError(format!("Failed to serialize: {}", e)))?;
-
-        tracing::debug!(
-            "[InProcess Publisher] Channel '{}' publishing {} bytes (type: {})",
-            self.channel_name,
-            bytes.len(),
-            data.data_type()
-        );
-
-        // Lock and push to buffer
-        let mut buf = self.buffer.lock().unwrap();
-        buf.extend_from_slice(&bytes);
-
-        // Update stats
-        if let Ok(mut stats) = self.stats.try_write() {
-            stats.messages_sent += 1;
-            stats.bytes_transferred += bytes.len() as u64;
-            stats.last_activity = Some(std::time::Instant::now());
-        }
-
-        Ok(())
+        require_capacity(self.try_publish(data)?)
     }
 
-    /// Try to publish without blocking (always succeeds for in-process)
+    /// Return false on backpressure before serialization or allocation.
     pub fn try_publish(&self, data: &RuntimeData) -> Result<bool> {
-        self.publish(data)?;
-        Ok(true)
+        self.channel.enqueue(|| {
+            super::data_transfer::to_bytes_with_copy_context(data, &self.channel.copies)
+                .map(SharedBytes::from)
+                .map_err(ipc_error)
+        })
     }
 
-    /// Send raw bytes directly (like READY signal)
+    /// Copy a borrowed frame once, with exact wire-byte accounting.
     pub fn send(&self, bytes: &[u8]) -> Result<()> {
-        tracing::debug!(
-            "[InProcess Publisher] Channel '{}' sending raw {} bytes",
-            self.channel_name,
-            bytes.len()
-        );
+        require_capacity(self.channel.enqueue(|| {
+            self.channel
+                .copies
+                .materialize(CopyReason::BorrowedInput, bytes.len() as u64, || {
+                    SharedBytes::from(bytes.to_vec())
+                })
+                .map_err(ipc_error)
+        })?)
+    }
 
-        let mut buf = self.buffer.lock().unwrap();
-        buf.extend_from_slice(bytes);
-
-        if let Ok(mut stats) = self.stats.try_write() {
-            stats.messages_sent += 1;
-            stats.bytes_transferred += bytes.len() as u64;
-            stats.last_activity = Some(std::time::Instant::now());
-        }
-
-        Ok(())
+    /// Transfer an immutable frame owner, including slices, without copying.
+    /// One call is one complete frame, not part of a byte-stream append.
+    pub fn send_owned(&self, bytes: SharedBytes) -> Result<()> {
+        require_capacity(self.channel.enqueue(|| Ok(bytes))?)
     }
 }
 
-/// In-process subscriber for receiving data from a channel
 pub struct InProcessSubscriber {
-    channel_name: String,
-    buffer: Arc<Mutex<Vec<u8>>>,
-    stats: Arc<RwLock<ChannelStats>>,
-    cursor: usize, // Track read position for message streaming
+    channel: Arc<Channel>,
+    reader: u64,
 }
 
 impl InProcessSubscriber {
-    /// Receive data from the channel
-    pub fn receive(&mut self) -> Result<Option<RuntimeData>> {
-        let mut buf = self.buffer.lock().unwrap();
-
-        // Check if there's data available from our cursor position
-        if self.cursor < buf.len() {
-            // Try to deserialize from cursor position
-            let data_slice = &buf[self.cursor..];
-
-            // Try to deserialize a single RuntimeData
-            match super::data_transfer::from_bytes(data_slice) {
-                Ok(data) => {
-                    // Calculate how many bytes we consumed
-                    let consumed = data_slice.len() - {
-                        // We can't easily know how many bytes were consumed,
-                        // so we use a simple approach: advance by the serialized size
-                        // For now, just clear the buffer after reading one message
-                        // This is a simplification - in a real impl we'd track precisely
-                        0
-                    };
-
-                    // Simple approach: clear and set cursor to end
-                    self.cursor = buf.len();
-
-                    // Update stats
-                    if let Ok(mut stats) = self.stats.try_write() {
-                        stats.messages_received += 1;
-                        stats.last_activity = Some(std::time::Instant::now());
-                    }
-
-                    return Ok(Some(data));
-                }
-                Err(_) => {
-                    // If deserialization failed, data might be incomplete
-                    // Return None to indicate we need more data
-                    return Ok(None);
-                }
-            }
-        }
-
-        Ok(None)
+    pub fn copy_context(&self) -> CopyContext {
+        self.channel.copies.clone()
     }
 
-    /// Receive raw bytes without deserialization
+    /// Decode exactly one complete portable frame. Malformed input, trailing
+    /// bytes and strict rejection return errors without advancing this reader.
+    pub fn receive(&mut self) -> Result<Option<RuntimeData>> {
+        let Some((sequence, frame)) = self.channel.frame(self.reader)? else {
+            return Ok(None);
+        };
+        let data = super::data_transfer::from_frame_with_copy_context(
+            frame.as_slice(),
+            &self.channel.copies,
+        )
+        .map_err(ipc_error)?;
+        self.channel.advance(self.reader, sequence + 1, None)?;
+        Ok(Some(data))
+    }
+
+    /// Receive one immutable frame with its backing storage retained. Strict mode
+    /// permits this ownership transfer; decoded/Vec conversion remains explicit.
+    pub fn receive_owned_bytes(&mut self) -> Result<Option<SharedBytes>> {
+        let Some((sequence, frame)) = self.channel.frame(self.reader)? else {
+            return Ok(None);
+        };
+        self.channel
+            .advance(self.reader, sequence + 1, Some(frame.len()))?;
+        Ok(Some(frame))
+    }
+
+    /// Legacy snapshot of all currently unread frames concatenated into one Vec.
+    /// Copying is explicit; rejection leaves frames available to the owning API.
     pub fn receive_bytes(&mut self) -> Result<Option<Vec<u8>>> {
-        let mut buf = self.buffer.lock().unwrap();
-
-        if self.cursor < buf.len() {
-            let data = buf[self.cursor..].to_vec();
-            self.cursor = buf.len();
-
-            // Update stats
-            if let Ok(mut stats) = self.stats.try_write() {
-                stats.messages_received += 1;
-                stats.bytes_transferred += data.len() as u64;
-                stats.last_activity = Some(std::time::Instant::now());
-            }
-
-            Ok(Some(data))
-        } else {
-            Ok(None)
+        let (next, frames) = self.channel.unread(self.reader)?;
+        if frames.is_empty() {
+            return Ok(None);
         }
+        let size = state::wire_bytes(frames.iter())?;
+        let bytes = self
+            .channel
+            .copies
+            .materialize(CopyReason::VecMaterialization, size as u64, || {
+                let mut output = Vec::with_capacity(size);
+                for frame in frames {
+                    output.extend_from_slice(frame.as_slice());
+                }
+                output
+            })
+            .map_err(ipc_error)?;
+        self.channel.advance(self.reader, next, Some(size))?;
+        Ok(Some(bytes))
+    }
+}
+
+impl Drop for InProcessSubscriber {
+    fn drop(&mut self) {
+        self.channel.remove_reader(self.reader);
+    }
+}
+
+fn ipc_error(message: impl std::fmt::Display) -> Error {
+    Error::IpcError(message.to_string())
+}
+fn require_capacity(accepted: bool) -> Result<()> {
+    if accepted {
+        Ok(())
+    } else {
+        Err(ipc_error("in-process channel full"))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_inprocess_channel_creation() {
-        let registry = InProcessChannelRegistry::global();
-
-        let channel_name = format!("test/channel/create/{}", std::process::id());
-        let channel = registry
-            .create_channel(&channel_name, 100, true)
-            .await
-            .unwrap();
-
-        assert_eq!(channel.name, channel_name);
-        assert_eq!(channel.capacity, 100);
-        assert!(channel.backpressure_enabled);
-
-        registry.destroy_channel(channel).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_inprocess_publish_subscribe() {
-        let registry = InProcessChannelRegistry::global();
-
-        let channel_name = format!(
-            "test/channel/pubsub/{}/{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-
-        let channel = registry
-            .create_channel(&channel_name, 10, false)
-            .await
-            .unwrap();
-
-        // Create publisher and subscriber
-        let publisher = registry.create_publisher(&channel_name).await.unwrap();
-        let mut subscriber = registry.create_subscriber(&channel_name).await.unwrap();
-
-        // Publish data
-        let data = RuntimeData::Text("Hello, InProcess!".into());
-        publisher.publish(&data).unwrap();
-
-        // Small delay
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Receive data
-        let received = subscriber.receive().unwrap();
-        assert!(received.is_some());
-
-        let received_data = received.unwrap();
-        match &received_data {
-            RuntimeData::Text(s) => assert_eq!(s.as_str(), "Hello, InProcess!"),
-            _ => panic!("Expected Text variant, got {:?}", received_data.data_type()),
-        }
-
-        registry.destroy_channel(channel).await.unwrap();
-    }
-}
+mod baseline_tests;
+#[cfg(test)]
+mod tests;

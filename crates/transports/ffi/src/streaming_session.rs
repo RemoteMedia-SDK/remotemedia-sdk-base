@@ -32,11 +32,19 @@ use remotemedia_core::transport::{
     SharedPipelineOutputReceivers, TransportData,
 };
 
-use crate::marshal::{python_to_runtime_data, runtime_data_to_python};
+use crate::marshal::{python_to_runtime_data_with_context, runtime_data_to_python_with_context};
+use crate::python::buffer_config::PipelineBufferConfig;
+use remotemedia_types::{CopyContext, OutputAllocator};
+
+mod input_copies;
+use input_copies::InputCopies;
 
 type InputSlot = Arc<Mutex<Option<InputSender>>>;
 type RxSlot = Arc<Mutex<Option<mpsc::Receiver<RuntimeData>>>>;
 type HandleSlot = Arc<Mutex<Option<SessionHandle>>>;
+
+#[cfg(test)]
+mod input_policy_tests;
 
 enum InputSender {
     Raw(SessionInputSender),
@@ -75,6 +83,9 @@ pub struct PyStreamingSession {
     /// task spawned at session creation holds `Arc` clones internally, but
     /// holding the executor here is a defensive cheap guarantee.
     _executor: Arc<PipelineExecutor>,
+    output_allocator: Arc<dyn OutputAllocator>,
+    input_copies: InputCopies,
+    node_copies: remotemedia_core::transport::NodeMaterializationCopies,
 }
 
 #[pymethods]
@@ -85,18 +96,54 @@ impl PyStreamingSession {
         self.session_id.clone()
     }
 
+    /// Allocate directly in this session's ingress storage. Release writable
+    /// views before publishing the loan; published views may outlive the session.
+    fn output_allocator(&self) -> _remotemedia_buffers::OutputAllocator {
+        _remotemedia_buffers::OutputAllocator::new(self.output_allocator.clone())
+    }
+
+    /// Logical input-selector reports plus the core session's transport report.
+    /// The historical `allow_copies` selector inherits session policy, including
+    /// strict policy. `session` includes both selectors and other instrumented
+    /// transport operations, including output decoding and control conversions;
+    /// these overlapping reports must not be summed.
+    fn input_copy_report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = serde_json::json!({
+            "allow_copies": self.input_copies.inherited.report(),
+            "require_zero_copy": self.input_copies.strict.report(),
+            "session": self.input_copies.session.report(),
+        });
+        Ok(crate::marshal::json_to_python(py, &value)?.unbind())
+    }
+
+    /// Per-node materialization ledgers, distinct from transport reports.
+    /// The retained ledgers remain readable after close.
+    fn node_copy_reports(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = serde_json::to_value(self.node_copies.reports())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(crate::marshal::json_to_python(py, &value)?.unbind())
+    }
+
     /// Push one input frame. `data` accepts the same shapes
     /// `execute_pipeline_with_input` does: numpy arrays, `{"type":"audio", ...}`
     /// dicts, strings, bytes, or anything `python_to_runtime_data` recognises.
     ///
     /// Returns a coroutine resolving to `None`. Raises `RuntimeError` if the
     /// input channel is closed.
+    /// `require_zero_copy=True` strengthens session policy; False inherits it.
+    #[pyo3(signature = (data, *, require_zero_copy=false))]
     fn send_input<'py>(
         &self,
         py: Python<'py>,
         data: Bound<'py, PyAny>,
+        require_zero_copy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let rd = python_to_runtime_data(py, &data)?;
+        let context = if require_zero_copy {
+            &self.input_copies.strict
+        } else {
+            &self.input_copies.inherited
+        };
+        let rd = python_to_runtime_data_with_context(py, &data, context)?;
         let input_sender = Arc::clone(&self.input_sender);
         future_into_py(py, async move {
             let guard = input_sender.lock().await;
@@ -117,17 +164,29 @@ impl PyStreamingSession {
     /// shape `runtime_data_to_python` produces) or `None` when the channel
     /// closes.
     fn recv_audio<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        recv_kind_async(py, Arc::clone(&self.audio_rx))
+        recv_kind_async(
+            py,
+            Arc::clone(&self.audio_rx),
+            self.input_copies.session.clone(),
+        )
     }
 
     /// Await the next data-kind output (text / json / numpy / tensor / etc.).
     fn recv_data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        recv_kind_async(py, Arc::clone(&self.data_rx))
+        recv_kind_async(
+            py,
+            Arc::clone(&self.data_rx),
+            self.input_copies.session.clone(),
+        )
     }
 
     /// Await the next video-kind output.
     fn recv_video<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        recv_kind_async(py, Arc::clone(&self.video_rx))
+        recv_kind_async(
+            py,
+            Arc::clone(&self.video_rx),
+            self.input_copies.session.clone(),
+        )
     }
 
     /// Await the next output across all kinds. Resolves to `(kind, data)` or
@@ -137,6 +196,7 @@ impl PyStreamingSession {
         let audio = Arc::clone(&self.audio_rx);
         let video = Arc::clone(&self.video_rx);
         let data = Arc::clone(&self.data_rx);
+        let copies = self.input_copies.session.clone();
         future_into_py(py, async move {
             loop {
                 let mut a_guard = audio.lock().await;
@@ -198,7 +258,7 @@ impl PyStreamingSession {
                         *a_guard = a_taken;
                         *v_guard = v_taken;
                         *d_guard = d_taken;
-                        return Python::attach(|py| pack_kind(py, kind, &rd));
+                        return Python::attach(|py| pack_kind(py, kind, rd, &copies));
                     }
                     Outcome::Closed("audio") => {
                         *a_guard = None;
@@ -224,15 +284,15 @@ impl PyStreamingSession {
     /// Non-blocking peek on audio. Returns the next frame, or `None` if
     /// the channel is empty / closed / locked.
     fn try_recv_audio(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        try_recv_kind_sync(py, &self.audio_rx)
+        try_recv_kind_sync(py, &self.audio_rx, &self.input_copies.session)
     }
 
     fn try_recv_data(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        try_recv_kind_sync(py, &self.data_rx)
+        try_recv_kind_sync(py, &self.data_rx, &self.input_copies.session)
     }
 
     fn try_recv_video(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        try_recv_kind_sync(py, &self.video_rx)
+        try_recv_kind_sync(py, &self.video_rx, &self.input_copies.session)
     }
 
     /// Signal end-of-input. After this, `send_input` raises. Outputs continue
@@ -280,7 +340,11 @@ impl PyStreamingSession {
     }
 }
 
-fn recv_kind_async(py: Python<'_>, rx_arc: RxSlot) -> PyResult<Bound<'_, PyAny>> {
+fn recv_kind_async(
+    py: Python<'_>,
+    rx_arc: RxSlot,
+    copies: CopyContext,
+) -> PyResult<Bound<'_, PyAny>> {
     future_into_py(py, async move {
         let mut guard = rx_arc.lock().await;
         let result = match guard.as_mut() {
@@ -292,13 +356,17 @@ fn recv_kind_async(py: Python<'_>, rx_arc: RxSlot) -> PyResult<Bound<'_, PyAny>>
         }
         drop(guard);
         Python::attach(|py| match result {
-            Some(rd) => Ok(runtime_data_to_python(py, &rd)?),
+            Some(rd) => Ok(runtime_data_to_python_with_context(
+                py,
+                &rd.into_shared(),
+                &copies,
+            )?),
             None => Ok(py.None()),
         })
     })
 }
 
-fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot) -> PyResult<Py<PyAny>> {
+fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot, copies: &CopyContext) -> PyResult<Py<PyAny>> {
     let mut guard = match rx.try_lock() {
         Ok(g) => g,
         Err(_) => return Ok(py.None()),
@@ -309,7 +377,11 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot) -> PyResult<Py<PyAny>> {
         None => return Ok(py.None()),
     };
     match outcome {
-        Ok(rd) => Ok(runtime_data_to_python(py, &rd)?),
+        Ok(rd) => Ok(runtime_data_to_python_with_context(
+            py,
+            &rd.into_shared(),
+            &copies,
+        )?),
         Err(TryRecvError::Empty) => Ok(py.None()),
         Err(TryRecvError::Disconnected) => {
             *guard = None;
@@ -318,8 +390,13 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot) -> PyResult<Py<PyAny>> {
     }
 }
 
-fn pack_kind(py: Python<'_>, kind: &str, rd: &RuntimeData) -> PyResult<Py<PyAny>> {
-    let data_py = runtime_data_to_python(py, rd)?;
+fn pack_kind(
+    py: Python<'_>,
+    kind: &str,
+    rd: RuntimeData,
+    copies: &CopyContext,
+) -> PyResult<Py<PyAny>> {
+    let data_py = runtime_data_to_python_with_context(py, &rd.into_shared(), &copies)?;
     let kind_py = kind.into_py_any(py)?;
     let tuple = pyo3::types::PyTuple::new(py, &[kind_py, data_py])?;
     Ok(tuple.into_any().unbind())
@@ -347,17 +424,24 @@ fn pack_kind(py: Python<'_>, kind: &str, rd: &RuntimeData) -> PyResult<Py<PyAny>
 /// asyncio.run(main())
 /// ```
 #[pyfunction]
+#[pyo3(signature = (manifest_json, *, pipeline_buffers=None))]
 pub fn create_streaming_session(
     py: Python<'_>,
     manifest_json: String,
+    pipeline_buffers: Option<PipelineBufferConfig>,
 ) -> PyResult<Bound<'_, PyAny>> {
     // Capture asyncio task-locals for inline-async dispatch — mirrors the
     // setup execute_pipeline does so inline Python nodes inside the manifest
     // can resolve their event loop.
     super::inline_python_node::set_task_locals(pyo3_async_runtimes::tokio::get_current_locals(py)?);
 
+    let config = pipeline_buffers
+        .as_ref()
+        .map(PipelineBufferConfig::to_executor_config)
+        .transpose()?
+        .unwrap_or_default();
     future_into_py(py, async move {
-        let executor = PipelineExecutor::new()
+        let executor = PipelineExecutor::with_config(config)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create executor: {}", e)))?;
         // Register every plugin loaded so far via `rt.load_plugin(path)`
         // BEFORE the manifest is parsed — otherwise unknown-node-type
@@ -388,7 +472,9 @@ pub fn create_streaming_session(
     participant_role,
     track_id=None,
     modality=None,
-    display_name=None
+    display_name=None,
+    *,
+    pipeline_buffers=None
 ))]
 pub fn create_shared_streaming_session(
     py: Python<'_>,
@@ -399,11 +485,17 @@ pub fn create_shared_streaming_session(
     track_id: Option<String>,
     modality: Option<String>,
     display_name: Option<String>,
+    pipeline_buffers: Option<PipelineBufferConfig>,
 ) -> PyResult<Bound<'_, PyAny>> {
     super::inline_python_node::set_task_locals(pyo3_async_runtimes::tokio::get_current_locals(py)?);
 
+    let config = pipeline_buffers
+        .as_ref()
+        .map(PipelineBufferConfig::to_executor_config)
+        .transpose()?
+        .unwrap_or_default();
     future_into_py(py, async move {
-        let executor = PipelineExecutor::new()
+        let executor = PipelineExecutor::with_config(config)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create executor: {}", e)))?;
         for factory in crate::plugins::collect_registered_factories() {
             executor.register_factory(factory).await;
@@ -446,6 +538,9 @@ pub(crate) async fn build_session(
         .ok_or_else(|| PyRuntimeError::new_err("session output receivers already taken"))?;
 
     Ok(PyStreamingSession {
+        output_allocator: handle.output_allocator(),
+        input_copies: InputCopies::new(handle.transport_copy_context()),
+        node_copies: handle.node_materialization_copies(),
         session_id,
         input_sender: Arc::new(Mutex::new(Some(InputSender::Raw(input_sender)))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.audio_rx))),
@@ -490,6 +585,9 @@ pub(crate) async fn build_shared_session(
     let receivers = bridge_shared_outputs(shared.subscribe_outputs());
 
     Ok(PyStreamingSession {
+        output_allocator: shared.output_allocator().await,
+        input_copies: InputCopies::new(shared.transport_copy_context().await),
+        node_copies: shared.node_materialization_copies().await,
         session_id: shared.session_id().to_string(),
         input_sender: Arc::new(Mutex::new(Some(InputSender::Participant(participant)))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.0))),

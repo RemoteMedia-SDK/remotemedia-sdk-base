@@ -3,6 +3,7 @@
 //! This module provides language-agnostic configuration types that are
 //! converted to/from language-specific types in the napi and python modules.
 
+use remotemedia_types::CopyPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -133,7 +134,20 @@ pub struct WebRtcServerConfig {
     /// Reconnection configuration for external signaling mode
     #[serde(default)]
     pub reconnect: ReconnectConfig,
+
+    /// Policy for instrumented transport copies; independent of node policies.
+    #[serde(default)]
+    pub transport_materialization_policy: CopyPolicy,
+
+    /// Unified core policy and explicit node-retention budget; overrides transport policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_buffers: Option<PipelineBufferConfig>,
 }
+
+pub(crate) use crate::buffer_config::parse_copy_policy;
+pub use crate::buffer_config::{
+    ConfigValidationError, MappedPoolConfig, MappedSizeClass, PipelineBufferConfig,
+};
 
 fn default_max_peers() -> u32 {
     10
@@ -151,13 +165,58 @@ impl Default for WebRtcServerConfig {
             audio_codec: AudioCodec::Opus,
             video_codec: VideoCodec::Vp9,
             reconnect: ReconnectConfig::default(),
+            transport_materialization_policy: CopyPolicy::AllowCopies,
+            pipeline_buffers: None,
         }
     }
 }
 
+/// Parse the canonical policy names shared by Python and Node configuration.
+pub(crate) fn parse_transport_copy_policy(value: &str) -> Result<CopyPolicy, String> {
+    parse_copy_policy(value, "transport_materialization_policy")
+}
+
+#[cfg(test)]
+#[path = "transport_policy_tests.rs"]
+mod transport_policy_tests;
+
+#[cfg(test)]
+#[path = "pipeline_policy_tests.rs"]
+mod pipeline_policy_tests;
+
+#[cfg(test)]
+#[path = "mapped_pool_tests.rs"]
+mod mapped_pool_tests;
+
 impl WebRtcServerConfig {
+    /// Preserve independent or unified policy for either FFI frontend.
+    pub fn to_executor_config(
+        &self,
+    ) -> Result<remotemedia_core::transport::ExecutorConfig, ConfigValidationError> {
+        let mut config = self
+            .pipeline_buffers
+            .as_ref()
+            .map(PipelineBufferConfig::to_executor_config)
+            .transpose()?
+            .unwrap_or_default();
+        config.transport_materialization_policy = self.transport_materialization_policy;
+        Ok(config)
+    }
+
+    fn validate_buffers(&self) -> Result<(), ConfigValidationError> {
+        if let Some(pool) = self
+            .pipeline_buffers
+            .as_ref()
+            .and_then(|config| config.mapped_pool.as_ref())
+        {
+            pool.validate()?;
+        }
+        Ok(())
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        self.validate_buffers()?;
         // Check mutual exclusivity of port and signaling_url
         match (&self.port, &self.signaling_url) {
             (None, None) => {
@@ -269,40 +328,6 @@ impl WebRtcServerConfig {
     }
 }
 
-/// Configuration validation errors
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum ConfigValidationError {
-    #[error("Either port (embedded) or signaling_url (external) must be specified")]
-    MissingSignalingConfig,
-
-    #[error("Cannot specify both port and signaling_url - choose embedded or external signaling")]
-    ConflictingSignalingConfig,
-
-    #[error("Invalid port: {0} (must be non-zero)")]
-    InvalidPort(u16),
-
-    #[error("Invalid signaling URL: {0} (must start with grpc:// or grpcs://)")]
-    InvalidSignalingUrl(String),
-
-    #[error("At least one STUN server is required")]
-    NoStunServers,
-
-    #[error("Invalid STUN URL: {0} (must start with stun: or stuns:)")]
-    InvalidStunUrl(String),
-
-    #[error("Invalid TURN URL: {0} (must start with turn: or turns:)")]
-    InvalidTurnUrl(String),
-
-    #[error("TURN server username is required")]
-    MissingTurnUsername,
-
-    #[error("TURN server credential is required")]
-    MissingTurnCredential,
-
-    #[error("Invalid max_peers: {0} (must be 1-10)")]
-    InvalidMaxPeers(u32),
-}
-
 /// Peer capabilities (audio/video/data support)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerCapabilities {
@@ -378,6 +403,8 @@ mod tests {
             audio_codec: AudioCodec::Opus,
             video_codec: VideoCodec::Vp9,
             reconnect: ReconnectConfig::default(),
+            transport_materialization_policy: CopyPolicy::AllowCopies,
+            pipeline_buffers: None,
         };
         assert!(config.validate().is_ok());
         assert!(config.is_embedded());
@@ -396,6 +423,8 @@ mod tests {
             audio_codec: AudioCodec::Opus,
             video_codec: VideoCodec::Vp8,
             reconnect: ReconnectConfig::default(),
+            transport_materialization_policy: CopyPolicy::AllowCopies,
+            pipeline_buffers: None,
         };
         assert!(config.validate().is_ok());
         assert!(!config.is_embedded());

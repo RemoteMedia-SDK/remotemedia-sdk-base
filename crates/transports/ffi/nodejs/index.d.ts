@@ -1,7 +1,7 @@
 /**
  * RemoteMedia Native Node.js Bindings
  *
- * Zero-copy IPC between Node.js, Python, and Rust via iceoryx2.
+ * Native shared-memory producer loans and explicit copying compatibility APIs.
  */
 
 // =============================================================================
@@ -100,24 +100,72 @@ export function isControlMessage(data: RuntimeData): data is RuntimeData & { typ
 // =============================================================================
 
 /**
- * A received sample with zero-copy buffer access.
+ * Immutable native receive owner. Slices and pipeline handoffs retain storage.
  */
 export interface ReceivedSample {
+  /** Counted independent snapshot; nonempty export rejects under strict policy. */
   readonly buffer: Buffer;
   readonly size: number;
   readonly isReleased: boolean;
-  readonly timestampNs: bigint;
+  /** Local arrival time as a JS number; nanosecond precision is approximate. */
+  readonly timestampNs: number;
   release(): void;
-  toRuntimeData(): RuntimeData;
+  readByte(index: number): number;
+  slice(start: number, end: number): ReceivedSample;
+  toBinary(): import('./native-buffers').NapiRuntimeData;
+  /** Legacy Python envelope metadata; does not decode MessagePack. */
+  toRuntimeData(): ParsedRuntimeData;
+  audioMetadata(payloadOffset: number): AudioMetadata;
+  videoMetadata(payloadOffset: number): VideoMetadata;
+  fileMetadata(payloadOffset: number): FileMetadata;
+  /** Explicit counted MessagePack decoding under this IPC session's policy. */
+  decode(): import('./native-buffers').NapiRuntimeData;
+}
+
+export interface ParsedRuntimeData {
+  dataType: number;
+  sessionId: string;
+  timestampNs: number;
+  payloadOffset: number;
+  payloadLen: number;
+}
+export interface AudioMetadata {
+  sampleRate: number;
+  channels: number;
+  numSamples: number;
+  samplesOffset: number;
+}
+export interface VideoMetadata {
+  width: number;
+  height: number;
+  format: number;
+  codec: number;
+  frameNum: number;
+  isKeyframe: boolean;
+  pixelDataOffset: number;
+}
+export interface FileMetadata {
+  path: string;
+  filename?: string;
+  mimeType?: string;
+  size?: number;
+  offset?: number;
+  length?: number;
+  streamId?: string;
 }
 
 /**
  * A loaned sample buffer for zero-copy publishing.
  */
 export interface LoanedSample {
+  /** Counted independent snapshot; writes do not modify the native loan. */
   readonly buffer: Buffer;
   readonly size: number;
   readonly isConsumed: boolean;
+  set(index: number, value: number): void;
+  fill(value: number): void;
+  /** Counted import from ordinary, non-shared Buffer storage. */
+  write(data: Buffer, offset?: number): void;
   send(): void;
   release(): void;
 }
@@ -131,11 +179,13 @@ export interface Subscriber {
   readonly isValid: boolean;
   readonly pendingCount: number;
   readonly bufferSize: number;
+  readonly borrowedCount: number;
+  readonly maxBorrowedSamples: number;
   receive(): ReceivedSample | null;
   receiveTimeout(timeoutMs: number): Promise<ReceivedSample | null>;
   receiveAsync(): Promise<ReceivedSample>;
-  onData(callback: (sample: ReceivedSample) => void): () => void;
-  [Symbol.asyncIterator](): AsyncIterableIterator<ReceivedSample>;
+  onData(callback: (sample: ReceivedSample | null, error: Error | null) => void): () => void;
+  unsubscribe(): void;
   close(): void;
 }
 
@@ -163,7 +213,9 @@ export interface Publisher {
   readonly maxLoans: number;
   loan(size: number): LoanedSample;
   tryLoan(size: number): LoanedSample | null;
-  publish(data: RuntimeData): void;
+  /** Counted MessagePack serialization; incompatible with strict bulk publication. */
+  publish(data: import('./native-buffers').NapiRuntimeData): void;
+  publishRaw(data: Buffer): void;
   close(): void;
 }
 
@@ -205,6 +257,7 @@ export interface Channel {
 
 export interface SessionConfig {
   id: string;
+  requireZeroCopy?: boolean;
   defaultChannelConfig?: ChannelConfig;
 }
 
@@ -213,6 +266,8 @@ export interface Session {
   readonly isActive: boolean;
   channel(name: string, config?: ChannelConfig): Channel;
   listChannels(): string[];
+  /** JSON report for this IPC session, separate from core pipeline accounting. */
+  copyReport(): string;
   close(): void;
 }
 
@@ -223,6 +278,12 @@ export interface Session {
 export function createSession(config: SessionConfig): Session;
 export function getSession(sessionId: string): Session | null;
 export function listSessions(): string[];
+
+/** Load a .so/.dylib loadable node plugin for future streaming sessions. */
+export function loadPlugin(path: string): string[];
+
+/** Return node types exposed by plugins loaded in this process. */
+export function listLoadedPlugins(): string[][];
 
 // =============================================================================
 // IPC Node Management
@@ -247,6 +308,23 @@ export interface TurnServer {
   credential: string;
 }
 
+/** Positive safe-integer slot geometry. */
+export interface MappedSizeClass { bytes: number; slots: number; }
+/** Per-session pool; requires mapped-buffers on Windows/Linux. All limits are safe integers. */
+export interface MappedPoolConfig {
+  classes: MappedSizeClass[];
+  maxBytes: number;
+  maxLeases: number;
+}
+
+/** Unified core policy; budgets must be nonnegative safe integers. */
+export interface PipelineBufferConfig {
+  policy: 'allow_copies' | 'require_zero_copy';
+  nodeRetentionOwners: number;
+  nodeRetentionBytes: number;
+  mappedPool?: MappedPoolConfig;
+}
+
 /** WebRTC server configuration */
 export interface WebRtcServerConfig {
   /** Port for embedded signaling server (mutually exclusive with signalingUrl) */
@@ -265,6 +343,10 @@ export interface WebRtcServerConfig {
   audioCodec?: 'opus';
   /** Video codec */
   videoCodec?: 'vp8' | 'vp9' | 'h264';
+  /** Policy for instrumented transport copies; defaults to allow_copies. */
+  transportMaterializationPolicy?: 'allow_copies' | 'require_zero_copy';
+  /** Overrides independent policy and requires both explicit retention budgets. */
+  pipelineBuffers?: PipelineBufferConfig;
 }
 
 /** Peer media capabilities */
@@ -350,15 +432,21 @@ export interface WebRtcSession {
   /**
    * Broadcast data to all peers in the session
    * @param data - Data to broadcast
+   * @param requireZeroCopy - Reject instead of snapshotting. The JS Buffer
+   *   stays mutable, so sending it is a counted copy
+   *   (see `nodejsBufferCopyReport`).
    */
-  broadcast(data: Buffer): Promise<void>;
+  broadcast(data: Buffer, requireZeroCopy?: boolean): Promise<void>;
 
   /**
    * Send data to a specific peer in the session
    * @param peerId - Target peer ID
    * @param data - Data to send
+   * @param requireZeroCopy - Reject instead of snapshotting. The JS Buffer
+   *   stays mutable, so sending it is a counted copy
+   *   (see `nodejsBufferCopyReport`).
    */
-  sendToPeer(peerId: string, data: Buffer): Promise<void>;
+  sendToPeer(peerId: string, data: Buffer, requireZeroCopy?: boolean): Promise<void>;
 
   /**
    * Add a peer to this session
@@ -413,14 +501,20 @@ export interface WebRtcServer {
    * Send data to a specific peer
    * @param peerId - Target peer ID
    * @param data - Data to send
+   * @param requireZeroCopy - Reject instead of snapshotting. The JS Buffer
+   *   stays mutable, so sending it is a counted copy
+   *   (see `nodejsBufferCopyReport`).
    */
-  sendToPeer(peerId: string, data: Buffer): Promise<void>;
+  sendToPeer(peerId: string, data: Buffer, requireZeroCopy?: boolean): Promise<void>;
 
   /**
    * Broadcast data to all connected peers
    * @param data - Data to broadcast
+   * @param requireZeroCopy - Reject instead of snapshotting. The JS Buffer
+   *   stays mutable, so sending it is a counted copy
+   *   (see `nodejsBufferCopyReport`).
    */
-  broadcast(data: Buffer): Promise<void>;
+  broadcast(data: Buffer, requireZeroCopy?: boolean): Promise<void>;
 
   /**
    * Disconnect a peer
@@ -483,6 +577,7 @@ export const WebRtcServer: WebRtcServerFactory | undefined;
 // =============================================================================
 
 export * from './proto-utils';
+export * from './native-buffers';
 
 import * as protoUtilsModule from './proto-utils';
 export const protoUtils: typeof protoUtilsModule;

@@ -4,6 +4,7 @@
 //! It implements JSON-RPC 2.0 over WebSocket for browser compatibility.
 
 mod control_handlers;
+mod control_wire;
 mod events;
 mod handler;
 mod server;

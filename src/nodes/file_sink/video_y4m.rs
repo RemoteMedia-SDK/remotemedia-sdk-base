@@ -8,34 +8,36 @@
 //!
 //! ## Format
 //!
-//! `C420jpeg` (YUV420p, JPEG-range chroma siting). The renderer
-//! emits RGB24 (per `Live2DRenderNode`); we convert to YUV420p
-//! per frame using the standard BT.601 coefficients. Subsequent
-//! ffmpeg conversion to H.264 / VP9 / etc. has no quality loss
-//! beyond the RGB→YUV step.
+//! `C420jpeg` (YUV420p, JPEG chroma siting). RGB24 converts with
+//! the existing full-range BT.601 coefficients directly into a
+//! context-selected loan. Planar YUV420p/I420 writes directly from
+//! the incoming owner; it does not convert color range or siting.
+//! All outputs forward the original input, including RGB pixels.
 //!
 //! ## Lifecycle
 //!
 //! - First Video frame: writes Y4M header (captures width / height
-//!   / fps from the first frame's metadata).
+//!   and uses the configured fps).
 //! - Each Video frame: writes `FRAME\n` + Y plane + Cb plane + Cr
 //!   plane.
 //! - On `Drop`: simply closes the file (no fixup needed — Y4M has
 //!   no length fields).
 //!
-//! ## Inferring fps
+//! ## Timing and I/O limits
 //!
-//! `RuntimeData::Video` carries `timestamp_us` per frame. We
-//! capture the first frame's pts as t0, then default to 30 fps
-//! for the header. Mismatches between header fps and actual frame
-//! cadence are not a correctness issue — Y4M readers tolerate
-//! variable frame rate; the header is a pacing hint.
+//! The header uses the configured positive integer fps (default 30).
+//! Per-frame timestamps remain in forwarded RuntimeData, not the file.
+//! Writes are synchronous OS calls; no real-time or physical-copy claim
+//! follows from retaining framework owners. A filesystem error can leave
+//! a partial file. Allocation failures happen before file modification.
 
 use crate::data::RuntimeData;
 use crate::error::Result;
 use crate::nodes::AsyncStreamingNode;
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use remotemedia_traits::runtime_context::NodeRuntimeContextRead;
+use remotemedia_types::{HeapOutputAllocator, OutputAllocator};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Write;
@@ -107,8 +109,44 @@ impl AsyncStreamingNode for VideoFileWriterNode {
     }
 
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
-        write_one(&self.state, &self.config, &data)?;
+        write_one(&self.state, &self.config, &data, Some(&HeapOutputAllocator))?;
         Ok(data)
+    }
+
+    async fn process_with_ctx(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData> {
+        let allocator = ctx.output_allocator();
+        write_one(&self.state, &self.config, &data, allocator.as_deref())?;
+        Ok(data)
+    }
+
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: std::collections::HashMap<String, RuntimeData>,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData> {
+        let data = inputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::Execution("No input data provided".into()))?
+            .1;
+        self.process_with_ctx(data, ctx).await
+    }
+
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+        mut callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        callback(self.process_with_ctx(data, ctx).await?)?;
+        Ok(1)
     }
 }
 
@@ -116,6 +154,7 @@ fn write_one(
     state: &Mutex<WriterState>,
     config: &VideoFileWriterConfig,
     data: &RuntimeData,
+    allocator: Option<&dyn OutputAllocator>,
 ) -> Result<()> {
     let RuntimeData::Video {
         pixel_data,
@@ -128,64 +167,83 @@ fn write_one(
         return Ok(()); // pass-through non-video
     };
     use crate::data::video::PixelFormat;
-    if !matches!(format, PixelFormat::Rgb24) {
-        tracing::warn!(
-            "VideoFileWriterNode: dropping frame with format {:?} \
-             (expected Rgb24)",
-            format
-        );
-        return Ok(());
+    if !matches!(
+        format,
+        PixelFormat::Rgb24 | PixelFormat::Yuv420p | PixelFormat::I420
+    ) {
+        return Err(crate::Error::InvalidData(
+            "Y4M sink supports only RGB24, YUV420p and I420".into(),
+        ));
     }
-    let expected_len = (*width as usize) * (*height as usize) * 3;
-    if pixel_data.len() != expected_len {
-        tracing::warn!(
-            "VideoFileWriterNode: dropping frame with bad payload \
-             length {} (expected {} for {}x{} RGB24)",
-            pixel_data.len(),
-            expected_len,
-            width,
-            height
-        );
-        return Ok(());
+    data.validate_shared_layout(remotemedia_types::TensorEncoding::Runtime)
+        .map_err(|error| crate::Error::InvalidData(format!("Y4M input: {error}")))?;
+    if config.fps == 0 {
+        return Err(crate::Error::InvalidData(
+            "Y4M frame rate must be positive".into(),
+        ));
     }
 
     let mut s = state.lock();
-    if s.file.is_none() {
-        if let Some(parent) = config.output_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let mut f = File::create(&config.output_path).map_err(|e| {
-            crate::Error::Execution(format!(
-                "VideoFileWriterNode: open {:?}: {e}",
-                config.output_path
-            ))
-        })?;
-        write_y4m_header(&mut f, *width, *height, config.fps)?;
-        s.file = Some(f);
-        s.width = *width;
-        s.height = *height;
-    }
-
-    if *width != s.width || *height != s.height {
-        tracing::warn!(
-            "VideoFileWriterNode: dropping frame with mismatched dimensions \
-             ({}x{} vs initial {}x{})",
-            width,
-            height,
-            s.width,
-            s.height
-        );
+    if s.file.is_some() && (*width != s.width || *height != s.height) {
+        tracing::warn!("VideoFileWriterNode: dropping frame with mismatched dimensions");
         return Ok(());
     }
+    // Reserve and compute before creating the file or emitting a FRAME marker.
+    // Allocation failure must leave the current file unchanged and permit retry.
+    let converted = if *format == PixelFormat::Rgb24 {
+        let allocator = allocator.ok_or_else(|| {
+            crate::Error::Execution("Y4M RGB conversion requires an output allocator".into())
+        })?;
+        let mut loan = allocator
+            .allocate_bytes(crate::data::video::yuv420p_size(
+                *width as usize,
+                *height as usize,
+            )?)
+            .map_err(|error| crate::Error::Execution(format!("Y4M output allocation: {error}")))?;
+        crate::data::video::rgb24_to_yuv420p_into(
+            pixel_data,
+            *width as usize,
+            *height as usize,
+            &mut loan,
+        )?;
+        Some(loan)
+    } else {
+        None
+    };
+    let bytes = converted.as_deref().unwrap_or(pixel_data.as_slice());
+    s.append(config, *width, *height, bytes)
+}
 
-    let f = s.file.as_mut().expect("file open after init");
-    f.write_all(b"FRAME\n")
-        .map_err(|e| crate::Error::Execution(format!("Y4M FRAME marker: {e}")))?;
-    let yuv = crate::data::video::rgb24_to_yuv420p(pixel_data, *width as usize, *height as usize);
-    f.write_all(&yuv)
-        .map_err(|e| crate::Error::Execution(format!("Y4M frame data: {e}")))?;
-    s.frames_written += 1;
-    Ok(())
+impl WriterState {
+    fn append(
+        &mut self,
+        config: &VideoFileWriterConfig,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if self.file.is_none() {
+            let path = &config.output_path;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            let mut f = File::create(path).map_err(|e| {
+                crate::Error::Execution(format!("VideoFileWriterNode: open {path:?}: {e}"))
+            })?;
+            write_y4m_header(&mut f, width, height, config.fps)?;
+            self.file = Some(f);
+            self.width = width;
+            self.height = height;
+        }
+
+        let f = self.file.as_mut().expect("file open after init");
+        f.write_all(b"FRAME\n")
+            .map_err(|e| crate::Error::Execution(format!("Y4M FRAME marker: {e}")))?;
+        f.write_all(bytes)
+            .map_err(|e| crate::Error::Execution(format!("Y4M frame data: {e}")))?;
+        self.frames_written += 1;
+        Ok(())
+    }
 }
 
 fn write_y4m_header(f: &mut File, width: u32, height: u32, fps: u32) -> Result<()> {
@@ -195,7 +253,7 @@ fn write_y4m_header(f: &mut File, width: u32, height: u32, fps: u32) -> Result<(
     //   F{n}:{d}    — frame rate as a rational (n/d)
     //   Ip          — progressive interlacing
     //   A1:1        — square pixel aspect
-    //   C420jpeg    — YUV420p, JPEG-range chroma siting
+    //   C420jpeg    — YUV420p, JPEG chroma siting (not a color-range declaration)
     let header = format!(
         "YUV4MPEG2 W{} H{} F{}:1 Ip A1:1 C420jpeg\n",
         width, height, fps
@@ -212,7 +270,7 @@ mod tests {
 
     fn rgb_frame(w: u32, h: u32, fill: u8) -> RuntimeData {
         RuntimeData::Video {
-            pixel_data: vec![fill; (w * h * 3) as usize],
+            pixel_data: vec![fill; (w * h * 3) as usize].into(),
             width: w,
             height: h,
             format: PixelFormat::Rgb24,

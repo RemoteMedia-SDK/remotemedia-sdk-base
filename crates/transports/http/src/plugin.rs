@@ -69,6 +69,16 @@ impl TransportPlugin for HttpTransportPlugin {
             .await
             .map_err(|e| remotemedia_core::Error::Transport(e.to_string()))?;
 
+        let policy = copy_policy(
+            config
+                .extra_config
+                .as_ref()
+                .unwrap_or(&serde_json::Value::Null),
+        )?;
+        let client = client.with_copy_context(remotemedia_types::CopyContext::new(
+            policy,
+            format!("http/client/{}", uuid::Uuid::new_v4()),
+        ));
         Ok(Box::new(client))
     }
 
@@ -116,13 +126,22 @@ impl TransportPlugin for HttpTransportPlugin {
     ///
     /// # Returns
     ///
-    /// Always returns `Ok(())` as HTTP accepts flexible configuration.
-    fn validate_config(&self, _extra_config: &serde_json::Value) -> Result<()> {
-        // HTTP accepts any extra configuration (headers, timeouts, etc.)
-        // Validation can be added here if specific config schema is needed
-        Ok(())
+    /// Validates the optional copy_policy; other transport options remain open.
+    fn validate_config(&self, extra_config: &serde_json::Value) -> Result<()> {
+        copy_policy(extra_config).map(|_| ())
     }
 }
+
+fn copy_policy(config: &serde_json::Value) -> Result<remotemedia_types::CopyPolicy> {
+    config
+        .get("copy_policy")
+        .map(|value| serde_json::from_value(value.clone()).map_err(crate::codec::error))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

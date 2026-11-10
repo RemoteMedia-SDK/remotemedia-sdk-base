@@ -62,6 +62,18 @@ pub struct InitializeContext {
 }
 
 impl InitializeContext {
+    /// Attach the session's existing ledger without changing context literals.
+    /// The wrapper preserves the host-context downcast used by legacy adapters.
+    pub fn with_copy_context(
+        self,
+        copies: remotemedia_types::CopyContext,
+    ) -> impl InitializeContextRead {
+        InitializeContextWithCopies {
+            context: self,
+            copies,
+        }
+    }
+
     /// Emit a progress event on the control bus.
     ///
     /// Clients subscribed to `__system__.out` receive these as JSON events
@@ -112,10 +124,36 @@ impl remotemedia_traits::runtime_context::InitializeContextRead for InitializeCo
     }
 }
 
+struct InitializeContextWithCopies {
+    context: InitializeContext,
+    copies: remotemedia_types::CopyContext,
+}
+
+impl InitializeContextRead for InitializeContextWithCopies {
+    fn copy_context(&self) -> Option<remotemedia_types::CopyContext> {
+        Some(self.copies.clone())
+    }
+    fn session_id(&self) -> &str {
+        &self.context.session_id
+    }
+    fn node_id(&self) -> &str {
+        &self.context.node_id
+    }
+    fn emit_progress(&self, status: &str, message: &str) {
+        self.context.emit_progress(status, message)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        &self.context
+    }
+}
+
 /// Registry for streaming nodes
 #[derive(Clone)]
 pub struct StreamingNodeRegistry {
     factories: HashMap<String, Arc<dyn StreamingNodeFactory>>,
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    session_workers:
+        HashMap<String, Arc<dyn crate::multiprocess::native_worker::SessionWorkerFactory>>,
     /// Build identity of node types registered with one (loadable / Python
     /// plugins). Types absent here are built-in, or Python when the factory
     /// says so.
@@ -127,6 +165,8 @@ impl StreamingNodeRegistry {
     pub fn new() -> Self {
         Self {
             factories: HashMap::new(),
+            #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+            session_workers: HashMap::new(),
             implementations: HashMap::new(),
         }
     }
@@ -134,6 +174,8 @@ impl StreamingNodeRegistry {
     /// Register a streaming node factory
     pub fn register(&mut self, factory: Arc<dyn StreamingNodeFactory>) {
         let node_type = factory.node_type().to_string();
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        self.session_workers.remove(&node_type);
         self.implementations.remove(&node_type);
         self.factories.insert(node_type, factory);
     }
@@ -146,6 +188,8 @@ impl StreamingNodeRegistry {
         implementation: crate::telemetry::NodeImplementation,
     ) {
         let node_type = factory.node_type().to_string();
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        self.session_workers.remove(&node_type);
         self.implementations
             .insert(node_type.clone(), implementation);
         self.factories.insert(node_type, factory);
@@ -174,6 +218,43 @@ impl StreamingNodeRegistry {
         self.factories.drain()
     }
 
+    /// Register a trusted mapped worker template. PipelineExecutor binds only the
+    /// templates used by a manifest, using that session's own shared pool.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub fn register_session_worker(
+        &mut self,
+        factory: Arc<dyn crate::multiprocess::native_worker::SessionWorkerFactory>,
+    ) {
+        let node_type = factory.node_type().to_string();
+        self.register(factory.clone());
+        self.session_workers.insert(node_type, factory);
+    }
+
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub(crate) fn session_worker(
+        &self,
+        node_type: &str,
+    ) -> Option<&Arc<dyn crate::multiprocess::native_worker::SessionWorkerFactory>> {
+        self.session_workers.get(node_type)
+    }
+
+    /// Replace a session template's executable factory while retaining its
+    /// registration provenance for preflight. Ordinary register clears it.
+    #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+    pub(crate) fn bind_session_worker(
+        &mut self,
+        node_type: &str,
+        factory: Arc<dyn StreamingNodeFactory>,
+    ) -> Result<(), Error> {
+        if !self.session_workers.contains_key(node_type) || factory.node_type() != node_type {
+            return Err(crate::Error::ConfigError(
+                "session worker binding changed its registered node type".into(),
+            ));
+        }
+        self.factories.insert(node_type.to_owned(), factory);
+        Ok(())
+    }
+
     /// Merge the factories from `other` into `self`, consuming `other`.
     ///
     /// Factories from `other` override any existing entries in `self` with
@@ -189,8 +270,13 @@ impl StreamingNodeRegistry {
                     self.implementations.remove(&k);
                 }
             }
+            // An ordinary registration replaces any session-worker template.
+            #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+            self.session_workers.remove(&k);
             self.factories.insert(k, v);
         }
+        #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+        self.session_workers.extend(other.session_workers.drain());
     }
 
     /// Create a streaming node by type
@@ -368,6 +454,8 @@ mod runtime_context_default_tests {
 
     fn ctx_for(node_id: &str, session_id: &str) -> NodeRuntimeContext {
         NodeRuntimeContext {
+            source_completion: None,
+            materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from(session_id),
             node_id: Arc::from(node_id),
             control: SessionControl::new(session_id),
@@ -375,6 +463,7 @@ mod runtime_context_default_tests {
             input_snapshots: Arc::new(HashMap::new()),
             session_state: Arc::new(()),
             cancel_gate: Arc::new(crate::transport::CancelGate::new()),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
         }
     }
 

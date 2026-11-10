@@ -15,12 +15,17 @@ pub enum PythonExecutionMode {
     Multiprocess,
     /// Run in-process via PyO3 (Android, or opt-in on Linux/macOS)
     InProcess,
+    /// Explicit owning-buffer hooks with a call-selected output allocator.
+    InProcessShared,
 }
 
 impl PythonExecutionMode {
     /// Check if this is in-process mode
     pub fn is_inprocess(&self) -> bool {
-        matches!(self, PythonExecutionMode::InProcess)
+        matches!(
+            self,
+            PythonExecutionMode::InProcess | PythonExecutionMode::InProcessShared
+        )
     }
 
     /// Check if this is multiprocess mode
@@ -60,6 +65,13 @@ pub struct PythonNodeConfig {
     /// Execution mode: "multiprocess" (default) or "inprocess" (PyO3)
     pub execution_mode: PythonExecutionMode,
 
+    /// Authored bounds for the explicit in-process owning-buffer adapter.
+    /// None leaves strict preflight unsupported; types alone imply no bounds.
+    pub shared_buffer_contract: Option<remotemedia_traits::buffer_contract::BufferContract>,
+    /// Explicit wall-clock source rate for the owning `tick_shared(tick, ctx)` hook.
+    /// Range is 1..=1_000_000 Hz (the pacer's microsecond resolution).
+    /// None keeps input-driven execution.
+    pub shared_source_rate_hz: Option<u32>,
     /// JSON Schema for the node's manifest `params` (documentation and
     /// `remotemedia validate` checks). Python nodes accept `**kwargs`, so
     /// these schemas describe known params without forbidding others.
@@ -78,12 +90,38 @@ impl Default for PythonNodeConfig {
             accepts: Vec::new(),
             produces: Vec::new(),
             execution_mode: PythonExecutionMode::default(),
+            shared_buffer_contract: None,
+            shared_source_rate_hz: None,
             config_schema: None,
         }
     }
 }
 
 impl PythonNodeConfig {
+    /// Select owning source execution. Each tick returns an iterable of published
+    /// outputs; an empty iterable is a quiet tick, not end-of-stream.
+    pub fn with_shared_source(mut self, rate_hz: u32) -> Self {
+        self.shared_source_rate_hz = Some(rate_hz);
+        self.with_shared_buffers()
+    }
+
+    /// Select owning-buffer execution and declare its bounded runtime contract.
+    /// Preflight and runtime guards validate this promise before/during execution.
+    pub fn with_shared_buffer_contract(
+        mut self,
+        contract: remotemedia_traits::buffer_contract::BufferContract,
+    ) -> Self {
+        self.shared_buffer_contract = Some(contract);
+        self.with_shared_buffers()
+    }
+
+    /// Select synchronous `process_shared` / `process_streaming_shared` hooks.
+    /// Nodes must publish allocator-backed outputs; private arrays are rejected.
+    pub fn with_shared_buffers(mut self) -> Self {
+        self.execution_mode = PythonExecutionMode::InProcessShared;
+        self
+    }
+
     /// Create a new config with just the node type (python_class defaults to node_type)
     pub fn new(node_type: impl Into<String>) -> Self {
         let node_type = node_type.into();

@@ -23,6 +23,7 @@ pub type VideoTrackCreator = Box<dyn Fn(&str) -> Result<Arc<VideoTrack>> + Send 
 /// - Automatic track creation on first frame (FR-008)
 /// - Fallback to default track when stream_id is None (FR-006)
 pub struct FrameRouter {
+    copies: remotemedia_types::CopyContext,
     /// Track registry for looking up and managing tracks
     registry: Arc<TrackRegistry<AudioTrack, VideoTrack>>,
 
@@ -48,12 +49,19 @@ impl FrameRouter {
     /// * `peer_id` - Peer identifier for logging
     pub fn new(registry: Arc<TrackRegistry<AudioTrack, VideoTrack>>, peer_id: String) -> Self {
         Self {
+            copies: remotemedia_types::CopyContext::legacy().clone(),
             registry,
             audio_track_creator: None,
             video_track_creator: None,
             peer_id,
             auto_create_tracks: true, // Default to auto-create
         }
+    }
+
+    /// Bind audio materialization to a caller-selected transport authority.
+    pub fn with_copy_context(mut self, copies: remotemedia_types::CopyContext) -> Self {
+        self.copies = copies;
+        self
     }
 
     /// Set the callback for creating audio tracks dynamically
@@ -157,14 +165,8 @@ impl FrameRouter {
             ..
         } = data
         {
-            // Send audio through the track.
-            // `send_audio` currently takes `Arc<Vec<f32>>`; convert from
-            // `AudioSamples` here. `into_vec` reuses the allocation for
-            // the `Vec` variant; the `Arc` / `Pooled` variants allocate
-            // once. Upgrading `send_audio` to accept `Arc<[f32]>` would
-            // make the `Arc` variant zero-copy end-to-end.
             track
-                .send_audio(Arc::new(samples.into_vec()), sample_rate)
+                .send_audio_with_context(samples.into_shared(), sample_rate, &self.copies)
                 .await
                 .map_err(|e| Error::MediaTrackError(format!("Failed to send audio: {}", e)))?;
 
@@ -186,7 +188,7 @@ impl FrameRouter {
 
         // Send video through the track
         track
-            .send_video_runtime_data(data)
+            .send_video_runtime_data_with_context(data, &self.copies)
             .await
             .map_err(|e| Error::MediaTrackError(format!("Failed to send video: {}", e)))?;
 
@@ -374,7 +376,7 @@ mod tests {
         use remotemedia_core::data::video::PixelFormat;
 
         let data = RuntimeData::Video {
-            pixel_data: vec![0u8; 100],
+            pixel_data: vec![0u8; 100].into(),
             width: 640,
             height: 480,
             format: PixelFormat::Yuv420p,
@@ -431,7 +433,7 @@ mod tests {
         use remotemedia_core::data::video::PixelFormat;
 
         let data = RuntimeData::Video {
-            pixel_data: vec![128u8; 100],
+            pixel_data: vec![128u8; 100].into(),
             width: 640,
             height: 480,
             format: PixelFormat::Rgb24,

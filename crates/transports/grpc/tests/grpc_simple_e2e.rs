@@ -175,7 +175,8 @@ async fn test_pipeline_runner_end_to_end() {
             0, 255, 0, // green
             0, 0, 255, // blue
             255, 255, 255, // white
-        ],
+        ]
+        .into(),
         width: 2,
         height: 2,
         format: PixelFormat::Rgb24,

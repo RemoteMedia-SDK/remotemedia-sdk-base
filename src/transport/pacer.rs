@@ -43,7 +43,7 @@ use crate::nodes::{NodeRuntimeContext, StreamingNode, Tick};
 use crate::transport::perf_aggregator::PerfAggregator;
 use crate::Result;
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 /// What to do when a node's `tick()` overruns its per-frame deadline.
@@ -73,13 +73,6 @@ impl Default for OnMiss {
     fn default() -> Self {
         OnMiss::Drop
     }
-}
-
-/// Rate-limit state for fan_tx backpressure drop warnings. Shared
-/// across all per-tick callbacks within a single Pacer's `run()` loop.
-struct DropSummary {
-    count: u64,
-    last_log: Instant,
 }
 
 /// Rate-limit state for transient tick errors. These are expected while
@@ -258,6 +251,7 @@ impl TickSource for WallTickSource {
 /// stored alongside the node's main + fan-out tasks and aborted on
 /// session shutdown.
 pub struct Pacer {
+    completion: Option<tokio::sync::oneshot::Sender<()>>,
     node_id: String,
     node: Arc<dyn StreamingNode>,
     ctx: NodeRuntimeContext,
@@ -291,6 +285,7 @@ impl Pacer {
     ) -> Self {
         Self {
             node_id: node_id.into(),
+            completion: None,
             node,
             ctx,
             fan_tx,
@@ -308,35 +303,60 @@ impl Pacer {
         self
     }
 
+    pub(crate) fn with_completion(
+        mut self,
+        completion: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Self {
+        self.completion = completion;
+        self
+    }
+
     /// Spawn the Pacer's main loop on the current tokio runtime.
     /// Returns the `JoinHandle` so the caller can `.abort()` it on
-    /// shutdown.
-    pub fn spawn(self) -> JoinHandle<()> {
-        tokio::spawn(tracing::Instrument::in_current_span(self.run()))
+    /// shutdown. The owner must join and propagate the returned node error.
+    pub fn spawn(self) -> JoinHandle<Result<()>> {
+        tokio::spawn(tracing::Instrument::in_current_span(self.run(None)))
+    }
+
+    /// Stop between ticks when the returned sender requests draining. An active
+    /// tick may finish publishing; session shutdown can still interrupt it.
+    pub(crate) fn spawn_draining(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> (JoinHandle<Result<()>>, watch::Sender<bool>) {
+        let (stop, stopping) = watch::channel(false);
+        let handle = tokio::spawn(tracing::Instrument::in_current_span(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|requested| *requested) => Ok(()),
+                result = self.run(Some(stopping)) => result,
+            }
+        }));
+        (handle, stop)
     }
 
     /// Main loop: pull a tick, dispatch, measure, apply on-miss
-    /// policy, repeat. Exits when the tick source returns `None`.
-    async fn run(mut self) {
-        // Aggregated fan_tx-full drop counter shared across all per-tick
-        // callbacks. A paced node firing at 30 Hz with a saturated
-        // downstream channel would otherwise emit ~30 warns/sec — the
-        // log spam buries every other diagnostic. Drops are accumulated
-        // here and surfaced as a single summary warn at most once per
-        // `DROP_LOG_INTERVAL`.
-        const DROP_LOG_INTERVAL: Duration = Duration::from_secs(5);
-        let drop_summary: Arc<std::sync::Mutex<DropSummary>> =
-            Arc::new(std::sync::Mutex::new(DropSummary {
-                count: 0,
-                last_log: Instant::now() - DROP_LOG_INTERVAL,
-            }));
+    /// policy, repeat. Exits when the tick source returns `None`. Returned node
+    /// errors fail the source, except the existing transient unbound-WebRTC case.
+    async fn run(mut self, mut stopping: Option<watch::Receiver<bool>>) -> Result<()> {
         const TRANSIENT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
         let mut transient_error_summary = TickErrorSummary {
             count: 0,
             last_log: Instant::now() - TRANSIENT_ERROR_LOG_INTERVAL,
         };
 
-        while let Some(tick) = self.source.next().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = async {
+                    match &mut stopping {
+                        Some(stop) => { let _ = stop.wait_for(|requested| *requested).await; }
+                        None => std::future::pending().await,
+                    }
+                } => None,
+                tick = self.source.next() => tick,
+            };
+            let Some(tick) = next else { break };
             let started = Instant::now();
             let deadline = Duration::from_micros(tick.deadline_us);
             let budget = deadline.saturating_sub(Duration::from_micros(tick.pts_us));
@@ -351,7 +371,6 @@ impl Pacer {
             let cb_drop_late = Arc::clone(&drop_late);
             let cb_perf = self.perf.clone();
             let cb_first_emit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let cb_drop_summary = Arc::clone(&drop_summary);
             let cb: Box<dyn FnMut(RuntimeData) -> Result<()> + Send> = Box::new(move |out| {
                 if cb_drop_late.load(std::sync::atomic::Ordering::Relaxed) {
                     // Late frame; the on-miss policy chose to
@@ -359,6 +378,7 @@ impl Pacer {
                     // emitted once at miss-detection time.
                     return Ok(());
                 }
+                crate::transport::output_delivery::send_output(&cb_fan_tx, &cb_node_id, out)?;
                 // Perf instrumentation: record one output per
                 // emit, with latency measured from the start of
                 // this tick. Without this, paced nodes
@@ -371,33 +391,15 @@ impl Pacer {
                     let is_first = !cb_first_emit.swap(true, std::sync::atomic::Ordering::Relaxed);
                     perf.record_output(&cb_node_id, lat_us, is_first);
                 }
-                if let Err(e) = cb_fan_tx.try_send(out) {
-                    // Aggregate drops across ticks; emit a single
-                    // summary at most once per DROP_LOG_INTERVAL so
-                    // a saturated downstream channel doesn't flood
-                    // the log at the tick rate.
-                    if let Ok(mut s) = cb_drop_summary.lock() {
-                        s.count = s.count.saturating_add(1);
-                        if s.last_log.elapsed() >= DROP_LOG_INTERVAL {
-                            tracing::warn!(
-                                pacer_node = %cb_node_id,
-                                dropped = s.count,
-                                interval_s = DROP_LOG_INTERVAL.as_secs(),
-                                last_error = %e,
-                                "Pacer: fan_tx backpressure (suppressed per-frame warns)"
-                            );
-                            s.count = 0;
-                            s.last_log = Instant::now();
-                        }
-                    }
-                }
+
                 Ok(())
             });
 
-            // Invoke the node's tick. Errors are logged + swallowed —
-            // a misbehaving node should not crash the Pacer. The
-            // callback may fire 0..N times depending on the node.
-            if let Err(e) = self.node.tick(tick.clone(), &self.ctx, cb).await {
+            // Preserve failures (including callback rejection and allocation
+            // errors) for the owning session. A quiet tick is Ok with no output.
+            let result = self.dispatch_tick(tick.clone(), cb).await;
+            let finished = matches!(result, Ok(true));
+            if let Err(e) = result {
                 if is_transient_unbound_tick_error(&e) {
                     transient_error_summary.count = transient_error_summary.count.saturating_add(1);
                     if transient_error_summary.last_log.elapsed() >= TRANSIENT_ERROR_LOG_INTERVAL {
@@ -412,12 +414,12 @@ impl Pacer {
                         transient_error_summary.last_log = Instant::now();
                     }
                 } else {
-                    tracing::warn!(
-                        pacer_node = %self.node_id,
-                        error = %e,
-                        "Pacer: tick returned error"
-                    );
+                    return Err(e);
                 }
+            }
+
+            if finished {
+                break;
             }
 
             let elapsed = started.elapsed();
@@ -454,6 +456,27 @@ impl Pacer {
             pacer_node = %self.node_id,
             "Pacer: tick source exhausted, exiting"
         );
+        Ok(())
+    }
+
+    /// Close escaped contexts on every return path; only successful ticks can
+    /// commit the request to the router. Dropping this future closes the scope.
+    async fn dispatch_tick(
+        &mut self,
+        tick: Tick,
+        output: Box<dyn FnMut(RuntimeData) -> Result<()> + Send>,
+    ) -> Result<bool> {
+        let (context, scope) = self.ctx.for_source_tick();
+        let result = self.node.tick(tick, &context, output).await;
+        let requested = scope.close();
+        result?;
+        if !requested {
+            return Ok(false);
+        }
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(());
+        }
+        Ok(true)
     }
 }
 
@@ -497,6 +520,7 @@ mod tests {
     /// tick's frame_idx; pure, no state, no async.
     struct CountingTickNode {
         node_id: String,
+        first_error: Option<&'static str>,
     }
     #[async_trait::async_trait]
     impl StreamingNode for CountingTickNode {
@@ -532,6 +556,11 @@ mod tests {
             _: &dyn NodeRuntimeContextRead,
             mut cb: Box<dyn FnMut(RuntimeData) -> Result<()> + Send>,
         ) -> std::result::Result<(), crate::Error> {
+            if tick.frame_idx == 0 {
+                if let Some(message) = self.first_error {
+                    return Err(crate::Error::Execution(message.into()));
+                }
+            }
             cb(RuntimeData::Json(serde_json::json!({
                 "frame_idx": tick.frame_idx
             })))
@@ -546,6 +575,7 @@ mod tests {
     async fn pacer_drives_node_once_per_tick_then_exits() {
         let node: Arc<dyn StreamingNode> = Arc::new(CountingTickNode {
             node_id: "tick".into(),
+            first_error: None,
         });
         let ctx = NodeRuntimeContext::for_test("sess-1", "tick");
 
@@ -574,7 +604,93 @@ mod tests {
             }
         }
 
-        let _ = handle.await;
+        handle.await.unwrap().unwrap();
         assert_eq!(frames, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn pacer_returns_closed_and_full_output_queue_errors() {
+        for closed in [false, true] {
+            let node = Arc::new(CountingTickNode {
+                node_id: "rejected".into(),
+                first_error: None,
+            });
+            let (tx, rx) = mpsc::channel(1);
+            tx.try_send(RuntimeData::Json(serde_json::json!("already full")))
+                .unwrap();
+            let _receiver = if closed {
+                drop(rx);
+                None
+            } else {
+                Some(rx)
+            };
+            let source = Box::new(CannedSource {
+                ticks: [Tick {
+                    clock_id: "test".into(),
+                    frame_idx: 0,
+                    pts_us: 0,
+                    deadline_us: 1000,
+                }]
+                .into(),
+            });
+            let result = Pacer::new(
+                "rejected",
+                node,
+                NodeRuntimeContext::for_test("s", "rejected"),
+                tx,
+                source,
+                OnMiss::Log,
+            )
+            .spawn()
+            .await
+            .unwrap();
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(if closed { "closed" } else { "full" }),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pacer_retries_only_the_existing_unbound_webrtc_case() {
+        for transient in [false, true] {
+            let message = if transient {
+                "WebRTC edge test is not bound"
+            } else {
+                "copy policy denied"
+            };
+            let node = Arc::new(CountingTickNode {
+                node_id: "retry".into(),
+                first_error: Some(message),
+            });
+            let (tx, mut rx) = mpsc::channel(2);
+            let ticks = (0..2)
+                .map(|frame_idx| Tick {
+                    clock_id: "test".into(),
+                    frame_idx,
+                    pts_us: 0,
+                    deadline_us: 1000,
+                })
+                .collect();
+            let result = Pacer::new(
+                "retry",
+                node,
+                NodeRuntimeContext::for_test("s", "retry"),
+                tx,
+                Box::new(CannedSource { ticks }),
+                OnMiss::Log,
+            )
+            .spawn()
+            .await
+            .unwrap();
+            if transient {
+                result.unwrap();
+                assert!(matches!(rx.recv().await, Some(RuntimeData::Json(_))));
+            } else {
+                assert!(result.unwrap_err().to_string().contains(message));
+            }
+            assert!(rx.recv().await.is_none());
+        }
     }
 }

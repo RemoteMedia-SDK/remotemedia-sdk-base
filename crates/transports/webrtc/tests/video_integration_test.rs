@@ -65,7 +65,7 @@ async fn test_vp8_encoder_for_webrtc() {
     let pixel_data = vec![128u8; frame_size];
 
     let raw_frame = RuntimeData::Video {
-        pixel_data,
+        pixel_data: pixel_data.into(),
         width,
         height,
         format: PixelFormat::Yuv420p,

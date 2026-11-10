@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
+#[cfg(test)]
+#[path = "shared_session_copy_tests.rs"]
+mod copy_tests;
+
 /// Broadcast output receivers for one subscriber attached to a shared session.
 pub struct SharedPipelineOutputReceivers {
     pub audio_rx: broadcast::Receiver<TransportData>,
@@ -190,6 +194,25 @@ impl SharedPipelineSession {
         self.input_sender.clone()
     }
 
+    /// Allocate directly against this shared session's ingress storage and budget.
+    pub async fn output_allocator(&self) -> Arc<dyn remotemedia_types::OutputAllocator> {
+        self.session_handle.lock().await.output_allocator()
+    }
+
+    /// Use the core session's transport authority for all attached participants.
+    /// The returned context remains valid after this shared session is closed.
+    pub async fn transport_copy_context(&self) -> remotemedia_types::CopyContext {
+        self.session_handle.lock().await.transport_copy_context()
+    }
+
+    /// Retain the exact node materialization ledgers across participant close.
+    pub async fn node_materialization_copies(&self) -> super::NodeMaterializationCopies {
+        self.session_handle
+            .lock()
+            .await
+            .node_materialization_copies()
+    }
+
     pub fn participant_handle(&self, participant: Participant) -> ParticipantSessionHandle {
         ParticipantSessionHandle::new(self.input_sender(), participant)
     }
@@ -231,7 +254,9 @@ impl SharedPipelineSession {
     ) {
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
-                let _ = tx.send(TransportData::new(data));
+                // Every subscriber clones on receive; promote once so those
+                // clones share one sample allocation.
+                let _ = tx.send(TransportData::new(data.into_shared()));
             }
         });
     }

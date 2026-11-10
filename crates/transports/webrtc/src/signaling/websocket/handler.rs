@@ -3,6 +3,7 @@
 //! Handles individual WebSocket connections and processes JSON-RPC messages.
 
 use super::control_handlers::{handle_control_method, ControlSessionState};
+use super::control_wire::Request;
 use super::events::WebRtcEventBridge;
 use crate::config::WebRtcTransportConfig;
 use crate::peer::ServerPeer;
@@ -27,6 +28,10 @@ use tokio_tungstenite::{
     tungstenite::{Message, Result as WsResult},
 };
 use tracing::{debug, error, info, warn};
+
+#[cfg(test)]
+#[path = "control_live_tests.rs"]
+mod control_live_tests;
 
 /// Peer connection info for WebSocket clients
 pub struct WsPeerConnection {
@@ -201,6 +206,16 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
     Ok(())
 }
 
+async fn send_parse_error(
+    tx: &mpsc::Sender<String>, error: serde_json::Error,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let error = JsonRpcError::new(
+        error_codes::PARSE_ERROR, format!("Failed to parse JSON: {error}"), json!(null),
+    );
+    tx.send(error.to_json()?).await?;
+    Ok(())
+}
+
 /// Handle a JSON-RPC message
 async fn handle_message(
     text: &str,
@@ -210,17 +225,9 @@ async fn handle_message(
     control_state: &Arc<ControlSessionState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Parse JSON-RPC request
-    let request: JsonRpcRequest = match serde_json::from_str(text) {
+    let request: Request<'_> = match serde_json::from_str(text) {
         Ok(req) => req,
-        Err(e) => {
-            let error = JsonRpcError::new(
-                error_codes::PARSE_ERROR,
-                format!("Failed to parse JSON: {}", e),
-                json!(null),
-            );
-            tx.send(error.to_json()?).await?;
-            return Ok(());
-        }
+        Err(e) => return send_parse_error(tx, e).await,
     };
 
     let request_id = request.id.clone().unwrap_or(json!(null));
@@ -266,6 +273,10 @@ async fn handle_message(
         }
     }
 
+    let request = match request.into_owned() {
+        Ok(request) => request,
+        Err(e) => return send_parse_error(tx, e).await,
+    };
     match request.method.as_str() {
         "peer.announce" => {
             handle_announce(request, state, peer_id, tx).await?;

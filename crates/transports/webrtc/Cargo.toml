@@ -36,10 +36,14 @@ hyper = { version = "1", features = ["full"], optional = true }
 hyper-util = { version = "0.1", features = ["default"], optional = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_yaml = { workspace = true }
 base64 = "0.22"
-bytes = "1.5"
+# Borrow little-endian PCM bytes without a staging allocation.
+bytemuck = { workspace = true }
+# from_owner retains immutable runtime owners in WebRTC samples.
+bytes = "1.11"
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "e8fc165eea4064717b6fb23de5f1a18d925533d4" }
 async-trait = { workspace = true }
 clap = { version = "4.5", features = ["derive", "env"], optional = true }
 bollard = { workspace = true }

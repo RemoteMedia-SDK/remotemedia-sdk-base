@@ -86,7 +86,7 @@ fn manifest(nodes: &[&str], conns: &[(&str, &str)]) -> Manifest {
 
 struct Harness {
     control: Arc<SessionControl>,
-    input: mpsc::Sender<DataPacket>,
+    input: crate::transport::SessionPacketSender,
     outputs: ClientOutputReceivers,
     shutdown: mpsc::Sender<()>,
     task: JoinHandle<Result<()>>,

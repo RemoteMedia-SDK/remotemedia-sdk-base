@@ -1,76 +1,71 @@
-//! Streaming wrapper for [`FastFormatConverter`].
+//! Streaming sample quantization with direct output allocation.
 //!
-//! Adapts the synchronous [`FastFormatConverter`] (a [`FastAudioNode`]) into
-//! the async streaming pipeline ([`AsyncStreamingNode`]) so the capability
-//! negotiation layer can splice it in for declared audio sample-format
-//! mismatches between connected nodes.
-//!
-//! # Data-plane caveat
-//!
-//! [`RuntimeData::Audio.samples`] is **always** an F32-backed
-//! [`crate::data::audio_samples::AudioSamples`] today — there is no I16/I32
-//! variant in the streaming runtime's transport. Concretely, this node runs
-//! a **quantize-then-dequantize roundtrip** through [`FastFormatConverter`]:
-//!
-//! 1. Take the F32 samples carried by `RuntimeData::Audio`.
-//! 2. Build an `AudioBuffer::F32`, convert to the configured `target_format`
-//!    via [`FastFormatConverter`].
-//! 3. Convert that back to F32 to repack into the next `RuntimeData::Audio`.
-//!
-//! For a 16-bit target this introduces ~-96 dB of quantization noise — below
-//! the audibility threshold for any realistic signal, but technically not a
-//! no-op. The roundtrip is honest about the data plane's constraint: any node
-//! downstream that declares it accepts only `target_format` will see audio
-//! whose values are quantized to that format's resolution, even though the
-//! transport byte-shape remains F32.
-//!
-//! When a future runtime carries multi-format `AudioSamples` natively, this
-//! wrapper should be updated to bypass the F32 repack and emit the target
-//! format directly.
+//! RuntimeData::Audio carries F32 samples. I16/I32 targets retain the existing
+//! quantize-then-dequantize semantics of FastFormatConverter, computing directly
+//! into one output loan rather than constructing intermediate integer buffers.
+//! F32 is an owning passthrough. This node does not emit native I16/I32 wire data.
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use parking_lot::Mutex;
-use serde_json::Value;
-
-use crate::audio::buffer::{AudioBuffer, AudioData, AudioFormat};
+use crate::audio::buffer::AudioFormat;
 use crate::capabilities::{
     AudioConstraints, AudioSampleFormat, CapabilityBehavior, ConstraintValue, MediaCapabilities,
     MediaConstraints,
 };
 use crate::data::RuntimeData;
 use crate::error::{Error, Result};
-use crate::nodes::audio::{FastAudioNode, FastFormatConverter};
 use crate::nodes::schema::{NodeSchema, RuntimeDataType};
 use crate::nodes::{AsyncStreamingNode, StreamingNode, StreamingNodeFactory};
+use async_trait::async_trait;
+use remotemedia_traits::runtime_context::NodeRuntimeContextRead;
+use remotemedia_types::{HeapOutputAllocator, OutputAllocator};
+use serde_json::Value;
+use std::sync::Arc;
 
-/// `node_type` exposed to manifests and the registry.
 pub const NODE_TYPE: &str = "FastFormatConverterNode";
 
-/// Streaming wrapper around [`FastFormatConverter`].
-///
-/// Holds the inner converter behind a [`parking_lot::Mutex`] because the
-/// underlying `FastAudioNode::process_audio` is `&mut self`. The lock is only
-/// held across a synchronous CPU pass (no `.await`), so `parking_lot::Mutex`
-/// is preferred over the async-aware alternative — same rationale as
-/// `ResampleStreamingNode`.
+/// Stateless quantization into the execution context's selected storage.
 pub struct AudioFormatConverterStreamingNode {
-    inner: Mutex<FastFormatConverter>,
-    /// Buffer format the wrapper is configured to "produce". Even though the
-    /// data leaves as F32 in `RuntimeData::Audio`, the inner converter runs a
-    /// quantize roundtrip into this format so the values match what a future
-    /// native-format consumer would see.
-    #[allow(dead_code)]
     target_format: AudioFormat,
 }
 
 impl AudioFormatConverterStreamingNode {
     pub fn new(target_format: AudioFormat) -> Self {
-        Self {
-            inner: Mutex::new(FastFormatConverter::new(target_format)),
-            target_format,
+        Self { target_format }
+    }
+
+    fn process_allocated(
+        &self,
+        mut data: RuntimeData,
+        allocator: Option<&dyn OutputAllocator>,
+    ) -> Result<RuntimeData> {
+        if self.target_format == AudioFormat::F32 {
+            return Ok(data);
         }
+        let RuntimeData::Audio { samples, .. } = &mut data else {
+            return Ok(data);
+        };
+        let allocator = allocator.ok_or_else(|| {
+            Error::Execution("format converter requires an output allocator".into())
+        })?;
+        let mut output = allocator.allocate_audio(samples.len()).map_err(|error| {
+            Error::Execution(format!("format converter allocation failed: {error}"))
+        })?;
+        // Keep the same clamp, saturating cast, f32 rounding and division as
+        // FastFormatConverter's two passes, including non-finite inputs.
+        match self.target_format {
+            AudioFormat::I16 => {
+                for (out, sample) in output.iter_mut().zip(samples.iter()) {
+                    *out = (sample.clamp(-1.0, 1.0) * 32767.0) as i16 as f32 / 32767.0;
+                }
+            }
+            AudioFormat::I32 => {
+                for (out, sample) in output.iter_mut().zip(samples.iter()) {
+                    *out = (sample.clamp(-1.0, 1.0) * 2147483647.0) as i32 as f32 / 2147483647.0;
+                }
+            }
+            AudioFormat::F32 => unreachable!("identity returned before allocation"),
+        }
+        *samples = output.freeze().into();
+        Ok(data)
     }
 }
 
@@ -81,96 +76,29 @@ impl AsyncStreamingNode for AudioFormatConverterStreamingNode {
     }
 
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
-        // Non-audio passes through unchanged. Mirrors ResampleStreamingNode's
-        // behavior — keeps the node safe to drop into a pipeline that
-        // multiplexes audio + text + control frames on the same connection.
-        if data.data_type() != "audio" {
-            return Ok(data);
-        }
+        self.process_allocated(data, Some(&HeapOutputAllocator))
+    }
 
-        let (samples, sample_rate, channels, stream_id, ts_us, arrival_us, metadata) = match data {
-            RuntimeData::Audio {
-                samples,
-                sample_rate,
-                channels,
-                stream_id,
-                timestamp_us,
-                arrival_ts_us,
-                metadata,
-            } => (
-                samples,
-                sample_rate,
-                channels,
-                stream_id,
-                timestamp_us,
-                arrival_ts_us,
-                metadata,
-            ),
-            other => return Ok(other),
-        };
+    async fn process_with_ctx(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData> {
+        let allocator = ctx.output_allocator();
+        self.process_allocated(data, allocator.as_deref())
+    }
 
-        // Step 1: pack the f32 samples into an AudioBuffer::F32. We deref via
-        // `as_ref` to get a `&[f32]` and only allocate when we cross the
-        // converter boundary — keeps the steady-state hot path cheap.
-        let f32_slice: &[f32] = samples.as_ref();
-        let f32_audio = AudioData::new(
-            AudioBuffer::new_f32(f32_slice.to_vec()),
-            sample_rate,
-            channels as usize,
-        );
-
-        // Step 2: F32 → target_format (the meaningful quantization step).
-        let converted = {
-            let mut inner = self.inner.lock();
-            inner.process_audio(f32_audio)?
-        };
-
-        // Step 3: target_format → F32 for the wire. When target was already
-        // F32 (caller misconfigured us) this short-circuits to a memcpy of the
-        // existing buffer.
-        let out_f32: Vec<f32> = match converted.buffer.format() {
-            AudioFormat::F32 => converted
-                .buffer
-                .as_f32()
-                .map(|s| s.to_vec())
-                .unwrap_or_default(),
-            AudioFormat::I16 => {
-                let mut back = FastFormatConverter::new(AudioFormat::F32);
-                let back_data = back.process_audio(AudioData::new(
-                    converted.buffer.clone(),
-                    converted.sample_rate,
-                    converted.channels,
-                ))?;
-                back_data
-                    .buffer
-                    .as_f32()
-                    .map(|s| s.to_vec())
-                    .unwrap_or_default()
-            }
-            AudioFormat::I32 => {
-                let mut back = FastFormatConverter::new(AudioFormat::F32);
-                let back_data = back.process_audio(AudioData::new(
-                    converted.buffer.clone(),
-                    converted.sample_rate,
-                    converted.channels,
-                ))?;
-                back_data
-                    .buffer
-                    .as_f32()
-                    .map(|s| s.to_vec())
-                    .unwrap_or_default()
-            }
-        };
-
-        Ok(RuntimeData::Audio {
-            samples: out_f32.into(),
-            sample_rate,
-            channels,
-            stream_id,
-            timestamp_us: ts_us,
-            arrival_ts_us: arrival_us,
-            metadata,
-        })
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+        mut callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        callback(self.process_with_ctx(data, ctx).await?)?;
+        Ok(1)
     }
 }
 
@@ -201,12 +129,23 @@ impl FastFormatConverterNodeFactory {
 }
 
 impl StreamingNodeFactory for FastFormatConverterNodeFactory {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>> {
+        super::media_buffer_contract::from_params(
+            params,
+            remotemedia_traits::buffer_contract::BufferLayout::AudioInterleavedF32,
+        )
+    }
+
     fn create(
         &self,
         _node_id: String,
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>> {
+        self.try_buffer_contract(params)?;
         let target_str = params
             .get("target_format")
             .or_else(|| params.get("targetFormat"))
@@ -274,7 +213,7 @@ impl StreamingNodeFactory for FastFormatConverterNodeFactory {
             NodeSchema::new(NODE_TYPE)
                 .description(
                     "Audio sample-format converter (F32/I16/I32). Quantize-then-dequantize \
-                     wrapper over FastFormatConverter; mainly useful for capability negotiation \
+                     with direct output allocation; useful for capability negotiation \
                      of declared sample formats when the runtime carries audio as F32.",
                 )
                 .category("audio")
@@ -283,6 +222,7 @@ impl StreamingNodeFactory for FastFormatConverterNodeFactory {
                 .config_schema(serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "buffer_limits": super::media_buffer_contract::schema(),
                         "target_format": {
                             "type": "string",
                             "enum": ["f32", "i16", "i32"],
@@ -322,6 +262,26 @@ mod tests {
             arrival_ts_us: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn missing_allocator_rejects_only_transforming_audio() {
+        let node = AudioFormatConverterStreamingNode::new(AudioFormat::I16);
+        assert!(node
+            .process_allocated(audio_frame(vec![0.5]), None)
+            .is_err());
+        assert!(node
+            .process_allocated(RuntimeData::Text("control".into()), None)
+            .is_ok());
+        let identity = AudioFormatConverterStreamingNode::new(AudioFormat::F32);
+        let input = vec![f32::from_bits(0x7fc01234), -0.0];
+        let pointer = input.as_ptr();
+        let output = identity
+            .process_allocated(audio_frame(input), None)
+            .unwrap();
+        assert!(matches!(output, RuntimeData::Audio { samples, .. }
+            if samples.as_ptr() == pointer && samples[0].to_bits() == 0x7fc01234
+                && samples[1].to_bits() == (-0.0f32).to_bits()));
     }
 
     #[tokio::test]

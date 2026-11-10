@@ -73,8 +73,8 @@ impl Default for AudioEvidenceConfig {
 /// Audio chunk in the buffer
 #[derive(Debug, Clone)]
 struct AudioChunk {
-    /// Audio samples
-    samples: Vec<f32>,
+    /// Audio samples: a shared view of the input chunk, not a private copy.
+    samples: crate::data::AudioSamples,
     /// Sample rate
     sample_rate: u32,
     /// Number of channels
@@ -256,7 +256,7 @@ impl AudioEvidenceNode {
             }
             let needed = pre_samples - collected.len();
             let start = chunk.samples.len().saturating_sub(needed);
-            collected.extend_from_slice(&chunk.samples[start..]);
+            collected.extend_from_slice(&chunk.samples.as_slice()[start..]);
             // Track metadata from the earliest chunk we're using
             earliest_timestamp = chunk.timestamp_us;
             earliest_sample_rate = chunk.sample_rate;
@@ -319,7 +319,7 @@ impl AudioEvidenceNode {
     /// Process audio data
     fn process_audio(
         &self,
-        samples: Vec<f32>,
+        samples: crate::data::AudioSamples,
         sample_rate: u32,
         channels: u32,
         timestamp_us: u64,
@@ -353,7 +353,7 @@ impl AudioEvidenceNode {
         for clip in &mut state.pending_clips {
             if clip.post_samples_remaining > 0 {
                 let take = clip.post_samples_remaining.min(chunk_samples);
-                clip.samples.extend_from_slice(&samples[..take]);
+                clip.samples.extend_from_slice(&samples.as_slice()[..take]);
                 clip.post_samples_remaining -= take;
             }
         }
@@ -454,7 +454,8 @@ impl AudioEvidenceNode {
                 ..
             } => {
                 let ts = timestamp_us.unwrap_or_else(Self::current_timestamp_us);
-                self.process_audio(samples.to_vec(), *sample_rate, *channels, ts, &mut state);
+                // Shared input storage is retained by reference count.
+                self.process_audio(samples.clone(), *sample_rate, *channels, ts, &mut state);
             }
 
             // Process JSON - check for triggers

@@ -8,47 +8,40 @@
 //! - DELETE /stream/:id - Close session
 //! - GET /health - Health check
 
-use crate::error::{Error, Result};
+mod output;
+mod session;
+use crate::body::JsonBody;
+use crate::{
+    codec,
+    error::{Error, Result},
+};
 use async_trait::async_trait;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
-use futures::stream::Stream;
 use remotemedia_core::manifest::Manifest;
 use remotemedia_core::transport::{
     Participant, PipelineExecutor, PipelineTransport, SharedPipelineStreamSession, StreamSession,
     TransportData,
 };
 use serde::{Deserialize, Serialize};
+use session::{Guard, HttpSession};
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt as _;
+use tokio::sync::RwLock;
 
 /// HTTP server state shared across handlers
 #[derive(Clone)]
 struct ServerState {
     /// Pipeline executor for executing pipelines (spec 026 migration)
     executor: Arc<PipelineExecutor>,
+    copy_observer: Option<Arc<dyn Fn(&str, remotemedia_types::CopyContext) + Send + Sync>>,
     /// Active streaming sessions
-    sessions: Arc<RwLock<HashMap<String, SessionHandle>>>,
-}
-
-/// Handle to a streaming session
-#[allow(dead_code)] // Fields used internally
-struct SessionHandle {
-    /// Session ID
-    session_id: String,
-    /// Stream session from executor (spec 026 migration)
-    session: SessionHandleWrapper,
-    /// Broadcast channel for sending outputs to multiple SSE subscribers
-    output_tx: broadcast::Sender<TransportData>,
+    sessions: Arc<RwLock<HashMap<String, Arc<HttpSession>>>>,
 }
 
 /// HTTP server with SSE streaming support
@@ -74,6 +67,7 @@ impl HttpServer {
     pub async fn new(bind_address: String, executor: Arc<PipelineExecutor>) -> Result<Self> {
         let state = ServerState {
             executor,
+            copy_observer: None,
             sessions: Arc::new(RwLock::new(HashMap::new())),
         };
 
@@ -81,6 +75,27 @@ impl HttpServer {
             bind_address,
             state,
         })
+    }
+
+    /// Observe each unary/streaming session's authority before bulk conversion.
+    /// Retain the context to inspect reports after cleanup. The callback runs
+    /// synchronously; the host controls report retention and should return promptly.
+    pub fn with_copy_observer(
+        mut self,
+        observer: impl Fn(&str, remotemedia_types::CopyContext) + Send + Sync + 'static,
+    ) -> Self {
+        self.state.copy_observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Retain an active HTTP session's exact core transport authority/report.
+    pub async fn session_copy_context(&self, id: &str) -> Option<remotemedia_types::CopyContext> {
+        self.state
+            .sessions
+            .read()
+            .await
+            .get(id)
+            .map(|session| session.copies.clone())
     }
 
     /// Build the router with all endpoints
@@ -203,7 +218,6 @@ async fn health_handler() -> StatusCode {
 /// Request body for /execute
 #[derive(Debug, Deserialize)]
 struct ExecuteRequest {
-    manifest: serde_json::Value,
     input: TransportData,
 }
 
@@ -273,28 +287,78 @@ fn map_runtime_error(e: remotemedia_core::Error) -> (StatusCode, Json<ErrorRespo
 /// POST /execute - Unary pipeline execution
 async fn execute_handler(
     State(state): State<ServerState>,
-    Json(request): Json<ExecuteRequest>,
-) -> std::result::Result<Json<ExecuteResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Parse manifest
-    let manifest: Manifest = serde_json::from_value(request.manifest).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error_type: "manifest".to_string(),
-                message: format!("Invalid manifest: {}", e),
-                validation_errors: None,
-            }),
-        )
-    })?;
-
-    // Execute pipeline - uses map_runtime_error for proper validation error handling
-    let output = state
+    request: Request,
+) -> std::result::Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let body = read_body(request).await?;
+    let manifest = body.manifest().map_err(map_input_error)?;
+    let session = state
         .executor
-        .execute_unary(Arc::new(manifest), request.input)
+        .create_session(Arc::new(manifest))
         .await
         .map_err(map_runtime_error)?;
+    let mut guard = Guard::new(session);
+    let copies = guard.core().transport_copy_context();
+    if let Some(observer) = &state.copy_observer {
+        observer(&guard.core().session_id, copies.clone());
+    }
+    let outcome = async {
+        let mut errors = session::subscribe_errors(&state.executor, guard.core())?;
+        let request: ExecuteRequest = body
+            .decode(&copies)
+            .map_err(|error| remotemedia_core::Error::InvalidData(error.to_string()))?;
+        guard.core().send_input(request.input).await?;
+        let output = tokio::select! {
+            biased;
+            error = session::failure(&mut errors) => return Err(error),
+            output = guard.core().recv_output() => output?,
+        }
+        .ok_or_else(|| codec::error("No output from pipeline"))?;
+        let size = output.data.bulk_payload_bytes();
+        codec::encode(&ExecuteResponse { output }, size, &copies)
+    }
+    .await;
+    let cleanup = guard.close().await;
+    let wire = outcome.map_err(map_runtime_error)?;
+    cleanup.map_err(map_runtime_error)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        wire,
+    )
+        .into_response())
+}
 
-    Ok(Json(ExecuteResponse { output }))
+fn map_input_error(error: remotemedia_core::Error) -> (StatusCode, Json<ErrorResponse>) {
+    map_runtime_error(remotemedia_core::Error::InvalidData(error.to_string()))
+}
+
+async fn read_body(
+    request: Request,
+) -> std::result::Result<JsonBody, (StatusCode, Json<ErrorResponse>)> {
+    let content_type = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if content_type != "application/json"
+        && !(content_type.starts_with("application/") && content_type.ends_with("+json"))
+    {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(ErrorResponse {
+                error_type: "input".into(),
+                message: "Expected application/json".into(),
+                validation_errors: None,
+            }),
+        ));
+    }
+    // Preserve Axum Json's default 2 MiB request bound without coalescing chunks.
+    JsonBody::collect(request.into_body().into_data_stream(), 2 * 1024 * 1024)
+        .await
+        .map_err(map_input_error)
 }
 
 /// Request body for POST /stream
@@ -335,17 +399,10 @@ async fn create_stream_handler(
 
     let session_id = session.session_id.clone();
 
-    // Create broadcast channel for SSE (supports multiple subscribers)
-    // Capacity of 100 means it can buffer up to 100 outputs before dropping oldest
-    let (output_tx, _output_rx) = broadcast::channel(100);
-
-    // Store session (wrap in SessionHandleWrapper for trait compatibility)
-    let handle = SessionHandle {
-        session_id: session_id.clone(),
-        session: SessionHandleWrapper(session),
-        output_tx,
-    };
-
+    let handle = HttpSession::start(session, &state.executor).map_err(map_runtime_error)?;
+    if let Some(observer) = &state.copy_observer {
+        observer(&session_id, handle.copies.clone());
+    }
     state
         .sessions
         .write()
@@ -367,110 +424,66 @@ struct StreamInputRequest {
 async fn stream_input_handler(
     State(state): State<ServerState>,
     Path(session_id): Path<String>,
-    Json(request): Json<StreamInputRequest>,
-) -> std::result::Result<StatusCode, (StatusCode, String)> {
-    let mut sessions = state.sessions.write().await;
-
-    let handle = sessions.get_mut(&session_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("Session not found: {}", session_id),
-        )
-    })?;
-
-    // Send input to session
-    handle.session.send_input(request.data).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to send input: {}", e),
-        )
-    })?;
-
-    // Poll for outputs and broadcast to all SSE subscribers
-    while let Ok(Some(output)) = handle.session.recv_output().await {
-        // Broadcast ignores send errors (no subscribers) which is fine
-        let _ = handle.output_tx.send(output);
-    }
-
+    request: Request,
+) -> std::result::Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let handle = find_session(&state, &session_id).await?;
+    let input = handle.input().map_err(map_runtime_error)?;
+    let body = read_body(request).await?;
+    let request: StreamInputRequest = body.decode(&handle.copies).map_err(map_input_error)?;
+    input.send(request.data).await.map_err(map_runtime_error)?;
     Ok(StatusCode::OK)
 }
 
-/// GET /stream/:session_id/output - SSE stream of outputs
+async fn find_session(
+    state: &ServerState,
+    id: &str,
+) -> std::result::Result<Arc<HttpSession>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .sessions
+        .read()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| not_found(id))
+}
+
+fn not_found(id: &str) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error_type: "session".into(),
+            message: format!("Session not found: {id}"),
+            validation_errors: None,
+        }),
+    )
+}
+
+/// GET output subscribes without holding the session map during delivery.
 async fn stream_output_handler(
     State(state): State<ServerState>,
     Path(session_id): Path<String>,
-) -> std::result::Result<
-    Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>,
-    (StatusCode, String),
-> {
-    // Get session and subscribe to broadcast channel
-    let rx = {
-        let sessions = state.sessions.read().await;
-        let handle = sessions.get(&session_id).ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Session not found: {}", session_id),
-            )
-        })?;
-
-        // Subscribe to broadcast channel (supports multiple SSE connections)
-        handle.output_tx.subscribe()
-    };
-
-    // Convert broadcast receiver to SSE stream
-    let session_id_clone = session_id.clone();
-    let stream = BroadcastStream::new(rx).filter_map(move |result| {
-        // Filter out lagged messages (when buffer is full)
-        match result {
-            Ok(data) => {
-                let json = serde_json::to_string(&data).unwrap_or_default();
-                Some(Ok(Event::default().data(json)))
-            }
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                tracing::warn!(
-                    "SSE stream lagged by {} messages for session {}",
-                    n,
-                    session_id_clone
-                );
-                None
-            }
-        }
-    });
-
-    tracing::debug!("SSE connection established for session {}", session_id);
-
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+) -> std::result::Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let session = find_session(&state, &session_id).await?;
+    Ok(output::response(&session))
 }
 
-/// DELETE /stream/:session_id - Close streaming session
+/// Remove admission first, then signal and join output/core cleanup outside the map lock.
 async fn close_stream_handler(
     State(state): State<ServerState>,
     Path(session_id): Path<String>,
-) -> std::result::Result<StatusCode, (StatusCode, String)> {
-    let mut sessions = state.sessions.write().await;
-
-    let mut handle = sessions.remove(&session_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("Session not found: {}", session_id),
-        )
-    })?;
-
-    // Close session
-    handle.session.close().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to close session: {}", e),
-        )
-    })?;
-
-    tracing::info!("Closed streaming session: {}", session_id);
-
+) -> std::result::Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let handle = state
+        .sessions
+        .write()
+        .await
+        .remove(&session_id)
+        .ok_or_else(|| not_found(&session_id))?;
+    handle.close().await.map_err(map_runtime_error)?;
     Ok(StatusCode::OK)
 }
 
 #[cfg(test)]
-mod tests {
+mod baseline_tests {
     use super::*;
 
     #[tokio::test]
@@ -510,3 +523,6 @@ mod tests {
         assert_eq!(first.session_id(), second.session_id());
     }
 }
+
+#[cfg(test)]
+mod tests;

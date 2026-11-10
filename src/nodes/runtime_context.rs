@@ -50,6 +50,7 @@
 //! downcasts on access via [`Self::state`].
 
 use std::any::Any;
+mod source_completion;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -84,6 +85,12 @@ pub use crate::nodes::ports::SnapshotPort;
 /// See the module-level docs for lifecycle, scopes, and lifecycle.
 #[derive(Clone)]
 pub struct NodeRuntimeContext {
+    pub(crate) source_completion: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// Policy and attributed ledger for explicit host node materializations.
+    pub materialization: remotemedia_types::CopyContext,
+    /// Output storage provider. Clones retain the selected provider; loans and
+    /// published buffers independently retain their backing storage.
+    pub output_allocator: Arc<dyn remotemedia_types::OutputAllocator>,
     /// Pipeline session this call belongs to. Stored as `Arc<str>`
     /// because we frequently clone it into spawned tasks and across
     /// thread boundaries.
@@ -180,14 +187,22 @@ impl NodeRuntimeContext {
         session_state: Arc<dyn AnySessionState>,
         input_snapshots: HashMap<String, Arc<dyn SnapshotPort>>,
     ) -> Self {
+        let session_id: Arc<str> = session_id.into();
+        let node_id: Arc<str> = node_id.into();
         Self {
-            session_id: session_id.into(),
-            node_id: node_id.into(),
+            materialization: remotemedia_types::CopyContext::new(
+                remotemedia_types::CopyPolicy::AllowCopies,
+                format!("session/{session_id}/node/{node_id}/materialization"),
+            ),
+            session_id,
+            node_id,
             control,
             capabilities: Arc::new(DashMap::new()),
             input_snapshots: Arc::new(input_snapshots),
             session_state,
             cancel_gate: Arc::new(CancelGate::new()),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
+            source_completion: None,
         }
     }
 
@@ -199,6 +214,21 @@ impl NodeRuntimeContext {
     /// dispatch future.
     pub fn with_cancel_gate(mut self, cancel_gate: Arc<CancelGate>) -> Self {
         self.cancel_gate = cancel_gate;
+        self
+    }
+
+    /// Install the provider selected for this node's output memory domain.
+    pub fn with_output_allocator(
+        mut self,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Self {
+        self.output_allocator = allocator;
+        self
+    }
+
+    /// Bind the session's fixed node ledger before handing this context to calls.
+    pub fn with_copy_context(mut self, context: remotemedia_types::CopyContext) -> Self {
+        self.materialization = context;
         self
     }
 
@@ -291,13 +321,13 @@ impl NodeRuntimeContext {
     ///     wiring at session-bind time without a schema, so this is a
     ///     safety net rather than a panic).
     ///
-    /// `T: Clone` because snapshots are deep-copied on read; this is
-    /// usually fine because snapshot payloads are small (blendshape
-    /// weight vectors, idle pose tuples). If your snapshot is large,
-    /// box it: `OutputPort<Arc<MyBigStruct>>` then clone the `Arc`.
-    pub fn snapshot<T>(&self, port: &str) -> Option<crate::nodes::ports::TimestampedSnapshot<T>>
+    /// The returned owner retains the original publication without cloning T.
+    pub fn snapshot<T>(
+        &self,
+        port: &str,
+    ) -> Option<Arc<crate::nodes::ports::TimestampedSnapshot<T>>>
     where
-        T: Clone + Send + Sync + 'static,
+        T: Send + Sync + 'static,
     {
         let handle = self.input_snapshots.get(port)?;
         let typed: &crate::nodes::ports::InputPort<T> = handle.as_any().downcast_ref()?;
@@ -358,6 +388,30 @@ impl NodeRuntimeContext {
 // — no edits needed at the call site for the common case.
 
 impl NodeRuntimeContextRead for NodeRuntimeContext {
+    fn finish_source(&self) -> crate::Result<()> {
+        NodeRuntimeContext::finish_source(self)
+    }
+    fn copy_context(&self) -> Option<remotemedia_types::CopyContext> {
+        Some(self.materialization.clone())
+    }
+    fn output_allocator(&self) -> Option<Arc<dyn remotemedia_types::OutputAllocator>> {
+        Some(self.output_allocator.clone())
+    }
+
+    fn allocate_output_bytes(
+        &self,
+        len: usize,
+    ) -> Result<remotemedia_types::BufferLoan<u8>, remotemedia_types::BufferAllocationError> {
+        self.output_allocator.allocate_bytes(len)
+    }
+
+    fn allocate_output_audio(
+        &self,
+        samples: usize,
+    ) -> Result<remotemedia_types::BufferLoan<f32>, remotemedia_types::BufferAllocationError> {
+        self.output_allocator.allocate_audio(samples)
+    }
+
     fn session_id(&self) -> &str {
         self.session_id.as_ref()
     }
@@ -381,6 +435,10 @@ impl NodeRuntimeContextRead for NodeRuntimeContext {
         // downcasts back to the consumer's `T`.
         let handle = self.input_snapshots.get(port)?;
         handle.snapshot_any()
+    }
+
+    fn snapshot_inputs(&self) -> HashMap<String, Arc<dyn SnapshotPort>> {
+        self.input_snapshots.as_ref().clone()
     }
 
     fn state_any(&self) -> Option<Arc<dyn Any + Send + Sync>> {
@@ -491,6 +549,8 @@ mod tests {
         struct A;
         struct B;
         let ctx = NodeRuntimeContext {
+            source_completion: None,
+            materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
             control: SessionControl::new("sess-1"),
@@ -498,6 +558,7 @@ mod tests {
             input_snapshots: Arc::new(HashMap::new()),
             session_state: Arc::new(A),
             cancel_gate: Arc::new(CancelGate::new()),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
         };
         // Should panic; `should_panic` only matches the prefix to keep
         // the test resilient to future message tweaks.
@@ -514,6 +575,8 @@ mod tests {
         };
 
         let ctx = NodeRuntimeContext {
+            source_completion: None,
+            materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
             control: SessionControl::new("sess-1"),
@@ -521,6 +584,7 @@ mod tests {
             input_snapshots: Arc::new(HashMap::new()),
             session_state: Arc::new(()),
             cancel_gate: Arc::new(CancelGate::new()),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
         };
 
         assert!(ctx.capability("audio:default").is_none());
@@ -563,6 +627,8 @@ mod tests {
             counter: std::sync::atomic::AtomicU32::new(0),
         });
         let ctx = NodeRuntimeContext {
+            source_completion: None,
+            materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
             control: SessionControl::new("sess-1"),
@@ -570,6 +636,7 @@ mod tests {
             input_snapshots: Arc::new(HashMap::new()),
             session_state: state.clone(),
             cancel_gate: Arc::new(CancelGate::new()),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
         };
 
         let a: Arc<MyState> = ctx.state();
@@ -600,6 +667,8 @@ mod tests {
         snapshots.insert("weights".to_string(), Arc::new(out.input()));
 
         let ctx = NodeRuntimeContext {
+            source_completion: None,
+            materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
             control: SessionControl::new("sess-1"),
@@ -607,6 +676,7 @@ mod tests {
             input_snapshots: Arc::new(snapshots),
             session_state: Arc::new(()),
             cancel_gate: Arc::new(CancelGate::new()),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
         };
 
         let snap = ctx.snapshot::<u32>("weights").expect("populated");
@@ -628,6 +698,8 @@ mod tests {
         snapshots.insert("port".to_string(), Arc::new(out.input()));
 
         let ctx = NodeRuntimeContext {
+            source_completion: None,
+            materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
             control: SessionControl::new("sess-1"),
@@ -635,6 +707,7 @@ mod tests {
             input_snapshots: Arc::new(snapshots),
             session_state: Arc::new(()),
             cancel_gate: Arc::new(CancelGate::new()),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
         };
 
         assert!(ctx.snapshot::<String>("port").is_none());
@@ -703,6 +776,8 @@ mod tests {
         let mut snapshots: HashMap<String, Arc<dyn SnapshotPort>> = HashMap::new();
         snapshots.insert("weights".into(), Arc::new(out.input()));
         let ctx = NodeRuntimeContext {
+            source_completion: None,
+            materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
             control: SessionControl::new("sess-1"),
@@ -710,6 +785,7 @@ mod tests {
             input_snapshots: Arc::new(snapshots),
             session_state: Arc::new(()),
             cancel_gate: Arc::new(CancelGate::new()),
+            output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
         };
 
         let dyn_ctx: &dyn NodeRuntimeContextRead = &ctx;

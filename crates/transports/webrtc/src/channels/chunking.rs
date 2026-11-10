@@ -22,6 +22,8 @@
 //! - `total_chunks` may be `None` for streaming mode (unknown total);
 //!   completion is signaled by `is_final` instead.
 
+use bytes::Bytes;
+use remotemedia_types::{CopyContext, CopyReason, CopyRejected};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -30,14 +32,21 @@ use tracing::{debug, trace, warn};
 
 use super::messages::{ChunkInfo, MAX_CHUNK_SIZE};
 
+#[cfg(test)]
+#[path = "chunk_ownership_tests.rs"]
+mod ownership_tests;
+
 /// Default timeout for incomplete reassembly (30 seconds).
 const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum total memory for pending reassemblies (64 MB).
+/// Maximum logical payload bytes for pending reassemblies (64 MB).
 const DEFAULT_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum number of pending reassemblies before eviction.
 const DEFAULT_MAX_PENDING: usize = 128;
+
+/// Bound metadata/owner entries even when a sender supplies empty chunks.
+const MAX_CHUNKS_PER_MESSAGE: u32 = 4096;
 
 /// Key for identifying a message being reassembled.
 type MessageKey = (String, String); // (stream_id, message_id)
@@ -45,13 +54,9 @@ type MessageKey = (String, String); // (stream_id, message_id)
 /// State for a single in-progress reassembly.
 struct PendingMessage {
     /// Chunks buffered by index.
-    chunks: HashMap<u32, Vec<u8>>,
+    chunks: HashMap<u32, Bytes>,
     /// Total expected chunks (if known).
     total_chunks: Option<u32>,
-    /// Index of the final chunk (if received).
-    max_index: u32,
-    /// Whether the final chunk has arrived.
-    is_complete: bool,
     /// Content type hint from the final chunk.
     content_type: Option<String>,
     /// Data type hint from the final chunk.
@@ -69,8 +74,6 @@ impl PendingMessage {
         Self {
             chunks: HashMap::new(),
             total_chunks: None,
-            max_index: 0,
-            is_complete: false,
             content_type: None,
             data_type_hint: None,
             created_at: Instant::now(),
@@ -79,60 +82,65 @@ impl PendingMessage {
         }
     }
 
-    /// Add a chunk and return true if the message is now complete.
-    fn insert(&mut self, index: u32, data: Vec<u8>, is_final: bool, total: Option<u32>) -> bool {
+    /// Validate terminal/count metadata without changing existing ownership.
+    fn accepts(&self, chunk: &ChunkInfo) -> bool {
+        if chunk.chunk_index >= MAX_CHUNKS_PER_MESSAGE {
+            return false;
+        }
+        let declared = chunk
+            .total_chunks
+            .or_else(|| chunk.is_final.then_some(chunk.chunk_index + 1));
+        let total = self.total_chunks.or(declared);
+        if let Some(total) = total {
+            total > 0
+                && total <= MAX_CHUNKS_PER_MESSAGE
+                && chunk.chunk_index < total
+                && (!chunk.is_final || chunk.chunk_index + 1 == total)
+                && declared.map_or(true, |n| n == total)
+                && self.chunks.keys().all(|&index| index < total)
+        } else {
+            true
+        }
+    }
+
+    /// Retain a validated chunk and return true only when every index is present.
+    fn insert(&mut self, index: u32, data: Bytes, is_final: bool, total: Option<u32>) -> bool {
         // Skip duplicates
         if self.chunks.contains_key(&index) {
-            return self.is_complete;
+            return false;
         }
 
         let data_len = data.len();
-        self.total_chunks = self.total_chunks.or(total);
+        self.total_chunks = self
+            .total_chunks
+            .or(total)
+            .or_else(|| is_final.then_some(index + 1));
         self.chunks.insert(index, data);
         self.total_bytes += data_len;
 
-        if index > self.max_index {
-            self.max_index = index;
-        }
-
-        if is_final {
-            self.is_complete = true;
-        } else if let Some(total) = self.total_chunks {
-            // Complete if we have all chunks 0..total-1
-            self.is_complete = self.chunks.len() >= total as usize;
-        }
-
         self.last_updated = Instant::now();
-        self.is_complete
+        self.total_chunks
+            .is_some_and(|total| self.chunks.len() == total as usize)
     }
 
-    /// Reassemble chunks in order. Returns None if not complete.
-    fn take_reassembled(&mut self) -> Option<Vec<u8>> {
-        if !self.is_complete {
-            return None;
+    /// Consume a complete index set, retaining a single owner or explicitly
+    /// assembling disjoint received ranges into the required contiguous output.
+    fn into_reassembled(mut self, copies: &CopyContext) -> Result<Bytes, CopyRejected> {
+        let total = self.total_chunks.expect("complete chunk count");
+        if total == 1 {
+            return Ok(self.chunks.remove(&0).expect("complete single chunk"));
         }
-
+        let transfer = copies.begin(CopyReason::VecMaterialization, self.total_bytes as u64)?;
         let mut result = Vec::with_capacity(self.total_bytes);
-        for i in 0..=self.max_index {
-            match self.chunks.remove(&i) {
-                Some(data) => result.extend(data),
-                None => {
-                    // Gap in sequence - not actually complete yet.
-                    // Chunks already consumed; mark incomplete so the
-                    // caller knows to wait for more chunks.
-                    self.is_complete = false;
-                    return None;
-                }
-            }
+        for index in 0..total {
+            let data = self
+                .chunks
+                .remove(&index)
+                .expect("validated complete chunk range");
+            result.extend_from_slice(&data);
         }
-
-        // Extract metadata from the last chunk's info before clearing
-        let _content_type = self.content_type.take();
-        let _data_type_hint = self.data_type_hint.take();
-
-        self.total_bytes = 0;
-        self.max_index = 0;
-        Some(result)
+        transfer.complete();
+        Ok(result.into())
     }
 
     /// Check if this message has timed out.
@@ -200,18 +208,64 @@ impl DataChannelSplitter {
     ///
     /// A vector of [`ChunkInfo`] frames, or an empty vector if the
     /// input is empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics for nonempty input when the configured chunk size is zero or
+    /// more than 4096 chunks would be required. Use [`Self::split_with_context`]
+    /// or [`Self::split_owned`] for checked errors.
     pub fn split(&self, data: &[u8]) -> Vec<ChunkInfo> {
-        if data.is_empty() {
-            return Vec::new();
-        }
+        self.split_with_context(data, CopyContext::legacy())
+            .expect("valid chunk size and count required")
+    }
 
+    /// Snapshot borrowed input with explicit copy authority before splitting.
+    pub fn split_with_context(
+        &self,
+        data: &[u8],
+        copies: &CopyContext,
+    ) -> crate::Result<Vec<ChunkInfo>> {
+        self.chunk_count(data.len())?;
+        let owned = copies
+            .materialize(CopyReason::BorrowedInput, data.len() as u64, || {
+                Bytes::copy_from_slice(data)
+            })
+            .map_err(anyhow::Error::from)?;
+        self.split_owned(owned)
+    }
+
+    fn chunk_count(&self, len: usize) -> crate::Result<usize> {
+        if len == 0 {
+            return Ok(0);
+        }
+        if self.max_chunk_size == 0 {
+            return Err(crate::Error::InvalidConfig(
+                "chunk size must be nonzero".into(),
+            ));
+        }
+        let count = len.div_ceil(self.max_chunk_size);
+        if count > MAX_CHUNKS_PER_MESSAGE as usize {
+            return Err(crate::Error::InvalidData(
+                "message exceeds 4096 chunk limit".into(),
+            ));
+        }
+        Ok(count)
+    }
+
+    /// Split an owning payload into ranges without copying payload bytes.
+    /// Each chunk retains the input owner. Nonempty input requires a nonzero
+    /// configured chunk size and at most 4096 chunks.
+    pub fn split_owned(&self, data: Bytes) -> crate::Result<Vec<ChunkInfo>> {
+        let total_chunks = self.chunk_count(data.len())?;
+        if total_chunks == 0 {
+            return Ok(Vec::new());
+        }
         let chunk_size = self.max_chunk_size;
-        let total_chunks = data.len().div_ceil(chunk_size);
 
         let mut chunks = Vec::with_capacity(total_chunks);
         let mut index = 0u32;
 
-        for chunk_bytes in data.chunks(chunk_size) {
+        for start in (0..data.len()).step_by(chunk_size) {
             let is_final = index + 1 >= total_chunks as u32;
 
             let chunk = ChunkInfo::new(
@@ -220,14 +274,14 @@ impl DataChannelSplitter {
                 index,
                 Some(total_chunks as u32),
                 is_final,
-                chunk_bytes.to_vec(),
+                data.slice(start..start.saturating_add(chunk_size).min(data.len())),
             );
 
             chunks.push(chunk);
             index += 1;
         }
 
-        chunks
+        Ok(chunks)
     }
 
     /// Check if the data needs chunking.
@@ -251,8 +305,10 @@ impl Default for DataChannelSplitter {
 /// # Memory Management
 ///
 /// - Evicts entries older than the timeout (default 30s).
-/// - Caps total pending memory at a configurable limit (default 64 MB).
+/// - Caps logical pending payload bytes (default 64 MB). Slices may retain
+///   larger backing allocations; metadata is not included in this byte count.
 /// - Caps the number of pending reassemblies (default 128).
+/// - Caps each message at 4096 chunks, including empty chunks.
 ///
 /// # Example
 ///
@@ -272,7 +328,7 @@ impl Default for DataChannelSplitter {
 ///     }
 /// }
 ///
-/// assert_eq!(result, Some(payload));
+/// assert_eq!(result, Some(payload.into()));
 /// ```
 pub struct DataChannelReassembler {
     /// Pending reassemblies keyed by (stream_id, message_id).
@@ -286,7 +342,7 @@ pub struct DataChannelReassembler {
     /// Current total bytes in pending reassemblies.
     current_memory_bytes: usize,
     /// Optional channel to emit reassembled payloads.
-    output_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    output_tx: Option<mpsc::UnboundedSender<Bytes>>,
 }
 
 impl DataChannelReassembler {
@@ -318,7 +374,7 @@ impl DataChannelReassembler {
 
     /// Set an output channel for completed payloads.
     #[must_use]
-    pub fn with_output(mut self, tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+    pub fn with_output(mut self, tx: mpsc::UnboundedSender<Bytes>) -> Self {
         self.output_tx = Some(tx);
         self
     }
@@ -331,11 +387,46 @@ impl DataChannelReassembler {
     /// # Arguments
     ///
     /// * `chunk` - The chunk info to process.
-    pub fn feed_chunk(&mut self, chunk: &ChunkInfo) -> Option<Vec<u8>> {
+    pub fn feed_chunk(&mut self, chunk: &ChunkInfo) -> Option<Bytes> {
+        self.feed_chunk_with_context(chunk, CopyContext::legacy())
+            .expect("legacy policy permits reassembly")
+    }
+
+    /// Retain chunks under a logical payload-byte/entry bound. Multiple ranges
+    /// require one contiguous output materialization; a single chunk retains
+    /// its owner. Rejected final materialization discards that pending message.
+    /// Invalid/duplicate/over-limit chunks return None without admission.
+    pub fn feed_chunk_with_context(
+        &mut self,
+        chunk: &ChunkInfo,
+        copies: &CopyContext,
+    ) -> Result<Option<Bytes>, CopyRejected> {
         let key = (chunk.stream_id.clone(), chunk.message_id.clone());
 
+        // Validate before evicting or retaining anything. A fixed entry bound
+        // also covers metadata-only chunks, which have no payload byte charge.
+        if chunk.chunk_index >= MAX_CHUNKS_PER_MESSAGE || chunk.data.len() > self.max_memory_bytes {
+            warn!("Rejecting chunk exceeding reassembly bounds");
+            return Ok(None);
+        }
+        if self
+            .pending
+            .get(&key)
+            .is_some_and(|p| p.chunks.contains_key(&chunk.chunk_index))
+        {
+            return Ok(None);
+        }
+        let valid = self.pending.get(&key).map_or_else(
+            || PendingMessage::new().accepts(chunk),
+            |pending| pending.accepts(chunk),
+        );
+        if !valid {
+            warn!("Rejecting inconsistent chunk count or terminal index");
+            return Ok(None);
+        }
+
         // Evict expired entries before inserting new ones
-        if self.pending.len() >= self.max_pending {
+        if !self.pending.contains_key(&key) && self.pending.len() >= self.max_pending {
             self.evict_expired();
             // If still over limit, evict the oldest entry
             if self.pending.len() >= self.max_pending {
@@ -344,7 +435,7 @@ impl DataChannelReassembler {
         }
 
         // Check memory limit
-        if self.current_memory_bytes + chunk.data.len() > self.max_memory_bytes {
+        while self.current_memory_bytes > self.max_memory_bytes - chunk.data.len() {
             warn!(
                 "Reassembly memory limit exceeded ({} + {} > {}), evicting oldest",
                 self.current_memory_bytes,
@@ -359,12 +450,14 @@ impl DataChannelReassembler {
             .entry(key.clone())
             .or_insert_with(PendingMessage::new);
 
+        let previous_bytes = pending.total_bytes;
         let was_complete = pending.insert(
             chunk.chunk_index,
             chunk.data.clone(),
             chunk.is_final,
             chunk.total_chunks,
         );
+        self.current_memory_bytes += pending.total_bytes - previous_bytes;
 
         // Update metadata from chunk hints
         if let Some(ref ct) = chunk.content_type {
@@ -381,32 +474,32 @@ impl DataChannelReassembler {
                 "Reassembled complete message"
             );
 
-            if let Some(payload) = pending.take_reassembled() {
-                let payload_size = payload.len();
-                self.current_memory_bytes = self
-                    .current_memory_bytes
-                    .saturating_sub(pending.total_bytes);
-                self.pending.remove(&key);
+            let pending = self
+                .pending
+                .remove(&key)
+                .expect("completed pending message");
+            self.current_memory_bytes -= pending.total_bytes;
+            let payload = pending.into_reassembled(copies)?;
+            let payload_size = payload.len();
 
-                debug!(
-                    stream_id = %chunk.stream_id,
-                    message_id = %chunk.message_id,
-                    bytes = payload_size,
-                    "Emitting reassembled payload"
-                );
+            debug!(
+                stream_id = %chunk.stream_id,
+                message_id = %chunk.message_id,
+                bytes = payload_size,
+                "Emitting reassembled payload"
+            );
 
-                // Send to output channel if configured
-                if let Some(ref tx) = self.output_tx {
-                    if let Err(e) = tx.send(payload.clone()) {
-                        warn!("Failed to send reassembled payload: {}", e);
-                    }
+            // Send to output channel if configured
+            if let Some(ref tx) = self.output_tx {
+                if let Err(e) = tx.send(payload.clone()) {
+                    warn!("Failed to send reassembled payload: {}", e);
                 }
-
-                return Some(payload);
             }
+
+            return Ok(Some(payload));
         }
 
-        None
+        Ok(None)
     }
 
     /// Evict expired reassemblies.
@@ -450,7 +543,8 @@ impl DataChannelReassembler {
         self.pending.len()
     }
 
-    /// Get the total memory used by pending reassemblies.
+    /// Get logical payload bytes retained by pending reassemblies.
+    /// Shared backing allocations and metadata can retain additional memory.
     pub fn memory_used(&self) -> usize {
         self.current_memory_bytes
     }
@@ -523,7 +617,7 @@ mod tests {
         let splitter = DataChannelSplitter::with_max_chunk_size("s", "m", 2);
         let chunks = splitter.split(&data);
 
-        let mut result = Vec::new();
+        let mut result = Bytes::new();
         for chunk in &chunks {
             if let Some(payload) = reassembler.feed_chunk(chunk) {
                 result = payload;
@@ -545,7 +639,7 @@ mod tests {
         let chunks: Vec<_> = chunks.into_iter().collect();
         let order = vec![1, 0, 2];
 
-        let mut result = Vec::new();
+        let mut result = Bytes::new();
         for idx in order {
             if let Some(payload) = reassembler.feed_chunk(&chunks[idx]) {
                 result = payload;
@@ -616,7 +710,7 @@ mod tests {
         let chunks = splitter.split(&large_data);
 
         let mut reassembler = DataChannelReassembler::new();
-        let mut result = Vec::new();
+        let mut result = Bytes::new();
 
         for chunk in &chunks {
             if let Some(payload) = reassembler.feed_chunk(chunk) {

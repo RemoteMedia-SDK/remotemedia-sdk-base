@@ -170,13 +170,12 @@ impl ExecutorBridge for MultiprocessExecutorBridge {
             self.session_id
         );
 
-        // For MVP: The multiprocess executor handles the actual execution
-        // TODO: Use params for runtime configuration in Phase 4 (US2)
-        // Data conversion between executors will be added in Phase 4 (US2)
-        // For now, we verify the node can be executed via multiprocess
-
-        // Return input data (actual execution happens through existing pipeline)
-        Ok(input_data)
+        // This bridge never reached the worker; echoing the input silently
+        // skipped the node. Reject explicitly, as streaming execution already does.
+        let _ = input_data;
+        Err(Error::Execution(format!(
+            "MultiprocessExecutorBridge cannot execute node '{node_id}' ({node_type}); run it through a streaming session"
+        )))
     }
 
     async fn execute_node_streaming(
@@ -254,6 +253,105 @@ impl InProcessExecutorBridge {
             node_handles: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    async fn loaded_node(
+        &self,
+        node_id: &str,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, PythonNodeHandle>> {
+        tokio::sync::RwLockReadGuard::try_map(self.node_handles.read().await, |handles| {
+            handles.get(node_id)
+        })
+        .map_err(|_| Error::Execution(format!("Python node not loaded: {node_id}")))
+    }
+
+    /// Execute the owning Python contract without a portable wire roundtrip.
+    pub async fn execute_shared(
+        &self,
+        node_id: &str,
+        input: RuntimeData,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+    ) -> Result<RuntimeData> {
+        let handle = self.loaded_node(node_id).await?;
+        handle.process_shared_with_ctx(input, ctx)
+    }
+
+    /// Deliver shared outputs incrementally; callback rejection stops Python.
+    pub async fn execute_streaming_shared<F>(
+        &self,
+        node_id: &str,
+        input: RuntimeData,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+        callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        let handle = self.loaded_node(node_id).await?;
+        handle.process_streaming_shared_with_ctx(input, ctx, callback)
+    }
+
+    /// Execute a paced owning source with the current call's allocator and identity.
+    pub async fn execute_tick_shared<F>(
+        &self,
+        node_id: &str,
+        tick: crate::nodes::Tick,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+        callback: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(RuntimeData) -> Result<()> + Send,
+    {
+        self.loaded_node(node_id)
+            .await?
+            .tick_shared_with_ctx(tick, ctx, callback)
+    }
+
+    /// Legacy Python conversions are not certified by a strict call context.
+    pub fn validate_legacy_context(ctx: &dyn crate::nodes::NodeRuntimeContextRead) -> Result<()> {
+        Self::legacy_copy_context(ctx).map(|_| ())
+    }
+
+    /// Retain the exact caller ledger, rather than validating then discarding it.
+    pub fn legacy_copy_context(
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+    ) -> Result<remotemedia_types::CopyContext> {
+        match ctx.copy_context() {
+            Some(context) if context.policy() == remotemedia_types::CopyPolicy::AllowCopies => Ok(context),
+            _ => Err(Error::Execution(
+                "Legacy in-process Python requires allow_copies; select shared-buffer execution for strict calls".into(),
+            )),
+        }
+    }
+
+    /// Preserve the legacy Python data format without a redundant in-process
+    /// portable wire roundtrip. Python conversions retain the caller's ledger.
+    pub async fn execute_legacy(
+        &self,
+        node_id: &str,
+        input: &RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<RuntimeData> {
+        self.loaded_node(node_id)
+            .await?
+            .process_with_copy_context(input, copies)
+            .map_err(|e| Error::Execution(format!("Python node process failed: {e}")))
+    }
+
+    /// Legacy generators still collect outputs, with per-output copy accounting.
+    /// Use execute_streaming_shared for incremental owning output delivery.
+    pub async fn execute_streaming_legacy(
+        &self,
+        node_id: &str,
+        input: &RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<Box<dyn futures::Stream<Item = Result<RuntimeData>> + Send + Unpin>> {
+        let outputs = self
+            .loaded_node(node_id)
+            .await?
+            .process_streaming_with_copy_context(input, copies)
+            .map_err(|e| Error::Execution(format!("Python node streaming failed: {e}")))?;
+        Ok(Box::new(futures::stream::iter(outputs.into_iter().map(Ok))))
+    }
 }
 
 #[cfg(feature = "inprocess-python")]
@@ -273,10 +371,7 @@ impl ExecutorBridge for InProcessExecutorBridge {
         );
 
         // Get the Python node handle
-        let handles = self.node_handles.read().await;
-        let handle = handles
-            .get(node_id)
-            .ok_or_else(|| Error::Execution(format!("Python node not loaded: {}", node_id)))?;
+        let handle = self.loaded_node(node_id).await?;
 
         // Deserialize input data
         let runtime_data = data_transfer::from_bytes(&input_data)
@@ -302,8 +397,12 @@ impl ExecutorBridge for InProcessExecutorBridge {
         );
 
         // Parse config from params
-        let config: HashMap<String, serde_json::Value> = serde_json::from_value(params.clone())
-            .map_err(|e| Error::Execution(format!("Failed to parse config: {}", e)))?;
+        let config: HashMap<String, serde_json::Value> = if params.is_null() {
+            HashMap::new()
+        } else {
+            serde_json::from_value(params.clone())
+                .map_err(|e| Error::Execution(format!("Failed to parse config: {}", e)))?
+        };
 
         // For in-process, we need to specify the module and class based on node_type
         // This maps node type to Python module/class - configurable via params
@@ -355,10 +454,7 @@ impl ExecutorBridge for InProcessExecutorBridge {
         );
 
         // Get the Python node handle
-        let handles = self.node_handles.read().await;
-        let handle = handles
-            .get(node_id)
-            .ok_or_else(|| Error::Execution(format!("Python node not loaded: {}", node_id)))?;
+        let handle = self.loaded_node(node_id).await?;
 
         // Deserialize input data
         let runtime_data = data_transfer::from_bytes(&input_data)

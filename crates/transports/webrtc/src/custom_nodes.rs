@@ -205,6 +205,19 @@ pub fn create_custom_registry_with_factories(
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "multiprocess"))]
+    #[test]
+    fn python_creation_requires_the_multiprocess_feature() {
+        let factory = PythonNodeFactory::new("TestNode", false);
+        let result = factory.create("test".into(), &serde_json::json!({}), None);
+        let Err(error) = result else {
+            panic!("Python creation must reject without the multiprocess feature");
+        };
+        assert!(error
+            .to_string()
+            .contains("to be built with the `multiprocess` feature"));
+    }
+
     #[test]
     fn test_python_node_factory_creation() {
         let factory = PythonNodeFactory::new("TestNode", true);

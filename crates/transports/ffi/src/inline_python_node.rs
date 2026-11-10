@@ -26,11 +26,17 @@ use remotemedia_core::nodes::streaming_node::{
 };
 use remotemedia_core::nodes::InitializeContextRead;
 use remotemedia_core::Error;
+use remotemedia_traits::buffer_contract::{
+    BufferContract, BufferProduction, BufferProtocol, BUFFER_CONTRACT_VERSION,
+    INPROCESS_PYTHON_BUFFER_VERSION,
+};
+use remotemedia_traits::runtime_context::NodeRuntimeContextRead;
+use remotemedia_types::CopyContext;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 use tokio::sync::Mutex;
-use tracing::{debug, error};
+use tracing::debug;
 
 /// One inline registration: the class object plus optional metadata.
 pub struct InlineNodeConfig {
@@ -41,6 +47,7 @@ pub struct InlineNodeConfig {
     pub category: Option<String>,
     pub accepts: Vec<String>,
     pub produces: Vec<String>,
+    pub buffer_contract: Option<BufferContract>,
 }
 
 impl InlineNodeConfig {
@@ -54,8 +61,45 @@ impl InlineNodeConfig {
             category: self.category.clone(),
             accepts: self.accepts.clone(),
             produces: self.produces.clone(),
+            buffer_contract: self.buffer_contract.clone(),
         }
     }
+}
+
+/// A declaration is a node-author promise, not proof about arbitrary Python code.
+/// Inline dispatch implements default ports and version 1 owning Python buffers.
+pub fn parse_buffer_contract(cls: &Bound<'_, PyAny>, json: &str) -> PyResult<BufferContract> {
+    use pyo3::exceptions::PyValueError;
+    let contract: BufferContract = serde_json::from_str(json)
+        .map_err(|e| PyValueError::new_err(format!("Invalid buffer contract: {e}")))?;
+    if contract.version != BUFFER_CONTRACT_VERSION
+        || contract.protocol
+            != (BufferProtocol::InProcessPython {
+                buffers: INPROCESS_PYTHON_BUFFER_VERSION,
+            })
+    {
+        return Err(PyValueError::new_err("Inline nodes require buffer contract version 1 and in_process_python buffers version 1"));
+    }
+    for (name, port) in contract.inputs.iter().chain(&contract.outputs) {
+        if !name.is_empty() {
+            return Err(PyValueError::new_err(
+                "Inline buffer contracts support only the default port",
+            ));
+        }
+        port.validate_definition().map_err(PyValueError::new_err)?;
+    }
+    if matches!(
+        contract.production,
+        BufferProduction::OutputAllocator | BufferProduction::ForwardOrOutputAllocator
+    ) && !cls
+        .getattr("process_shared")
+        .is_ok_and(|method| method.is_callable())
+    {
+        return Err(PyValueError::new_err(
+            "Allocator production requires process_shared(data, ctx)",
+        ));
+    }
+    Ok(contract)
 }
 
 /// Process-global registry of inline-registered Python node classes.
@@ -125,8 +169,9 @@ pub struct InlinePythonStreamingNode {
     cls: Py<PyAny>,
     params: Value,
     /// Constructed once on `initialize`. `Mutex<Option<>>` to satisfy
-    /// `Send + Sync` and allow lazy init.
+    /// `Send + Sync` and serialize initialization.
     instance: Mutex<Option<Py<PyAny>>>,
+    copies: OnceLock<CopyContext>,
 }
 
 impl InlinePythonStreamingNode {
@@ -137,23 +182,25 @@ impl InlinePythonStreamingNode {
             cls,
             params,
             instance: Mutex::new(None),
+            copies: OnceLock::new(),
         }
     }
 
     /// Build the Python instance from the class object and `params`.
     /// Called lazily on first `initialize()`.
-    fn instantiate(&self, py: Python<'_>) -> Result<Py<PyAny>, Error> {
+    fn instantiate(&self, py: Python<'_>, copies: &CopyContext) -> Result<Py<PyAny>, Error> {
         let kwargs = PyDict::new(py);
 
         // params is a JSON Value — convert to a Python dict of keyword args.
         if let Value::Object(map) = &self.params {
             for (k, v) in map {
-                let py_val = super::marshal::json_to_python(py, v).map_err(|e| {
-                    Error::Execution(format!(
-                        "Inline node '{}' param '{}' conversion failed: {}",
-                        self.node_id, k, e
-                    ))
-                })?;
+                let py_val = super::marshal::json_to_python_with_context(py, v, None, copies)
+                    .map_err(|e| {
+                        Error::Execution(format!(
+                            "Inline node '{}' param '{}' conversion failed: {}",
+                            self.node_id, k, e
+                        ))
+                    })?;
                 kwargs.set_item(k, py_val).map_err(py_err_to_exec)?;
             }
         }
@@ -192,130 +239,191 @@ impl InlinePythonStreamingNode {
     fn dispatch_result(
         result: Py<PyAny>,
         callback: &mut (dyn FnMut(RuntimeData) -> Result<(), Error> + Send),
-        node_id: String,
+        copies: CopyContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, Error>> + Send + '_>>
     {
         Box::pin(async move {
-            enum Shape {
-                None,
-                Sync(RuntimeData),
-                Awaitable(Py<PyAny>),
-                AsyncGen(Py<PyAny>),
-            }
-
-            let shape = Python::attach(|py| -> Result<Shape, Error> {
+            let (is_generator, is_awaitable) = Python::attach(|py| -> PyResult<_> {
                 let bound = result.bind(py);
-                if bound.is_none() {
-                    return Ok(Shape::None);
-                }
-                // Async generator: has both __aiter__ and __anext__.
-                let is_async_gen = bound.hasattr("__aiter__").unwrap_or(false)
-                    && bound.hasattr("__anext__").unwrap_or(false);
-                if is_async_gen {
-                    return Ok(Shape::AsyncGen(bound.clone().unbind()));
-                }
-                // Awaitable: has __await__ (covers coroutines & most awaitables).
-                let is_awaitable = bound.hasattr("__await__").unwrap_or(false);
-                if is_awaitable {
-                    return Ok(Shape::Awaitable(bound.clone().unbind()));
-                }
-                let rd =
-                    super::marshal::python_to_runtime_data(py, bound).map_err(py_err_to_exec)?;
-                Ok(Shape::Sync(rd))
-            })?;
-
-            match shape {
-                Shape::None => Ok(0),
-                Shape::Sync(rd) => {
-                    callback(rd)?;
-                    Ok(1)
-                }
-                Shape::Awaitable(coro) => {
-                    // Bridge the Python coroutine into a Rust future.
-                    // We use `into_future_with_locals` because the
-                    // surrounding tokio task (a node task spawned by
-                    // SessionRouter) does NOT inherit the asyncio-loop
-                    // task-locals that the FFI entry registered.
-                    // Snapshot them from our global instead.
-                    let fut = Python::attach(|py| -> PyResult<_> {
-                        let locals = task_locals_snapshot(py).ok_or_else(|| {
-                            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                                "Inline async dispatch requires a captured \
-                                 asyncio loop, but none was registered. Call \
-                                 from inside `await execute_pipeline*(...)`.",
-                            )
-                        })?;
-                        let bound = coro.bind(py).clone();
-                        pyo3_async_runtimes::into_future_with_locals(&locals, bound)
-                    })
-                    .map_err(py_err_to_exec)?;
-                    let py_result = fut.await.map_err(py_err_to_exec)?;
-                    // The coroutine might itself have returned a
-                    // generator / coroutine; recurse.
-                    Self::dispatch_result(py_result, callback, node_id).await
-                }
-                Shape::AsyncGen(gen) => {
-                    let mut count = 0usize;
-                    loop {
-                        // Call __anext__() to get the next awaitable.
-                        // StopAsyncIteration can fire either at the
-                        // call site (synchronous raise) or when the
-                        // awaitable is driven — handle both.
-                        let next_fut = Python::attach(|py| -> PyResult<_> {
-                            let locals = task_locals_snapshot(py).ok_or_else(|| {
-                                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                                    "Inline async-gen dispatch requires a \
-                                     captured asyncio loop, but none was \
-                                     registered.",
-                                )
-                            })?;
-                            let aw = gen.bind(py).call_method0("__anext__")?;
-                            pyo3_async_runtimes::into_future_with_locals(&locals, aw)
-                        });
-                        let next_fut = match next_fut {
-                            Ok(f) => f,
-                            Err(e) => {
-                                if Python::attach(|py| {
-                                    e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py)
-                                }) {
-                                    break;
-                                }
-                                return Err(py_err_to_exec(e));
-                            }
-                        };
-                        let item = match next_fut.await {
-                            Ok(v) => v,
-                            Err(e) => {
-                                if Python::attach(|py| {
-                                    e.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py)
-                                }) {
-                                    break;
-                                }
-                                return Err(py_err_to_exec(e));
-                            }
-                        };
-                        let maybe_rd =
-                            Python::attach(|py| -> Result<Option<RuntimeData>, Error> {
-                                let bound = item.bind(py);
-                                if bound.is_none() {
-                                    return Ok(None);
-                                }
-                                Ok(Some(
-                                    super::marshal::python_to_runtime_data(py, bound)
-                                        .map_err(py_err_to_exec)?,
-                                ))
-                            })?;
-                        if let Some(rd) = maybe_rd {
-                            callback(rd)?;
-                            count += 1;
-                        }
-                    }
-                    let _ = node_id; // silence unused on this branch
-                    Ok(count)
-                }
+                Ok((
+                    bound.hasattr("__aiter__")? && bound.hasattr("__anext__")?,
+                    bound.hasattr("__await__")?,
+                ))
+            })
+            .map_err(py_err_to_exec)?;
+            if is_generator {
+                return Self::drain_generator(result, callback, copies).await;
             }
+            if is_awaitable {
+                let value = await_python(result).await.map_err(py_err_to_exec)?;
+                return Self::dispatch_result(value, callback, copies).await;
+            }
+            Self::emit_result(result, callback, &copies)
         })
     }
+
+    fn emit_result(
+        result: Py<PyAny>,
+        callback: &mut (dyn FnMut(RuntimeData) -> Result<(), Error> + Send),
+        copies: &CopyContext,
+    ) -> Result<usize, Error> {
+        let value = Python::attach(|py| -> PyResult<_> {
+            if result.bind(py).is_none() {
+                return Ok(None);
+            }
+            super::marshal::python_to_runtime_data_with_context(py, result.bind(py), copies)
+                .map(Some)
+        })
+        .map_err(py_err_to_exec)?;
+        match value {
+            Some(value) => {
+                callback(value)?;
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
+
+    async fn drain_generator(
+        generator: Py<PyAny>,
+        callback: &mut (dyn FnMut(RuntimeData) -> Result<(), Error> + Send),
+        copies: CopyContext,
+    ) -> Result<usize, Error> {
+        let result = async {
+            let mut count = 0;
+            loop {
+                let next = Python::attach(|py| {
+                    generator
+                        .bind(py)
+                        .call_method0("__anext__")
+                        .map(Bound::unbind)
+                });
+                let next = match next {
+                    Ok(next) => await_python(next).await,
+                    Err(error) => Err(error),
+                };
+                match next {
+                    Ok(value) => count += Self::emit_result(value, callback, &copies)?,
+                    Err(error)
+                        if Python::attach(|py| {
+                            error.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py)
+                        }) =>
+                    {
+                        break
+                    }
+                    Err(error) => return Err(py_err_to_exec(error)),
+                }
+            }
+            Ok(count)
+        }
+        .await;
+        // Run finally blocks even when conversion or downstream delivery fails.
+        // Preserve the original operation error if closing also fails.
+        let closed: Result<(), Error> = async {
+            let close = Python::attach(|py| -> PyResult<_> {
+                let bound = generator.bind(py);
+                if bound.hasattr("aclose")? {
+                    Ok(Some(bound.call_method0("aclose")?.unbind()))
+                } else {
+                    Ok(None)
+                }
+            })
+            .map_err(py_err_to_exec)?;
+            if let Some(close) = close {
+                await_python(close).await.map_err(py_err_to_exec)?;
+            }
+            Ok(())
+        }
+        .await;
+        let count = result?;
+        closed?;
+        Ok(count)
+    }
+
+    fn bound_copies(&self) -> Result<CopyContext, Error> {
+        self.copies.get().cloned().ok_or_else(|| {
+            Error::Execution(
+                "Inline Python node requires initialization with node copy authority".into(),
+            )
+        })
+    }
+
+    async fn process_one(
+        &self,
+        data: RuntimeData,
+        ctx: Option<&dyn NodeRuntimeContextRead>,
+    ) -> Result<RuntimeData, Error> {
+        let mut output = None;
+        self.process_streaming_inner(data, ctx, &mut |value| {
+            if output.is_none() {
+                output = Some(value);
+            }
+            Ok(())
+        })
+        .await?;
+        output.ok_or_else(|| {
+            Error::Execution(format!("Inline node '{}' produced no output", self.node_id))
+        })
+    }
+
+    async fn process_streaming_inner(
+        &self,
+        data: RuntimeData,
+        ctx: Option<&dyn NodeRuntimeContextRead>,
+        callback: &mut (dyn FnMut(RuntimeData) -> Result<(), Error> + Send),
+    ) -> Result<usize, Error> {
+        let copies = match ctx {
+            Some(ctx) => ctx.copy_context().ok_or_else(|| {
+                Error::Execution("Inline Python call requires node copy authority".into())
+            })?,
+            None => self.bound_copies()?,
+        };
+        let instance = {
+            let guard = self.instance.lock().await;
+            let instance = guard
+                .as_ref()
+                .ok_or_else(|| Error::Execution("Inline Python node was not initialized".into()))?;
+            Python::attach(|py| instance.clone_ref(py))
+        };
+        let result = Python::attach(|py| -> Result<Py<PyAny>, Error> {
+            let py_data = super::marshal::runtime_data_to_python_with_context(
+                py,
+                &data.into_shared(),
+                &copies,
+            )
+            .map_err(py_err_to_exec)?;
+            let bound = instance.bind(py);
+            let output = if bound.hasattr("process_shared").map_err(py_err_to_exec)? {
+                let ctx = ctx.ok_or_else(|| {
+                    Error::Execution("process_shared requires a runtime allocator context".into())
+                })?;
+                let allocator = ctx.output_allocator().ok_or_else(|| {
+                    Error::Execution("process_shared requires the node output allocator".into())
+                })?;
+                let allocator = _remotemedia_buffers::OutputAllocator::new(allocator)
+                    .with_identity(ctx.session_id(), ctx.node_id());
+                let allocator = Py::new(py, allocator).map_err(py_err_to_exec)?;
+                bound.call_method1("process_shared", (py_data, allocator))
+            } else {
+                bound.call_method1("process", (py_data,))
+            }
+            .map_err(py_err_to_exec)?;
+            Ok(output.unbind())
+        })?;
+        Self::dispatch_result(result, callback, copies).await
+    }
+}
+
+async fn await_python(value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let future = Python::attach(|py| {
+        let locals = task_locals_snapshot(py).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "Inline async dispatch requires a captured asyncio loop",
+            )
+        })?;
+        pyo3_async_runtimes::into_future_with_locals(&locals, value.into_bound(py))
+    })?;
+    future.await
 }
 
 fn py_err_to_exec(e: PyErr) -> Error {
@@ -328,46 +436,58 @@ impl AsyncStreamingNode for InlinePythonStreamingNode {
         &self.node_type
     }
 
-    async fn initialize(&self, _ctx: &dyn InitializeContextRead) -> Result<(), Error> {
+    async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
         let mut guard = self.instance.lock().await;
         if guard.is_some() {
             return Ok(());
         }
-        let instance = Python::attach(|py| self.instantiate(py))?;
-        // If the instance exposes an `initialize()` method, call it.
-        Python::attach(|py| -> Result<(), Error> {
-            let bound = instance.bind(py);
-            if bound.hasattr("initialize").map_err(py_err_to_exec)? {
-                if let Err(e) = bound.call_method0("initialize") {
-                    // Coroutines returned by sync initialize() in async subclasses:
-                    // ignore — we'll resolve them lazily.
-                    error!("Inline node '{}' initialize raised: {}", self.node_id, e);
-                    return Err(py_err_to_exec(e));
-                }
-            }
-            Ok(())
+        let copies = ctx.copy_context().ok_or_else(|| {
+            Error::Execution("Inline initialization requires node copy authority".into())
         })?;
+        let instance = Python::attach(|py| self.instantiate(py, &copies))?;
+        let initialized = Python::attach(|py| -> PyResult<_> {
+            let bound = instance.bind(py);
+            if !bound.hasattr("initialize")? {
+                return Ok(None);
+            }
+            let result = bound.call_method0("initialize")?;
+            Ok(result.hasattr("__await__")?.then(|| result.unbind()))
+        })
+        .map_err(py_err_to_exec)?;
+        if let Some(initialized) = initialized {
+            await_python(initialized).await.map_err(py_err_to_exec)?;
+        }
+        self.copies
+            .set(copies)
+            .map_err(|_| Error::Execution("Inline copy authority already bound".into()))?;
         *guard = Some(instance);
         Ok(())
     }
 
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
-        // Collect a single output via the streaming path.
-        let mut out: Option<RuntimeData> = None;
-        let mut cb = |rd: RuntimeData| -> Result<(), Error> {
-            if out.is_none() {
-                out = Some(rd);
-            }
-            Ok(())
-        };
-        let n = self.process_streaming_inner(data, &mut cb).await?;
-        if n == 0 {
-            return Err(Error::Execution(format!(
-                "Inline node '{}' produced no output",
-                self.node_id
-            )));
+        self.process_one(data, None).await
+    }
+
+    async fn process_with_ctx(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        self.process_one(data, Some(ctx)).await
+    }
+
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: HashMap<String, RuntimeData>,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        if inputs.len() != 1 {
+            return Err(Error::Execution(
+                "Inline Python nodes require exactly one input".into(),
+            ));
         }
-        Ok(out.unwrap())
+        self.process_one(inputs.into_values().next().unwrap(), Some(ctx))
+            .await
     }
 
     async fn process_streaming<F>(
@@ -379,38 +499,21 @@ impl AsyncStreamingNode for InlinePythonStreamingNode {
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
-        self.process_streaming_inner(data, &mut callback).await
+        self.process_streaming_inner(data, None, &mut callback)
+            .await
     }
-}
 
-impl InlinePythonStreamingNode {
-    async fn process_streaming_inner(
+    async fn process_streaming_with_ctx<F>(
         &self,
         data: RuntimeData,
-        callback: &mut (dyn FnMut(RuntimeData) -> Result<(), Error> + Send),
-    ) -> Result<usize, Error> {
-        // Lazy-instantiate if initialize() wasn't called.
-        let instance = {
-            let mut guard = self.instance.lock().await;
-            if guard.is_none() {
-                let i = Python::attach(|py| self.instantiate(py))?;
-                *guard = Some(i);
-            }
-            Python::attach(|py| guard.as_ref().unwrap().clone_ref(py))
-        };
-
-        // Call instance.process(data) under GIL.
-        let result = Python::attach(|py| -> Result<Py<PyAny>, Error> {
-            let py_data =
-                super::marshal::runtime_data_to_python(py, &data).map_err(py_err_to_exec)?;
-            let bound = instance.bind(py);
-            let py_result = bound
-                .call_method1("process", (py_data,))
-                .map_err(py_err_to_exec)?;
-            Ok(py_result.unbind())
-        })?;
-
-        Self::dispatch_result(result, callback, self.node_id.clone()).await
+        ctx: &dyn NodeRuntimeContextRead,
+        mut callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        self.process_streaming_inner(data, Some(ctx), &mut callback)
+            .await
     }
 }
 
@@ -420,6 +523,19 @@ struct InlinePythonNodeFactory {
 }
 
 impl StreamingNodeFactory for InlinePythonNodeFactory {
+    fn buffer_contract(&self, _params: &Value) -> Option<BufferContract> {
+        self.config.buffer_contract.clone()
+    }
+
+    fn supports_buffer_protocol(&self, protocol: &BufferProtocol) -> bool {
+        matches!(
+            protocol,
+            BufferProtocol::InProcessPython {
+                buffers: INPROCESS_PYTHON_BUFFER_VERSION
+            }
+        )
+    }
+
     fn create(
         &self,
         node_id: String,
@@ -479,6 +595,7 @@ fn string_types_to_runtime(types: &[String]) -> Vec<RuntimeDataType> {
             "binary" | "bytes" => Some(RuntimeDataType::Binary),
             "tensor" => Some(RuntimeDataType::Tensor),
             "numpy" => Some(RuntimeDataType::Numpy),
+            "control_message" => Some(RuntimeDataType::ControlMessage),
             _ => None,
         })
         .collect()

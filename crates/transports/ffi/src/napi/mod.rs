@@ -1,39 +1,19 @@
-//! Node.js FFI bindings for RemoteMedia zero-copy IPC
+//! Node.js owning pipeline handles and native shared-memory IPC.
 //!
-//! This module provides napi-rs bindings for iceoryx2 shared memory IPC,
-//! enabling Node.js applications to participate in zero-copy data pipelines
-//! with Python and Rust nodes.
+//! Publishers keep exclusive native loans on a dedicated thread. Receivers use
+//! the thread-safe IPC service and retain immutable samples through SharedBytes.
+//! Pull, asynchronous and callback delivery share one bounded native borrow budget.
+//! Callback wakeups carry no payload pointers; abort and environment teardown
+//! reclaim the separate owning queue before joining its polling thread.
 //!
-//! # Architecture
-//!
-//! - **node.rs**: iceoryx2 Node wrapper for IPC management
-//! - **channel.rs**: Channel creation and configuration
-//! - **subscriber.rs**: Zero-copy sample receiving
-//! - **publisher.rs**: Zero-copy sample publishing
-//! - **sample.rs**: Sample lifecycle (LoanedSample, ReceivedSample)
-//! - **session.rs**: Session-scoped channel isolation
-//! - **threadsafe.rs**: ThreadsafeFunction helpers for callbacks
-//! - **error.rs**: Error types for napi
-//! - **runtime_data.rs**: RuntimeData serialization/deserialization
-//!
-//! # Threading Model
-//!
-//! iceoryx2 `Publisher`/`Subscriber` are `!Send` and cannot cross thread boundaries.
-//! This module uses dedicated OS threads for IPC operations and communicates
-//! with the JavaScript main thread via `ThreadsafeFunction` callbacks.
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────┐
-//! │  Dedicated OS Thread (iceoryx2 lives here)      │
-//! │    ├─ iceoryx2::Subscriber (!Send)              │
-//! │    ├─ Polling loop with yield_now()             │
-//! │    └─ ThreadsafeFunction.call() when data ready │
-//! ├─────────────────────────────────────────────────┤
-//! │  JavaScript Main Thread                         │
-//! │    └─ Callback receives zero-copy buffer        │
-//! └─────────────────────────────────────────────────┘
-//! ```
+//! Mutable JS Buffer imports/exports and portable MessagePack codecs are explicit
+//! copying compatibility operations under the immutable IPC-session CopyContext.
+//! Owning pipeline handoff and retained slices do not materialize payloads.
+//! Legacy public threadsafe helpers remain separate from the native receive path.
 
+pub mod buffer_config;
+mod buffers;
+mod output_loans;
 pub mod channel;
 pub mod control_session;
 pub mod error;
@@ -47,6 +27,7 @@ pub mod session;
 pub mod streaming_session;
 pub mod subscriber;
 pub mod threadsafe;
+mod unary;
 
 // WebRTC bindings (only compiled with `napi-webrtc` feature)
 #[cfg(feature = "napi-webrtc")]

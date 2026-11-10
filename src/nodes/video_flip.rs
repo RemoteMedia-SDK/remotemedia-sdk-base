@@ -254,7 +254,7 @@ impl SyncStreamingNode for VideoFlipNode {
                 };
 
                 Ok(RuntimeData::Video {
-                    pixel_data: flipped_data,
+                    pixel_data: flipped_data.into(),
                     width,
                     height,
                     format,
@@ -296,7 +296,7 @@ mod tests {
         ];
 
         let input_data = RuntimeData::Video {
-            pixel_data: input,
+            pixel_data: input.into(),
             width: 2,
             height: 2,
             format: PixelFormat::Rgb24,
@@ -339,7 +339,7 @@ mod tests {
         ];
 
         let input_data = RuntimeData::Video {
-            pixel_data: input,
+            pixel_data: input.into(),
             width: 2,
             height: 2,
             format: PixelFormat::Rgb24,
@@ -387,7 +387,7 @@ mod tests {
         input[20..24].copy_from_slice(&[200, 201, 202, 203]);
 
         let input_data = RuntimeData::Video {
-            pixel_data: input,
+            pixel_data: input.into(),
             width: 4,
             height: 4,
             format: PixelFormat::I420,

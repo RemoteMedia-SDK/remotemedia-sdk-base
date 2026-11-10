@@ -288,6 +288,9 @@ impl AsyncStreamingNode for AsyncNodeAdapter {
     fn node_type(&self) -> &str {
         self.inner.node_type()
     }
+    fn accepts_device(&self, device: remotemedia_types::Device) -> bool {
+        self.inner.accepts_device(device)
+    }
     
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
         // Block on the sync version
@@ -314,6 +317,9 @@ impl StreamingNodeAdapter {
 impl StreamingNode for StreamingNodeAdapter {
     fn node_type(&self) -> &str {
         self.inner.node_type()
+    }
+    fn accepts_device(&self, device: remotemedia_types::Device) -> bool {
+        self.inner.accepts_device(device)
     }
     
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {

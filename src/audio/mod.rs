@@ -8,6 +8,7 @@
 
 pub mod buffer;
 pub mod format;
+pub mod pcm_frames;
 
 pub use buffer::{AudioBuffer as AudioBufferNew, AudioData};
 use std::sync::Arc;

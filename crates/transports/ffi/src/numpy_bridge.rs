@@ -1,7 +1,7 @@
-//! Numpy array marshaling with zero-copy support (Phase 1.7.3)
+//! NumPy compatibility helpers. Owning pipeline views live in marshal::buffers.
 //!
 //! This module provides efficient data exchange between Rust and Python numpy arrays
-//! using rust-numpy for zero-copy buffer access.
+//! using rust-numpy and explicit compatibility materialization.
 //!
 //! Strategy:
 //! 1. Python → Rust: Use rust-numpy's PyReadonlyArray for zero-copy read access
@@ -90,76 +90,32 @@ pub fn extract_numpy_metadata(_py: Python, obj: &Bound<'_, PyAny>) -> PyResult<N
     })
 }
 
-/// Convert numpy array to JSON (with metadata + base64 data)
-///
-/// Uses rust-numpy for zero-copy read access to the array data.
+mod json;
+
+/// Compatibility JSON encoding with explicit logical payload-copy accounting.
 pub fn numpy_to_json(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
-    let meta = extract_numpy_metadata(py, obj)?;
-
-    // Get raw bytes using tobytes() method (copies data)
-    // TODO: For true zero-copy, we'd pass shared memory handles instead
-    let bytes_obj = obj.call_method0("tobytes")?;
-    let bytes: &[u8] = bytes_obj.extract()?;
-
-    // Encode as base64
-    use base64::Engine;
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(bytes);
-
-    let array_data = NumpyArrayData {
-        meta,
-        data: base64_data,
-    };
-
-    // Return as JSON with special marker
-    Ok(serde_json::json!({
-        "__numpy__": true,
-        "array": serde_json::to_value(&array_data).unwrap()
-    }))
+    numpy_to_json_with_context(py, obj, remotemedia_types::CopyContext::legacy())
 }
 
-/// Convert JSON (with numpy metadata) back to numpy array
-///
-/// Uses rust-numpy to create the array from raw bytes.
+pub fn numpy_to_json_with_context(
+    py: Python,
+    obj: &Bound<'_, PyAny>,
+    context: &remotemedia_types::CopyContext,
+) -> PyResult<Value> {
+    json::encode(py, obj, context)
+}
+
+/// Decode once, then expose an owning read-only array over the decoder storage.
 pub fn json_to_numpy<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
-    // Extract array data
-    let array_data: NumpyArrayData = serde_json::from_value(
-        value
-            .get("array")
-            .ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>("Missing 'array' field")
-            })?
-            .clone(),
-    )
-    .map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-            "Failed to parse array data: {}",
-            e
-        ))
-    })?;
+    json_to_numpy_with_context(py, value, remotemedia_types::CopyContext::legacy())
+}
 
-    // Decode base64 data
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&array_data.data)
-        .map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Failed to decode base64: {}",
-                e
-            ))
-        })?;
-
-    // Import numpy
-    let numpy = py.import("numpy")?;
-
-    // Create numpy array from bytes
-    // numpy.frombuffer(bytes, dtype=dtype).reshape(shape)
-    let frombuffer = numpy.getattr("frombuffer")?;
-    let flat_array = frombuffer.call1((bytes, array_data.meta.dtype.as_str()))?;
-
-    // Reshape to original shape
-    let shaped_array = flat_array.call_method1("reshape", (array_data.meta.shape,))?;
-
-    Ok(shaped_array)
+pub fn json_to_numpy_with_context<'py>(
+    py: Python<'py>,
+    value: &Value,
+    context: &remotemedia_types::CopyContext,
+) -> PyResult<Bound<'py, PyAny>> {
+    json::decode(py, value, context)
 }
 
 /// Check if a JSON value represents a numpy array
@@ -274,11 +230,12 @@ pub fn numpy_to_runtime_data(py: Python<'_>, arr: Bound<'_, PyAny>) -> PyResult<
     // We keep this function for API compatibility and documentation
     Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
         "numpy_to_runtime_data is deprecated. Pass numpy arrays directly to execute_pipeline_with_input - \
-         they will be automatically wrapped in RuntimeData::Numpy for zero-copy passthrough."
+         private arrays use explicit copying; published owning views can pass without copying."
     ))
 }
 
-/// Convert AudioBuffer to numpy array with zero-copy (Phase 4: T049-T053)
+/// Legacy copying AudioBuffer-to-NumPy conversion. Owning RuntimeData views
+/// are exported by marshal::buffers instead.
 ///
 /// This function provides efficient transfer from Rust to Python by:
 /// 1. Getting a slice from the AudioBuffer (zero-copy via Arc)
@@ -298,7 +255,7 @@ pub fn audio_buffer_to_numpy_ffi<'py>(
     let slice = buffer.as_slice();
 
     // Create numpy array from slice
-    // PyArray::from_slice creates a numpy array that borrows from the Rust data
+    // PyArray::from_slice copies into a NumPy-owned allocation.
     let array = PyArray::from_slice(py, slice);
 
     // For multi-channel audio, reshape to (frames, channels)
@@ -416,6 +373,8 @@ mod tests {
 
     #[test]
     fn test_is_numpy_array() {
+        Python::initialize();
+
         Python::attach(|py| {
             // Try to import numpy (skip test if not available)
             if py.import("numpy").is_err() {
@@ -447,6 +406,8 @@ result = np.array([1.0, 2.0, 3.0])
 
     #[test]
     fn test_extract_numpy_metadata() {
+        Python::initialize();
+
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -476,6 +437,8 @@ result = np.array([[1, 2], [3, 4]], dtype=np.int32)
 
     #[test]
     fn test_numpy_roundtrip() {
+        Python::initialize();
+
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -519,6 +482,8 @@ result = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
 
     #[test]
     fn test_numpy_to_vec() {
+        Python::initialize();
+
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -546,6 +511,8 @@ result = np.array([1.0, 2.0, 3.0, 4.0])
 
     #[test]
     fn test_vec_to_numpy() {
+        Python::initialize();
+
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -568,6 +535,8 @@ result = np.array([1.0, 2.0, 3.0, 4.0])
 
     #[test]
     fn test_numpy_to_audio_buffer() {
+        Python::initialize();
+
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -605,6 +574,8 @@ result = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.float32)
 
     #[test]
     fn test_audio_buffer_to_numpy_mono() {
+        Python::initialize();
+
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -627,6 +598,8 @@ result = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.float32)
 
     #[test]
     fn test_audio_buffer_to_numpy_stereo() {
+        Python::initialize();
+
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");
@@ -648,7 +621,9 @@ result = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.float32)
     }
 
     #[test]
-    fn test_zero_copy_roundtrip() {
+    fn test_audio_buffer_value_roundtrip() {
+        Python::initialize();
+
         Python::attach(|py| {
             if py.import("numpy").is_err() {
                 println!("Skipping test: numpy not available");

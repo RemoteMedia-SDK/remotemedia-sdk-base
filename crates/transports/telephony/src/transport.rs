@@ -108,6 +108,8 @@ impl StreamSession for TelephonyParticipantStream {
 
 /// Accepted inbound SIP call attached to a pipeline stream session.
 pub struct AcceptedCall {
+    /// Fixed authority for media materialization in this pipeline session.
+    pub copies: remotemedia_types::CopyContext,
     /// SIP response to send to the caller.
     pub response: SipTransactionResponse,
     /// RemoteMedia streaming session for decoded inbound/outbound audio.
@@ -551,7 +553,7 @@ impl TelephonyTransport {
         let rtp_socket = UdpSocket::bind(prepared.local_rtp_addr)
             .await
             .map_err(Error::Io)?;
-        let stream = self
+        let (stream, copies) = self
             .participant_stream(
                 manifest,
                 &prepared.call_id,
@@ -561,6 +563,7 @@ impl TelephonyTransport {
             .await
             .map_err(|e| Error::Pipeline(e.to_string()))?;
         Ok(AcceptedCall {
+            copies,
             response: prepared.response,
             stream,
             rtp_socket,
@@ -580,7 +583,7 @@ impl TelephonyTransport {
         call_id: &str,
         leg_id: &str,
         role: ParticipantRole,
-    ) -> remotemedia_core::Result<Box<dyn StreamSession>> {
+    ) -> remotemedia_core::Result<(Box<dyn StreamSession>, remotemedia_types::CopyContext)> {
         let shared = self
             .executor
             .get_or_create_shared_session(self.shared_session_key(), manifest)
@@ -595,11 +598,15 @@ impl TelephonyTransport {
                 format!("{role:?}").to_lowercase(),
             );
 
-        Ok(Box::new(TelephonyParticipantStream {
-            participant: shared.participant_handle(participant),
-            outputs: shared.subscribe_outputs(),
-            closed: false,
-        }))
+        let copies = shared.transport_copy_context().await;
+        Ok((
+            Box::new(TelephonyParticipantStream {
+                participant: shared.participant_handle(participant),
+                outputs: shared.subscribe_outputs(),
+                closed: false,
+            }),
+            copies,
+        ))
     }
 
     /// Gracefully terminate all tracked call sessions.
@@ -1289,6 +1296,7 @@ a=ptime:20\r\n",
             .unwrap();
 
         assert_eq!(accepted.stream.session_id(), shared.session_id());
+        assert!(accepted.copies.same_authority(&shared.transport_copy_context().await));
         accepted.stream.close().await.unwrap();
         assert!(shared.is_active().await);
         shared.close().await.unwrap();
@@ -1341,7 +1349,7 @@ a=ptime:20\r\n",
                 ssrc: 1,
                 marker: false,
             },
-            payload: vec![0xff; 160],
+            payload: vec![0xff; 160].into(),
         };
 
         let start = Instant::now();

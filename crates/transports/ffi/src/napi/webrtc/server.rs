@@ -278,9 +278,14 @@ impl WebRtcServer {
         let manifest = Arc::new(manifest);
 
         // Create PipelineExecutor
-        let runner = Arc::new(PipelineExecutor::new().map_err(|e| {
-            Error::from_reason(format!("Failed to create PipelineExecutor: {}", e))
-        })?);
+        let runner = Arc::new(
+            PipelineExecutor::with_config(
+                config
+                    .to_executor_config()
+                    .map_err(|e| Error::from_reason(e.to_string()))?,
+            )
+            .map_err(|e| Error::from_reason(format!("Failed to create PipelineExecutor: {}", e)))?,
+        );
 
         // Build WebRTC transport configuration
         let transport_config = Arc::new(config.to_webrtc_config());
@@ -395,30 +400,25 @@ impl WebRtcServer {
                     }
                     remotemedia_webrtc::signaling::WebRtcEventBridge::PipelineOutput {
                         peer_id,
-                        data_json,
+                        data,
                         timestamp_ns,
+                        ..
                     } => {
-                        // Parse the data_json to extract data type
-                        let (data_type, data_str) = if let Ok(runtime_data) =
-                            serde_json::from_str::<remotemedia_core::data::RuntimeData>(&data_json)
-                        {
-                            use remotemedia_core::data::RuntimeData;
-                            match &runtime_data {
-                                RuntimeData::Audio { samples, sample_rate, channels, .. } => (
-                                    "audio".to_string(),
-                                    serde_json::json!({ "sample_rate": sample_rate, "channels": channels, "num_samples": samples.len() }).to_string(),
-                                ),
-                                RuntimeData::Text(content) => ("text".to_string(), serde_json::json!({ "content": content }).to_string()),
-                                RuntimeData::Video { width, height, format, .. } => (
-                                    "video".to_string(),
-                                    serde_json::json!({ "width": width, "height": height, "format": format!("{:?}", format) }).to_string(),
-                                ),
-                                RuntimeData::Binary(data) => ("binary".to_string(), serde_json::json!({ "size": data.len() }).to_string()),
-                                RuntimeData::Json(value) => ("json".to_string(), value.to_string()),
-                                _ => ("unknown".to_string(), "{}".to_string()),
-                            }
-                        } else {
-                            ("unknown".to_string(), data_json)
+                        use remotemedia_core::data::RuntimeData;
+                        // Summarize metadata directly; do not serialize bulk payloads.
+                        let (data_type, data_str) = match &data {
+                            RuntimeData::Audio { samples, sample_rate, channels, .. } => (
+                                "audio".to_string(),
+                                serde_json::json!({ "sample_rate": sample_rate, "channels": channels, "num_samples": samples.len() }).to_string(),
+                            ),
+                            RuntimeData::Text(content) => ("text".to_string(), serde_json::json!({ "content": content }).to_string()),
+                            RuntimeData::Video { width, height, format, .. } => (
+                                "video".to_string(),
+                                serde_json::json!({ "width": width, "height": height, "format": format!("{:?}", format) }).to_string(),
+                            ),
+                            RuntimeData::Binary(data) => ("binary".to_string(), serde_json::json!({ "size": data.len() }).to_string()),
+                            RuntimeData::Json(value) => ("json".to_string(), value.to_string()),
+                            _ => ("unknown".to_string(), "{}".to_string()),
                         };
                         let data = PipelineOutputData {
                             peer_id: peer_id.clone(),
@@ -438,6 +438,7 @@ impl WebRtcServer {
                         peer_id,
                         data,
                         timestamp_ns,
+                        ..
                     } => {
                         let data = DataReceivedData {
                             peer_id: peer_id.clone(),
@@ -529,9 +530,16 @@ impl WebRtcServer {
     /// @param peer_id - Target peer ID
     /// @param data - Data to send (Buffer)
     #[napi]
-    pub async fn send_to_peer(&self, peer_id: String, data: Buffer) -> Result<()> {
+    pub async fn send_to_peer(
+        &self,
+        peer_id: String,
+        data: Buffer,
+        require_zero_copy: Option<bool>,
+    ) -> Result<()> {
+        // A JS Buffer stays mutable: this snapshot is a counted copy (strict rejects).
+        let data = crate::napi::buffers::import_vec(data.as_ref(), require_zero_copy)?;
         self.core
-            .send_to_peer(&peer_id, data.to_vec())
+            .send_to_peer(&peer_id, data)
             .await
             .map_err(|e| Error::from_reason(e.to_string()))
     }
@@ -540,9 +548,11 @@ impl WebRtcServer {
     ///
     /// @param data - Data to broadcast (Buffer)
     #[napi]
-    pub async fn broadcast(&self, data: Buffer) -> Result<()> {
+    pub async fn broadcast(&self, data: Buffer, require_zero_copy: Option<bool>) -> Result<()> {
+        // A JS Buffer stays mutable: this snapshot is a counted copy (strict rejects).
+        let data = crate::napi::buffers::import_vec(data.as_ref(), require_zero_copy)?;
         self.core
-            .broadcast(data.to_vec())
+            .broadcast(data)
             .await
             .map_err(|e| Error::from_reason(e.to_string()))
     }

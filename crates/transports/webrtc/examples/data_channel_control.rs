@@ -59,7 +59,7 @@ fn create_pipeline_control_messages() -> Vec<DataChannelMessage> {
         DataChannelMessage::Binary {
             action: "binary".to_string(),
             headers: BTreeMap::new(),
-            data: vec![0x01, 0x02, 0x03, 0x04],
+            data: vec![0x01, 0x02, 0x03, 0x04].into(),
         },
         // Simple text message
         DataChannelMessage::Text {

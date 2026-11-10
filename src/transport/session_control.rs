@@ -609,10 +609,16 @@ impl Default for NodeState {
     }
 }
 
+struct ControlIngress {
+    sender: Option<super::SessionPacketSender>,
+    admission: super::ingress::IngressAdmission,
+}
+
 /// Per-session control state. Created alongside the `SessionRouter` and
 /// handed to the router via `attach_control`.
 pub struct SessionControl {
     session_id: String,
+    transport_copies: remotemedia_types::CopyContext,
     /// Latest office observation, read at the start of an LLM turn. This is
     /// replaceable state, not a queued input that could stall the media router.
     office_observation: parking_lot::RwLock<Option<serde_json::Value>>,
@@ -624,7 +630,7 @@ pub struct SessionControl {
     intercepts: DashMap<InterceptKey, Arc<InterceptSlot>>,
     /// Handle to the router's input channel so `publish` can inject packets.
     /// Set by `attach_input_sender` after the router is constructed.
-    input_tx: RwLock<Option<mpsc::Sender<DataPacket>>>,
+    input_tx: parking_lot::RwLock<Option<ControlIngress>>,
     rpc_inputs: DashMap<String, RpcLane>,
     /// Serial `__call_reply__` delivery lanes for nodes that opted into
     /// endpoint calls (see `rpc_dispatch::run`).
@@ -797,6 +803,16 @@ impl SystemEventReceiver {
 
 impl SessionControl {
     pub fn new(session_id: impl Into<String>) -> Arc<Self> {
+        Self::with_transport_copy_context(
+            session_id, remotemedia_types::CopyContext::legacy().clone(),
+        )
+    }
+
+    /// Bind control transports to the same immutable authority as session media.
+    pub fn with_transport_copy_context(
+        session_id: impl Into<String>,
+        transport_copies: remotemedia_types::CopyContext,
+    ) -> Arc<Self> {
         let session_id: String = session_id.into();
         let (close_tx, _) = broadcast::channel(1);
 
@@ -809,10 +825,11 @@ impl SessionControl {
 
         Arc::new(Self {
             session_id: session_id.clone(),
+            transport_copies,
             office_observation: parking_lot::RwLock::new(None),
             taps: DashMap::new(),
             intercepts: DashMap::new(),
-            input_tx: RwLock::new(None),
+            input_tx: parking_lot::RwLock::new(None),
             rpc_inputs: DashMap::new(),
             call_reply_lanes: DashMap::new(),
             endpoints: EndpointRegistry::new(session_id.clone()),
@@ -840,6 +857,11 @@ impl SessionControl {
     }
 
     // ─── Discovery / telemetry ─────────────────────────────────────────────
+
+    /// Retained transport authority remains valid after the session closes.
+    pub fn transport_copy_context(&self) -> remotemedia_types::CopyContext {
+        self.transport_copies.clone()
+    }
 
     /// Wall-clock creation time (ms since epoch).
     pub fn created_at_ms(&self) -> u64 {
@@ -949,7 +971,7 @@ impl SessionControl {
                 .system_retained
                 .lock()
                 .expect("system_retained mutex poisoned");
-            let _ = sender.send(data);
+            let _ = sender.send(data.into_shared());
         }
     }
 
@@ -1040,13 +1062,36 @@ impl SessionControl {
 
     /// Wire the router's input channel so `publish` can reach nodes.
     /// Called once from `SessionRouter::attach_control`.
-    pub async fn attach_input_sender(&self, tx: mpsc::Sender<DataPacket>) {
-        *self.input_tx.write().await = Some(tx);
+    pub async fn attach_input_sender(&self, tx: impl Into<super::SessionPacketSender>) {
+        let sender = tx.into();
+        *self.input_tx.write() = Some(ControlIngress {
+            admission: sender.admission(),
+            sender: Some(sender),
+        });
+    }
+
+    /// Release only the internal sender; independent participant handles still
+    /// own their input lifetime. Keep admission checks active through draining.
+    pub(crate) fn finish_input(&self) {
+        if let Some(input) = self.input_tx.write().as_mut() {
+            input.sender = None;
+        }
     }
 
     /// Clone the router input sender for transport-level participant joins.
-    pub async fn input_sender(&self) -> Option<mpsc::Sender<DataPacket>> {
-        self.input_tx.read().await.clone()
+    pub async fn input_sender(&self) -> Option<super::SessionPacketSender> {
+        self.input_tx.read().as_ref().and_then(|input| input.sender.clone())
+    }
+
+    fn admit_external_control(&self, mut data: RuntimeData) -> Result<RuntimeData> {
+        if let Some(input) = self.input_tx.read().as_ref() {
+            input.admission.admit_payload(&mut data).map_err(|error| {
+                crate::Error::Execution(format!(
+                    "session {} control ingress buffer budget: {error}", self.session_id
+                ))
+            })?;
+        }
+        Ok(data)
     }
 
     // ─── Client-facing API (driven by `handle_frame`) ──────────────────────
@@ -1417,7 +1462,7 @@ impl SessionControl {
             .taps
             .get(&key)
             .ok_or_else(|| crate::Error::Execution("RPC reply subscriber closed".into()))?;
-        tap.send(data)
+        tap.send(data.into_shared())
             .map_err(|_| crate::Error::Execution("RPC reply subscriber closed".into()))?;
         Ok(())
     }
@@ -1512,15 +1557,17 @@ impl SessionControl {
                 }
             }
         }
-        let tx_guard = self.input_tx.read().await;
-        let tx = tx_guard.as_ref().ok_or_else(|| {
-            crate::Error::Execution("session control not yet attached to router".into())
-        })?;
-
-        let payload = match &addr.port {
-            None => data,
-            Some(port) => wrap_aux_port(port, data),
+        let tx = {
+            let binding = self.input_tx.read();
+            let input = binding.as_ref().ok_or_else(|| {
+                crate::Error::Execution("session control not yet attached to router".into())
+            })?;
+            input.sender.clone().ok_or_else(|| {
+                crate::Error::Execution("session control input is complete".into())
+            })?
         };
+
+        let payload = tx.control_payload(addr.port.as_deref(), data, &self.transport_copies)?;
 
         let packet = DataPacket {
             data: payload,
@@ -1533,8 +1580,8 @@ impl SessionControl {
             sub_sequence: 0,
             metadata: std::collections::HashMap::new(),
         };
-        tx.send(packet).await.map_err(|_| {
-            crate::Error::Execution(format!("session {} router input closed", self.session_id))
+        tx.send(packet).await.map_err(|error| {
+            crate::Error::Execution(format!("session {} ingress: {error}", self.session_id))
         })
     }
 
@@ -1550,6 +1597,7 @@ impl SessionControl {
             ));
         }
         // Write to the tap (broadcast channel) for this node/port.
+        let data = self.admit_external_control(data)?;
         self.publish_tap(&addr.node_id, addr.port.as_deref(), data);
         Ok(())
     }
@@ -1592,15 +1640,32 @@ impl SessionControl {
 
     /// Complete a pending intercept. Called by the transport when the
     /// client sends an `InterceptReply` frame.
-    pub fn complete_intercept(&self, correlation_id: u64, decision: InterceptDecision) {
+    /// A rejected replacement leaves the pending intercept open for retry, Pass
+    /// or Drop until its original deadline. No unadmitted buffer is delivered.
+    pub fn complete_intercept(
+        &self,
+        correlation_id: u64,
+        decision: InterceptDecision,
+    ) -> Result<()> {
         // We don't know which (node,port) owns this correlation_id without
         // searching — intercepts are few, so a linear scan is fine.
         for entry in self.intercepts.iter() {
-            if let Some((_, tx)) = entry.value().pending.remove(&correlation_id) {
-                let _ = tx.send(decision);
-                return;
+            if let dashmap::mapref::entry::Entry::Occupied(pending) =
+                entry.value().pending.entry(correlation_id)
+            {
+                let decision = match decision {
+                    InterceptDecision::Replace(data) => {
+                        InterceptDecision::Replace(self.admit_external_control(data)?)
+                    }
+                    other => other,
+                };
+                let tx = pending.remove();
+                return tx.send(decision).map_err(|_| {
+                    crate::Error::Execution("intercept receiver closed".into())
+                });
             }
         }
+        Ok(())
     }
 
     /// Dispatch a client-originated frame. This is the single entry point the
@@ -1634,7 +1699,7 @@ impl SessionControl {
                 correlation_id,
                 decision,
             } => {
-                self.complete_intercept(correlation_id, decision);
+                self.complete_intercept(correlation_id, decision)?;
                 Ok(FrameOutcome::Done)
             }
             ControlFrame::SetNodeState { node_id, state } => {
@@ -1696,6 +1761,7 @@ impl SessionControl {
         data: RuntimeData,
         sender: broadcast::Sender<RuntimeData>,
     ) {
+        let data = data.into_shared();
         if node_id == "__system__" && port.is_none() {
             // CRITICAL: hold `system_retained` across both retain-append AND
             // broadcast::send so a concurrent subscribe_system either sees this
@@ -1843,6 +1909,7 @@ impl SessionControl {
         port: Option<&str>,
         data: RuntimeData,
     ) -> Option<RuntimeData> {
+        let data = data.into_shared();
         let port_owned = port.map(|s| s.to_string());
 
         // 1. Broadcast to tap subscribers (fire-and-forget; slow subs lag).
@@ -1914,7 +1981,7 @@ impl SessionControl {
 
         match tokio::time::timeout(slot.deadline, reply_rx).await {
             Ok(Ok(InterceptDecision::Pass)) => Some(data),
-            Ok(Ok(InterceptDecision::Replace(replacement))) => Some(replacement),
+            Ok(Ok(InterceptDecision::Replace(replacement))) => Some(replacement.into_shared()),
             Ok(Ok(InterceptDecision::Drop)) => None,
             Ok(Err(_canceled)) => {
                 tracing::warn!(
@@ -2328,6 +2395,10 @@ pub fn global_bus() -> Option<Arc<SessionControlBus>> {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[path = "session_control_input_tests.rs"]
+mod input_completion_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2369,7 +2440,8 @@ mod tests {
         let ControlEvent::InterceptRequest { correlation_id, .. } = ev else {
             panic!("expected InterceptRequest");
         };
-        ctrl.complete_intercept(correlation_id, InterceptDecision::Replace(text("redacted")));
+        ctrl.complete_intercept(correlation_id, InterceptDecision::Replace(text("redacted")))
+            .unwrap();
 
         let out = data_task.await.unwrap().unwrap();
         match out {
@@ -2861,5 +2933,91 @@ mod discovery_tests {
         ctrl.clear_node_state("n");
         assert_eq!(tel.node(0).node_state(), NodeState::Enabled);
         assert!(ctrl.summary().has_telemetry);
+    }
+
+    fn legacy_audio(fill: f32) -> (RuntimeData, *const f32) {
+        let samples = vec![fill; 32];
+        let address = samples.as_ptr();
+        let data = RuntimeData::Audio {
+            samples: crate::data::AudioSamples::Vec(samples),
+            sample_rate: 16_000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: None,
+        };
+        (data, address)
+    }
+
+    fn shared_at(data: &RuntimeData, expected: *const f32) {
+        let RuntimeData::Audio { samples, .. } = data else {
+            panic!("expected audio");
+        };
+        assert!(!matches!(samples, crate::data::AudioSamples::Vec(_)));
+        assert_eq!(
+            samples.as_ptr(),
+            expected,
+            "control path copied the samples"
+        );
+    }
+
+    #[tokio::test]
+    async fn intercept_pass_and_replace_retain_promoted_owners() {
+        let ctrl = SessionControl::new("sess-identity");
+        let addr = ControlAddress::node_out("tts");
+        let mut tap = ctrl.subscribe(&addr).unwrap();
+        let mut events = ctrl.intercept(&addr, Some(Duration::from_secs(2))).unwrap();
+        for replace in [false, true] {
+            let (data, original) = legacy_audio(0.5);
+            let ctrl_dp = ctrl.clone();
+            let task = tokio::spawn(async move { ctrl_dp.on_node_output("tts", None, data).await });
+            let ControlEvent::InterceptRequest {
+                correlation_id,
+                data: requested,
+                ..
+            } = events.recv().await.unwrap()
+            else {
+                panic!("expected InterceptRequest");
+            };
+            shared_at(&requested, original);
+            shared_at(&tap.recv().await.unwrap(), original);
+            let (replacement, replaced) = legacy_audio(0.75);
+            let (decision, expected) = if replace {
+                (InterceptDecision::Replace(replacement), replaced)
+            } else {
+                (InterceptDecision::Pass, original)
+            };
+            ctrl.complete_intercept(correlation_id, decision).unwrap();
+            let forwarded = task.await.unwrap().expect("not dropped");
+            shared_at(&forwarded, expected);
+            // The client's request copy and the forwarded owner coexist.
+            shared_at(&requested, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn system_and_rpc_reply_broadcasts_promote_legacy_audio() {
+        let ctrl = SessionControl::new("sess-broadcast");
+        let mut system = ctrl
+            .subscribe(&ControlAddress::node_out(SYSTEM_PORT))
+            .unwrap();
+        let mut second = ctrl
+            .subscribe(&ControlAddress::node_out(SYSTEM_PORT))
+            .unwrap();
+        let (data, original) = legacy_audio(0.25);
+        ctrl.publish_system_ephemeral(data);
+        shared_at(&system.recv().await.unwrap(), original);
+        shared_at(&second.recv().await.unwrap(), original);
+
+        let reply = ControlAddress {
+            node_id: "tts".into(),
+            port: Some("__reply__".into()),
+            direction: Direction::Out,
+        };
+        let mut replies = ctrl.subscribe(&reply).unwrap();
+        let (data, original) = legacy_audio(0.125);
+        ctrl.publish_rpc_reply("tts", data).unwrap();
+        shared_at(&replies.recv().await.unwrap(), original);
     }
 }

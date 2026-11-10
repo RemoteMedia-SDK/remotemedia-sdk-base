@@ -21,11 +21,13 @@
 //! ```
 
 use crate::error::{Error, Result};
+use crate::{codec, sse};
 use async_trait::async_trait;
 use futures::StreamExt;
 use remotemedia_core::manifest::Manifest;
 use remotemedia_core::transport::client::EmbeddedPythonEnv;
 use remotemedia_core::transport::{ClientStreamSession, PipelineClient, TransportData};
+use remotemedia_types::{CopyContext, CopyPolicy};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -42,6 +44,7 @@ pub struct HttpPipelineClient {
 
     /// Reqwest HTTP client
     client: reqwest::Client,
+    copies: CopyContext,
 }
 
 impl HttpPipelineClient {
@@ -80,9 +83,8 @@ impl HttpPipelineClient {
             )));
         }
 
-        // Create reqwest client with timeout
+        // Bound individual RPC requests; SSE connections remain open until closed.
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| Error::ConnectionError(format!("Failed to create HTTP client: {}", e)))?;
 
@@ -90,7 +92,23 @@ impl HttpPipelineClient {
             base_url,
             auth_token,
             client,
+            copies: CopyContext::new(
+                CopyPolicy::AllowCopies,
+                format!("http/client/{}", uuid::Uuid::new_v4()),
+            ),
         })
+    }
+
+    /// Bind explicit authority for all subsequent requests and stream handles.
+    /// Retain a clone to inspect accounting after the client/session is dropped.
+    pub fn with_copy_context(mut self, copies: CopyContext) -> Self {
+        self.copies = copies;
+        self
+    }
+
+    /// Retain this client's compatibility-transfer ledger.
+    pub fn copy_context(&self) -> CopyContext {
+        self.copies.clone()
     }
 
     /// Build authorization header if token is present
@@ -138,14 +156,6 @@ struct StreamInputRequest {
     data: TransportData,
 }
 
-/// SSE event data
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Fields used during deserialization
-struct SseEvent {
-    /// Output data
-    data: TransportData,
-}
-
 #[async_trait]
 impl PipelineClient for HttpPipelineClient {
     /// Execute a pipeline with unary semantics
@@ -171,7 +181,17 @@ impl PipelineClient for HttpPipelineClient {
         };
 
         // Build request
-        let mut request = self.client.post(&url).json(&request_body);
+        let bytes = codec::encode(
+            &request_body,
+            request_body.input.data.bulk_payload_bytes(),
+            &self.copies,
+        )?;
+        let mut request = self
+            .client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .header("content-type", "application/json")
+            .body(bytes);
 
         // Add auth header if present
         if let Some(auth_header) = self.build_auth_header() {
@@ -184,27 +204,13 @@ impl PipelineClient for HttpPipelineClient {
         })?;
 
         // Check status
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(remotemedia_core::Error::RemoteExecutionFailed(format!(
-                "HTTP {} {}: {}",
-                status.as_u16(),
-                status.canonical_reason().unwrap_or("Unknown"),
-                error_text
-            )));
-        }
+        let response = checked_response(response)
+            .await
+            .map_err(remotemedia_core::Error::RemoteExecutionFailed)?;
 
         // Parse response
-        let execute_response: ExecuteResponse = response.json().await.map_err(|e| {
-            remotemedia_core::Error::RemoteExecutionFailed(format!(
-                "Failed to parse response: {}",
-                e
-            ))
-        })?;
+        let body = crate::body::JsonBody::collect(response.bytes_stream(), usize::MAX).await?;
+        let execute_response: ExecuteResponse = body.decode(&self.copies)?;
 
         Ok(execute_response.output)
     }
@@ -231,7 +237,11 @@ impl PipelineClient for HttpPipelineClient {
         };
 
         // Build request
-        let mut request = self.client.post(&url).json(&request_body);
+        let mut request = self
+            .client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .json(&request_body);
         if let Some(auth_header) = self.build_auth_header() {
             request = request.header("authorization", auth_header);
         }
@@ -244,19 +254,9 @@ impl PipelineClient for HttpPipelineClient {
             ))
         })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(remotemedia_core::Error::RemoteExecutionFailed(format!(
-                "HTTP {} {}: {}",
-                status.as_u16(),
-                status.canonical_reason().unwrap_or("Unknown"),
-                error_text
-            )));
-        }
+        let response = checked_response(response)
+            .await
+            .map_err(remotemedia_core::Error::RemoteExecutionFailed)?;
 
         // Parse response
         let create_response: CreateStreamResponse = response.json().await.map_err(|e| {
@@ -268,15 +268,30 @@ impl PipelineClient for HttpPipelineClient {
 
         // Create stream session
         let session = HttpStreamSession::new(
-            create_response.session_id,
+            create_response.session_id.clone(),
             self.base_url.clone(),
             self.auth_token.clone(),
             self.client.clone(),
+            self.copies.clone(),
         )
-        .await
-        .map_err(|e| remotemedia_core::Error::Transport(e.to_string()))?;
-
-        Ok(Box::new(session))
+        .await;
+        match session {
+            Ok(session) => Ok(Box::new(session)),
+            Err(error) => {
+                let cleanup = delete_session(
+                    &self.client,
+                    &self.base_url,
+                    &create_response.session_id,
+                    self.auth_token.as_deref(),
+                )
+                .await;
+                let detail = cleanup
+                    .err()
+                    .map(|e| format!("; session cleanup failed: {e}"))
+                    .unwrap_or_default();
+                Err(codec::error(format!("{error}{detail}")))
+            }
+        }
     }
 
     /// Check if the remote endpoint is healthy
@@ -330,13 +345,14 @@ pub struct HttpStreamSession {
     /// Bounded — the background SSE parser task `.await`s its send, so
     /// a slow consumer back-pressures the SSE stream parsing rather
     /// than buffering events unboundedly in memory.
-    output_rx: mpsc::Receiver<TransportData>,
+    output_rx: mpsc::Receiver<remotemedia_core::Result<TransportData>>,
+    copies: CopyContext,
 
     /// Whether the session is active
     active: bool,
 
     /// Handle to the background SSE task
-    _sse_task: tokio::task::JoinHandle<()>,
+    sse_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HttpStreamSession {
@@ -346,6 +362,7 @@ impl HttpStreamSession {
         base_url: String,
         auth_token: Option<String>,
         client: reqwest::Client,
+        copies: CopyContext,
     ) -> Result<Self> {
         // Create bounded channel for SSE outputs. Small capacity because
         // SSE events are typically text/JSON frames and we want to
@@ -358,65 +375,21 @@ impl HttpStreamSession {
             .unwrap_or(16);
         let (output_tx, output_rx) = mpsc::channel(capacity);
 
-        // Start SSE stream in background task
+        // Establish the subscription before returning, so the first input cannot
+        // race the server's subscriber registration. HTTP failures remain visible.
         let sse_url = format!("{}/stream/{}/output", base_url, session_id);
-        let sse_client = client.clone();
-        let sse_auth = auth_token.clone();
-
+        let mut request = client.get(sse_url);
+        if let Some(token) = &auth_token {
+            request = request.bearer_auth(token);
+        }
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), request.send())
+            .await
+            .map_err(|e| Error::ConnectionError(e.to_string()))??
+            .error_for_status()?;
+        let stream_copies = copies.clone();
         let sse_task = tokio::spawn(async move {
-            let mut request = sse_client.get(&sse_url);
-            if let Some(auth_header) = sse_auth.as_ref().map(|t| format!("Bearer {}", t)) {
-                request = request.header("authorization", auth_header);
-            }
-
-            match request.send().await {
-                Ok(response) => {
-                    let mut stream = response.bytes_stream();
-
-                    // Simple SSE parsing: read "data: {json}\n\n" events
-                    let mut buffer = String::new();
-
-                    while let Some(chunk_result) = stream.next().await {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                if let Ok(text) = std::str::from_utf8(&chunk) {
-                                    buffer.push_str(text);
-
-                                    // Process complete SSE events
-                                    while let Some(event_end) = buffer.find("\n\n") {
-                                        let event = buffer[..event_end].to_string();
-                                        buffer.drain(..event_end + 2);
-
-                                        // Parse "data: {json}" format
-                                        if let Some(data_line) = event.strip_prefix("data: ") {
-                                            if let Ok(transport_data) =
-                                                serde_json::from_str::<TransportData>(
-                                                    data_line.trim(),
-                                                )
-                                            {
-                                                // Bounded: .await applies backpressure to SSE parsing
-                                                // when the consumer falls behind.
-                                                if output_tx.send(transport_data).await.is_err() {
-                                                    tracing::debug!(
-                                                        "SSE receiver dropped, stopping stream"
-                                                    );
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("SSE stream error: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to connect to SSE stream: {}", e);
-                }
+            if let Err(error) = receive_sse(response, &output_tx, &stream_copies).await {
+                let _ = output_tx.send(Err(error)).await;
             }
         });
 
@@ -427,7 +400,8 @@ impl HttpStreamSession {
             client,
             output_rx,
             active: true,
-            _sse_task: sse_task,
+            sse_task: Some(sse_task),
+            copies,
         })
     }
 }
@@ -450,7 +424,17 @@ impl ClientStreamSession for HttpStreamSession {
         let request_body = StreamInputRequest { data };
 
         // Build request
-        let mut request = self.client.post(&url).json(&request_body);
+        let bytes = codec::encode(
+            &request_body,
+            request_body.data.data.bulk_payload_bytes(),
+            &self.copies,
+        )?;
+        let mut request = self
+            .client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .header("content-type", "application/json")
+            .body(bytes);
         if let Some(auth_header) = self.build_auth_header() {
             request = request.header("authorization", auth_header);
         }
@@ -460,19 +444,9 @@ impl ClientStreamSession for HttpStreamSession {
             remotemedia_core::Error::Transport(format!("Failed to send data: {}", e))
         })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(remotemedia_core::Error::Transport(format!(
-                "HTTP {} {}: {}",
-                status.as_u16(),
-                status.canonical_reason().unwrap_or("Unknown"),
-                error_text
-            )));
-        }
+        let _response = checked_response(response)
+            .await
+            .map_err(remotemedia_core::Error::Transport)?;
 
         Ok(())
     }
@@ -484,7 +458,11 @@ impl ClientStreamSession for HttpStreamSession {
 
         // Receive from SSE stream channel
         match self.output_rx.recv().await {
-            Some(data) => Ok(Some(data)),
+            Some(Ok(data)) => Ok(Some(data)),
+            Some(Err(error)) => {
+                self.active = false;
+                Err(error)
+            }
             None => {
                 // SSE stream ended
                 self.active = false;
@@ -494,22 +472,21 @@ impl ClientStreamSession for HttpStreamSession {
     }
 
     async fn close(&mut self) -> remotemedia_core::Result<()> {
-        if !self.active {
-            return Ok(());
-        }
-
-        // Send DELETE request to close session
-        let url = format!("{}/stream/{}", self.base_url, self.session_id);
-        let mut request = self.client.delete(&url);
-        if let Some(auth_header) = self.build_auth_header() {
-            request = request.header("authorization", auth_header);
-        }
-
-        let _ = request.send().await; // Ignore errors on close
-
         self.active = false;
-        tracing::info!("HTTP stream session {} closed", self.session_id);
-        Ok(())
+        self.output_rx.close();
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+            // Join releases retained wire chunks, including a blocked output send.
+            let _ = task.await;
+        }
+        while self.output_rx.try_recv().is_ok() {}
+        delete_session(
+            &self.client,
+            &self.base_url,
+            &self.session_id,
+            self.auth_token.as_deref(),
+        )
+        .await
     }
 
     fn is_active(&self) -> bool {
@@ -523,6 +500,77 @@ impl HttpStreamSession {
             .as_ref()
             .map(|token| format!("Bearer {}", token))
     }
+}
+
+impl Drop for HttpStreamSession {
+    fn drop(&mut self) {
+        if let Some(task) = &self.sse_task {
+            task.abort();
+        }
+    }
+}
+
+async fn receive_sse(
+    response: reqwest::Response,
+    outputs: &mpsc::Sender<remotemedia_core::Result<TransportData>>,
+    copies: &CopyContext,
+) -> remotemedia_core::Result<()> {
+    let mut stream = response.bytes_stream();
+    let mut frames = sse::Frames::default();
+    while let Some(chunk) = stream.next().await {
+        frames.push(chunk.map_err(codec::error)?);
+        while let Some(frame) = frames.next(copies)? {
+            if let Some(data) = sse::decode(&frame, copies)? {
+                if outputs.send(Ok(data)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    if !frames.is_empty() {
+        return Err(codec::error(
+            "SSE connection ended with an incomplete event",
+        ));
+    }
+    Ok(())
+}
+
+async fn checked_response(
+    response: reqwest::Response,
+) -> std::result::Result<reqwest::Response, String> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let detail = response
+        .text()
+        .await
+        .map_err(|error| format!("HTTP {status}: failed to read error response: {error}"))?;
+    Err(format!(
+        "HTTP {} {}: {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("Unknown"),
+        detail
+    ))
+}
+
+async fn delete_session(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+    auth: Option<&str>,
+) -> remotemedia_core::Result<()> {
+    let mut request = client
+        .delete(format!("{base_url}/stream/{session_id}"))
+        .timeout(std::time::Duration::from_secs(30));
+    if let Some(token) = auth {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(codec::error)?;
+    if response.status() != reqwest::StatusCode::NOT_FOUND {
+        response.error_for_status().map_err(codec::error)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

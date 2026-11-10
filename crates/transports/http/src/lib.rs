@@ -58,9 +58,12 @@
 //! ```
 
 pub mod builder;
+mod body;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod client;
+mod codec;
+mod sse;
 pub mod error;
 pub mod plugin;
 pub mod server;
@@ -73,3 +76,6 @@ pub use client::{HttpPipelineClient, HttpStreamSession};
 pub use error::{Error, Result};
 pub use plugin::HttpTransportPlugin;
 pub use server::HttpServer;
+
+#[cfg(test)]
+mod copy_tests;

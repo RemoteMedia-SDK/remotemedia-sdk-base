@@ -417,6 +417,22 @@ impl SyncStreamingNode for SyncPipelineExecutor {
         }
         Ok(data)
     }
+
+    /// Context-bearing form: every enabled step receives the caller's
+    /// context, so nested nodes see its output provider and copy ledger
+    /// (for example inside a prepared real-time bridge).
+    fn process_with_ctx(
+        &self,
+        mut data: RuntimeData,
+        ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+    ) -> std::result::Result<RuntimeData, Error> {
+        for step in &self.order {
+            if let NodeState::Enabled = step.state.load() {
+                data = step.node.process_with_ctx(data, ctx)?;
+            }
+        }
+        Ok(data)
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -513,6 +529,58 @@ mod tests {
             arrival_ts_us: None,
             metadata: None,
         }
+    }
+
+    /// Reports the session id of the context it was called with.
+    struct ContextProbe;
+    impl SyncStreamingNode for ContextProbe {
+        fn node_type(&self) -> &str {
+            "Probe"
+        }
+        fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
+            Ok(RuntimeData::Text("no context".into()))
+        }
+        fn process_with_ctx(
+            &self,
+            _data: RuntimeData,
+            ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead,
+        ) -> Result<RuntimeData> {
+            Ok(RuntimeData::Text(ctx.session_id().to_string()))
+        }
+    }
+    struct ProbeFactory;
+    impl SyncStreamingNodeFactory for ProbeFactory {
+        fn create(&self, _id: String, _params: &Value) -> Result<Box<dyn SyncStreamingNode>> {
+            Ok(Box::new(ContextProbe))
+        }
+        fn node_type(&self) -> &str {
+            "Probe"
+        }
+    }
+
+    #[test]
+    fn context_bearing_calls_reach_every_nested_node() {
+        let mut manifest = build_chain(&[2.0]);
+        manifest.nodes.push(NodeManifest {
+            id: "probe".into(),
+            node_type: "Probe".into(),
+            ..Default::default()
+        });
+        manifest.connections.push(Connection {
+            from: "g0".into(),
+            to: "probe".into(),
+            ..Default::default()
+        });
+        let mut reg = SyncStreamingNodeRegistry::new();
+        reg.register(Arc::new(GainFactory));
+        reg.register(Arc::new(ProbeFactory));
+        let pipe = SyncPipelineExecutor::from_manifest(&manifest, &reg).unwrap();
+        let ctx = crate::nodes::NodeRuntimeContext::for_test("bridge-session", "pipe");
+        let out = pipe.process_with_ctx(audio(vec![1.0]), &ctx).unwrap();
+        assert!(
+            matches!(&out, RuntimeData::Text(t) if t == "bridge-session"),
+            "{out:?}"
+        );
     }
 
     #[test]

@@ -4,30 +4,10 @@
 //! Primary backend: ac-ffmpeg (FFmpeg bindings)
 //! Optional: rav1e (pure Rust AV1 encoder)
 //!
-//! ## ac-ffmpeg Integration Status
-//!
-//! The codec implementations below provide functional mock encoding/decoding
-//! that enables end-to-end testing of the video pipeline architecture.
-//!
-//! To enable actual FFmpeg encoding/decoding, implement the TODOs in:
-//! - FFmpegEncoder::encode() - Use ac-ffmpeg VideoEncoder
-//! - FFmpegDecoder::decode() - Use ac-ffmpeg VideoDecoder
-//!
-//! FFmpeg 7.1.1 is installed with libvpx (VP8), libx264 (H.264), and libaom/librav1e (AV1).
-//!
-//! Key ac-ffmpeg API elements (from source inspection):
-//! - VideoDecoder::new(codec_name) or VideoDecoder::builder(codec_name).build()
-//! - VideoEncoder::builder(codec_name).pixel_format(fmt).width(w).height(h).time_base(tb).bit_rate(br).build()
-//! - PixelFormat: parse from strings "yuv420p", "rgb24", "nv12", etc.
-//! - VideoFrameMut::black(format, width, height) - Create frame, use planes_mut()[i].data_mut() to write pixels
-//! - decoder.push(packet), decoder.take() -> Option<VideoFrame>
-//! - encoder.push(frame), encoder.take() -> Option<Packet>
-//! - Packet data access: packet is from demuxer or needs PacketMut construction
-//!
-//! References:
-//! - Source: ~/.cargo/registry/src/.../ac-ffmpeg-0.19.0/src/codec/video/
-//! - Docs: https://docs.rs/ac-ffmpeg/0.19.0
-//! - Examples: https://github.com/angelcam/rust-ac-ffmpeg/tree/master/examples
+//! The `video` feature runs real ac-ffmpeg backends; codec availability depends
+//! on the linked FFmpeg build. Single encoded packets retain their immutable
+//! FFmpeg owner. Input frame/packet staging and decoded frame packing remain
+//! separate ownership and layout boundaries.
 
 use super::decoder::VideoDecoderConfig;
 use super::encoder::VideoEncoderConfig;
@@ -54,6 +34,18 @@ pub enum CodecError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error(transparent)]
+    CopyRejected(#[from] remotemedia_types::CopyRejected),
+
+    #[error(transparent)]
+    OutputAllocation(#[from] remotemedia_types::BufferAllocationError),
+
+    #[error("Invalid decoded output: {0}")]
+    OutputLayout(String),
+
+    #[error("Codec task failed: {0}")]
+    TaskFailed(String),
 }
 
 /// Video encoder backend trait
@@ -69,6 +61,17 @@ pub trait VideoEncoderBackend: Send + Sync {
     /// * `Ok(RuntimeData)` - Encoded frame with codec=Some(...)
     /// * `Err(CodecError)` - Encoding failure
     fn encode(&mut self, input: RuntimeData) -> Result<RuntimeData>;
+
+    /// Execute with caller-owned copy authority. Backends must opt in explicitly.
+    fn encode_with_copy_context(
+        &mut self,
+        _input: RuntimeData,
+        _copies: &remotemedia_types::CopyContext,
+    ) -> Result<RuntimeData> {
+        Err(CodecError::NotAvailable(
+            "encoder does not support contextual copy accounting".into(),
+        ))
+    }
 
     /// Get the codec this encoder produces
     fn codec(&self) -> VideoCodec;
@@ -91,6 +94,18 @@ pub trait VideoDecoderBackend: Send + Sync {
     /// * `Err(CodecError)` - Decoding failure
     fn decode(&mut self, input: RuntimeData) -> Result<RuntimeData>;
 
+    /// Preserve caller copy authority and selected output storage, or reject.
+    fn decode_with_context(
+        &mut self,
+        _input: RuntimeData,
+        _copies: &remotemedia_types::CopyContext,
+        _allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<RuntimeData> {
+        Err(CodecError::NotAvailable(
+            "decoder does not support contextual output allocation".into(),
+        ))
+    }
+
     /// Get the codec this decoder handles
     fn codec(&self) -> VideoCodec;
 
@@ -100,11 +115,7 @@ pub trait VideoDecoderBackend: Send + Sync {
 
 /// FFmpeg encoder implementation
 ///
-/// Currently returns mock encoded frames. To enable actual encoding:
-/// 1. Use VideoEncoder::builder() from ac-ffmpeg
-/// 2. Create VideoFrameMut from pixel_data
-/// 3. Push frame, take packets
-/// 4. Return bitstream as encoded RuntimeData
+/// Lazily selects an available encoder and retains single-packet output storage.
 #[cfg(feature = "video")]
 pub struct FFmpegEncoder {
     config: VideoEncoderConfig,
@@ -126,6 +137,14 @@ impl FFmpegEncoder {
 #[cfg(feature = "video")]
 impl VideoEncoderBackend for FFmpegEncoder {
     fn encode(&mut self, input: RuntimeData) -> Result<RuntimeData> {
+        self.encode_with_copy_context(input, remotemedia_types::CopyContext::legacy())
+    }
+
+    fn encode_with_copy_context(
+        &mut self,
+        input: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<RuntimeData> {
         // Extract raw video frame
         let (pixel_data, width, height, format, frame_number, timestamp_us) = match input {
             RuntimeData::Video {
@@ -162,75 +181,7 @@ impl VideoEncoderBackend for FFmpegEncoder {
             ));
         }
 
-        // Encoder requires even dimensions for YUV 4:2:0 chroma sub-sampling.
-        if width % 2 != 0 || height % 2 != 0 {
-            return Err(CodecError::InvalidInput(format!(
-                "VideoEncoder requires even dimensions for YUV 4:2:0; got {}x{}",
-                width, height
-            )));
-        }
-
-        // Convert input to YUV420p planar (Y || U || V) once, regardless of
-        // the source pixel format. Earlier revisions of this method assumed
-        // pixel_data was already YUV420p and silently memcpy'd whatever bytes
-        // came in into the Y/U/V planes — feeding RGB into the encoder
-        // produced a green-tinted, horizontally banded output over WebRTC
-        // (the Y4M sink worked because it converts RGB→YUV itself).
-        let y_size = (width * height) as usize;
-        let uv_size = ((width / 2) * (height / 2)) as usize;
-        let yuv_buffer: Vec<u8> = match format {
-            PixelFormat::Yuv420p | PixelFormat::I420 => {
-                let expected = y_size + 2 * uv_size;
-                if pixel_data.len() != expected {
-                    return Err(CodecError::InvalidInput(format!(
-                        "YUV420p frame buffer size mismatch: got {} bytes, expected {} for {}x{}",
-                        pixel_data.len(),
-                        expected,
-                        width,
-                        height
-                    )));
-                }
-                pixel_data
-            }
-            PixelFormat::Rgb24 => {
-                let expected = (width * height * 3) as usize;
-                if pixel_data.len() != expected {
-                    return Err(CodecError::InvalidInput(format!(
-                        "RGB24 frame buffer size mismatch: got {} bytes, expected {} for {}x{}",
-                        pixel_data.len(),
-                        expected,
-                        width,
-                        height
-                    )));
-                }
-                crate::data::video::rgb24_to_yuv420p(&pixel_data, width as usize, height as usize)
-            }
-            PixelFormat::Rgba32 => {
-                let expected = (width * height * 4) as usize;
-                if pixel_data.len() != expected {
-                    return Err(CodecError::InvalidInput(format!(
-                        "RGBA32 frame buffer size mismatch: got {} bytes, expected {} for {}x{}",
-                        pixel_data.len(),
-                        expected,
-                        width,
-                        height
-                    )));
-                }
-                crate::data::video::rgba32_to_yuv420p(&pixel_data, width as usize, height as usize)
-            }
-            PixelFormat::NV12 => {
-                return Err(CodecError::InvalidInput(
-                    "NV12 input not yet supported by VideoEncoder; convert to Yuv420p upstream"
-                        .to_string(),
-                ));
-            }
-            PixelFormat::Encoded | PixelFormat::Unspecified => {
-                return Err(CodecError::InvalidInput(format!(
-                    "Unsupported pixel format for encoding: {:?}",
-                    format
-                )));
-            }
-        };
+        let frame = super::frames::encoder_frame(&pixel_data, width, height, format, copies)?;
 
         // Lazy initialize encoder on first frame
         if self.encoder.is_none() {
@@ -355,37 +306,9 @@ impl VideoEncoderBackend for FFmpegEncoder {
 
         let encoder = self.encoder.as_mut().unwrap();
 
-        // Create frame and copy YUV plane data
-        use ac_ffmpeg::codec::{
-            video::{frame::get_pixel_format, VideoFrameMut},
-            Encoder,
-        };
+        use ac_ffmpeg::codec::Encoder;
         use ac_ffmpeg::time::{TimeBase, Timestamp};
-
-        let pixel_format = get_pixel_format("yuv420p");
         let time_base = TimeBase::new(1, self.config.framerate as i32);
-
-        let mut frame = VideoFrameMut::black(pixel_format, width as usize, height as usize);
-
-        {
-            let mut planes_mut = frame.planes_mut();
-            if !planes_mut.is_empty() {
-                let y_plane = planes_mut[0].data_mut();
-                let copy_len = y_plane.len().min(y_size);
-                y_plane[..copy_len].copy_from_slice(&yuv_buffer[..copy_len]);
-            }
-            if planes_mut.len() > 1 {
-                let u_plane = planes_mut[1].data_mut();
-                let copy_len = u_plane.len().min(uv_size);
-                u_plane[..copy_len].copy_from_slice(&yuv_buffer[y_size..y_size + copy_len]);
-            }
-            if planes_mut.len() > 2 {
-                let v_plane = planes_mut[2].data_mut();
-                let copy_len = v_plane.len().min(uv_size);
-                v_plane[..copy_len]
-                    .copy_from_slice(&yuv_buffer[y_size + uv_size..y_size + uv_size + copy_len]);
-            }
-        }
 
         // Set timestamp
         let pts = Timestamp::new(self.frame_count as i64, time_base);
@@ -396,16 +319,9 @@ impl VideoEncoderBackend for FFmpegEncoder {
             CodecError::EncodingFailed(format!("Failed to push frame to encoder: {}", e))
         })?;
 
-        // Collect encoded packets
-        let mut bitstream = Vec::new();
-        let mut is_keyframe = false;
-
-        while let Some(packet) = encoder.take().map_err(|e| {
-            CodecError::EncodingFailed(format!("Failed to take packet from encoder: {}", e))
-        })? {
-            bitstream.extend_from_slice(packet.data());
-            is_keyframe |= packet.is_key();
-        }
+        // Preserve a single packet's immutable FFmpeg owner. Multiple packets
+        // require contiguous aggregation in the existing RuntimeData wire shape.
+        let (bitstream, is_keyframe) = super::packets::take_encoded(encoder, copies)?;
 
         self.frame_count += 1;
 
@@ -435,11 +351,8 @@ impl VideoEncoderBackend for FFmpegEncoder {
 
 /// FFmpeg decoder implementation
 ///
-/// Currently returns mock decoded frames. To enable actual decoding:
-/// 1. Use VideoDecoder::new() from ac-ffmpeg
-/// 2. Create Packet from bitstream (may need PacketMut)
-/// 3. Push packet, take frames
-/// 4. Copy frame planes to RuntimeData
+/// Lazily creates a decoder and reuses complete FFmpeg packet owners. Arbitrary
+/// packet ingress and raw frame output still require staging.
 #[cfg(feature = "video")]
 pub struct FFmpegDecoder {
     config: VideoDecoderConfig,
@@ -459,6 +372,19 @@ impl FFmpegDecoder {
 #[cfg(feature = "video")]
 impl VideoDecoderBackend for FFmpegDecoder {
     fn decode(&mut self, input: RuntimeData) -> Result<RuntimeData> {
+        self.decode_with_context(
+            input,
+            remotemedia_types::CopyContext::legacy(),
+            &remotemedia_types::HeapOutputAllocator,
+        )
+    }
+
+    fn decode_with_context(
+        &mut self,
+        input: RuntimeData,
+        copies: &remotemedia_types::CopyContext,
+        allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<RuntimeData> {
         // Extract encoded video frame
         let (pixel_data, _width, _height, codec, frame_number, timestamp_us) = match input {
             RuntimeData::Video {
@@ -512,13 +438,10 @@ impl VideoDecoderBackend for FFmpegDecoder {
 
         let decoder = self.decoder.as_mut().unwrap();
 
-        // Create packet from bitstream
+        // Reuse a complete FFmpeg packet owner when available. Arbitrary bytes
+        // still require padded backend storage under the caller's authority.
         use ac_ffmpeg::codec::Decoder;
-        use ac_ffmpeg::packet::PacketMut;
-
-        let mut packet_mut = PacketMut::new(pixel_data.len());
-        packet_mut.data_mut().copy_from_slice(&pixel_data);
-        let packet = packet_mut.freeze();
+        let packet = super::packets::decoder_packet(pixel_data, copies)?;
 
         // Decode packet
         decoder.push(packet).map_err(|e| {
@@ -529,20 +452,12 @@ impl VideoDecoderBackend for FFmpegDecoder {
         if let Some(frame) = decoder.take().map_err(|e| {
             CodecError::DecodingFailed(format!("Failed to take frame from decoder: {}", e))
         })? {
-            // Copy frame planes to output buffer (YUV420P format)
-            let mut decoded_pixel_data = Vec::new();
-
-            let planes = frame.planes();
-            // Only access first 3 planes (Y, U, V for YUV420P)
-            // Planes index 3 may be uninitialized/invalid
-            for i in 0..3 {
-                if i < planes.len() {
-                    let plane_data = planes[i].data();
-                    if !plane_data.is_empty() {
-                        decoded_pixel_data.extend_from_slice(plane_data);
-                    }
-                }
-            }
+            let decoded_pixel_data = super::decoded_frames::decoder_frame(
+                &frame,
+                self.config.output_format,
+                copies,
+                allocator,
+            )?;
 
             Ok(RuntimeData::Video {
                 pixel_data: decoded_pixel_data,
@@ -560,7 +475,7 @@ impl VideoDecoderBackend for FFmpegDecoder {
             // No frame available yet (decoder may need more packets)
             // Return empty frame to indicate no output
             Ok(RuntimeData::Video {
-                pixel_data: vec![],
+                pixel_data: Vec::new().into(),
                 width: 0,
                 height: 0,
                 format: PixelFormat::Unspecified,

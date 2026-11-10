@@ -51,7 +51,9 @@ use remotemedia_core::transport::{
     PipelineExecutor, SessionHandle, SessionInputSender, TransportData,
 };
 
+use super::buffer_config::PipelineBufferConfig;
 use super::control_session::NapiAttachedSession;
+use super::output_loans::NapiOutputAllocator;
 use super::pipeline::NapiRuntimeData;
 
 type InputSlot = Arc<Mutex<Option<SessionInputSender>>>;
@@ -78,9 +80,7 @@ impl PipelineEvent {
 
     #[napi(getter)]
     pub fn data(&self) -> NapiRuntimeData {
-        NapiRuntimeData {
-            inner: self.data.get_inner().clone(),
-        }
+        self.data.clone()
     }
 }
 
@@ -93,12 +93,14 @@ impl PipelineEvent {
 #[napi]
 pub struct NapiStreamingSession {
     session_id: String,
+    copies: remotemedia_types::CopyContext,
     input_sender: InputSlot,
     audio_rx: RxSlot,
     video_rx: RxSlot,
     data_rx: RxSlot,
     handle: HandleSlot,
     _executor: Arc<PipelineExecutor>,
+    output_allocator: Arc<dyn remotemedia_types::OutputAllocator>,
 }
 
 #[napi]
@@ -109,41 +111,64 @@ impl NapiStreamingSession {
         self.session_id.clone()
     }
 
+    /// Logical copies observed by the core session, including snapshots of its
+    /// bound owners. Standalone imports/getters use nodejsBufferCopyReport.
+    #[napi]
+    pub fn copy_report(&self) -> Result<String> {
+        serde_json::to_string(&self.copies.report()).map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    /// Produce directly in the session ingress provider without escaped JS aliases.
+    #[napi]
+    pub fn output_allocator(&self) -> NapiOutputAllocator {
+        NapiOutputAllocator {
+            inner: self.output_allocator.clone(),
+            copies: self.copies.clone(),
+        }
+    }
+
     /// Push one input frame into the pipeline.
     ///
     /// Returns a Promise resolving to `null`. Throws if the input channel is
     /// closed (i.e. `signalInputComplete` or `close` was already called).
-    #[napi]
-    pub async fn send_input(&self, data: &NapiRuntimeData) -> Result<()> {
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn send_input(&self, env: Env, data: &NapiRuntimeData) -> Result<napi::JsObject> {
+        // Take the owner on the JS thread: a borrowed handle must not be read
+        // inside the future, which runs after this call returns.
         let rd = data.get_inner().clone();
-        let guard = self.input_sender.lock().await;
-        let sender = guard.as_ref().ok_or_else(|| {
-            Error::from_reason("Input channel closed — sendInput after signalInputComplete/close")
-        })?;
-        sender
-            .send(TransportData::new(rd))
-            .await
-            .map_err(|e| Error::from_reason(format!("sendInput failed: {}", e)))?;
-        Ok(())
+        let slot = self.input_sender.clone();
+        env.spawn_future(async move {
+            let guard = slot.lock().await;
+            let sender = guard.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "Input channel closed — sendInput after signalInputComplete/close",
+                )
+            })?;
+            sender
+                .send(TransportData::new(rd))
+                .await
+                .map_err(|e| Error::from_reason(format!("sendInput failed: {}", e)))?;
+            Ok(())
+        })
     }
 
     /// Await the next audio-kind output. Resolves to a `NapiRuntimeData` or
     /// `null` once the channel is closed.
     #[napi]
     pub async fn recv_audio(&self) -> Result<Option<NapiRuntimeData>> {
-        recv_kind(&self.audio_rx).await
+        recv_kind(&self.audio_rx, &self.copies).await
     }
 
     /// Await the next video-kind output.
     #[napi]
     pub async fn recv_video(&self) -> Result<Option<NapiRuntimeData>> {
-        recv_kind(&self.video_rx).await
+        recv_kind(&self.video_rx, &self.copies).await
     }
 
     /// Await the next data-kind output (text / json / tensor / etc.).
     #[napi]
     pub async fn recv_data(&self) -> Result<Option<NapiRuntimeData>> {
-        recv_kind(&self.data_rx).await
+        recv_kind(&self.data_rx, &self.copies).await
     }
 
     /// Await the next output across all kinds. Resolves to a
@@ -222,7 +247,7 @@ impl NapiStreamingSession {
                     *d_guard = d_taken;
                     return Ok(Some(PipelineEvent {
                         kind: kind.to_string(),
-                        data: NapiRuntimeData { inner: rd },
+                        data: NapiRuntimeData::from_runtime_with_context(rd, &self.copies),
                     }));
                 }
                 Outcome::Closed("audio") => {
@@ -277,7 +302,10 @@ impl NapiStreamingSession {
     }
 }
 
-async fn recv_kind(rx_arc: &RxSlot) -> Result<Option<NapiRuntimeData>> {
+async fn recv_kind(
+    rx_arc: &RxSlot,
+    copies: &remotemedia_types::CopyContext,
+) -> Result<Option<NapiRuntimeData>> {
     let mut guard = rx_arc.lock().await;
     let result = match guard.as_mut() {
         Some(rx) => rx.recv().await,
@@ -286,7 +314,7 @@ async fn recv_kind(rx_arc: &RxSlot) -> Result<Option<NapiRuntimeData>> {
     if result.is_none() {
         *guard = None;
     }
-    Ok(result.map(|rd| NapiRuntimeData { inner: rd }))
+    Ok(result.map(|rd| NapiRuntimeData::from_runtime_with_context(rd, copies)))
 }
 
 /// Create a long-lived streaming session for the given manifest.
@@ -305,9 +333,30 @@ async fn recv_kind(rx_arc: &RxSlot) -> Result<Option<NapiRuntimeData>> {
 /// await sess.close();
 /// ```
 #[napi]
-pub async fn create_streaming_session(manifest_json: String) -> Result<NapiStreamingSession> {
+pub async fn create_streaming_session(
+    manifest_json: String,
+    pipeline_buffers: Option<PipelineBufferConfig>,
+) -> Result<NapiStreamingSession> {
     ensure_tracing_initialized();
-    let executor = PipelineExecutor::new()
+    let executor = plugin_executor(pipeline_buffers.as_ref(), None).await?;
+    build_session(executor, manifest_json).await
+}
+
+/// An executor for `pipeline_buffers` (default policy when absent) with the
+/// loaded plugin factories registered. `session_prefix` names its sessions,
+/// which namespaces their IPC channels.
+pub(crate) async fn plugin_executor(
+    pipeline_buffers: Option<&PipelineBufferConfig>,
+    session_prefix: Option<String>,
+) -> Result<Arc<PipelineExecutor>> {
+    let mut config = pipeline_buffers
+        .map(PipelineBufferConfig::to_executor_config)
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(prefix) = session_prefix {
+        config.session_id_prefix = prefix;
+    }
+    let executor = PipelineExecutor::with_config(config)
         .map_err(|e| Error::from_reason(format!("Failed to create executor: {}", e)))?;
     // Register every loaded plugin so the manifest can reference dynamic node
     // types. Mirrors `create_streaming_session` in the Python FFI. The
@@ -319,8 +368,7 @@ pub async fn create_streaming_session(manifest_json: String) -> Result<NapiStrea
     for factory in crate::plugins::collect_registered_factories() {
         executor.register_factory(factory).await;
     }
-    let executor = Arc::new(executor);
-    build_session(executor, manifest_json).await
+    Ok(Arc::new(executor))
 }
 
 #[doc(hidden)]
@@ -345,6 +393,8 @@ pub(crate) async fn build_session(
         .ok_or_else(|| Error::from_reason("session output receivers already taken"))?;
 
     Ok(NapiStreamingSession {
+        output_allocator: handle.output_allocator(),
+        copies: handle.transport_copy_context(),
         session_id,
         input_sender: Arc::new(Mutex::new(Some(input_sender))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.audio_rx))),

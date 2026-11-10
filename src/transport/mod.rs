@@ -27,15 +27,25 @@ use std::sync::Arc;
 
 // Re-export submodules
 pub mod avatar_session;
+pub mod buffer_preflight;
+pub mod buffer_validation;
 mod call_routing;
 pub mod caps_handshake;
 pub mod cancel_gate;
+pub(crate) mod device_delivery;
 pub mod client;
 pub mod control_transport;
 pub mod data;
 pub mod embedded_python_env;
+mod ingress;
+pub use ingress::{IngressSendError, SessionPacketPermit, SessionPacketSender};
 pub mod endpoint;
 mod managed_ardy;
+#[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
+mod mapped_placement;
+mod node_materialization;
+pub use node_materialization::NodeMaterializationCopies;
+mod output_delivery;
 pub mod pacer;
 pub mod perf_aggregator;
 pub mod plugin_registry;

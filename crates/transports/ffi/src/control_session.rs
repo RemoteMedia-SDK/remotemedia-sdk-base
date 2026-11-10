@@ -25,7 +25,8 @@ use remotemedia_core::transport::session_control::{
     ControlAddress, Direction, InterceptDecision, NodeState,
 };
 
-use crate::marshal::runtime_data_to_python;
+use crate::marshal::{python_to_runtime_data_with_context, runtime_data_to_python_with_context};
+use remotemedia_types::CopyContext;
 
 // ─── Custom exceptions ───────────────────────────────────────────────────────
 
@@ -145,6 +146,7 @@ impl PyAttachedSession {
                     py,
                     PySubscription {
                         rpc: addr.port.as_deref() == Some("__reply__"),
+                        copies: transport.transport_copy_context(),
                         rx: Arc::new(Mutex::new(rx)),
                     },
                 )
@@ -178,6 +180,7 @@ impl PyAttachedSession {
                     py,
                     PySubscription {
                         rpc: addr.port.as_deref() == Some("__reply__"),
+                        copies: transport.transport_copy_context(),
                         rx: Arc::new(Mutex::new(rx)),
                     },
                 )
@@ -208,7 +211,11 @@ impl PyAttachedSession {
                 "publish requires an '.in' address",
             ));
         }
-        let rd = crate::marshal::python_to_runtime_data(py, &data)?;
+        let rd = python_to_runtime_data_with_context(
+            py,
+            &data,
+            &self.transport.transport_copy_context(),
+        )?;
         let transport = Arc::clone(&self.transport);
         future_into_py(py, async move {
             transport
@@ -238,7 +245,11 @@ impl PyAttachedSession {
                 "publish_out requires an '.out' address (use publish for '.in')",
             ));
         }
-        let rd = crate::marshal::python_to_runtime_data(py, &data)?;
+        let rd = python_to_runtime_data_with_context(
+            py,
+            &data,
+            &self.transport.transport_copy_context(),
+        )?;
         let transport = Arc::clone(&self.transport);
         future_into_py(py, async move {
             transport
@@ -312,6 +323,7 @@ impl PyAttachedSession {
                     py,
                     PyInterceptSession {
                         inner: Arc::new(Mutex::new(sess)),
+                        copies: transport.transport_copy_context(),
                         reply,
                     },
                 )
@@ -357,6 +369,7 @@ pub struct PyInterceptSession {
     inner: Arc<Mutex<InterceptSession>>,
     /// Cloned eagerly so `complete` doesn't need to lock `inner`.
     reply: InterceptReplyHandle,
+    copies: CopyContext,
 }
 
 #[pymethods]
@@ -367,6 +380,7 @@ impl PyInterceptSession {
     /// Returns `None` when the bus closes the upstream channel (session ended).
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
+        let copies = self.copies.clone();
         future_into_py(py, async move {
             let result = {
                 let mut guard = inner.lock().await;
@@ -374,7 +388,8 @@ impl PyInterceptSession {
             };
             match result {
                 Some(req) => Python::attach(|py| {
-                    let py_data = crate::marshal::runtime_data_to_python(py, &req.data)?;
+                    let py_data =
+                        runtime_data_to_python_with_context(py, &req.data.into_shared(), &copies)?;
                     let cid_py = req.correlation_id.into_pyobject(py)?;
                     let tuple =
                         pyo3::types::PyTuple::new(py, [cid_py.into_any(), py_data.into_bound(py)])?;
@@ -404,7 +419,7 @@ impl PyInterceptSession {
                 let r = replacement.ok_or_else(|| {
                     PyValueError::new_err("decision_kind=1 (replace) requires a replacement object")
                 })?;
-                let rd = crate::marshal::python_to_runtime_data(py, &r)?;
+                let rd = python_to_runtime_data_with_context(py, &r, &self.copies)?;
                 InterceptDecision::Replace(rd)
             }
             2 => InterceptDecision::Drop,
@@ -416,7 +431,10 @@ impl PyInterceptSession {
         };
         let reply = self.reply.clone();
         future_into_py(py, async move {
-            reply.complete(correlation_id, decision).await;
+            reply
+                .complete(correlation_id, decision)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Python::attach(|py| Ok(py.None()))
         })
     }
@@ -437,6 +455,7 @@ impl PyInterceptSession {
 #[pyclass]
 pub struct PySubscription {
     rpc: bool,
+    copies: CopyContext,
     rx: Arc<Mutex<broadcast::Receiver<remotemedia_core::data::RuntimeData>>>,
 }
 
@@ -451,6 +470,7 @@ impl PySubscription {
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rx = Arc::clone(&self.rx);
         let rpc = self.rpc;
+        let copies = self.copies.clone();
         future_into_py(py, async move {
             use tokio::sync::broadcast::error::RecvError;
             let result = {
@@ -462,7 +482,7 @@ impl PySubscription {
                     // Return the marshalled Python object. The Python adapter
                     // wraps non-dict primitives in a canonical dict envelope
                     // before passing to Data._from_runtime_dict.
-                    Ok(runtime_data_to_python(py, &rd)?)
+                    Ok(runtime_data_to_python_with_context(py, &rd.into_shared(), &copies)?)
                 }),
                 Err(RecvError::Lagged(count)) if rpc => Err(PyRuntimeError::new_err(format!(
                     "RPC reply subscription lagged by {count} frames; pending calls cannot complete reliably"

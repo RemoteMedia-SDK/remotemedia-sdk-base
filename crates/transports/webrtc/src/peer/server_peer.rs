@@ -21,7 +21,6 @@ use crate::media::{
 #[cfg(feature = "ws-signaling")]
 use crate::signaling::{current_timestamp_ns, WebRtcEventBridge};
 use crate::{config::WebRtcTransportConfig, peer::PeerConnection, Error, Result};
-use prost::Message;
 use remotemedia_core::{
     data::RuntimeData,
     manifest::Manifest,
@@ -75,6 +74,7 @@ fn participant_metadata(
 /// Json/Text envelopes still go through the data channel inline because
 /// they're low-rate and don't have parallelism to extract.
 struct PerTrackDispatcher {
+    copies: remotemedia_types::CopyContext,
     audio_txs: TokioMutex<HashMap<String, mpsc::Sender<TransportData>>>,
     video_txs: TokioMutex<HashMap<String, mpsc::Sender<TransportData>>>,
     track_registry: Arc<TrackRegistry<AudioTrack, VideoTrack>>,
@@ -107,8 +107,10 @@ impl PerTrackDispatcher {
         track_registry: Arc<TrackRegistry<AudioTrack, VideoTrack>>,
         data_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
         peer_id: String,
+        copies: remotemedia_types::CopyContext,
     ) -> Arc<Self> {
         Arc::new(Self {
+            copies,
             audio_txs: TokioMutex::new(HashMap::new()),
             video_txs: TokioMutex::new(HashMap::new()),
             track_registry,
@@ -220,13 +222,13 @@ impl PerTrackDispatcher {
                         warn!("audio shard closed before speech_end (peer {})", self.peer_id);
                     }
                 }
-                if let Err(e) = Self::send_data_channel(&self.data_channel, &transport_data.data).await {
+                if let Err(e) = Self::send_data_channel(&self.data_channel, &transport_data.data, &self.copies).await {
                     error!("data channel send failed (peer {}): {}", self.peer_id, e);
                 }
             }
             RuntimeData::Json(_) | RuntimeData::Text(_) => {
                 if let Err(e) =
-                    Self::send_data_channel(&self.data_channel, &transport_data.data).await
+                    Self::send_data_channel(&self.data_channel, &transport_data.data, &self.copies).await
                 {
                     error!("data channel send failed (peer {}): {}", self.peer_id, e);
                 }
@@ -259,6 +261,7 @@ impl PerTrackDispatcher {
         let stream = stream_id.to_string();
         let registry = self.track_registry.clone();
         let peer = self.peer_id.clone();
+        let copies = self.copies.clone();
         tokio::spawn(async move {
             let mut first = true;
             let mut chunk_idx: u64 = 0;
@@ -307,7 +310,7 @@ impl PerTrackDispatcher {
                     first = false;
                 }
                 let res = track
-                    .send_audio(Arc::new(samples.to_vec()), sample_rate)
+                    .send_audio_with_context(samples.into_shared(), sample_rate, &copies)
                     .await;
                 let send_ms = send_start.elapsed().as_millis();
                 if let Err(e) = res {
@@ -341,6 +344,7 @@ impl PerTrackDispatcher {
         let stream = stream_id.to_string();
         let registry = self.track_registry.clone();
         let peer = self.peer_id.clone();
+        let copies = self.copies.clone();
         tokio::spawn(async move {
             while let Some(td) = rx.recv().await {
                 let Some(track) = registry.get_video_track(&stream).await else {
@@ -350,7 +354,7 @@ impl PerTrackDispatcher {
                     );
                     continue;
                 };
-                if let Err(e) = track.send_video_runtime_data(td.data).await {
+                if let Err(e) = track.send_video_runtime_data_with_context(td.data, &copies).await {
                     warn!(
                         "video send failed for stream '{}' (peer {}): {}",
                         stream, peer, e
@@ -370,14 +374,15 @@ impl PerTrackDispatcher {
     async fn send_data_channel(
         data_channel: &Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
         runtime_data: &RuntimeData,
+        copies: &remotemedia_types::CopyContext,
     ) -> Result<()> {
         let dc_guard = data_channel.read().await;
         let Some(dc) = dc_guard.as_ref() else {
             trace!("no data channel available; dropping json/text output");
             return Ok(());
         };
-        let data_buffer = crate::adapters::runtime_data_to_data_buffer(runtime_data);
-        let encoded = data_buffer.encode_to_vec();
+        let encoded = crate::adapters::encode_runtime_data_with_context(runtime_data, copies)
+            .map_err(|e| Error::Other(e.into()))?;
         if let Err(e) = dc.send(&bytes::Bytes::from(encoded)).await {
             return Err(Error::WebRtcError(format!(
                 "Data channel send failed: {}",
@@ -402,6 +407,8 @@ struct PeerOutputTarget {
 /// fanned out to registered peers while all peer inputs share one core router.
 pub struct SharedPipelineSession {
     core: Arc<CoreSharedPipelineSession>,
+    #[cfg(feature = "ws-signaling")]
+    observer_copies: remotemedia_types::CopyContext,
     output_targets: Arc<RwLock<HashMap<String, PeerOutputTarget>>>,
     close_when_empty: bool,
 }
@@ -414,8 +421,12 @@ impl SharedPipelineSession {
     ) -> Result<Arc<Self>> {
         let session_id = core.session_id().to_string();
         let receivers = core.subscribe_outputs();
+        #[cfg(feature = "ws-signaling")]
+        let observer_copies = core.transport_copy_context().await;
         let shared = Arc::new(Self {
             core,
+            #[cfg(feature = "ws-signaling")]
+            observer_copies,
             output_targets: Arc::new(RwLock::new(HashMap::new())),
             close_when_empty,
         });
@@ -471,7 +482,8 @@ impl SharedPipelineSession {
         data_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
         #[cfg(feature = "ws-signaling")] event_tx: Option<mpsc::Sender<WebRtcEventBridge>>,
     ) {
-        let dispatcher = PerTrackDispatcher::new(track_registry, data_channel, peer_id.clone());
+        let copies = self.core.transport_copy_context().await;
+        let dispatcher = PerTrackDispatcher::new(track_registry, data_channel, peer_id.clone(), copies);
         self.output_targets.write().await.insert(
             peer_id,
             PeerOutputTarget {
@@ -521,13 +533,17 @@ impl SharedPipelineSession {
     ) {
         let output_targets = Arc::clone(&self.output_targets);
         let session_id = self.session_id().to_string();
+        #[cfg(feature = "ws-signaling")]
+        let observer_copies = self.observer_copies.clone();
         tokio::spawn(async move {
             loop {
-                let transport_data = match rx.recv().await {
+                let mut transport_data = match rx.recv().await {
                     Ok(data) => data,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
+                // Promote legacy Vec audio once before any per-peer clone.
+                transport_data.data = transport_data.data.into_shared();
                 let targets: Vec<PeerOutputTarget> =
                     output_targets.read().await.values().cloned().collect();
                 if targets.is_empty() {
@@ -542,12 +558,11 @@ impl SharedPipelineSession {
                 for target in targets {
                     #[cfg(feature = "ws-signaling")]
                     if let Some(ref tx) = target.event_tx {
-                        let data_json = serde_json::to_string(&transport_data.data)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        let event = WebRtcEventBridge::pipeline_output(
+                        let event = WebRtcEventBridge::pipeline_output_with_context(
                             target.dispatcher.peer_id.clone(),
-                            data_json,
+                            transport_data.data.clone(),
                             current_timestamp_ns(),
+                            &observer_copies,
                         );
                         if let Err(e) = tx.try_send(event) {
                             trace!(
@@ -961,6 +976,8 @@ impl ServerPeer {
         // Clone dc_input_tx before moving into closures
         let dc_input_tx_for_dc = dc_input_tx.clone();
         let dc_input_tx_for_track = dc_input_tx.clone();
+        let copies_for_dc = shared_session.core.transport_copy_context().await;
+        let allocator_for_track = shared_session.core.output_allocator().await;
 
         // Clone event_tx for closures (FFI event forwarding)
         #[cfg(feature = "ws-signaling")]
@@ -986,6 +1003,7 @@ impl ServerPeer {
             .on_data_channel(Box::new(move |data_channel| {
                 let peer_id = peer_id_for_dc.clone();
                 let dc_input_tx = dc_input_tx_for_dc.clone();
+                let copies = copies_for_dc.clone();
                 let data_channel_ref = Arc::clone(&data_channel_ref_for_dc);
                 #[cfg(feature = "ws-signaling")]
                 let event_tx = event_tx_for_dc_clone.clone();
@@ -1030,6 +1048,7 @@ impl ServerPeer {
                     dc_for_handler.on_message(Box::new(move |msg| {
                         let peer_id = peer_id.clone();
                         let dc_input_tx = dc_input_tx.clone();
+                        let copies = copies.clone();
                         #[cfg(feature = "ws-signaling")]
                         let event_tx = event_tx_for_msg.clone();
                         let reassembler = Arc::clone(&reassembler);
@@ -1040,109 +1059,43 @@ impl ServerPeer {
                             // Emit raw data received event for FFI integration
                             #[cfg(feature = "ws-signaling")]
                             if let Some(ref tx) = event_tx {
-                                let event = WebRtcEventBridge::data_received(
+                                let event = WebRtcEventBridge::data_received_with_context(
                                     peer_id.clone(),
-                                    msg.data.to_vec(),
+                                    remotemedia_types::SharedBytes::from_owner(msg.data.clone()),
                                     current_timestamp_ns(),
+                                    &copies,
                                 );
                                 if let Err(e) = tx.send(event).await {
                                     warn!("Failed to emit data_received event: {}", e);
                                 }
                             }
 
-                            // Try to decode message as our binary DataChannelMessage envelope
-                            use crate::channels::DataChannelMessage;
-                            let parsed_msg = match DataChannelMessage::decode(&msg.data[..]) {
-                                Ok(m) => Some(m),
-                                Err(e) => {
-                                    // Fallback to legacy raw DataBuffer decode for old clients
-                                    match crate::generated::DataBuffer::decode(&msg.data[..]) {
-                                        Ok(_) => {
-                                            info!("Decoded legacy raw DataBuffer from data channel (peer {})", peer_id);
-                                            Some(DataChannelMessage::runtime_data(msg.data.to_vec()))
-                                        }
-                                        Err(_) => {
-                                            error!("Failed to decode DataChannelMessage envelope or raw DataBuffer: {}", e);
-                                            None
-                                        }
-                                    }
-                                }
+                            // Drop the reassembly lock before awaiting pipeline backpressure.
+                            let decoded = {
+                                let mut pending = reassembler.lock().await;
+                                super::data_channel_ingress::decode_pipeline_input(
+                                    msg.data,
+                                    &mut pending,
+                                    &copies,
+                                )
                             };
-
-                            if let Some(parsed) = parsed_msg {
-                                match parsed {
-                                    DataChannelMessage::RuntimeData { data_buffer, .. } => {
-                                        // Deserialize Protobuf DataBuffer
-                                        match crate::generated::DataBuffer::decode(&data_buffer[..]) {
-                                            Ok(data_buffer) => {
-                                                // Convert Protobuf DataBuffer → RuntimeData
-                                                if let Some(runtime_data) = crate::adapters::data_buffer_to_runtime_data(&data_buffer) {
-                                                    info!("Decoded RuntimeData from data channel: type={}", runtime_data.data_type());
-
-                                                    let transport_data = remotemedia_core::transport::TransportData {
-                                                        data: runtime_data,
-                                                        sequence: None,
-                                                        metadata: participant_metadata(
-                                                            &peer_id,
-                                                            format!("{}:data", peer_id),
-                                                            participant::modality::CONTROL,
-                                                        ),
-                                                    };
-
-                                                    if let Err(e) = dc_input_tx.send(transport_data).await {
-                                                        error!("Failed to forward data channel message to pipeline: {}", e);
-                                                    }
-                                                } else {
-                                                    error!("Failed to convert DataBuffer to RuntimeData: invalid data type");
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to decode Protobuf DataBuffer from RuntimeData payload: {}", e);
-                                            }
-                                        }
-                                    }
-                                    DataChannelMessage::Chunk { chunk, .. } => {
-                                        let mut r = reassembler.lock().await;
-                                        if let Some(reassembled_bytes) = r.feed_chunk(&chunk) {
-                                            // Deserialize Protobuf DataBuffer from reassembled chunks
-                                            match crate::generated::DataBuffer::decode(&reassembled_bytes[..]) {
-                                                Ok(data_buffer) => {
-                                                    if let Some(runtime_data) = crate::adapters::data_buffer_to_runtime_data(&data_buffer) {
-                                                        info!("Reassembled and decoded RuntimeData from chunks: type={}", runtime_data.data_type());
-
-                                                        let transport_data = remotemedia_core::transport::TransportData {
-                                                            data: runtime_data,
-                                                            sequence: None,
-                                                            metadata: participant_metadata(
-                                                                &peer_id,
-                                                                format!("{}:data", peer_id),
-                                                                participant::modality::CONTROL,
-                                                            ),
-                                                        };
-
-                                                        if let Err(e) = dc_input_tx.send(transport_data).await {
-                                                            error!("Failed to forward reassembled data to pipeline: {}", e);
-                                                        }
-                                                    } else {
-                                                        error!("Failed to convert reassembled DataBuffer to RuntimeData: invalid data type");
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("Failed to decode Protobuf DataBuffer from reassembled payload: {}", e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    DataChannelMessage::Control { action, json, .. } => {
-                                        info!("Received control message on data-plane channel: action={}, json={}", action, json);
-                                    }
-                                    DataChannelMessage::Text { action, text, .. } => {
-                                        info!("Received text message on data-plane channel: action={}, text={}", action, text);
-                                    }
-                                    DataChannelMessage::Binary { action, data, .. } => {
-                                        info!("Received binary message on data-plane channel: action={}, bytes={}", action, data.len());
+                            match decoded {
+                                Ok(Some(runtime_data)) => {
+                                    let transport_data = remotemedia_core::transport::TransportData {
+                                        data: runtime_data,
+                                        sequence: None,
+                                        metadata: participant_metadata(
+                                            &peer_id,
+                                            format!("{}:data", peer_id),
+                                            participant::modality::CONTROL,
+                                        ),
+                                    };
+                                    if let Err(e) = dc_input_tx.send(transport_data).await {
+                                        error!("Failed to forward data channel message to pipeline: {}", e);
                                     }
                                 }
+                                Ok(None) => {}
+                                Err(e) => error!("Failed to decode pipeline data from peer {}: {}", peer_id, e),
                             }
                         })
                     }));
@@ -1157,6 +1110,7 @@ impl ServerPeer {
                 let peer_id = peer_id_for_track.clone();
                 let dc_input_tx = dc_input_tx_for_track.clone();
                 let peer_connection = Arc::clone(&peer_connection_for_track);
+                let output_allocator = allocator_for_track.clone();
 
                 Box::pin(async move {
                     info!("Remote track added for peer {}: kind={}", peer_id, track.kind());
@@ -1232,7 +1186,9 @@ impl ServerPeer {
                             };
 
                             // Decode Opus payload to audio samples
-                            match audio_track.on_rtp_packet(&rtp_packet.payload).await {
+                            match audio_track.on_rtp_packet_with_allocator(
+                                &rtp_packet.payload, output_allocator.as_ref(),
+                            ).await {
                                 Ok(samples) => {
                                     // Diagnostic: every ~50 packets (~1s at 50Hz),
                                     // log RMS + peak so we can confirm whether mic
@@ -1248,7 +1204,7 @@ impl ServerPeer {
                                         let len = samples.len();
                                         let mut peak: f32 = 0.0;
                                         let mut sumsq: f64 = 0.0;
-                                        for s in &samples {
+                                        for s in samples.as_slice() {
                                             let a = s.abs();
                                             if a > peak { peak = a; }
                                             sumsq += (*s as f64) * (*s as f64);
@@ -1366,128 +1322,6 @@ impl ServerPeer {
         Ok(())
     }
 
-    /// Send TransportData to WebRTC peer connection using multi-track routing (Spec 013)
-    ///
-    /// Routes RuntimeData to appropriate tracks based on stream_id field.
-    /// Falls back to DEFAULT_STREAM_ID for backward compatibility.
-    /// Json and Text data are sent through the data channel.
-    ///
-    /// # Arguments
-    ///
-    /// * `track_registry` - Registry of audio/video tracks keyed by stream_id
-    /// * `data_channel` - Optional data channel for Json/Text output
-    /// * `transport_data` - Data to send, containing RuntimeData with optional stream_id
-    async fn send_to_webrtc_multitrack(
-        track_registry: &Arc<TrackRegistry<AudioTrack, VideoTrack>>,
-        data_channel: &Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
-        transport_data: TransportData,
-    ) -> Result<()> {
-        // Get RuntimeData and extract stream_id
-        let runtime_data = transport_data.data;
-        let stream_id = extract_stream_id(&runtime_data).unwrap_or(DEFAULT_STREAM_ID);
-
-        match &runtime_data {
-            RuntimeData::Audio {
-                samples,
-                sample_rate,
-                channels,
-                ..
-            } => {
-                trace!(
-                    "Sending audio to stream '{}': {} samples, {}Hz, {} channels",
-                    stream_id,
-                    samples.len(),
-                    sample_rate,
-                    channels
-                );
-
-                // Get the audio track from registry
-                if let Some(audio_track) = track_registry.get_audio_track(stream_id).await {
-                    // Send audio samples through the track with dynamic sample rate.
-                    // `send_audio` takes `Arc<Vec<f32>>`; copy via `to_vec`
-                    // regardless of `AudioSamples` variant (Vec path is a
-                    // full clone, same as before this refactor).
-                    audio_track
-                        .send_audio(Arc::new(samples.to_vec()), *sample_rate)
-                        .await?;
-
-                    // Record frame for activity tracking
-                    track_registry.record_audio_frame(stream_id).await;
-                    trace!("Audio sent successfully to stream '{}'", stream_id);
-                } else {
-                    warn!(
-                        "No audio track for stream_id '{}', cannot send audio (registered tracks: {:?})",
-                        stream_id,
-                        track_registry.audio_stream_ids().await
-                    );
-                }
-            }
-            RuntimeData::Video { .. } => {
-                trace!("Sending video frame to stream '{}' via WebRTC", stream_id);
-
-                // Get the video track from registry
-                if let Some(video_track) = track_registry.get_video_track(stream_id).await {
-                    // Send video using VideoTrack's send_video_runtime_data method
-                    video_track
-                        .send_video_runtime_data(runtime_data.clone())
-                        .await?;
-
-                    // Record frame for activity tracking
-                    track_registry.record_video_frame(stream_id).await;
-                    trace!("Video sent successfully to stream '{}'", stream_id);
-                } else {
-                    warn!(
-                        "No video track for stream_id '{}', cannot send video (registered tracks: {:?})",
-                        stream_id,
-                        track_registry.video_stream_ids().await
-                    );
-                }
-            }
-            RuntimeData::Json(_) | RuntimeData::Text(_) => {
-                // Send Json/Text data through data channel
-                let dc_guard = data_channel.read().await;
-                if let Some(dc) = dc_guard.as_ref() {
-                    // Convert RuntimeData to Protobuf DataBuffer
-                    let data_buffer = crate::adapters::runtime_data_to_data_buffer(&runtime_data);
-                    let encoded = data_buffer.encode_to_vec();
-
-                    debug!(
-                        "Sending {} data ({} bytes) through data channel",
-                        runtime_data.data_type(),
-                        encoded.len()
-                    );
-
-                    // Send through data channel
-                    if let Err(e) = dc.send(&bytes::Bytes::from(encoded)).await {
-                        error!("Failed to send data through data channel: {}", e);
-                        return Err(Error::WebRtcError(format!(
-                            "Data channel send failed: {}",
-                            e
-                        )));
-                    }
-
-                    debug!(
-                        "Successfully sent {} data through data channel",
-                        runtime_data.data_type()
-                    );
-                } else {
-                    trace!(
-                        "No data channel available to send {} output",
-                        runtime_data.data_type()
-                    );
-                }
-            }
-            _ => {
-                debug!(
-                    "Unsupported RuntimeData type for WebRTC output: {}",
-                    runtime_data.data_type()
-                );
-            }
-        }
-
-        Ok(())
-    }
-
     /// Handle incoming ICE candidate from client
     pub async fn handle_ice_candidate(
         &self,
@@ -1592,6 +1426,14 @@ impl Drop for ServerPeer {
         debug!("ServerPeer {} dropped", self.peer_id);
     }
 }
+
+#[cfg(test)]
+#[path = "audio_dispatch_tests.rs"]
+mod audio_dispatch_tests;
+
+#[cfg(all(test, feature = "video"))]
+#[path = "video_dispatch_tests.rs"]
+mod video_dispatch_tests;
 
 #[cfg(test)]
 mod tests {

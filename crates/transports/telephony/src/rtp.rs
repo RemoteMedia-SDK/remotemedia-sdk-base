@@ -1,11 +1,17 @@
 //! RTP media primitives.
 
+#[cfg(test)]
+#[path = "rtp_copy_tests.rs"]
+mod copy_tests;
+
 use crate::codec::{decode_g711, encode_g711, CodecMap, OpusCodec};
 use crate::jitter::{JitterBuffer, JitterDecision};
 use crate::session::{apply_frame_metadata, CallId, CallLegId, ParticipantRole};
 use crate::{AudioCodec, Error, Result};
+use remotemedia_core::audio::pcm_frames::AudioPcmPacketizer;
 use remotemedia_core::data::{AudioSamples, RuntimeData};
 use remotemedia_core::transport::TransportData;
+use remotemedia_types::{CopyContext, CopyReason, SharedBuffer, SharedBytes};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -31,7 +37,7 @@ pub struct RtpPacket {
     /// Packet metadata.
     pub info: RtpPacketInfo,
     /// RTP payload bytes after header, CSRC list, and optional extension.
-    pub payload: Vec<u8>,
+    pub payload: SharedBytes,
 }
 
 /// Stateful RTP packetizer for one outbound media stream.
@@ -86,7 +92,7 @@ impl RtpPacketizer {
                 ssrc: self.ssrc,
                 marker: self.mark_next,
             },
-            payload,
+            payload: payload.into(),
         };
 
         self.next_sequence = self.next_sequence.wrapping_add(1);
@@ -109,6 +115,32 @@ impl RtpPacketizer {
 impl RtpPacket {
     /// Parse an RTP packet from a UDP datagram.
     pub fn parse(datagram: &[u8]) -> Result<Self> {
+        Self::parse_with_context(datagram, CopyContext::legacy())
+    }
+
+    /// Snapshot only the validated borrowed payload under caller copy authority.
+    pub fn parse_with_context(datagram: &[u8], copies: &CopyContext) -> Result<Self> {
+        let (info, payload_offset) = Self::header(datagram)?;
+        let payload = copies
+            .materialize(
+                CopyReason::BorrowedInput,
+                (datagram.len() - payload_offset) as u64,
+                || datagram[payload_offset..].to_vec().into(),
+            )
+            .map_err(|e| Error::Rtp(e.to_string()))?;
+        Ok(Self { info, payload })
+    }
+
+    /// Retain the received datagram through jitter buffering without a payload copy.
+    pub fn parse_owned(datagram: SharedBytes) -> Result<Self> {
+        let (info, payload_offset) = Self::header(&datagram)?;
+        let payload = datagram
+            .slice(payload_offset..datagram.len())
+            .expect("validated RTP payload bounds");
+        Ok(Self { info, payload })
+    }
+
+    fn header(datagram: &[u8]) -> Result<(RtpPacketInfo, usize)> {
         if datagram.len() < 12 {
             return Err(Error::Rtp(format!(
                 "RTP packet too short: {} bytes",
@@ -155,20 +187,30 @@ impl RtpPacket {
             }
         }
 
-        Ok(Self {
-            info: RtpPacketInfo {
+        Ok((
+            RtpPacketInfo {
                 payload_type,
                 sequence,
                 timestamp,
                 ssrc,
                 marker,
             },
-            payload: datagram[payload_offset..].to_vec(),
-        })
+            payload_offset,
+        ))
     }
 
     /// Serialize this packet as RTP version 2 without CSRC or extension headers.
     pub fn write(&self) -> Vec<u8> {
+        self.write_with_context(CopyContext::legacy())
+            .expect("legacy policy permits RTP serialization")
+    }
+
+    /// Serialize into one final datagram, counting the encoded-payload transfer.
+    /// The RTP header is computed metadata and is not counted as copied payload.
+    pub fn write_with_context(&self, copies: &CopyContext) -> Result<Vec<u8>> {
+        let attempt = copies
+            .begin(CopyReason::PortableSerialization, self.payload.len() as u64)
+            .map_err(|e| Error::Rtp(e.to_string()))?;
         let mut out = Vec::with_capacity(12 + self.payload.len());
         out.push(0x80);
         out.push(self.info.payload_type | if self.info.marker { 0x80 } else { 0 });
@@ -176,7 +218,8 @@ impl RtpPacket {
         out.extend_from_slice(&self.info.timestamp.to_be_bytes());
         out.extend_from_slice(&self.info.ssrc.to_be_bytes());
         out.extend_from_slice(&self.payload);
-        out
+        attempt.complete();
+        Ok(out)
     }
 }
 
@@ -246,6 +289,7 @@ pub struct RtpPortLease {
 /// RTP media session for one inbound audio stream.
 #[derive(Debug)]
 pub struct RtpMediaSession {
+    copies: CopyContext,
     call_id: CallId,
     leg_id: CallLegId,
     participant_role: ParticipantRole,
@@ -277,6 +321,7 @@ impl RtpMediaSession {
             .unwrap_or(8_000);
         let plc_samples_per_frame = (plc_sample_rate_hz / 50) as usize;
         Self {
+            copies: CopyContext::legacy().clone(),
             call_id,
             leg_id,
             participant_role,
@@ -291,7 +336,22 @@ impl RtpMediaSession {
 
     /// Admit an RTP datagram and return any in-order decoded audio frames.
     pub fn receive_datagram(&mut self, datagram: &[u8]) -> Result<Vec<TransportData>> {
-        let packet = RtpPacket::parse(datagram)?;
+        let packet = RtpPacket::parse_with_context(datagram, &self.copies)?;
+        self.receive_packet(packet)
+    }
+
+    /// Bind borrowed-input compatibility materialization before admitting packets.
+    pub fn with_copy_context(mut self, copies: CopyContext) -> Self {
+        self.copies = copies;
+        self
+    }
+
+    /// Admit an owning UDP datagram without a payload snapshot.
+    pub fn receive_owned_datagram(&mut self, datagram: SharedBytes) -> Result<Vec<TransportData>> {
+        self.receive_packet(RtpPacket::parse_owned(datagram)?)
+    }
+
+    fn receive_packet(&mut self, packet: RtpPacket) -> Result<Vec<TransportData>> {
         match self.jitter.push(packet) {
             JitterDecision::Accepted => {}
             JitterDecision::Duplicate | JitterDecision::Late => return Ok(Vec::new()),
@@ -393,10 +453,12 @@ impl RtpMediaSession {
 /// RTP media session for outbound audio packets.
 #[derive(Debug)]
 pub struct RtpOutboundMediaSession {
+    copies: CopyContext,
     codec: AudioCodec,
     packetizer: RtpPacketizer,
     opus: Option<OpusCodec>,
     expected_samples_per_frame: usize,
+    pcm: AudioPcmPacketizer,
 }
 
 impl RtpOutboundMediaSession {
@@ -411,7 +473,13 @@ impl RtpOutboundMediaSession {
     ) -> Result<Self> {
         let sample_rate = codec.clock_rate_hz();
         let samples_per_frame = (sample_rate / 1000) * u32::from(frame_duration_ms);
+        if samples_per_frame == 0 {
+            return Err(Error::InvalidConfig(
+                "RTP frame duration must be positive".into(),
+            ));
+        }
         Ok(Self {
+            copies: CopyContext::legacy().clone(),
             codec,
             packetizer: RtpPacketizer::new(
                 payload_type,
@@ -426,6 +494,7 @@ impl RtpOutboundMediaSession {
                 None
             },
             expected_samples_per_frame: samples_per_frame as usize,
+            pcm: AudioPcmPacketizer::new(samples_per_frame as usize),
         })
     }
 
@@ -449,6 +518,112 @@ impl RtpOutboundMediaSession {
         };
         Ok(self.packetizer.packetize(payload))
     }
+
+    /// Bind final RTP serialization to the pipeline session's transport authority.
+    pub fn with_copy_context(mut self, copies: CopyContext) -> Self {
+        self.copies = copies;
+        self
+    }
+
+    /// Encode and serialize one audio frame using this session's fixed authority.
+    pub fn packetize_audio_datagram(&mut self, samples: &[f32]) -> Result<Vec<u8>> {
+        self.packetize_audio_frame(samples)?
+            .write_with_context(&self.copies)
+    }
+
+    /// Queue an owning input. Matching mono PCM retains its original storage.
+    /// Channel mixing computes directly into the resampled output; mono rate
+    /// conversion copies selected elements and is governed by the session policy.
+    pub fn queue_audio(
+        &mut self,
+        samples: SharedBuffer<f32>,
+        sample_rate: u32,
+        channels: u32,
+    ) -> Result<()> {
+        let samples = prepare_pcm(
+            samples,
+            sample_rate,
+            channels,
+            self.codec.clock_rate_hz(),
+            &self.copies,
+        )?;
+        self.pcm
+            .append(samples, &self.copies)
+            .map_err(|error| Error::Rtp(error.to_string()))
+    }
+
+    /// Encode the next complete frame. Fragment assembly rejection retains the
+    /// queued owners; clear the queue when abandoning the failed stream.
+    pub fn next_audio_packet(&mut self) -> Result<Option<RtpPacket>> {
+        let frame = self
+            .pcm
+            .next_frame()
+            .map_err(|error| Error::Rtp(error.to_string()))?;
+        frame
+            .map(|frame| self.packetize_audio_frame(&frame))
+            .transpose()
+    }
+
+    /// Encode and serialize the next complete frame under the session policy.
+    pub fn next_audio_datagram(&mut self) -> Result<Option<Vec<u8>>> {
+        self.next_audio_packet()?
+            .map(|packet| packet.write_with_context(&self.copies))
+            .transpose()
+    }
+
+    /// Discard incomplete or rejected audio and release its retained owners.
+    pub fn clear_pending_audio(&mut self) {
+        self.pcm.clear();
+    }
+}
+
+fn prepare_pcm(
+    samples: SharedBuffer<f32>,
+    source_rate: u32,
+    channels: u32,
+    target_rate: u32,
+    copies: &CopyContext,
+) -> Result<SharedBuffer<f32>> {
+    let channels =
+        usize::try_from(channels).map_err(|_| Error::Rtp("PCM channel count overflow".into()))?;
+    if source_rate == 0 || target_rate == 0 || channels == 0 || samples.len() % channels != 0 {
+        return Err(Error::Rtp(
+            "invalid PCM rate, channel count or interleaved length".into(),
+        ));
+    }
+    if channels == 1 && source_rate == target_rate {
+        return Ok(samples);
+    }
+    let frames = samples.len() / channels;
+    let output_len =
+        usize::try_from((frames as u128 * u128::from(target_rate)) / u128::from(source_rate))
+            .map_err(|_| Error::Rtp("resampled PCM length overflow".into()))?;
+    let generate = || {
+        (0..output_len)
+            .map(|index| {
+                let frame =
+                    ((index as u128 * u128::from(source_rate)) / u128::from(target_rate)) as usize;
+                let start = frame * channels;
+                if channels == 1 {
+                    samples[start]
+                } else {
+                    samples[start..start + channels].iter().sum::<f32>() / channels as f32
+                }
+            })
+            .collect::<Vec<f32>>()
+    };
+    let output = if channels == 1 {
+        let bytes = u64::try_from(output_len)
+            .ok()
+            .and_then(|len| len.checked_mul(4))
+            .ok_or_else(|| Error::Rtp("resampled PCM byte length overflow".into()))?;
+        copies
+            .materialize(CopyReason::VecMaterialization, bytes, generate)
+            .map_err(|error| Error::Rtp(error.to_string()))?
+    } else {
+        generate()
+    };
+    Ok(output.into())
 }
 
 impl RtpPortLease {
@@ -501,7 +676,7 @@ mod tests {
         assert_eq!(packet.info.sequence, 0x1234);
         assert_eq!(packet.info.timestamp, 0x0102_0304);
         assert_eq!(packet.info.ssrc, 0xaabb_ccdd);
-        assert_eq!(packet.payload, vec![1, 2, 3]);
+        assert_eq!(packet.payload.as_slice(), &[1, 2, 3]);
     }
 
     #[test]
@@ -514,7 +689,7 @@ mod tests {
                 ssrc: 42,
                 marker: false,
             },
-            payload: vec![9, 8, 7],
+            payload: vec![9, 8, 7].into(),
         };
 
         let encoded = packet.write();
@@ -556,7 +731,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(packet.info.payload_type, 111);
-        assert_eq!(packet.payload, vec![0x44, 0x55]);
+        assert_eq!(packet.payload.as_slice(), &[0x44, 0x55]);
     }
 
     #[test]
@@ -622,7 +797,7 @@ mod tests {
                 ssrc: 9,
                 marker: false,
             },
-            payload: vec![0xff; 160],
+            payload: vec![0xff; 160].into(),
         };
 
         let frames = session.receive_datagram(&packet.write()).unwrap();
@@ -694,7 +869,7 @@ mod tests {
                     ssrc: 9,
                     marker: false,
                 },
-                payload: vec![0xff; 160],
+                payload: vec![0xff; 160].into(),
             };
             frames.extend(session.receive_datagram(&packet.write()).unwrap());
         }
@@ -706,7 +881,7 @@ mod tests {
                 ssrc: 9,
                 marker: false,
             },
-            payload: vec![0xff; 160],
+            payload: vec![0xff; 160].into(),
         };
         frames.extend(session.receive_datagram(&packet.write()).unwrap());
         assert!(frames

@@ -19,6 +19,8 @@ class TurnServer:
 
     def __init__(self, url: str, username: str, credential: str) -> None: ...
 
+from .runtime import MappedSizeClass as MappedSizeClass, MappedPoolConfig as MappedPoolConfig, PipelineBufferConfig as PipelineBufferConfig
+
 class WebRtcServerConfig:
     """WebRTC server configuration."""
     port: Optional[int]
@@ -29,6 +31,8 @@ class WebRtcServerConfig:
     max_peers: int
     audio_codec: str
     video_codec: str
+    transport_materialization_policy: str
+    pipeline_buffers: Optional[PipelineBufferConfig]
 
     def __init__(
         self,
@@ -41,6 +45,8 @@ class WebRtcServerConfig:
         max_peers: int = 10,
         audio_codec: str = "opus",
         video_codec: str = "vp9",
+        transport_materialization_policy: str = "allow_copies",
+        pipeline_buffers: Optional[PipelineBufferConfig] = None,
     ) -> None: ...
 
 class PeerCapabilities:
@@ -81,11 +87,21 @@ class PipelineOutputEvent:
     data: bytes
     timestamp: int
 
+    @property
+    def runtime_data(self) -> Any:
+        """Canonical runtime value with retained read-only bulk buffers."""
+        ...
+
 class DataReceivedEvent:
     """Event emitted when raw data is received from a peer."""
     peer_id: str
     data: bytes
     timestamp: int
+
+    @property
+    def view(self) -> memoryview:
+        """Read-only view retaining the original receive allocation."""
+        ...
 
 class ErrorEvent:
     """Error event."""

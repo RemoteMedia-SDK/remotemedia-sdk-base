@@ -51,9 +51,19 @@ fn main() {
             |fresh_dir| {
                 // Vendored protoc, so the output does not depend on a system install.
                 std::env::set_var("PROTOC", protobuf_src::protoc());
+                // Bulk payload fields are `bytes::Bytes`, so decoded frames
+                // keep the received buffer instead of copying it into a Vec.
                 tonic_prost_build::configure()
                     .build_server(true)
                     .build_client(true)
+                    .bytes(".remotemedia.v1.AudioBuffer.samples")
+                    .bytes(".remotemedia.v1.VideoFrame.pixel_data")
+                    .bytes(".remotemedia.v1.TensorBuffer.data")
+                    .bytes(".remotemedia.v1.NumpyBuffer.data")
+                    .bytes(".remotemedia.v1.BinaryBuffer.data")
+                    .bytes(".remotemedia.v1.webrtc.BinaryFrame.data")
+                    .bytes(".remotemedia.v1.webrtc.RuntimeDataFrame.data_buffer")
+                    .bytes(".remotemedia.v1.webrtc.ChunkFrame.data")
                     .out_dir(fresh_dir)
                     .compile_protos(PROTOS, &["../../../proto/"])
                     .unwrap_or_else(|e| panic!("Failed to compile protos: {}", e));

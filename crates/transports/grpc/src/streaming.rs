@@ -277,6 +277,9 @@ pub(crate) struct StreamSession {
     /// behind — this is the transport-level backpressure surface.
     pub(crate) router_input: Option<tokio::sync::mpsc::Sender<DataPacket>>,
 
+    /// Session transport ledger for gRPC wire decode of client chunks.
+    pub(crate) transport_copies: Option<remotemedia_core::data::CopyContext>,
+
     /// Router task handle
     pub(crate) router_task: Option<JoinHandle<()>>,
 
@@ -286,7 +289,7 @@ pub(crate) struct StreamSession {
 
 impl StreamSession {
     /// Create new session from StreamInit request
-    fn new(
+    pub(crate) fn new(
         session_id: String,
         manifest: Manifest,
         recommended_chunk_size: u64,
@@ -314,6 +317,7 @@ impl StreamSession {
             cache_hits: 0,
             cache_misses: 0,
             router_input: None,
+            transport_copies: None,
             router_task: None,
             router_shutdown: None,
         }
@@ -682,7 +686,12 @@ async fn handle_stream(
                     // node initialization: source-Python nodes can publish blips
                     // and progress while initialize() is still running, and output
                     // taps must be attachable as soon as StreamReady is emitted.
-                    let control = SessionControl::new(session_id.clone());
+                    // The control bus shares the router's transport ledger, so wire
+                    // encode/decode on taps, publish and intercepts is attributed.
+                    let control = SessionControl::with_transport_copy_context(
+                        session_id.clone(),
+                        router.transport_copy_context(),
+                    );
                     router.attach_control(control.clone());
                     // Discovery metadata (openspec: add-live-pipeline-observer);
                     // the router attached its descriptor + telemetry above.
@@ -722,6 +731,7 @@ async fn handle_stream(
 
                         // Store the input sender for feeding chunks
                         sess_guard.router_input = Some(input_sender);
+                        sess_guard.transport_copies = Some(control.transport_copy_context());
 
                         // Store the shutdown sender for cleanup
                         sess_guard.router_shutdown = Some(shutdown_tx);
@@ -749,12 +759,13 @@ async fn handle_stream(
                         })?;
                         for tap in output_taps {
                             let tap_tx = tx.clone();
+                            let tap_copies = control.transport_copy_context();
                             let output_key = format!("__tap__.{tap}");
                             if tap == "__system__" {
                                 let mut receiver = control.subscribe_system();
                                 tokio::spawn(async move {
                                     while let Some(data) = receiver.recv().await {
-                                        if send_tap_result(&tap_tx, &output_key, data).await.is_err() {
+                                        if send_tap_result(&tap_tx, &output_key, data, &tap_copies).await.is_err() {
                                             break;
                                         }
                                     }
@@ -771,7 +782,7 @@ async fn handle_stream(
                                     loop {
                                         match receiver.recv().await {
                                             Ok(data) => {
-                                                if send_tap_result(&tap_tx, &output_key, data)
+                                                if send_tap_result(&tap_tx, &output_key, data, &tap_copies)
                                                     .await
                                                     .is_err()
                                                 {
@@ -807,25 +818,36 @@ async fn handle_stream(
                     // release the session lock before the (bounded, awaited) send:
                     // the router takes this lock to lazily create node tasks, so
                     // holding it across a full-queue send deadlocks the session.
-                    let router_input = sess.lock().await.router_input.clone();
+                    let (router_input, transport_copies) = {
+                        let guard = sess.lock().await;
+                        (guard.router_input.clone(), guard.transport_copies.clone())
+                    };
                     if let Some(router_input) = router_input {
-                        // Convert DataBuffer to RuntimeData with arrival timestamp (spec 026)
-                        use crate::adapters::{data_buffer_to_runtime_data_with_arrival, now_micros};
+                        // Convert DataBuffer to RuntimeData with arrival timestamp (spec 026).
+                        // The chunk owns its buffer: bulk bytes move into shared storage
+                        // and audio conversion is charged to the session ledger.
+                        use crate::adapters::{data_buffer_into_runtime_data_with_context, now_micros};
                         let arrival_ts = Some(now_micros());
+                        let copies = transport_copies.ok_or_else(|| {
+                            ServiceError::Internal("session transport ledger unavailable".to_string())
+                        })?;
+                        let decode = |buffer| {
+                            data_buffer_into_runtime_data_with_context(buffer, arrival_ts, &copies)
+                                .map_err(|rejected| ServiceError::Validation(rejected.to_string()))?
+                                .ok_or_else(|| {
+                                    ServiceError::Validation("Data conversion failed".to_string())
+                                })
+                        };
 
                         let runtime_data = if let Some(buffer) = data_chunk.buffer {
-                            data_buffer_to_runtime_data_with_arrival(&buffer, arrival_ts).ok_or_else(
-                                || ServiceError::Validation("Data conversion failed".to_string()),
-                            )?
+                            decode(buffer)?
                         } else if !data_chunk.named_buffers.is_empty() {
                             // For multi-input, just use the first buffer for now
                             let (_, buffer) =
                                 data_chunk.named_buffers.into_iter().next().ok_or_else(|| {
                                     ServiceError::Validation("No input data provided".to_string())
                                 })?;
-                            data_buffer_to_runtime_data_with_arrival(&buffer, arrival_ts).ok_or_else(
-                                || ServiceError::Validation("Data conversion failed".to_string()),
-                            )?
+                            decode(buffer)?
                         } else {
                             return Err(ServiceError::Validation(
                                 "DataChunk must have buffer or named_buffers".to_string(),
@@ -962,12 +984,18 @@ async fn send_tap_result(
     tx: &tokio::sync::mpsc::Sender<Result<StreamResponse, Status>>,
     output_key: &str,
     data: RuntimeData,
+    copies: &remotemedia_core::data::CopyContext,
 ) -> Result<(), ()> {
     let mut outputs = HashMap::new();
-    outputs.insert(
-        output_key.to_string(),
-        crate::adapters::runtime_data_to_data_buffer(&data),
-    );
+    let buffer = match crate::adapters::runtime_data_to_data_buffer_with_context(&data, copies) {
+        Ok(buffer) => buffer,
+        Err(rejected) => {
+            // Strict policy refuses the copying wire encode; skip this event.
+            warn!(tap = %output_key, error = %rejected, "gRPC output tap not encoded");
+            return Ok(());
+        }
+    };
+    outputs.insert(output_key.to_string(), buffer);
     tx.send(Ok(StreamResponse {
         response: Some(StreamResponseType::Result(ChunkResult {
             sequence: 0,

@@ -5,6 +5,10 @@
 // Phase 4 (US2) media track infrastructure
 #![allow(dead_code)]
 
+use super::audio_packetizer::AudioPcmPacketizer;
+#[cfg(test)]
+use super::audio_packetizer::PcmFixtureExt;
+use remotemedia_types::{CopyContext, SharedBuffer};
 use super::audio::{AudioEncoder, AudioEncoderConfig};
 use super::audio_sender::{AudioSender, MediaClockPublisher};
 use super::video::{VideoFormat, VideoFrame};
@@ -36,7 +40,15 @@ impl VideoEncoderNode {
     pub fn new(_config: VideoEncoderConfig) -> Result<Self> {
         Ok(Self)
     }
-    pub async fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
+    pub async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
+        self.encode_frame_with_copy_context(data, CopyContext::legacy())
+            .await
+    }
+    pub async fn encode_frame_with_copy_context(
+        &self,
+        _data: RuntimeData,
+        _copies: &CopyContext,
+    ) -> Result<RuntimeData> {
         Err(crate::Error::EncodingError(
             "Video support is disabled".to_string(),
         ))
@@ -60,7 +72,20 @@ impl VideoDecoderNode {
     pub fn new(_config: VideoDecoderConfig) -> Result<Self> {
         Ok(Self)
     }
-    pub async fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
+    pub async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
+        self.process_with_copy_context(
+            data,
+            CopyContext::legacy().clone(),
+            Arc::new(remotemedia_types::HeapOutputAllocator),
+        )
+        .await
+    }
+    pub async fn process_with_copy_context(
+        &self,
+        _data: RuntimeData,
+        _copies: CopyContext,
+        _allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Result<RuntimeData> {
         Err(crate::Error::EncodingError(
             "Video support is disabled".to_string(),
         ))
@@ -72,44 +97,44 @@ use tokio::sync::RwLock as AsyncRwLock;
 use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
-/// Codec-frame assembly across arbitrary PCM callback boundaries. Padding is
-/// reserved for an explicit utterance end, never an input chunk boundary.
-struct AudioPcmPacketizer {
-    frame_size: usize,
-    pending: std::collections::VecDeque<f32>,
+#[cfg(test)]
+#[path = "audio_track_owner_tests.rs"]
+mod audio_owner_tests;
+
+#[cfg(test)]
+#[path = "audio_shutdown_tests.rs"]
+mod audio_shutdown_tests;
+
+#[cfg(all(test, not(feature = "video")))]
+#[tokio::test]
+async fn video_copy_disabled_backend_keeps_explicit_error_without_materialization() {
+    let encoder = VideoEncoderNode;
+    let copies = CopyContext::new(remotemedia_types::CopyPolicy::RequireZeroCopy, "disabled-video");
+    let error = encoder
+        .encode_frame_with_copy_context(RuntimeData::Binary(vec![1].into()), &copies)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Video support is disabled"));
+    assert!(encoder.process(RuntimeData::Binary(vec![1].into())).await.is_err());
+    let decoder = VideoDecoderNode;
+    assert!(decoder
+        .process_with_copy_context(
+            RuntimeData::Binary(vec![1].into()),
+            copies.clone(),
+            Arc::new(remotemedia_types::HeapOutputAllocator),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Video support is disabled"));
+    assert!(decoder.process(RuntimeData::Binary(vec![1].into())).await.is_err());
+    assert!(copies.report().entries.iter()
+        .all(|(_, c)| c.copied_bytes == 0 && c.rejected == 0));
 }
 
-impl AudioPcmPacketizer {
-    fn new(frame_size: usize) -> Self {
-        assert!(frame_size > 0);
-        Self { frame_size, pending: std::collections::VecDeque::new() }
-    }
-
-    fn append(&mut self, samples: &[f32]) {
-        self.pending.extend(samples.iter().copied());
-    }
-
-    fn next_frame(&mut self) -> Option<Vec<f32>> {
-        (self.pending.len() >= self.frame_size)
-            .then(|| self.pending.drain(..self.frame_size).collect())
-    }
-
-    #[cfg(test)]
-    fn push(&mut self, samples: &[f32]) -> Vec<(Vec<f32>, usize)> {
-        self.append(samples);
-        std::iter::from_fn(|| self.next_frame().map(|pcm| (pcm, self.frame_size))).collect()
-    }
-
-    fn finish(&mut self) -> Option<(Vec<f32>, usize)> {
-        if self.pending.is_empty() { return None; }
-        let real = self.pending.len();
-        let mut pcm: Vec<f32> = self.pending.drain(..).collect();
-        pcm.resize(self.frame_size, 0.0);
-        Some((pcm, real))
-    }
-
-    fn clear(&mut self) { self.pending.clear(); }
-}
+#[cfg(all(test, feature = "video"))]
+#[path = "video_copy_tests.rs"]
+pub(crate) mod video_copy_tests;
 
 /// Audio track for WebRTC
 ///
@@ -166,7 +191,7 @@ impl AudioTrack {
             // Async RwLock: see field doc — guard held across await.
             sender: Arc::new(AsyncRwLock::new(Some(sender))),
             packetizer: tokio::sync::Mutex::new(AudioPcmPacketizer::new(
-                (config.sample_rate as usize * 20) / 1000,
+                (config.sample_rate as usize * 20) / 1000 * config.channels as usize,
             )),
             timestamp: Arc::new(RwLock::new(0)),
         })
@@ -192,6 +217,14 @@ impl AudioTrack {
     /// - Transmission (dedicated thread): Dequeue frames and send at real-time pace (20ms intervals)
     /// - This decouples TTS generation speed from playback speed, preventing interruptions
     pub async fn send_audio(&self, samples: Arc<Vec<f32>>, sample_rate: u32) -> Result<()> {
+        self.send_audio_with_context(samples.into(), sample_rate, CopyContext::legacy()).await
+    }
+
+    /// Send owning samples without PCM staging when a codec frame can borrow a
+    /// contiguous range. Required assembly uses each retained input's authority.
+    pub async fn send_audio_with_context(
+        &self, samples: SharedBuffer<f32>, sample_rate: u32, copies: &CopyContext,
+    ) -> Result<()> {
         use tracing::{info, trace};
 
         // Phase B2: encoder / decoder / sender / timestamp locks
@@ -205,7 +238,10 @@ impl AudioTrack {
         // Serialize assembly through enqueue across concurrent producers and cancellation.
         let mut packetizer = self.packetizer.lock().await;
         let frame_duration = Duration::from_millis(20);
-        let old_rate = self.encoder.read().config.sample_rate;
+        let (old_rate, channels) = {
+            let encoder = self.encoder.read();
+            (encoder.config.sample_rate, encoder.config.channels as usize)
+        };
         let replacement = if old_rate != sample_rate {
             let encoder = self.encoder.read();
             let config = crate::media::audio::AudioEncoderConfig {
@@ -219,14 +255,14 @@ impl AudioTrack {
         } else {
             None
         };
-        let frame_size = (sample_rate as usize * 20) / 1000; // 20ms Opus frame
+        let frame_size = (sample_rate as usize * 20) / 1000 * channels; // interleaved 20ms frame
 
         trace!(
             "AudioTrack: Enqueuing {} samples as {}sample frames @ {}Hz (duration: {:.2}s)",
             samples.len(),
             frame_size,
             sample_rate,
-            samples.len() as f64 / sample_rate as f64
+            samples.len() as f64 / sample_rate as f64 / channels as f64
         );
 
         // `sender` is `tokio::sync::RwLock` — the read-guard needs to
@@ -237,12 +273,15 @@ impl AudioTrack {
         let sender = sender_guard
             .as_ref()
             .ok_or_else(|| Error::MediaTrackError("AudioSender not initialized".to_string()))?;
+        if sender.is_shutdown() {
+            return Err(Error::MediaTrackError("AudioSender is shut down".into()));
+        }
 
         if let Some(replacement) = replacement {
             // End the previous format once, before replacing its encoder.
-            if let Some((pcm, _real)) = packetizer.finish() {
+            while let Some((pcm, _real)) = packetizer.finish()? {
                 let encoded = self.encoder.write().encode(&pcm)?;
-                sender.enqueue_frame(encoded, pcm.len() as u32, frame_duration).await?;
+                sender.enqueue_frame(encoded, (pcm.len() / channels) as u32, frame_duration).await?;
             }
             *self.encoder.write() = replacement;
             *packetizer = AudioPcmPacketizer::new(frame_size);
@@ -250,10 +289,10 @@ impl AudioTrack {
         }
 
         let mut frames_enqueued = 0;
-        packetizer.append(&samples);
-        while let Some(pcm) = packetizer.next_frame() {
+        packetizer.append(samples, copies)?;
+        while let Some(pcm) = packetizer.next_frame()? {
             let encoded = self.encoder.write().encode(&pcm)?;
-            sender.enqueue_frame(encoded, pcm.len() as u32, frame_duration).await?;
+            sender.enqueue_frame(encoded, (pcm.len() / channels) as u32, frame_duration).await?;
             frames_enqueued += 1;
         }
 
@@ -269,12 +308,13 @@ impl AudioTrack {
     /// Encode the final partial frame once at an explicit speech boundary.
     pub async fn finish_audio(&self) -> Result<()> {
         let mut packetizer = self.packetizer.lock().await;
-        if let Some((pcm, _real)) = packetizer.finish() {
+        while let Some((pcm, _real)) = packetizer.finish()? {
             let sender_guard = self.sender.read().await;
             let sender = sender_guard.as_ref().ok_or_else(||
                 Error::MediaTrackError("AudioSender not initialized".to_string()))?;
             let encoded = self.encoder.write().encode(&pcm)?;
-            sender.enqueue_frame(encoded, pcm.len() as u32, Duration::from_millis(20)).await?;
+            let channels = self.encoder.read().config.channels as usize;
+            sender.enqueue_frame(encoded, (pcm.len() / channels) as u32, Duration::from_millis(20)).await?;
         }
         Ok(())
     }
@@ -312,6 +352,15 @@ impl AudioTrack {
         Ok(samples)
     }
 
+    /// Decode PCM into the session-selected owner, retaining its allocation credit.
+    pub async fn on_rtp_packet_with_allocator(
+        &self,
+        payload: &[u8],
+        allocator: &dyn remotemedia_types::OutputAllocator,
+    ) -> Result<SharedBuffer<f32>> {
+        self.decoder.write().decode_with_allocator(payload, allocator)
+    }
+
     /// Drain queued TTS packets and discard any incomplete PCM frame
     /// without stopping the sender thread.
     ///
@@ -343,12 +392,19 @@ impl AudioTrack {
 
     /// Shutdown the audio track and wait for sender thread to complete
     pub async fn shutdown(&self) -> Result<()> {
-        // Take the sender under the async write-lock, then await the
-        // actual shutdown (the `.take()` returns owned).
-        let taken = self.sender.write().await.take();
-        if let Some(sender) = taken {
+        // Closing needs only a shared sender read, which can coexist with a
+        // producer holding that read while backpressured on enqueue.
+        let sender = self.sender.read().await.clone();
+        if let Some(sender) = &sender {
+            sender.request_shutdown();
+        }
+        self.packetizer.lock().await.clear();
+        if let Some(sender) = sender {
             sender.shutdown().await?;
         }
+        // Keep the closed sender observable until joining completes. Concurrent
+        // shutdown calls must not mistake a taken handle for completed teardown.
+        self.sender.write().await.take();
         Ok(())
     }
 
@@ -496,25 +552,7 @@ impl VideoTrack {
     /// Converts VideoFrame to RuntimeData, encodes with core, sends via RTP.
     /// For new code, use `send_video_runtime_data` directly with RuntimeData::Video.
     pub async fn send_video(&self, frame: &VideoFrame) -> Result<()> {
-        // Convert VideoFrame to RuntimeData
-        let runtime_data = RuntimeData::Video {
-            pixel_data: frame.data.clone(),
-            width: frame.width,
-            height: frame.height,
-            format: match frame.format {
-                VideoFormat::I420 => PixelFormat::I420,
-                VideoFormat::NV12 => PixelFormat::NV12,
-                VideoFormat::RGB24 => PixelFormat::Rgb24,
-            },
-            codec: None, // Raw frame
-            frame_number: 0,
-            timestamp_us: frame.timestamp_us,
-            is_keyframe: frame.is_keyframe,
-            stream_id: None,
-            arrival_ts_us: None,
-        };
-
-        self.send_video_runtime_data(runtime_data).await
+        self.send_video_runtime_data(frame.as_runtime_data()).await
     }
 
     /// Send video frame over RTP (encodes using core VideoEncoderNode)
@@ -530,12 +568,21 @@ impl VideoTrack {
     ///
     /// Phase 5 T067, T078: RTP transmission with 90kHz timestamp mapping
     pub async fn send_video_runtime_data(&self, runtime_data: RuntimeData) -> Result<()> {
-        use remotemedia_core::nodes::streaming_node::AsyncStreamingNode;
+        self.send_video_runtime_data_with_context(runtime_data, CopyContext::legacy())
+            .await
+    }
 
+    /// Encode with caller-owned copy authority, then retain the encoded owner
+    /// through RTP sample submission. Backend/network-internal copies are separate.
+    pub async fn send_video_runtime_data_with_context(
+        &self,
+        runtime_data: RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<()> {
         // Encode raw frame using core VideoEncoderNode
         let encoded = self
             .encoder
-            .process(runtime_data)
+            .encode_frame_with_copy_context(runtime_data, copies)
             .await
             .map_err(|e| Error::EncodingError(format!("Video encoding failed: {}", e)))?;
 
@@ -595,12 +642,7 @@ impl VideoTrack {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Create WebRTC sample with encoded bitstream
-        let sample = Sample {
-            data: bitstream.into(),
-            duration: frame_duration,
-            timestamp: capture_wall_clock,
-            ..Default::default()
-        };
+        let sample = sample_from_owner(bitstream, frame_duration, capture_wall_clock);
 
         // Send sample (webrtc-rs handles RTP packetization per RFC 7741/6184)
         self.track
@@ -656,11 +698,11 @@ impl VideoTrack {
         Arc::clone(&self.track)
     }
 
-    /// Decode received RTP packet to RuntimeData (uses core VideoDecoderNode)
+    /// Decode an assembled codec sample using legacy copy authority.
     ///
     /// # Arguments
     ///
-    /// * `payload` - RTP payload (encoded video bitstream)
+    /// * `payload` - Complete encoded video sample, after RTP depacketization
     ///
     /// # Returns
     ///
@@ -668,16 +710,48 @@ impl VideoTrack {
     ///
     /// # Note
     ///
-    /// Decodes RTP payload using core VideoDecoderNode (VP8/H.264/AV1 via ac-ffmpeg).
-    /// Phase 5 T068: RTP depacketization and decoding
+    /// Does not assemble fragmented RTP payloads. Prefer the owning contextual API
+    /// when the depacketizer already supplies an immutable sample owner.
     pub async fn decode_rtp_payload(&self, payload: &[u8]) -> Result<RuntimeData> {
-        use remotemedia_core::nodes::streaming_node::AsyncStreamingNode;
+        self.decode_rtp_payload_with_context(
+            payload,
+            CopyContext::legacy(),
+            Arc::new(remotemedia_types::HeapOutputAllocator),
+        )
+        .await
+    }
 
-        // Create encoded RuntimeData from RTP payload
+    /// Snapshot a borrowed assembled sample under caller authority before decoding.
+    pub async fn decode_rtp_payload_with_context(
+        &self,
+        payload: &[u8],
+        copies: &CopyContext,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Result<RuntimeData> {
+        let owner = copies
+            .materialize(
+                remotemedia_types::CopyReason::BorrowedInput,
+                payload.len() as u64,
+                || payload.to_vec().into(),
+            )
+            .map_err(|e| Error::EncodingError(e.to_string()))?;
+        self.decode_owned_payload_with_context(owner, copies, allocator)
+            .await
+    }
+
+    /// Retain an assembled encoded sample and use the selected output provider.
+    /// Backend padding and decoded-plane transfers remain counted or rejected.
+    pub async fn decode_owned_payload_with_context(
+        &self,
+        payload: remotemedia_types::SharedBytes,
+        copies: &CopyContext,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+    ) -> Result<RuntimeData> {
+        let arrival_ts_us = now_micros();
         let encoded_data = RuntimeData::Video {
-            pixel_data: payload.to_vec(),
-            width: 1280, // Will be overridden by decoder
-            height: 720,
+            pixel_data: payload,
+            width: 0, // Read from the encoded sample by the decoder.
+            height: 0,
             format: PixelFormat::Encoded,
             codec: Some(self.codec),
             frame_number: 0,
@@ -689,8 +763,17 @@ impl VideoTrack {
 
         // Decode using core VideoDecoderNode
         self.decoder
-            .process(encoded_data)
+            .process_with_copy_context(encoded_data, copies.clone(), allocator)
             .await
+            .map(|mut frame| {
+                if let RuntimeData::Video {
+                    arrival_ts_us: arrival,
+                    ..
+                } = &mut frame {
+                    *arrival = Some(arrival_ts_us);
+                }
+                frame
+            })
             .map_err(|e| Error::EncodingError(format!("Video decoding failed: {}", e)))
     }
 
@@ -742,6 +825,23 @@ impl VideoTrack {
     }
 }
 
+fn sample_from_owner(
+    data: remotemedia_types::SharedBytes,
+    duration: Duration,
+    timestamp: std::time::SystemTime,
+) -> Sample {
+    Sample {
+        data: bytes::Bytes::from_owner(data),
+        duration,
+        timestamp,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+#[path = "tracks/owner_tests.rs"]
+mod owner_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,7 +872,7 @@ mod tests {
         let contiguous = whole.push(&pcm);
         let mut stream = AudioPcmPacketizer::new(960);
         let per_tick: Vec<_> = pcm.chunks(1_600).flat_map(|chunk| stream.push(chunk)).collect();
-        let stats = |frames: &Vec<(Vec<f32>, usize)>| {
+        let stats = |frames: &Vec<(SharedBuffer<f32>, usize)>| {
             (
                 frames.len(),
                 frames.iter().map(|(pcm, _)| pcm.len()).sum::<usize>(),
@@ -817,12 +917,12 @@ mod tests {
     fn packetizer_pads_only_at_explicit_end_and_discards_on_cancel() {
         let mut stream = AudioPcmPacketizer::new(960);
         assert!(stream.push(&vec![0.25; 1_600]).len() == 1);
-        assert_eq!(stream.finish().map(|(_, real)| real), Some(640));
-        assert!(stream.finish().is_none());
+        assert_eq!(stream.finish().unwrap().map(|(_, real)| real), Some(640));
+        assert!(stream.finish().unwrap().is_none());
         assert!(stream.push(&vec![0.5; 500]).is_empty());
         stream.clear();
         assert!(stream.push(&vec![0.75; 460]).is_empty());
-        assert!(stream.finish().is_some_and(|(f, real)| real == 460 && f[0] == 0.75));
+        assert!(stream.finish().unwrap().is_some_and(|(f, real)| real == 460 && f[0] == 0.75));
     }
 
     #[tokio::test]
@@ -938,6 +1038,25 @@ fn now_micros() -> u64 {
         .as_micros() as u64
 }
 
+/// Decode a complete Opus payload into the selected ingress owner.
+pub(crate) async fn audio_rtp_to_runtime_data(
+    payload: &[u8],
+    track: &AudioTrack,
+    allocator: &dyn remotemedia_types::OutputAllocator,
+) -> Result<RuntimeData> {
+    let arrival_ts_us = Some(now_micros());
+    let samples = track.on_rtp_packet_with_allocator(payload, allocator).await?;
+    Ok(RuntimeData::Audio {
+        samples: samples.into(),
+        sample_rate: 48000,
+        channels: 1,
+        stream_id: None,
+        timestamp_us: None,
+        arrival_ts_us,
+        metadata: None,
+    })
+}
+
 /// Convert RTP payload to RuntimeData (T073)
 ///
 /// # Arguments
@@ -969,18 +1088,7 @@ pub async fn rtp_to_runtime_data(
             Error::MediaTrackError("No audio track available for decoding".to_string())
         })?;
 
-        // Decode Opus to f32 samples
-        let samples = audio_track.on_rtp_packet(payload).await?;
-
-        Ok(RuntimeData::Audio {
-            samples: samples.into(),
-            sample_rate: 48000, // Opus always decodes to 48kHz
-            channels: 1,        // Assuming mono for now
-            stream_id: None,
-            timestamp_us: None,
-            arrival_ts_us,
-            metadata: None,
-        })
+        audio_rtp_to_runtime_data(payload, audio_track, &remotemedia_types::HeapOutputAllocator).await
     } else {
         let video_track = video_track.ok_or_else(|| {
             Error::MediaTrackError("No video track available for decoding".to_string())

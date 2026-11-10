@@ -10,6 +10,18 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::IntoPyObjectExt;
 use remotemedia_core::data::RuntimeData;
+use remotemedia_types::CopyContext;
+#[cfg(test)]
+#[path = "marshal/buffer_tests.rs"]
+mod buffer_tests;
+pub(crate) mod buffers;
+pub(crate) use buffers::storage::{materialize, view as payload_view};
+#[cfg(test)]
+#[path = "marshal/control_tests.rs"]
+mod control_tests;
+#[cfg(test)]
+#[path = "marshal/json_tests.rs"]
+mod json_tests;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -78,7 +90,7 @@ impl PyObjectCache {
 /// If a cache is provided, complex objects that can't be serialized to JSON
 /// will be stored in the cache and a reference will be returned instead of pickling.
 pub fn python_to_json(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
-    python_to_json_impl(py, obj, None)
+    python_to_json_with_context(py, obj, None, CopyContext::legacy())
 }
 
 /// Convert with optional cache support
@@ -87,17 +99,25 @@ pub fn python_to_json_with_cache(
     obj: &Bound<'_, PyAny>,
     cache: Option<&PyObjectCache>,
 ) -> PyResult<Value> {
-    python_to_json_impl(py, obj, cache)
+    python_to_json_with_context(py, obj, cache, CopyContext::legacy())
 }
 
-fn python_to_json_impl(
+pub fn python_to_json_with_context(
     py: Python,
     obj: &Bound<'_, PyAny>,
     cache: Option<&PyObjectCache>,
+    context: &CopyContext,
 ) -> PyResult<Value> {
     // None
     if obj.is_none() {
         return Ok(Value::Null);
+    }
+
+    // Check before scalar extraction: NumPy permits conversion of some
+    // singleton arrays to scalars, which would discard their shape/dtype.
+    #[cfg(feature = "native-numpy")]
+    if crate::numpy_bridge::is_numpy_array(py, obj) {
+        return crate::numpy_bridge::numpy_to_json_with_context(py, obj, context);
     }
 
     // Boolean (check before int, as bool is subclass of int in Python)
@@ -128,7 +148,7 @@ fn python_to_json_impl(
     if let Ok(list) = obj.downcast::<PyList>() {
         let mut vec = Vec::new();
         for item in list.iter() {
-            vec.push(python_to_json_impl(py, &item, cache)?);
+            vec.push(python_to_json_with_context(py, &item, cache, context)?);
         }
         return Ok(Value::Array(vec));
     }
@@ -137,7 +157,7 @@ fn python_to_json_impl(
     if let Ok(tuple) = obj.downcast::<PyTuple>() {
         let mut vec = Vec::new();
         for item in tuple.iter() {
-            vec.push(python_to_json_impl(py, &item, cache)?);
+            vec.push(python_to_json_with_context(py, &item, cache, context)?);
         }
         return Ok(Value::Array(vec));
     }
@@ -147,18 +167,12 @@ fn python_to_json_impl(
         let mut map = serde_json::Map::new();
         for (key, value) in dict.iter() {
             let key_str = key.extract::<String>()?;
-            map.insert(key_str, python_to_json_impl(py, &value, cache)?);
+            map.insert(
+                key_str,
+                python_to_json_with_context(py, &value, cache, context)?,
+            );
         }
         return Ok(Value::Object(map));
-    }
-
-    // Numpy array - serialize with metadata for cross-language support (only with native-numpy feature)
-    #[cfg(feature = "native-numpy")]
-    {
-        if crate::numpy_bridge::is_numpy_array(py, obj) {
-            tracing::info!("Converting numpy array to JSON with metadata");
-            return crate::numpy_bridge::numpy_to_json(py, obj);
-        }
     }
 
     // Unsupported type - try to cache it if cache is available, otherwise pickle
@@ -185,6 +199,14 @@ fn python_to_json_impl(
         );
 
         return Ok(Value::Object(ref_obj));
+    }
+
+    // An opaque serializer has no inspectable payload contract. Strict mode
+    // cannot grant permission based on an unknown byte count or invoke reducers.
+    if context.policy() == remotemedia_types::CopyPolicy::RequireZeroCopy {
+        return Err(pyo3::exceptions::PyBufferError::new_err(
+            "opaque Python serialization is unsupported under require_zero_copy",
+        ));
     }
 
     // No cache - must pickle
@@ -216,6 +238,13 @@ fn python_to_json_impl(
     };
 
     let bytes: &[u8] = pickled_bytes.extract()?;
+    // Opaque compatibility serialization: the pickled length is the exact
+    // payload this boundary materialized. Strict policy was rejected above.
+    record_opaque_copy(
+        context,
+        remotemedia_types::CopyReason::PortableSerialization,
+        bytes.len(),
+    )?;
 
     // Base64 encode the pickled bytes
     let base64_encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
@@ -236,6 +265,19 @@ fn python_to_json_impl(
     Ok(Value::Object(map))
 }
 
+/// Charge one completed opaque (pickle) conversion to the caller's ledger.
+/// Callers reject `RequireZeroCopy` before converting, so this records an
+/// already-authorized compatibility copy of exactly `bytes` encoded bytes.
+fn record_opaque_copy(
+    context: &remotemedia_types::CopyContext,
+    reason: remotemedia_types::CopyReason,
+    bytes: usize,
+) -> PyResult<()> {
+    context
+        .materialize(reason, bytes as u64, || ())
+        .map_err(|rejected| pyo3::exceptions::PyBufferError::new_err(rejected.to_string()))
+}
+
 /// Convert a JSON Value to a Python object
 ///
 /// Supports:
@@ -254,6 +296,15 @@ pub fn json_to_python_with_cache<'py>(
     py: Python<'py>,
     value: &Value,
     cache: Option<&PyObjectCache>,
+) -> PyResult<Bound<'py, PyAny>> {
+    json_to_python_with_context(py, value, cache, CopyContext::legacy())
+}
+
+pub fn json_to_python_with_context<'py>(
+    py: Python<'py>,
+    value: &Value,
+    cache: Option<&PyObjectCache>,
+    context: &CopyContext,
 ) -> PyResult<Bound<'py, PyAny>> {
     match value {
         Value::Null => Ok(py.None().into_bound(py)),
@@ -276,7 +327,7 @@ pub fn json_to_python_with_cache<'py>(
         Value::Array(arr) => {
             let py_list = PyList::empty(py);
             for item in arr {
-                let py_item = json_to_python_with_cache(py, item, cache)?;
+                let py_item = json_to_python_with_context(py, item, cache, context)?;
                 py_list.append(py_item)?;
             }
             Ok(py_list.into_any())
@@ -288,7 +339,7 @@ pub fn json_to_python_with_cache<'py>(
             {
                 if crate::numpy_bridge::is_numpy_json(value) {
                     tracing::info!("Converting JSON back to numpy array");
-                    return crate::numpy_bridge::json_to_numpy(py, value);
+                    return crate::numpy_bridge::json_to_numpy_with_context(py, value, context);
                 }
             }
 
@@ -321,6 +372,11 @@ pub fn json_to_python_with_cache<'py>(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
             {
+                if context.policy() == remotemedia_types::CopyPolicy::RequireZeroCopy {
+                    return Err(pyo3::exceptions::PyBufferError::new_err(
+                        "opaque Python deserialization is unsupported under require_zero_copy",
+                    ));
+                }
                 if let Some(Value::String(base64_data)) = obj.get("data") {
                     tracing::info!(
                         "Unpickling Python object: {}",
@@ -343,6 +399,11 @@ pub fn json_to_python_with_cache<'py>(
                     let pickle = py.import("pickle")?;
                     let py_bytes = pyo3::types::PyBytes::new(py, &pickled_bytes);
                     let unpickled = pickle.call_method1("loads", (py_bytes,))?;
+                    record_opaque_copy(
+                        context,
+                        remotemedia_types::CopyReason::PortableDeserialization,
+                        pickled_bytes.len(),
+                    )?;
 
                     tracing::info!("Successfully unpickled object");
                     return Ok(unpickled);
@@ -352,7 +413,7 @@ pub fn json_to_python_with_cache<'py>(
             // Regular dict - recursively convert values (may contain __pyobj__ references)
             let py_dict = PyDict::new(py);
             for (key, value) in obj {
-                py_dict.set_item(key, json_to_python_with_cache(py, value, cache)?)?;
+                py_dict.set_item(key, json_to_python_with_context(py, value, cache, context)?)?;
             }
             Ok(py_dict.into_any())
         }
@@ -384,148 +445,81 @@ pub fn json_to_python_with_cache<'py>(
 /// });
 /// ```
 pub fn runtime_data_to_python(py: Python<'_>, data: &RuntimeData) -> PyResult<Py<PyAny>> {
+    runtime_data_to_python_with_context(py, data, CopyContext::legacy())
+}
+
+/// Consume input storage so legacy Vec audio can be promoted without copying.
+pub fn runtime_data_into_python(py: Python<'_>, data: RuntimeData) -> PyResult<Py<PyAny>> {
+    runtime_data_to_python(py, &data.into_shared())
+}
+
+/// Export JSON metadata without cloning embedded encoded payload strings.
+fn json_runtime_output(py: Python<'_>, v: &Value, context: &CopyContext) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("type", "json")?;
+
+    let metadata_dict = PyDict::new(py);
+    if let Some(obj) = v.as_object() {
+        for (key, value) in obj
+            .iter()
+            .filter(|(key, _)| key.starts_with("participant."))
+        {
+            if let Some(text) = value.as_str() {
+                metadata_dict.set_item(key, text)?;
+            }
+        }
+    }
+    let value = if let Some(obj) = v.as_object().filter(|obj| {
+        let numpy = cfg!(feature = "native-numpy")
+            && obj.get("__numpy__").and_then(Value::as_bool) == Some(true);
+        let pickle = obj.get("__pickled__").and_then(Value::as_bool) == Some(true)
+            && obj.get("data").and_then(Value::as_str).is_some();
+        !numpy && !pickle
+    }) {
+        let fields = PyDict::new(py);
+        for (key, value) in obj
+            .iter()
+            .filter(|(key, _)| !key.starts_with("participant."))
+        {
+            fields.set_item(key, json_to_python_with_context(py, value, None, context)?)?;
+        }
+        fields.into_any()
+    } else {
+        json_to_python_with_context(py, v, None, context)?
+    };
+    dict.set_item("value", value)?;
+    if !metadata_dict.is_empty() {
+        dict.set_item("metadata", metadata_dict)?;
+    }
+    Ok(dict.into())
+}
+
+pub fn runtime_data_to_python_with_context(
+    py: Python<'_>,
+    data: &RuntimeData,
+    context: &CopyContext,
+) -> PyResult<Py<PyAny>> {
+    if let Some(value) = buffers::export(py, data, context)? {
+        return Ok(value);
+    }
     // T007: Convert RuntimeData to Python objects
     match data {
-        RuntimeData::Audio {
-            samples,
-            sample_rate,
-            channels,
-            ..
-        } => {
-            let dict = PyDict::new(py);
-            dict.set_item("type", "audio")?;
-            dict.set_item("samples", samples.as_slice())?;
-            dict.set_item("sample_rate", sample_rate)?;
-            dict.set_item("channels", channels)?;
-            Ok(dict.into())
-        }
         RuntimeData::Text(s) => Ok(s.into_py_any(py)?),
-        RuntimeData::Json(v) => {
-            // Wrap as {"type": "json", "value": <value>} so that
-            // _wrap_for_data / Data._from_runtime_dict on the Python side can
-            // detect this as kind="json" rather than treating it as an opaque
-            // audio-style dict or falling through to "unset".
-            let dict = PyDict::new(py);
-            dict.set_item("type", "json")?;
-
-            let mut clean_v = v.clone();
-            let metadata_dict = PyDict::new(py);
-            let mut has_metadata = false;
-
-            if let Some(obj) = clean_v.as_object_mut() {
-                let keys: Vec<String> = obj
-                    .keys()
-                    .filter(|k| k.starts_with("participant."))
-                    .cloned()
-                    .collect();
-                for k in keys {
-                    if let Some(serde_json::Value::String(s)) = obj.remove(&k) {
-                        metadata_dict.set_item(&k, s)?;
-                        has_metadata = true;
-                    }
-                }
-            }
-
-            let value = json_to_python(py, &clean_v)?;
-            dict.set_item("value", value)?;
-            if has_metadata {
-                dict.set_item("metadata", metadata_dict)?;
-            }
-            Ok(dict.into())
-        }
-        RuntimeData::Binary(b) => Ok(pyo3::types::PyBytes::new(py, b).into()),
-        RuntimeData::Video { .. } => {
-            // Video not fully supported yet
-            let dict = PyDict::new(py);
-            dict.set_item("type", "video")?;
-            dict.set_item("note", "Video data not fully supported in FFI yet")?;
-            Ok(dict.into())
-        }
-        RuntimeData::Image {
-            data,
-            format,
-            width,
-            height,
-            ..
+        RuntimeData::Json(v) => json_runtime_output(py, v, context),
+        RuntimeData::ControlMessage {
+            message_type,
+            segment_id,
+            timestamp_ms,
+            metadata,
         } => {
-            let dict = PyDict::new(py);
-            dict.set_item("type", "image")?;
-            dict.set_item("data", pyo3::types::PyBytes::new(py, data))?;
-            dict.set_item("width", width)?;
-            dict.set_item("height", height)?;
-            if let Some(mime) = format.mime_type() {
-                dict.set_item("mime_type", mime)?;
-            }
-            Ok(dict.into())
-        }
-        RuntimeData::Tensor { .. } => {
-            // Tensor not fully supported yet
-            let dict = PyDict::new(py);
-            dict.set_item("type", "tensor")?;
-            dict.set_item("note", "Tensor data not fully supported in FFI yet")?;
-            Ok(dict.into())
-        }
-        RuntimeData::Numpy {
-            data,
-            shape,
-            dtype,
-            strides: _strides,
-            c_contiguous: _c_contiguous,
-            f_contiguous: _f_contiguous,
-        } => {
-            // Convert numpy array back to Python numpy array using numpy_bridge
-            use crate::numpy_bridge::vec_to_numpy_f64;
-
-            // For now, only support float32/float64 dtypes
-            // TODO: Support all numpy dtypes
-            match dtype.as_str() {
-                "float32" => {
-                    // Reinterpret bytes as f32
-                    let samples: Vec<f32> = data
-                        .chunks_exact(4)
-                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                        .collect();
-
-                    // Create numpy array
-                    use numpy::{PyArray, PyArrayMethods};
-                    let array = PyArray::from_vec(py, samples);
-                    let reshaped = array.reshape(shape.as_slice())?;
-                    Ok(reshaped.into_any().unbind())
-                }
-                "float64" => {
-                    // Reinterpret bytes as f64
-                    let samples: Vec<f64> = data
-                        .chunks_exact(8)
-                        .map(|chunk| {
-                            f64::from_le_bytes([
-                                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5],
-                                chunk[6], chunk[7],
-                            ])
-                        })
-                        .collect();
-
-                    // Create numpy array
-                    vec_to_numpy_f64(py, &samples, shape).map(|arr| arr.unbind())
-                }
-                _ => {
-                    // For unsupported dtypes, return metadata dict
-                    let dict = PyDict::new(py);
-                    dict.set_item("type", "numpy")?;
-                    dict.set_item("shape", shape.as_slice())?;
-                    dict.set_item("dtype", dtype.as_str())?;
-                    dict.set_item("note", format!("Dtype {} not yet supported in FFI", dtype))?;
-                    Ok(dict.into())
-                }
-            }
-        }
-        RuntimeData::ControlMessage { .. } => {
-            // Control message not fully supported yet
             let dict = PyDict::new(py);
             dict.set_item("type", "control_message")?;
-            dict.set_item(
-                "note",
-                "Control message data not fully supported in FFI yet",
-            )?;
+            let kind = serde_json::to_value(message_type)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            dict.set_item("message_type", buffers::metadata_to_python(py, &kind)?)?;
+            dict.set_item("segment_id", segment_id)?;
+            dict.set_item("timestamp_ms", timestamp_ms)?;
+            dict.set_item("metadata", buffers::metadata_to_python(py, metadata)?)?;
             Ok(dict.into())
         }
         RuntimeData::File {
@@ -561,6 +555,7 @@ pub fn runtime_data_to_python(py: Python<'_>, data: &RuntimeData) -> PyResult<Py
             }
             Ok(dict.into())
         }
+        _ => unreachable!("bulk variants handled by owning exporter"),
     }
 }
 
@@ -589,73 +584,25 @@ pub fn runtime_data_to_python(py: Python<'_>, data: &RuntimeData) -> PyResult<Py
 /// });
 /// ```
 pub fn python_to_runtime_data(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<RuntimeData> {
-    // T008: Convert Python objects to RuntimeData
+    python_to_runtime_data_with_context(py, obj, CopyContext::legacy())
+}
 
-    // Check if it's a numpy array first (zero-copy passthrough)
-    if crate::numpy_bridge::is_numpy_array(py, obj) {
-        use crate::numpy_bridge::extract_numpy_metadata;
-
-        // Extract metadata
-        let meta = extract_numpy_metadata(py, obj)?;
-
-        // Get raw bytes using tobytes() method
-        let bytes_obj = obj.call_method0("tobytes")?;
-        let data: Vec<u8> = bytes_obj.extract()?;
-
-        // Get strides
-        let strides_obj = obj.getattr("strides")?;
-        let strides: Vec<isize> = strides_obj.extract()?;
-
-        return Ok(RuntimeData::Numpy {
-            data,
-            shape: meta.shape,
-            dtype: meta.dtype,
-            strides,
-            c_contiguous: meta.c_contiguous,
-            f_contiguous: meta.f_contiguous,
-        });
+pub fn python_to_runtime_data_with_context(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    context: &CopyContext,
+) -> PyResult<RuntimeData> {
+    if let Some(value) = buffers::import(py, obj, context)? {
+        return Ok(value);
     }
+    // T008: Convert Python objects to RuntimeData
 
     // Check if it's a dict with "type" field (structured data)
     if let Ok(dict) = obj.downcast::<PyDict>() {
         if let Ok(Some(type_val)) = dict.get_item("type") {
             let type_str: String = type_val.extract()?;
             match type_str.as_str() {
-                "audio" => {
-                    let samples: Vec<f32> = dict
-                        .get_item("samples")?
-                        .ok_or_else(|| {
-                            PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                                "Audio data missing 'samples' field",
-                            )
-                        })?
-                        .extract()?;
-                    let sample_rate: u32 = dict
-                        .get_item("sample_rate")?
-                        .ok_or_else(|| {
-                            PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                                "Audio data missing 'sample_rate' field",
-                            )
-                        })?
-                        .extract()?;
-                    let channels: u32 = dict
-                        .get_item("channels")?
-                        .ok_or_else(|| {
-                            PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                                "Audio data missing 'channels' field",
-                            )
-                        })?
-                        .extract()?;
-                    return Ok(RuntimeData::Audio {
-                        samples: samples.into(),
-                        sample_rate,
-                        channels,
-                        stream_id: None,
-                        timestamp_us: None,
-                        arrival_ts_us: None,
-                        metadata: None,
-                    });
-                }
+                "control_message" => return buffers::control(py, dict),
                 "text" => {
                     let data: String = dict
                         .get_item("data")?
@@ -673,7 +620,12 @@ pub fn python_to_runtime_data(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResul
                             "Json data missing 'value' field",
                         )
                     })?;
-                    let mut json_val = python_to_json(py, &value_obj)?;
+                    let mut json_val =
+                        if context.policy() == remotemedia_types::CopyPolicy::RequireZeroCopy {
+                            buffers::metadata_json(py, &value_obj)?
+                        } else {
+                            python_to_json_with_context(py, &value_obj, None, context)?
+                        };
                     if let Ok(Some(metadata_val)) = dict.get_item("metadata") {
                         if let Ok(metadata_dict) = metadata_val.downcast::<PyDict>() {
                             if let Some(obj) = json_val.as_object_mut() {
@@ -688,17 +640,6 @@ pub fn python_to_runtime_data(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResul
                         }
                     }
                     return Ok(RuntimeData::Json(json_val));
-                }
-                "binary" => {
-                    let data: Vec<u8> = dict
-                        .get_item("data")?
-                        .ok_or_else(|| {
-                            PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                                "Binary data missing 'data' field",
-                            )
-                        })?
-                        .extract()?;
-                    return Ok(RuntimeData::Binary(data));
                 }
                 "file" => {
                     // Spec 001: File reference support
@@ -743,13 +684,12 @@ pub fn python_to_runtime_data(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResul
         return Ok(RuntimeData::Text(s));
     }
 
-    // Try as bytes
-    if let Ok(b) = obj.extract::<Vec<u8>>() {
-        return Ok(RuntimeData::Binary(b));
-    }
-
     // Default: Convert to JSON
-    let json_val = python_to_json(py, obj)?;
+    let json_val = if context.policy() == remotemedia_types::CopyPolicy::RequireZeroCopy {
+        buffers::metadata_json(py, obj)?
+    } else {
+        python_to_json_with_context(py, obj, None, context)?
+    };
     Ok(RuntimeData::Json(json_val))
 }
 

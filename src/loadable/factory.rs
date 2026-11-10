@@ -14,28 +14,20 @@
 //! // `registry.create_node("MyPluginNode", ...)`.
 //! ```
 //!
-//! # Wire format
+//! # Media ownership and compatibility
 //!
-//! The FFI payload is the public `crate::data::RuntimeData` enum
-//! serialized with `rmp-serde` (MessagePack). That gives **full
-//! variant coverage automatically** — Audio (with `AudioSamples`),
-//! Video, Image, Tensor, Numpy, Json, Text, Binary, ControlMessage,
-//! File — because the public type derives `Serialize` / `Deserialize`
-//! and so do all its sub-types.
+//! ABI 0.8 plugins advertising buffer protocol 2 exchange payload-free JSON
+//! metadata and retained immutable owners. Per-call execution contexts supply
+//! the host output allocator for direct production into shared storage. Shared
+//! hook failures propagate; they never retry through the copying codec.
 //!
-//! MessagePack rather than bincode 1.x: bincode 1 doesn't support
-//! `deserialize_any`, which `serde_json::Value` (used inside Json,
-//! ControlMessage metadata, Audio metadata) requires. MessagePack is
-//! self-describing and handles it natively.
-//!
-//! Plugin and host must agree on the rmp-serde version. Both link
-//! `remotemedia-core` and use it transitively, so they always agree.
-//!
-//! For the multiprocess Python path we still use the hand-crafted
-//! `multiprocess::data_transfer::RuntimeData` binary format — it
-//! has a stable wire layout the Python decoder expects, predates
-//! this loadable path, and supports a smaller variant set. The two
-//! formats coexist because they target different runtimes.
+//! Rebuilt protocol-0 plugins use the legacy MessagePack RuntimeData hooks.
+//! Context-bearing calls require an explicit allow-copies policy and attribute
+//! host encoding/decoding to its ledger; strict and missing policies reject before
+//! invoking legacy hooks, including metadata-only calls. Plugin-internal copies
+//! cannot be accounted through protocol 0. Context-free APIs use the legacy ledger.
+//! RPC remains on its separate MessagePack request/reply channel. Native Rust
+//! enum layouts and allocator implementations never cross the dynamic ABI.
 //!
 //! # ABI safety
 //!
@@ -54,12 +46,22 @@ use abi_stable::std_types::{RErr, ROk, RResult, RString, RVec};
 use async_ffi::FutureExt;
 use async_trait::async_trait;
 use loadable_node_abi::{
+    buffer::{
+        FfiExecutionContext, FfiMessage, FfiNamedInput, SharedOutputSink, SharedOutputSink_TO,
+        BUFFER_ABI_VERSION,
+    },
+    runtime_buffer,
+};
+use loadable_node_abi::{
     FfiCallContext, FfiNodeBox, FfiNodeFactory, FfiNodeFactoryBox, FfiNodeFactory_TO,
     NodePluginRef, OutputSink, OutputSinkBox, OutputSink_TO, RpcReplySink as FfiRpcReplySink,
     RpcReplySinkBox, RpcReplySink_TO,
 };
 use remotemedia_traits::rpc::{RpcEvent, RpcMethod, RpcMode, RpcReply, RpcRequest, RpcResponder};
+use remotemedia_types::CopyContext;
 use serde_json::Value;
+
+mod legacy;
 
 use crate::data::RuntimeData;
 use crate::nodes::{
@@ -77,12 +79,17 @@ use crate::Error;
 /// the plugin's multi-thread runtime (`plugin_runtime()` in
 /// `plugin-sdk`), `blocking_send` is safe — one worker parks, the
 /// other keeps spinning until the host catches up.
-struct ChannelSink {
-    tx: tokio::sync::mpsc::Sender<RVec<u8>>,
+enum NativeFrame {
+    Legacy(RVec<u8>),
+    Shared(FfiMessage),
 }
 
-impl OutputSink for ChannelSink {
-    fn push(&self, bytes: RVec<u8>) -> RResult<(), RString> {
+struct ChannelSink {
+    tx: tokio::sync::mpsc::Sender<NativeFrame>,
+}
+
+impl ChannelSink {
+    fn send(&self, bytes: NativeFrame) -> RResult<(), RString> {
         match self.tx.try_send(bytes) {
             Ok(()) => ROk(()),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -115,6 +122,17 @@ impl OutputSink for ChannelSink {
                 }
             }
         }
+    }
+}
+
+impl OutputSink for ChannelSink {
+    fn push(&self, bytes: RVec<u8>) -> RResult<(), RString> {
+        self.send(NativeFrame::Legacy(bytes))
+    }
+}
+impl SharedOutputSink for ChannelSink {
+    fn push(&self, message: FfiMessage) -> RResult<(), RString> {
+        self.send(NativeFrame::Shared(message))
     }
 }
 
@@ -265,6 +283,61 @@ struct LoadableFactoryAdapter {
 }
 
 impl StreamingNodeFactory for LoadableFactoryAdapter {
+    fn try_buffer_contract(
+        &self,
+        params: &Value,
+    ) -> Result<Option<remotemedia_traits::buffer_contract::BufferContract>, Error> {
+        let params =
+            serde_json::to_string(params).map_err(|error| Error::ConfigError(error.to_string()))?;
+        let encoded = self
+            .inner
+            .buffer_contract(params.into())
+            .into_result()
+            .map_err(|error| {
+                Error::ConfigError(format!("native factory '{}': {error}", self.node_type))
+            })?;
+        let Some(encoded) = encoded.into_option() else {
+            return Ok(None);
+        };
+        if encoded.len() > loadable_node_abi::MAX_BUFFER_CONTRACT_BYTES {
+            return Err(Error::ConfigError(format!(
+                "native factory '{}': buffer contract exceeds 1 MiB",
+                self.node_type
+            )));
+        }
+        let contract: remotemedia_traits::buffer_contract::BufferContract =
+            serde_json::from_str(&encoded).map_err(|error| {
+                Error::ConfigError(format!(
+                    "native factory '{}': invalid buffer contract: {error}",
+                    self.node_type
+                ))
+            })?;
+        if !self.supports_buffer_protocol(&contract.protocol) {
+            return Err(Error::ConfigError(format!(
+                "native factory '{}' binding does not support {:?}",
+                self.node_type, contract.protocol
+            )));
+        }
+        Ok(Some(contract))
+    }
+
+    fn supports_buffer_protocol(
+        &self,
+        protocol: &remotemedia_traits::buffer_contract::BufferProtocol,
+    ) -> bool {
+        matches!(protocol, remotemedia_traits::buffer_contract::BufferProtocol::NativeAbi { abi, buffers }
+            if abi == loadable_node_abi::ABI_VERSION && *buffers == BUFFER_ABI_VERSION)
+    }
+    fn input_port_kinds(
+        &self,
+    ) -> std::collections::HashMap<String, remotemedia_traits::ports::PortKind> {
+        loadable_node_abi::snapshot::runtime::import_kinds(self.inner.input_ports())
+    }
+    fn output_port_kinds(
+        &self,
+    ) -> std::collections::HashMap<String, remotemedia_traits::ports::PortKind> {
+        loadable_node_abi::snapshot::runtime::import_kinds(self.inner.output_ports())
+    }
     fn schema(&self) -> Option<crate::nodes::schema::NodeSchema> {
         self.schema.clone()
     }
@@ -279,6 +352,7 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
+        let contract = self.try_buffer_contract(params)?;
         let params_json = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
         let ffi_node = match self.inner.create(RString::from(params_json)) {
             RResult::ROk(n) => n,
@@ -290,6 +364,10 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
                 )));
             }
         };
+
+        if contract.is_some() && ffi_node.shared_buffer_protocol() != BUFFER_ABI_VERSION {
+            return Err(Error::ConfigError(format!("native factory '{}': created node buffer protocol {} disagrees with declared protocol {}", self.node_type, ffi_node.shared_buffer_protocol(), BUFFER_ABI_VERSION)));
+        }
 
         let pacing: Value = serde_json::from_str(ffi_node.pacing().as_str())
             .map_err(|e| Error::Execution(format!("invalid plugin pacing: {e}")))?;
@@ -308,7 +386,14 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
             .map_err(|e| Error::Execution(format!("invalid plugin clock address: {e}")))?;
         let rpc_methods: Vec<RpcMethod> = serde_json::from_str(ffi_node.rpc_methods().as_str())
             .map_err(|e| Error::Execution(format!("invalid plugin RPC descriptors: {e}")))?;
+        let snapshots = loadable_node_abi::snapshot::runtime::import_ports(
+            ffi_node
+                .snapshot_outputs()
+                .into_result()
+                .map_err(|e| Error::Execution(e.into_string()))?,
+        )?;
         Ok(Box::new(AsyncNodeWrapper(Arc::new(LoadableNodeAdapter {
+            snapshots: parking_lot::RwLock::new(snapshots),
             rpc_methods,
             inner: ffi_node,
             nature,
@@ -321,6 +406,9 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
 }
 
 struct LoadableNodeAdapter {
+    snapshots: parking_lot::RwLock<
+        std::collections::HashMap<String, Arc<dyn remotemedia_traits::ports::SnapshotPort>>,
+    >,
     rpc_methods: Vec<RpcMethod>,
     inner: FfiNodeBox,
     nature: PacingNature,
@@ -332,8 +420,100 @@ struct LoadableNodeAdapter {
 
 #[async_trait]
 impl AsyncStreamingNode for LoadableNodeAdapter {
+    fn validate_snapshot_input(
+        &self,
+        port: &str,
+        reader: &dyn remotemedia_traits::ports::SnapshotPort,
+    ) -> Result<(), Error> {
+        if !self.uses_shared()? || !reader.supports_runtime_data() {
+            return Err(Error::Execution(format!(
+                "plugin snapshot input '{port}' requires shared protocol and portable RuntimeData"
+            )));
+        }
+        Ok(())
+    }
+    fn snapshot_outputs(
+        &self,
+    ) -> std::collections::HashMap<String, Arc<dyn remotemedia_traits::ports::SnapshotPort>> {
+        self.snapshots.read().clone()
+    }
     fn node_type(&self) -> &str {
         &self.node_type
+    }
+
+    fn is_multi_input(&self) -> bool {
+        self.inner.is_multi_input()
+    }
+
+    async fn process_with_ctx(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        if self.uses_shared()? {
+            self.shared_result(
+                self.inner
+                    .process_shared(encode_shared(data)?, self.context_from(ctx)?),
+            )
+            .await
+        } else {
+            self.legacy_process(data, &self.legacy_copies(ctx)?).await
+        }
+    }
+
+    async fn process_multi(
+        &self,
+        inputs: std::collections::HashMap<String, RuntimeData>,
+    ) -> Result<RuntimeData, Error> {
+        self.shared_inputs(inputs, self.execution_context(None, None))
+            .await
+    }
+
+    async fn process_multi_with_ctx(
+        &self,
+        inputs: std::collections::HashMap<String, RuntimeData>,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<RuntimeData, Error> {
+        self.shared_inputs(inputs, self.context_from(ctx)?).await
+    }
+
+    async fn tick_with_ctx(
+        &self,
+        tick: Tick,
+        ctx: &dyn NodeRuntimeContextRead,
+        callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
+    ) -> Result<(), Error> {
+        if self.uses_shared()? {
+            self.shared_tick(tick, self.context_from(ctx)?, callback)
+                .await
+        } else {
+            self.legacy_tick(
+                tick,
+                context_session(ctx),
+                &self.legacy_copies(ctx)?,
+                callback,
+            )
+            .await
+        }
+    }
+
+    async fn process_control_with_ctx(
+        &self,
+        message: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<bool, Error> {
+        if self.uses_shared()? {
+            self.inner
+                .process_control_shared(encode_shared(message)?, self.context_from(ctx)?)
+                .await
+                .into_result()
+                .map_err(|error| {
+                    Error::from_plugin(error.into_string(), &self.node_id, &self.node_type)
+                })
+        } else {
+            self.legacy_control(message, context_session(ctx), &self.legacy_copies(ctx)?)
+                .await
+        }
     }
 
     fn rpc_methods(&self) -> Vec<RpcMethod> {
@@ -346,23 +526,31 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         ctx: &dyn NodeRuntimeContextRead,
         replies: &mut RpcResponder,
     ) -> Result<(), Error> {
+        if !self.uses_shared()? {
+            self.legacy_copies(ctx)?;
+        }
         let bytes = rmp_serde::to_vec_named(&request)
             .map_err(|e| Error::Execution(format!("RPC encode: {e}")))?;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let sink: RpcReplySinkBox = RpcReplySink_TO::from_value(RpcChannelSink { tx }, TD_Opaque);
-        let future = self.inner.call_rpc(
-            bytes.into(),
-            FfiCallContext {
-                session_id: if ctx.session_id().is_empty() {
-                    None
-                } else {
-                    Some(RString::from(ctx.session_id()))
-                }
-                .into(),
-                node_id: ctx.node_id().into(),
-            },
-            sink,
-        );
+        let future = if self.uses_shared()? {
+            self.inner
+                .call_rpc_shared(bytes.into(), self.context_from(ctx)?, sink)
+        } else {
+            self.inner.call_rpc(
+                bytes.into(),
+                FfiCallContext {
+                    session_id: if ctx.session_id().is_empty() {
+                        None
+                    } else {
+                        Some(RString::from(ctx.session_id()))
+                    }
+                    .into(),
+                    node_id: ctx.node_id().into(),
+                },
+                sink,
+            )
+        };
         tokio::pin!(future);
         let mut result = None;
         let mut terminal = false;
@@ -421,20 +609,13 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         session_id: Option<String>,
         callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
     ) -> Result<(), Error> {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let sink = OutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
-        let future = self.inner.tick(
-            loadable_node_abi::FfiTick {
-                clock_id: tick.clock_id.into(),
-                pts_us: tick.pts_us,
-                frame_idx: tick.frame_idx,
-                deadline_us: tick.deadline_us,
-            },
-            session_id.unwrap_or_default().into(),
-            sink,
-        );
-
-        self.drain_outputs(future, rx, callback).await.map(|_| ())
+        if self.uses_shared()? {
+            return self
+                .shared_tick(tick, self.execution_context(session_id, None), callback)
+                .await;
+        }
+        self.legacy_tick(tick, session_id, CopyContext::legacy(), callback)
+            .await
     }
 
     async fn process_control_message(
@@ -442,20 +623,21 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         message: RuntimeData,
         session_id: Option<String>,
     ) -> Result<bool, Error> {
-        let bytes = rmp_serde::to_vec_named(&message)
-            .map_err(|e| Error::Execution(format!("rmp encode control: {e}")))?;
-        match self
-            .inner
-            .process_control_message(bytes.into(), session_id.unwrap_or_default().into())
-            .await
-        {
-            RResult::ROk(handled) => Ok(handled),
-            RResult::RErr(e) => Err(Error::from_plugin(
-                e.into_string(),
-                &self.node_id,
-                &self.node_type,
-            )),
+        if self.uses_shared()? {
+            return self
+                .inner
+                .process_control_shared(
+                    encode_shared(message)?,
+                    self.execution_context(session_id, None),
+                )
+                .await
+                .into_result()
+                .map_err(|error| {
+                    Error::from_plugin(error.into_string(), &self.node_id, &self.node_type)
+                });
         }
+        self.legacy_control(message, session_id, CopyContext::legacy())
+            .await
     }
 
     /// Forward initialization across the FFI boundary so lazy-load
@@ -472,7 +654,16 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
             )
             .await
         {
-            RResult::ROk(()) => Ok(()),
+            RResult::ROk(()) => {
+                let snapshots = loadable_node_abi::snapshot::runtime::import_ports(
+                    self.inner
+                        .snapshot_outputs()
+                        .into_result()
+                        .map_err(|e| Error::Execution(e.into_string()))?,
+                )?;
+                *self.snapshots.write() = snapshots;
+                Ok(())
+            }
             RResult::RErr(e) => Err(Error::from_plugin(
                 e.into_string(),
                 &self.node_id,
@@ -482,36 +673,15 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
     }
 
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
-        // Encode any RuntimeData variant via MessagePack. No
-        // per-variant mapping needed — the public type derives
-        // Serialize and so does every sub-type (AudioSamples,
-        // ImageFormat, ControlMessageType, serde_json::Value, …).
-        // Use named (map) encoding to remain compatible with
-        // `#[serde(skip_serializing_if = "Option::is_none")]` fields
-        // on `RuntimeData` variants. The compact (positional) encoder
-        // would shift fields when partial optionals are skipped.
-        let req_bytes = rmp_serde::to_vec_named(&data).map_err(|e| {
-            Error::Execution(format!(
-                "rmp encode for plugin '{}' (id={}): {e}",
-                self.node_type, self.node_id
-            ))
-        })?;
-
-        match self.inner.process(RVec::from(req_bytes)).await {
-            RResult::ROk(out) => {
-                rmp_serde::from_slice::<RuntimeData>(out.as_slice()).map_err(|e| {
-                    Error::Execution(format!(
-                        "rmp decode from plugin '{}' (id={}): {e}",
-                        self.node_type, self.node_id
-                    ))
-                })
-            }
-            RResult::RErr(e) => Err(Error::from_plugin(
-                e.into_string(),
-                &self.node_id,
-                &self.node_type,
-            )),
+        if self.uses_shared()? {
+            return self
+                .shared_result(
+                    self.inner
+                        .process_shared(encode_shared(data)?, self.execution_context(None, None)),
+                )
+                .await;
         }
+        self.legacy_process(data, CopyContext::legacy()).await
     }
 
     /// Streaming entry point — forwards through the per-frame FFI
@@ -542,36 +712,13 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
-        let req_bytes = rmp_serde::to_vec_named(&data).map_err(|e| {
-            Error::Execution(format!(
-                "rmp encode for plugin '{}' (id={}): {e}",
-                self.node_type, self.node_id
-            ))
-        })?;
-
-        // Capacity 32 is a comfortable margin for any real plugin —
-        // the drain loop below runs on the host runtime and pulls
-        // frames as fast as the user callback consumes them. If the
-        // callback is slow the sink's `push` parks via blocking_send
-        // (multi-threaded plugin runtime → safe), propagating real
-        // backpressure to the plugin's generator.
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<RVec<u8>>(32);
-        let sink: OutputSinkBox =
-            OutputSink_TO::from_value(ChannelSink { tx: frame_tx }, TD_Opaque);
-
-        // Build the FFI future before we await anything else so the
-        // plugin starts generating in parallel with our drain loop.
-        // The future captures `sink` by value (FfiFuture is `'static`),
-        // so there's no borrow on `self`.
-        let ffi_fut = self.inner.process_streaming_with_context(
-            RVec::from(req_bytes),
-            FfiCallContext {
-                session_id: session_id.map(RString::from).into(),
-                node_id: self.node_id.clone().into(),
-            },
-            sink,
-        );
-        self.drain_outputs(ffi_fut, frame_rx, callback).await
+        if self.uses_shared()? {
+            return self
+                .shared_stream(data, self.execution_context(session_id, None), callback)
+                .await;
+        }
+        self.legacy_stream(data, session_id, CopyContext::legacy(), callback)
+            .await
     }
 
     /// Ctx-aware streaming entry point — same per-frame FFI path,
@@ -586,20 +733,139 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
-        let session_id = if ctx.session_id().is_empty() {
-            None
-        } else {
-            Some(ctx.session_id().to_string())
-        };
-        self.process_streaming(data, session_id, callback).await
+        if self.uses_shared()? {
+            return self
+                .shared_stream(data, self.context_from(ctx)?, callback)
+                .await;
+        }
+        self.legacy_stream(
+            data,
+            context_session(ctx),
+            &self.legacy_copies(ctx)?,
+            callback,
+        )
+        .await
     }
 }
 
 impl LoadableNodeAdapter {
+    fn uses_shared(&self) -> Result<bool, Error> {
+        match self.inner.shared_buffer_protocol() {
+            0 => Ok(false),
+            BUFFER_ABI_VERSION => Ok(true),
+            other => Err(Error::Execution(format!(
+                "plugin '{}' (id={}): unsupported buffer protocol {other}; rebuild it against the current plugin SDK (shared buffer protocol {BUFFER_ABI_VERSION})",
+                self.node_type, self.node_id
+            ))),
+        }
+    }
+
+    fn execution_context(
+        &self,
+        session_id: Option<String>,
+        allocator: Option<Arc<dyn remotemedia_types::OutputAllocator>>,
+    ) -> FfiExecutionContext {
+        FfiExecutionContext {
+            materialization: None.into(),
+            identity: FfiCallContext {
+                session_id: session_id.map(RString::from).into(),
+                node_id: self.node_id.clone().into(),
+            },
+            allocator: allocator.map(runtime_buffer::export_allocator).into(),
+            snapshots: RVec::new(),
+        }
+    }
+
+    fn context_from(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<FfiExecutionContext, Error> {
+        let mut context = self.execution_context(context_session(ctx), ctx.output_allocator());
+        context.materialization = ctx
+            .copy_context()
+            .map(loadable_node_abi::copy_ledger::runtime::export)
+            .into();
+        context.snapshots =
+            loadable_node_abi::snapshot::runtime::export_ports(ctx.snapshot_inputs())?;
+        Ok(context)
+    }
+
+    async fn shared_result(
+        &self,
+        future: async_ffi::FfiFuture<RResult<FfiMessage, RString>>,
+    ) -> Result<RuntimeData, Error> {
+        let message = future.await.into_result().map_err(|error| {
+            Error::from_plugin(error.into_string(), &self.node_id, &self.node_type)
+        })?;
+        runtime_buffer::decode(message).map_err(|error| Error::Execution(error.into_string()))
+    }
+
+    async fn shared_inputs(
+        &self,
+        inputs: std::collections::HashMap<String, RuntimeData>,
+        context: FfiExecutionContext,
+    ) -> Result<RuntimeData, Error> {
+        if !self.uses_shared()? {
+            return Err(Error::Execution(
+                "legacy plugin ABI has no named-input transport".into(),
+            ));
+        }
+        let inputs = inputs
+            .into_iter()
+            .map(|(name, data)| {
+                Ok(FfiNamedInput {
+                    name: name.into(),
+                    message: encode_shared(data)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        self.shared_result(self.inner.process_inputs_shared(inputs.into(), context))
+            .await
+    }
+
+    async fn shared_stream<F>(
+        &self,
+        data: RuntimeData,
+        context: FfiExecutionContext,
+        callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let sink = SharedOutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
+        let future = self
+            .inner
+            .process_streaming_shared(encode_shared(data)?, context, sink);
+        self.drain_outputs(future, rx, None, callback).await
+    }
+
+    async fn shared_tick(
+        &self,
+        tick: Tick,
+        context: FfiExecutionContext,
+        callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
+    ) -> Result<(), Error> {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let sink = SharedOutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
+        let tick = loadable_node_abi::FfiTick {
+            clock_id: tick.clock_id.into(),
+            pts_us: tick.pts_us,
+            frame_idx: tick.frame_idx,
+            deadline_us: tick.deadline_us,
+        };
+        self.drain_outputs(
+            self.inner.tick_shared(tick, context, sink),
+            rx,
+            None,
+            callback,
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn drain_outputs<F>(
         &self,
         ffi_fut: async_ffi::FfiFuture<RResult<usize, RString>>,
-        mut frame_rx: tokio::sync::mpsc::Receiver<RVec<u8>>,
+        mut frame_rx: tokio::sync::mpsc::Receiver<NativeFrame>,
+        legacy_copies: Option<&CopyContext>,
         mut callback: F,
     ) -> Result<usize, Error>
     where
@@ -614,14 +880,13 @@ impl LoadableNodeAdapter {
                 biased;
                 maybe_frame = frame_rx.recv() => {
                     match maybe_frame {
-                        Some(bytes) => {
-                            let out_data: RuntimeData =
-                                rmp_serde::from_slice(bytes.as_slice()).map_err(|e| {
-                                    Error::Execution(format!(
-                                        "rmp decode from plugin '{}' (id={}): {e}",
-                                        self.node_type, self.node_id
-                                    ))
-                                })?;
+                        Some(frame) => {
+                            let out_data = match frame {
+                                NativeFrame::Shared(message) => runtime_buffer::decode(message)
+                                    .map_err(|error| Error::Execution(error.into_string()))?,
+                                NativeFrame::Legacy(bytes) => self.legacy_decode(bytes.as_slice(), legacy_copies.ok_or_else(||
+                                    Error::Execution("unexpected legacy frame on shared plugin path".into()))?)?,
+                            };
                             callback(out_data)?;
                             count += 1;
                         }
@@ -658,6 +923,18 @@ impl LoadableNodeAdapter {
             )),
         }
     }
+}
+
+fn context_session(ctx: &dyn NodeRuntimeContextRead) -> Option<String> {
+    if ctx.session_id().is_empty() {
+        None
+    } else {
+        Some(ctx.session_id().to_string())
+    }
+}
+
+fn encode_shared(data: RuntimeData) -> Result<FfiMessage, Error> {
+    runtime_buffer::encode(data).map_err(|error| Error::Execution(error.into_string()))
 }
 
 #[cfg(all(test, feature = "loadable-export"))]

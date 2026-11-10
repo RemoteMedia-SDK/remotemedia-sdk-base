@@ -2,7 +2,6 @@
 
 use crate::{
     config::WebRtcTransportConfig,
-    media::tracks::runtime_data_to_rtp,
     peer::{PeerConnection, PeerInfo, PeerManager},
     session::{Session, SessionId, SessionManager},
     signaling::{IceCandidateParams, SignalingClient},
@@ -10,6 +9,7 @@ use crate::{
     Error, Result,
 };
 use remotemedia_core::data::RuntimeData;
+use remotemedia_types::CopyContext;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -35,6 +35,8 @@ pub struct BroadcastStats {
 /// Manages WebRTC peer connections in a mesh topology, coordinating
 /// signaling, media streams, and pipeline integration.
 pub struct WebRtcTransport {
+    /// Authority for media sends and structured data-channel operations.
+    copies: CopyContext,
     /// Transport configuration
     config: WebRtcTransportConfig,
 
@@ -62,6 +64,12 @@ impl WebRtcTransport {
     ///
     /// Returns error if configuration is invalid.
     pub fn new(config: WebRtcTransportConfig) -> Result<Self> {
+        Self::new_with_copy_context(config, CopyContext::legacy().clone())
+    }
+
+    /// Construct with immutable session/caller authority. Queued media and
+    /// receive callbacks retain this ledger; it cannot be rebound after startup.
+    pub fn new_with_copy_context(config: WebRtcTransportConfig, copies: CopyContext) -> Result<Self> {
         // Validate configuration
         config.validate()?;
 
@@ -75,12 +83,18 @@ impl WebRtcTransport {
         let session_manager = Arc::new(SessionManager::new(config.max_peers as usize)?);
 
         Ok(Self {
+            copies,
             config,
             signaling_client: Arc::new(RwLock::new(Some(signaling_client))),
             peer_manager,
             session_manager,
             local_peer_id: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// The ledger charged with this transport's media copies.
+    pub fn copy_context(&self) -> CopyContext {
+        self.copies.clone()
     }
 
     /// Start the transport
@@ -368,7 +382,7 @@ impl WebRtcTransport {
 
         // Send audio via track with default 24kHz sample rate (for backwards compatibility)
         // TODO: Add sample_rate parameter to this method
-        audio_track.send_audio(samples, 24000).await?;
+        audio_track.send_audio_with_context(samples.into(), 24000, &self.copies).await?;
 
         Ok(())
     }
@@ -405,7 +419,7 @@ impl WebRtcTransport {
         })?;
 
         // Send video via track
-        video_track.send_video(frame).await?;
+        video_track.send_video_runtime_data_with_context(frame.as_runtime_data(), &self.copies).await?;
 
         Ok(())
     }
@@ -582,7 +596,7 @@ impl WebRtcTransport {
     ///
     /// # Note
     ///
-    /// This method encodes the RuntimeData to the appropriate codec format (Opus for audio, VP9 for video)
+    /// This method encodes RuntimeData using the peer's configured media tracks
     /// and sends it via RTP to the specified peer.
     pub async fn send_to_peer(&self, peer_id: &str, data: &RuntimeData) -> Result<()> {
         debug!("Sending RuntimeData to peer: {}", peer_id);
@@ -592,32 +606,21 @@ impl WebRtcTransport {
 
         // Determine if this is audio or video and get the appropriate track
         match data {
-            RuntimeData::Audio { .. } => {
+            RuntimeData::Audio { samples, sample_rate, .. } => {
                 let audio_track = peer.audio_track().await.ok_or_else(|| {
                     Error::MediaTrackError("No audio track configured for peer".to_string())
                 })?;
 
-                // Encode and send audio
-                let _payload = runtime_data_to_rtp(data, Some(&audio_track), None).await?;
-
-                // Note: The actual RTP sending happens inside runtime_data_to_rtp via AudioTrack::send_audio
-                // which is called by the encoder. For direct sending, we'd need to:
-                // audio_track.send_audio(samples).await?;
-
-                Ok(())
+                audio_track
+                    .send_audio_with_context(samples.clone().into_shared(), *sample_rate, &self.copies)
+                    .await
             }
             RuntimeData::Video { .. } => {
                 let video_track = peer.video_track().await.ok_or_else(|| {
                     Error::MediaTrackError("No video track configured for peer".to_string())
                 })?;
 
-                // Encode and send video
-                let _payload = runtime_data_to_rtp(data, None, Some(&video_track)).await?;
-
-                // Note: Similar to audio, actual sending happens inside runtime_data_to_rtp
-                // via VideoTrack::send_video which is called by the encoder
-
-                Ok(())
+                video_track.send_video_runtime_data_with_context(data.clone(), &self.copies).await
             }
             _ => Err(Error::MediaTrackError(
                 "Unsupported RuntimeData type for peer-to-peer transmission".to_string(),
@@ -696,7 +699,7 @@ impl WebRtcTransport {
         debug!("Sending data channel message to peer: {}", peer_id);
 
         let peer = self.peer_manager.get_peer(peer_id).await?;
-        peer.send_data_channel_message(msg).await
+        peer.send_data_channel_message_with_context(msg, &self.copies).await
     }
 
     /// Broadcast a data channel message to all connected peers
@@ -794,10 +797,32 @@ impl WebRtcTransport {
         F: Fn(crate::channels::DataChannelMessage) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        debug!("Setting data channel message handler for peer: {}", peer_id);
+        let handler = Arc::new(handler);
+        self.on_peer_data_channel_message_result(peer_id, move |result| {
+            let handler = handler.clone();
+            async move {
+                match result {
+                    Ok(message) => handler(message).await,
+                    Err(error) => warn!("Failed to decode peer message: {}", error),
+                }
+            }
+        }).await
+    }
 
-        let peer = self.peer_manager.get_peer(peer_id).await?;
-        peer.on_data_channel_message(handler).await
+    /// Receive structured messages or typed decode/policy errors. Modern bulk
+    /// ranges retain their wire owner; legacy decoding uses this transport's ledger.
+    pub async fn on_peer_data_channel_message_result<F, Fut>(
+        &self,
+        peer_id: &str,
+        handler: F,
+    ) -> Result<()>
+    where
+        F: Fn(std::result::Result<crate::channels::DataChannelMessage, crate::channels::DataChannelDecodeError>) -> Fut
+            + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.peer_manager.get_peer(peer_id).await?
+            .on_data_channel_message_with_context(self.copies.clone(), handler).await
     }
 
     /// Check if a peer has a data channel configured
@@ -1007,6 +1032,10 @@ impl remotemedia_core::transport::StreamSession for SessionHandleWrapper {
         self.handle.is_active()
     }
 }
+
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {

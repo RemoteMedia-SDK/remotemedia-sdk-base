@@ -25,6 +25,17 @@ export interface PipelineOutput {
   getNodeIds(): string[];
   get(nodeId: string): NapiRuntimeData | null;
   has(nodeId: string): boolean;
+  /** Transport ledger of the execution (JSON), including output snapshots. */
+  copyReport(): string;
+  /** Per-node materialization ledgers (JSON object keyed by node id). */
+  nodeCopyReports(): string;
+}
+
+/** Copy policy and retention budget for a pipeline session. */
+export interface PipelineBufferConfig {
+  policy: 'require_zero_copy' | 'allow_copies';
+  nodeRetentionOwners: number;
+  nodeRetentionBytes: number;
 }
 
 export interface StreamSession {
@@ -33,6 +44,7 @@ export interface StreamSession {
   sendInput(data: NapiRuntimeData): Promise<void>;
   recvOutput(): Promise<NapiRuntimeData | null>;
   close(): Promise<void>;
+  copyReport(): string;
 }
 
 export interface NativeModule {
@@ -55,19 +67,26 @@ export interface NativeModule {
   };
 
   // Pipeline execution
+  // Runs one session: each input goes to the named source node; the result
+  // holds the last output of every sink.
   executePipeline(
     manifestJson: string,
-    inputs: Record<string, NapiRuntimeData>
+    inputs: Record<string, NapiRuntimeData>,
+    pipelineBuffers?: PipelineBufferConfig
   ): Promise<PipelineOutput>;
 
   executePipelineWithSession(
     manifestJson: string,
     inputs: Record<string, NapiRuntimeData>,
-    sessionId: string
+    sessionId: string,
+    pipelineBuffers?: PipelineBufferConfig
   ): Promise<PipelineOutput>;
 
   // Streaming API
-  createStreamSession(manifestJson: string): Promise<StreamSession>;
+  createStreamSession(
+    manifestJson: string,
+    pipelineBuffers?: PipelineBufferConfig
+  ): Promise<StreamSession>;
 
   // Runtime info
   getRuntimeVersion(): string;

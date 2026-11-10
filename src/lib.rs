@@ -58,6 +58,9 @@ pub mod loadable;
 pub mod multiprocess;
 pub mod nodes;
 pub mod python;
+// Real-time thread <-> pipeline bridge (prepared audio loans, playback queues).
+#[cfg(feature = "rt-bridge")]
+pub mod rt_bridge;
 pub mod validation;
 /// Public entrypoint for ergonomic registration macros.
 pub mod registration_macros {
@@ -130,6 +133,15 @@ pub mod data {
     // canonical definitions live in `remotemedia-types`.
     pub use remotemedia_types::{
         AudioBuffer, AudioFormat, DataTypeHint, ImageFormat, RuntimeData, TensorBuffer, VideoFrame,
+    };
+    // Owning bulk storage carried by `RuntimeData` payload variants.
+    pub use remotemedia_types::{SharedBuffer, SharedBytes};
+    // Copy authority for framework boundaries that must materialize payloads.
+    pub use remotemedia_types::{CopyContext, CopyPolicy, CopyReason, CopyRejected};
+    // Device-resident tensors (task 6.4): owners, readiness and host transfer.
+    pub use remotemedia_types::{
+        Device, DeviceAllocation, DeviceBuffer, DeviceCompletion, DeviceKind, DeviceReady, DlDtype,
+        TransferError,
     };
 }
 
@@ -239,7 +251,7 @@ mod tests {
     fn test_video_frame_validation_valid() {
         // Valid 720p YUV420P frame
         let frame = data::RuntimeData::Video {
-            pixel_data: vec![128u8; 1_382_400], // 1280*720*1.5
+            pixel_data: vec![128u8; 1_382_400].into(), // 1280*720*1.5
             width: 1280,
             height: 720,
             format: PixelFormat::Yuv420p,
@@ -257,7 +269,7 @@ mod tests {
     #[test]
     fn test_video_frame_validation_zero_dimensions() {
         let frame = data::RuntimeData::Video {
-            pixel_data: vec![],
+            pixel_data: vec![].into(),
             width: 0, // Invalid
             height: 720,
             format: PixelFormat::Yuv420p,
@@ -278,7 +290,7 @@ mod tests {
     fn test_video_frame_validation_odd_dimensions_yuv() {
         // YUV formats require even dimensions
         let frame = data::RuntimeData::Video {
-            pixel_data: vec![128u8; 100],
+            pixel_data: vec![128u8; 100].into(),
             width: 1281, // Odd width
             height: 720,
             format: PixelFormat::Yuv420p,
@@ -299,7 +311,7 @@ mod tests {
     fn test_video_frame_validation_buffer_size_mismatch() {
         // Buffer size doesn't match format
         let frame = data::RuntimeData::Video {
-            pixel_data: vec![128u8; 1000], // Wrong size for 1280x720 YUV420P
+            pixel_data: vec![128u8; 1000].into(), // Wrong size for 1280x720 YUV420P
             width: 1280,
             height: 720,
             format: PixelFormat::Yuv420p,
@@ -320,7 +332,7 @@ mod tests {
     fn test_video_frame_validation_rgb24() {
         // Valid RGB24 frame (odd dimensions OK)
         let frame = data::RuntimeData::Video {
-            pixel_data: vec![0u8; 1920 * 1081 * 3], // Odd height OK for RGB
+            pixel_data: vec![0u8; 1920 * 1081 * 3].into(), // Odd height OK for RGB
             width: 1920,
             height: 1081, // Odd height
             format: PixelFormat::Rgb24,
@@ -339,7 +351,7 @@ mod tests {
     fn test_video_frame_validation_encoded_variable_size() {
         // Encoded frames have variable size (validation skipped)
         let frame = data::RuntimeData::Video {
-            pixel_data: vec![0u8; 5000], // Variable encoded size
+            pixel_data: vec![0u8; 5000].into(), // Variable encoded size
             width: 1280,
             height: 720,
             format: PixelFormat::Encoded,
@@ -379,7 +391,7 @@ mod tests {
     #[test]
     fn test_runtime_data_timing_video() {
         let video = data::RuntimeData::Video {
-            pixel_data: vec![0u8; 1000],
+            pixel_data: vec![0u8; 1000].into(),
             width: 100,
             height: 100,
             format: PixelFormat::Rgb24,

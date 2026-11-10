@@ -18,7 +18,7 @@
 // StreamSession is intentionally kept private for internal use
 #![allow(private_interfaces)]
 
-use crate::adapters::runtime_data_to_data_buffer;
+use crate::adapters::{runtime_data_to_data_buffer, runtime_data_to_data_buffer_with_context};
 use crate::generated::{
     stream_response::Response as StreamResponseType, ChunkResult, StreamResponse,
 };
@@ -27,6 +27,7 @@ use remotemedia_core::data::RuntimeData;
 use remotemedia_core::executor::PipelineGraph;
 use remotemedia_core::metrics::RtProbeSet;
 use remotemedia_core::nodes::{StreamingNode, StreamingNodeRegistry};
+use remotemedia_core::telemetry::publisher::record_node_error;
 use remotemedia_core::telemetry::{
     approx_payload_bytes, NoQueue, QueueCapacity, SessionDescriptor, SessionTelemetry,
 };
@@ -165,6 +166,12 @@ pub struct SessionRouter {
     /// deadlocking with a node task that's blocked on `loopback_tx.send`.
     node_inputs: HashMap<String, mpsc::Sender<DataPacket>>,
 
+    /// One authority per node, shared by initialization, execution and IPC output.
+    node_materialization: remotemedia_core::transport::NodeMaterializationCopies,
+    /// Session transport ledger: gRPC wire encode/decode of bulk payloads is a
+    /// counted copying boundary (compatibility policy).
+    transport_copies: remotemedia_core::data::CopyContext,
+
     /// Whether the router is running
     running: bool,
 
@@ -207,7 +214,7 @@ impl SessionRouter {
         client_tx: mpsc::Sender<Result<StreamResponse, Status>>,
     ) -> Result<(Self, mpsc::Sender<()>), Status> {
         // Build and validate the pipeline graph (spec 021)
-        let (graph, descriptor, successors) = {
+        let (graph, descriptor, successors, node_materialization) = {
             let session_guard = session.lock().await;
             let graph = PipelineGraph::from_manifest(&session_guard.manifest).map_err(|e| {
                 error!(
@@ -236,7 +243,16 @@ impl SessionRouter {
                     .or_default()
                     .push((idx, c.to.clone()));
             }
-            (graph, descriptor, successors)
+            let copies = remotemedia_core::transport::NodeMaterializationCopies::new(
+                &session_id,
+                session_guard
+                    .manifest
+                    .nodes
+                    .iter()
+                    .map(|node| node.id.as_str()),
+                Default::default(), // Existing gRPC compatibility policy: AllowCopies.
+            );
+            (graph, descriptor, successors, copies)
         };
         let telemetry = Arc::new(SessionTelemetry::new(
             &descriptor,
@@ -269,6 +285,7 @@ impl SessionRouter {
         let (loopback_tx, loopback_rx) = mpsc::channel(grpc_loopback_capacity());
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let shutdown_tx_clone = shutdown_tx.clone();
+        let session_id_for_copies = session_id.clone();
 
         let router = Self {
             session_id,
@@ -284,6 +301,11 @@ impl SessionRouter {
             _shutdown_tx: shutdown_tx,
             node_tasks: HashMap::new(),
             node_inputs: HashMap::new(),
+            node_materialization,
+            transport_copies: remotemedia_core::data::CopyContext::new(
+                remotemedia_core::data::CopyPolicy::AllowCopies,
+                format!("session/{session_id_for_copies}/transport/materialization"),
+            ),
             running: false,
             control: None,
             #[cfg(feature = "multiprocess")]
@@ -310,6 +332,11 @@ impl SessionRouter {
         control.set_descriptor(Arc::new(self.descriptor.clone()));
         control.set_telemetry(self.telemetry.clone());
         self.control = Some(control);
+    }
+
+    /// The session's transport copy ledger, shared with its control bus.
+    pub fn transport_copy_context(&self) -> remotemedia_core::data::CopyContext {
+        self.transport_copies.clone()
     }
 
     /// The session's live telemetry handle.
@@ -450,6 +477,11 @@ impl SessionRouter {
                         node_id: node_id.clone(),
                         control: self.control.clone(),
                     };
+                    let copies = self
+                        .node_materialization
+                        .context(&node_id)
+                        .map_err(|error| Status::internal(error.to_string()))?;
+                    let init_ctx = init_ctx.with_copy_context(copies);
                     match node.initialize(&init_ctx).await {
                         Ok(_) => {
                             info!(
@@ -678,7 +710,12 @@ impl SessionRouter {
     }
 
     /// Route a packet through the pipeline
-    async fn route_packet(&mut self, packet: DataPacket) -> Result<(), Status> {
+    async fn route_packet(&mut self, mut packet: DataPacket) -> Result<(), Status> {
+        // Promote legacy Vec audio before any fan-out clone so every downstream
+        // receives a refcount handle to the same samples, regardless of whether
+        // the control bus (which also promotes) is attached or the packet is
+        // client ingress addressed to one node.
+        packet.data = packet.data.into_shared();
         // Node outputs pass through SessionControl before normal graph fan-out.
         // This publishes requested taps (including tool/blip/system events)
         // and applies any installed intercept without touching client ingress.
@@ -736,8 +773,10 @@ impl SessionRouter {
             };
         let bytes = approx_payload_bytes(&packet.data);
 
-        // Route to downstream nodes
-        for (edge_idx, next_node_id) in downstream_nodes {
+        // Route to downstream nodes; the last one takes the original owner.
+        let last = downstream_nodes.len().saturating_sub(1);
+        let mut packet = Some(packet);
+        for (index, (edge_idx, next_node_id)) in downstream_nodes.into_iter().enumerate() {
             // info!("🔀 Routing from '{}' → '{}'", packet.from_node, next_node_id);
 
             // Get or create the node task
@@ -749,7 +788,16 @@ impl SessionRouter {
             // The node task will handle both native and multiprocess nodes
             // Multiprocess nodes will internally use the IPC thread via process_streaming_async()
             if let Some(node_input) = self.node_inputs.get(&next_node_id) {
-                let packet_clone = packet.clone();
+                let packet_clone = if index == last {
+                    packet
+                        .take()
+                        .expect("packet is moved only into the last successor")
+                } else {
+                    packet
+                        .as_ref()
+                        .expect("packet is retained until the last successor")
+                        .clone()
+                };
                 let edge = edge_idx.and_then(|i| self.telemetry.edge(i));
                 // Bounded per-node input: `.await` stalls the router task
                 // when a node is saturated. Loopback capacity is sized
@@ -833,21 +881,29 @@ impl SessionRouter {
         let session_id = self.session_id.clone();
         let router_tx = self.loopback_tx.clone(); // Bounded loopback: node → router
         let probes = self.probes.clone(); // Phase B0 instrumentation
-        let control = self
-            .control
-            .clone()
-            .unwrap_or_else(|| SessionControl::new(session_id.clone()));
+        let control = self.control.clone().unwrap_or_else(|| {
+            SessionControl::with_transport_copy_context(
+                session_id.clone(),
+                self.transport_copies.clone(),
+            )
+        });
         let init_ctx = remotemedia_core::nodes::InitializeContext {
             session_id: session_id.clone(),
             node_id: node_id_clone.clone(),
             control: Some(control.clone()),
         };
+        let copies = self
+            .node_materialization
+            .context(&node_id_clone)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let init_ctx = init_ctx.with_copy_context(copies.clone());
         let runtime_ctx = remotemedia_core::nodes::NodeRuntimeContext::for_session(
             session_id.clone(),
             node_id_clone.clone(),
             control,
             node.make_session_state(&init_ctx),
-        );
+        )
+        .with_copy_context(copies);
 
         // Check if this is a multiprocess node and set up continuous output draining
         #[cfg(feature = "multiprocess")]
@@ -882,7 +938,12 @@ impl SessionRouter {
 
                     // Register callback with IPC thread
                     if let Err(e) = executor
-                        .register_output_callback(&node_id_clone, &session_id, output_tx)
+                        .register_output_callback_with_copy_context(
+                            &node_id_clone,
+                            &session_id,
+                            output_tx,
+                            &runtime_ctx.materialization,
+                        )
                         .await
                     {
                         error!(
@@ -899,6 +960,7 @@ impl SessionRouter {
                         let router_tx_for_drain = router_tx.clone();
                         let node_id_for_drain = node_id_clone.clone();
                         let session_id_for_drain = session_id.clone();
+                        let output_copies = runtime_ctx.materialization.clone();
 
                         tokio::spawn(async move {
                             let mut sub_sequence = 0;
@@ -913,7 +975,10 @@ impl SessionRouter {
                                 sub_sequence += 1;
 
                                 // Convert IPC wire bytes to RuntimeData
-                                match MultiprocessExecutor::from_ipc_runtime_data(ipc_output) {
+                                match MultiprocessExecutor::from_ipc_runtime_data_with_copy_context(
+                                    ipc_output,
+                                    &output_copies,
+                                ) {
                                     Ok(output_data) => {
                                         let output_packet = DataPacket {
                                             data: output_data,
@@ -1047,11 +1112,19 @@ impl SessionRouter {
                                 match router_tx_for_cb.try_send(output_packet) {
                                     Ok(()) => Ok(()),
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        // This synchronous callback cannot await
+                                        // the router without risking a mutual
+                                        // wait on this node's input. Report the
+                                        // undelivered output instead of
+                                        // acknowledging a frame that was dropped.
                                         warn!(
-                                            "Loopback full — dropping output from '{}' (session saturated)",
+                                            "Loopback full — output from '{}' not delivered (session saturated)",
                                             node_id_for_cb
                                         );
-                                        Ok(())
+                                        Err(remotemedia_core::Error::Execution(format!(
+                                            "router loopback full; output {} from node '{}' was not delivered",
+                                            output_count, node_id_for_cb
+                                        )))
                                     }
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                         error!(
@@ -1077,7 +1150,13 @@ impl SessionRouter {
                             debug!("✅ Node '{}' produced {} outputs", node_id_clone, count);
                         }
                         Err(e) => {
-                            record_node_error(&tel, node_idx, node_control.as_deref(), &node_id_clone, &e.to_string());
+                            record_node_error(
+                                &tel,
+                                node_idx,
+                                node_control.as_deref(),
+                                &node_id_clone,
+                                &e.to_string(),
+                            );
                             error!("Streaming node '{}' failed: {}", node_id_clone, e);
                         }
                     }
@@ -1110,7 +1189,13 @@ impl SessionRouter {
                             }
                         }
                         Err(e) => {
-                            record_node_error(&tel, node_idx, node_control.as_deref(), &node_id_clone, &e.to_string());
+                            record_node_error(
+                                &tel,
+                                node_idx,
+                                node_control.as_deref(),
+                                &node_id_clone,
+                                &e.to_string(),
+                            );
                             error!("Node '{}' failed: {}", node_id_clone, e);
                         }
                     }
@@ -1265,7 +1350,9 @@ impl SessionRouter {
             .egress_edge(&packet.from_node)
             .and_then(|i| self.telemetry.edge(i));
         let bytes = approx_payload_bytes(&packet.data);
-        let output_buffer = runtime_data_to_data_buffer(&packet.data);
+        let output_buffer =
+            runtime_data_to_data_buffer_with_context(&packet.data, &self.transport_copies)
+                .map_err(|rejected| Status::failed_precondition(rejected.to_string()))?;
 
         let mut data_outputs = HashMap::new();
         data_outputs.insert(packet.from_node, output_buffer);
@@ -1313,10 +1400,42 @@ impl SessionRouter {
         // Close all node input channels
         self.node_inputs.clear();
 
-        // Wait for all tasks to complete
-        for (node_id, task) in self.node_tasks.drain() {
-            debug!("Waiting for node '{}' to shutdown", node_id);
-            let _ = task.await;
+        // Wait for all tasks while draining their loopback output. A node
+        // parked on a full loopback (`router_tx.send(..).await`) never reaches
+        // its closed input otherwise; the drained packets are released here
+        // because the session is ending and no consumer will route them.
+        let joins =
+            futures::future::join_all(self.node_tasks.drain().map(|(node_id, task)| async move {
+                debug!("Waiting for node '{}' to shutdown", node_id);
+                let _ = task.await;
+            }));
+        tokio::pin!(joins);
+        let mut loopback_open = true;
+        let mut released = 0_u64;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut joins => break,
+                packet = self.loopback_rx.recv(), if loopback_open => match packet {
+                    Some(packet) => {
+                        released += 1;
+                        drop(packet);
+                    }
+                    None => loopback_open = false,
+                },
+            }
+        }
+        // A node may send its last output after the final drain above and
+        // before its task completes; release anything still queued.
+        while let Ok(packet) = self.loopback_rx.try_recv() {
+            released += 1;
+            drop(packet);
+        }
+        if released > 0 {
+            debug!(
+                "Released {} undelivered loopback packets during shutdown",
+                released
+            );
         }
 
         info!("All node tasks shut down");
@@ -1349,21 +1468,6 @@ impl SessionRouter {
     }
 }
 
-
-/// Count a dispatch error and publish a rate-limited `node_error` event.
-fn record_node_error(
-    tel: &SessionTelemetry,
-    idx: Option<usize>,
-    control: Option<&SessionControl>,
-    node_id: &str,
-    message: &str,
-) {
-    let Some(i) = idx else { return };
-    if let Some(ev) = tel.record_error(i, message) {
-        if let Some(ctrl) = control {
-            remotemedia_core::telemetry::publisher::publish_node_error(
-                ctrl, node_id, &ev.message, ev.count,
-            );
-        }
-    }
-}
+#[cfg(test)]
+#[path = "session_router_tests.rs"]
+mod tests;

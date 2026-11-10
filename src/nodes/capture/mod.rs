@@ -323,7 +323,7 @@ impl StreamingNode for CaptureSourceNode {
         };
         let frame_number = self.frame_number.fetch_add(1, Ordering::Relaxed);
         cb(RuntimeData::Video {
-            pixel_data: frame.pixels,
+            pixel_data: frame.pixels.into(),
             width: frame.width,
             height: frame.height,
             format: self.out.wire(),

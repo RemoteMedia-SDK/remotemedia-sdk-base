@@ -38,6 +38,9 @@ use super::stream::{
 };
 use super::{IngestConfig, IngestPlugin, IngestSource};
 
+mod direct;
+mod wav;
+
 /// File ingest plugin
 ///
 /// Handles local file and stdin ingestion with `file://`, bare paths, and `-`.
@@ -150,6 +153,9 @@ pub struct FileIngestSource {
 
     /// Stopped flag
     stopped: Arc<AtomicBool>,
+
+    /// Joined worker for allocator-backed file production.
+    direct_task: Option<tokio::task::JoinHandle<Result<(), Error>>>,
 }
 
 impl FileIngestSource {
@@ -164,6 +170,7 @@ impl FileIngestSource {
             metadata: Arc::new(RwLock::new(None)),
             stop_tx: None,
             stopped: Arc::new(AtomicBool::new(false)),
+            direct_task: None,
         })
     }
 
@@ -181,9 +188,17 @@ impl FileIngestSource {
 
 #[async_trait]
 impl IngestSource for FileIngestSource {
+    async fn start_with_output_allocator(
+        &mut self,
+        allocator: Arc<dyn remotemedia_types::OutputAllocator>,
+        max_frames: usize,
+    ) -> Result<IngestStream, Error> {
+        self.start_direct(allocator, max_frames).await
+    }
+
     async fn start(&mut self) -> Result<IngestStream, Error> {
         // Check if already started
-        if self.stop_tx.is_some() {
+        if self.stop_tx.is_some() || self.direct_task.is_some() {
             return Err(Error::ConfigError(
                 "Source already started. Call stop() first.".to_string(),
             ));
@@ -261,6 +276,14 @@ impl IngestSource for FileIngestSource {
         // Send stop signal
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
+        }
+
+        // Keep the handle in self across await: cancelling stop() must not
+        // detach the worker or allow a second producer to start over it.
+        if let Some(task) = self.direct_task.as_mut() {
+            let result = task.await;
+            self.direct_task = None;
+            result.map_err(|e| Error::Other(format!("File producer task failed: {e}")))??;
         }
 
         // Update status
@@ -439,9 +462,9 @@ fn decode_stdin(
         bitrate: None,
     };
 
-    // Create single audio chunk
+    // Create single audio chunk, moved into shared storage (no copy).
     let chunk = RuntimeData::Audio {
-        samples: samples.into(),
+        samples: crate::data::audio_samples::AudioSamples::Shared(samples.into()),
         sample_rate,
         channels: channels as u32,
         stream_id: Some("audio:0".to_string()),
@@ -679,9 +702,17 @@ fn decode_with_ffmpeg(
     let mut timestamp_us = 0u64;
     let samples_per_second = output_sample_rate as u64 * output_channels as u64;
 
-    for chunk_samples in all_samples.chunks(chunk_size.max(1)) {
+    // Promote the decoded buffer once; every chunk is a shared view of it
+    // (previously each chunk was copied out with `to_vec`).
+    let all_samples = remotemedia_types::SharedBuffer::from(all_samples);
+    let step = chunk_size.max(1);
+    for start in (0..all_samples.len()).step_by(step) {
+        let chunk_samples = all_samples
+            .slice(start..(start + step).min(all_samples.len()))
+            .expect("chunk range lies within the decoded buffer");
+        let chunk_len = chunk_samples.len();
         let chunk = RuntimeData::Audio {
-            samples: chunk_samples.to_vec().into(),
+            samples: crate::data::audio_samples::AudioSamples::Shared(chunk_samples),
             sample_rate: output_sample_rate,
             channels: output_channels,
             stream_id: Some("audio:0".to_string()),
@@ -698,7 +729,7 @@ fn decode_with_ffmpeg(
 
         // Calculate timestamp increment in microseconds
         if samples_per_second > 0 {
-            timestamp_us += (chunk_samples.len() as u64 * 1_000_000) / samples_per_second;
+            timestamp_us += (chunk_len as u64 * 1_000_000) / samples_per_second;
         }
     }
 
@@ -781,7 +812,9 @@ fn decode_wav_file(
 
     // Note: No resampling in fallback mode
     let chunk = RuntimeData::Audio {
-        samples: crate::data::audio_samples::AudioSamples::Vec(samples),
+        // Move the decoded Vec into shared storage (no copy) so later clones
+        // share it instead of deep-copying.
+        samples: crate::data::audio_samples::AudioSamples::Shared(samples.into()),
         sample_rate: target_sample_rate,
         channels: target_channels,
         stream_id: Some("audio:0".to_string()),
@@ -873,5 +906,63 @@ mod tests {
         assert!(schemes.contains(&"file"));
         assert!(schemes.contains(&"")); // bare paths
         assert!(schemes.contains(&"-")); // stdin
+    }
+
+    /// The legacy `start()` path decodes a whole file, then chunks it. Chunks
+    /// must be views of one shared allocation, not per-chunk copies.
+    #[cfg(feature = "video")]
+    #[test]
+    fn ffmpeg_decode_chunks_share_one_allocation() {
+        use crate::data::audio_samples::AudioSamples;
+        let samples: Vec<i16> = (0..4000)
+            .map(|i| ((i % 200) * 100 - 10_000) as i16)
+            .collect();
+        let mut wav = Vec::new();
+        let data_len = (samples.len() * 2) as u32;
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&32_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for s in &samples {
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        let path = std::env::temp_dir().join(format!(
+            "remotemedia-ingest-chunks-{}.wav",
+            std::process::id()
+        ));
+        std::fs::write(&path, &wav).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (_, chunks) = decode_with_ffmpeg(file, &path, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(chunks.len() >= 2, "expected several 100 ms chunks");
+        let views: Vec<_> = chunks
+            .iter()
+            .map(|chunk| match chunk {
+                RuntimeData::Audio {
+                    samples: AudioSamples::Shared(view),
+                    ..
+                } => view.clone(),
+                other => panic!("expected shared audio, got {other:?}"),
+            })
+            .collect();
+        for view in &views[1..] {
+            assert!(
+                view.shares_storage(&views[0]),
+                "chunks must share one allocation"
+            );
+        }
+        let total: usize = views.iter().map(|v| v.len()).sum();
+        assert_eq!(total, samples.len());
+        let first = samples[0] as f32 / 32768.0;
+        assert!((views[0][0] - first).abs() < 1e-4);
     }
 }

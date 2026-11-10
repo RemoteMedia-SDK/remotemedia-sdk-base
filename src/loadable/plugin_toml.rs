@@ -132,6 +132,29 @@ pub struct PluginPythonMeta {
     /// subdir (e.g. `"src/"`).
     #[serde(default = "default_module_root")]
     pub module_root: String,
+
+    /// Explicit mapped runner contract. Requires host-authorized mapped runtime;
+    /// it must never fall back to the legacy serialized runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped: Option<PluginPythonMapped>,
+}
+
+/// Versioned mapped Python capabilities declared by a source plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginPythonMapped {
+    pub runner_protocol: u16,
+    /// Static promises for each named node type, covering all parameters and lanes.
+    /// Omission remains unknown; declarations never authorize package execution.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub buffer_contracts: BTreeMap<String, PluginMappedBufferContract>,
+    /// Optional output-copy negotiation; a capability request, not permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_copy_protocol: Option<u16>,
+    #[serde(default)]
+    pub snapshot_inputs: Vec<String>,
+    #[serde(default)]
+    pub snapshot_outputs: Vec<String>,
 }
 
 fn default_module_root() -> String {
@@ -157,6 +180,67 @@ pub struct PluginRustMeta {
     /// `release-manifest.json` instead); reserved for v2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_pattern: Option<String>,
+    /// Explicit subprocess contract; never falls back to loading a cdylib.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped: Option<PluginNativeMapped>,
+}
+
+/// Platform-specific native mapped executables supplied by a local package.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginNativeMapped {
+    pub wire_protocol: u16,
+    pub workers: Vec<PluginNativeWorker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginNativeWorker {
+    pub node_type: String,
+    /// Static buffer promises for every instance of this worker type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_contract: Option<PluginMappedBufferContract>,
+    pub executables: BTreeMap<String, PluginNativeExecutable>,
+    #[serde(default)]
+    pub snapshot_inputs: Vec<String>,
+    #[serde(default)]
+    pub snapshot_outputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginNativeExecutable {
+    /// Relative path inside the resolved package root.
+    pub file: String,
+    pub sha256: String,
+}
+
+/// Static package-authored buffer capabilities, bound to the actual host adapter.
+/// The package cannot select or override the runtime's transport protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginMappedBufferContract {
+    pub version: u16,
+    pub inputs: BTreeMap<String, remotemedia_traits::buffer_contract::BufferPortContract>,
+    pub outputs: BTreeMap<String, remotemedia_traits::buffer_contract::BufferPortContract>,
+    pub production: remotemedia_traits::buffer_contract::BufferProduction,
+    pub retention: Option<remotemedia_traits::buffer_contract::BufferRetention>,
+}
+
+impl PluginMappedBufferContract {
+    pub(crate) fn bind(
+        &self,
+        protocol: &remotemedia_traits::buffer_contract::BufferProtocol,
+    ) -> remotemedia_traits::buffer_contract::BufferContract {
+        remotemedia_traits::buffer_contract::BufferContract {
+            version: self.version,
+            protocol: protocol.clone(),
+            inputs: self.inputs.clone(),
+            outputs: self.outputs.clone(),
+            production: self.production.clone(),
+            retention: self.retention,
+        }
+    }
 }
 
 /// Errors when parsing or validating a `plugin.toml`.
@@ -175,9 +259,8 @@ pub enum PluginTomlError {
     EmptyPythonNodeTypes,
 
     #[error(
-        "plugin.toml has `language = \"rust\"` — Rust plugins ship as \
-         cdylibs distributed via GitHub releases. Use the release-manifest.json \
-         path instead (see resolver Phase 1B docs)."
+        "a local Rust package directory requires [rust.mapped]; for an in-process \
+         cdylib use its explicit file path or a GitHub release-manifest.json"
     )]
     RustPluginWrongPath,
 }

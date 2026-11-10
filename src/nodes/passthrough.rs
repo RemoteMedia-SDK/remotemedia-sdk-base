@@ -35,6 +35,48 @@ mod tests {
     use crate::transport::data::participant;
 
     #[test]
+    fn factory_declares_metadata_or_explicit_bounded_forwarding() {
+        use crate::nodes::{streaming_registry::PassThroughNodeFactory, StreamingNodeFactory};
+        use remotemedia_traits::buffer_contract::*;
+        let factory = PassThroughNodeFactory;
+        let metadata = factory
+            .try_buffer_contract(&serde_json::json!({}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            metadata,
+            BufferContract::metadata_only(BufferProtocol::RustOwners)
+        );
+        let params = serde_json::json!({
+            "passthrough_layouts":["audio_interleaved_f32","binary"],
+            "buffer_limits":{"domain":"session_mapped","max_input_bytes":64,"max_output_bytes":64,
+                "retention":{"owners":2,"bytes":8192}}
+        });
+        let contract = factory.try_buffer_contract(&params).unwrap().unwrap();
+        assert_eq!(contract.production, BufferProduction::ForwardInput);
+        assert_eq!(
+            contract.inputs[""].domains,
+            vec![BufferDomain::SessionMapped]
+        );
+        assert_eq!(
+            contract.inputs[""].layouts,
+            vec![BufferLayout::AudioInterleavedF32, BufferLayout::Binary]
+        );
+        for invalid in [
+            serde_json::json!({"passthrough_layouts":["binary"]}),
+            serde_json::json!({"buffer_limits":params["buffer_limits"]}),
+            {
+                let mut value = params.clone();
+                value["buffer_limits"]["max_output_bytes"] = 32.into();
+                value
+            },
+        ] {
+            assert!(factory.try_buffer_contract(&invalid).is_err());
+            assert!(factory.create("pass".into(), &invalid, None).is_err());
+        }
+    }
+
+    #[test]
     fn preserves_participant_metadata_on_audio_frames() {
         let node = PassThroughNode::new("pass".into(), "{}").unwrap();
         let input = RuntimeData::Audio {
