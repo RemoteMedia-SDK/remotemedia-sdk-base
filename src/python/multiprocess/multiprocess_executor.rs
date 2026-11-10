@@ -425,6 +425,11 @@ pub struct MultiprocessConfig {
     /// Controls whether the SDK auto-provisions venvs via uv.
     #[serde(default)]
     pub python_env: crate::python::env_manager::PythonEnvConfig,
+
+    /// Shared model workers (off by default): sessions attach to one worker
+    /// per node type and model instead of each starting its own process.
+    #[serde(default)]
+    pub worker_sharing: super::shared_workers::WorkerSharingConfig,
 }
 
 /// Policy for handling Docker unavailability
@@ -492,6 +497,7 @@ impl Default for MultiprocessConfig {
             docker_fallback_policy: default_docker_fallback_policy(),
             python_path: Vec::new(),
             python_env: Default::default(),
+            worker_sharing: Default::default(),
         }
     }
 }
@@ -625,6 +631,11 @@ pub struct SessionState {
 
     /// Initialization progress for each node (node_id -> progress)
     pub init_progress: HashMap<String, InitProgress>,
+
+    /// Nodes whose lane is attached to a shared model worker (node_id ->
+    /// lease). Their `node_processes` entry is the shared worker, which is
+    /// detached from, not terminated, when the session ends.
+    pub shared_lanes: HashMap<String, super::shared_workers::Lease>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1821,6 +1832,52 @@ sys.stdout.flush()
         });
     }
 
+    /// For a lane attached to a shared worker: when the lane fails or the
+    /// worker dies, fail the node and end the session, as a crash of an
+    /// unshared node's process does.
+    async fn watch_shared_lane(&self, session_id: &str, node_id: &str) {
+        let watched = self
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|s| s.shared_lanes.get(node_id))
+            .map(|lease| (lease.failure_watch(), lease.worker.process.id));
+        let Some(((mut lane, mut worker), pid)) = watched else {
+            return;
+        };
+        let sessions = Arc::downgrade(&self.sessions);
+        let process_manager = Arc::downgrade(&self.process_manager);
+        let health_monitor = self.health_monitor.clone();
+        let (session_id, node_id) = (session_id.to_string(), node_id.to_string());
+        tokio::spawn(async move {
+            // A receiver whose sender is gone means the lane was detached.
+            let reason = tokio::select! {
+                r = lane.wait_for(Option::is_some) => match r { Ok(v) => v.clone(), Err(_) => return },
+                r = worker.wait_for(Option::is_some) => match r { Ok(v) => v.clone(), Err(_) => return },
+            }
+            .unwrap_or_default();
+            let (Some(sessions), Some(process_manager)) = (sessions.upgrade(), process_manager.upgrade()) else {
+                return;
+            };
+            let attached = sessions
+                .read()
+                .await
+                .get(&session_id)
+                .is_some_and(|s| s.shared_lanes.contains_key(&node_id));
+            if !attached {
+                return;
+            }
+            tracing::error!("Node {node_id} failed in its shared worker ({reason}); terminating pipeline {session_id}");
+            let _ = health_monitor
+                .handle_process_exit(pid, ExitReason::Error(-1), Some(session_id.clone()), Some(node_id.clone()))
+                .await;
+            if let Err(e) = Self::terminate_session_static(sessions, process_manager, &session_id).await {
+                tracing::error!("Failed to terminate session {}: {}", session_id, e);
+            }
+        });
+    }
+
     /// Static version of terminate_session for use in closures
     #[cfg(feature = "multiprocess")]
     async fn terminate_session_static(
@@ -1833,8 +1890,12 @@ sys.stdout.flush()
         if let Some(mut session) = sessions_guard.remove(session_id) {
             session.status = SessionStatus::Terminating;
 
-            // Terminate all processes in the session
-            for (_, process) in session.node_processes.drain() {
+            // Terminate all processes in the session; detach from shared workers
+            for (node_id, process) in session.node_processes.drain() {
+                if let Some(lease) = session.shared_lanes.remove(&node_id) {
+                    lease.detach().await;
+                    continue;
+                }
                 process_manager
                     .terminate_process(process, std::time::Duration::from_secs(5))
                     .await?;
@@ -1868,6 +1929,7 @@ sys.stdout.flush()
             status: SessionStatus::Initializing,
             created_at: std::time::Instant::now(),
             init_progress: HashMap::new(),
+            shared_lanes: HashMap::new(),
         };
 
         sessions.insert(session_id, session);
@@ -2073,14 +2135,18 @@ sys.stdout.flush()
         let node_id_clone = node_id.to_string();
         let session_id_clone = session_id.to_string();
         let control = self.get_control();
-        let process = self
-            .sessions
-            .read()
-            .await
-            .get(session_id)
-            .and_then(|session| session.node_processes.get(node_id))
-            .cloned()
-            .ok_or_else(|| Error::Execution(format!("Missing process for node {node_id}")))?;
+        let (process, shared_failure) = {
+            let sessions = self.sessions.read().await;
+            let session = sessions.get(session_id);
+            let process = session
+                .and_then(|session| session.node_processes.get(node_id))
+                .cloned()
+                .ok_or_else(|| Error::Execution(format!("Missing process for node {node_id}")))?;
+            let shared_failure = session
+                .and_then(|session| session.shared_lanes.get(node_id))
+                .map(|lease| lease.failure_watch());
+            (process, shared_failure)
+        };
 
         // Control channel was already created in initialize() before spawning Python
         // Now poll for the READY signal - need direct iceoryx2 subscriber (not RuntimeData wrapper)
@@ -2106,6 +2172,14 @@ sys.stdout.flush()
 
                 poll_count += 1;
                 if poll_count % 100 == 0 {
+                    if let Some((lane, worker)) = &shared_failure {
+                        let failure = lane.borrow().clone().or_else(|| worker.borrow().clone());
+                        if let Some(failure) = failure {
+                            return Err(Error::Execution(format!(
+                                "Node {node_id_clone} failed in its shared worker before readiness: {failure}"
+                            )));
+                        }
+                    }
                     let status = handle.block_on(async { process.status.read().await.clone() });
                     if matches!(status, super::process_manager::ProcessStatus::Error(_)
                         | super::process_manager::ProcessStatus::Stopped
@@ -2642,7 +2716,12 @@ sys.stdout.flush()
             // Then terminate processes
             #[cfg(feature = "multiprocess")]
             {
-                for (_, process) in session.node_processes.drain() {
+                for (node_id, process) in session.node_processes.drain() {
+                    // A shared worker keeps running for its other sessions.
+                    if let Some(lease) = session.shared_lanes.remove(&node_id) {
+                        lease.detach().await;
+                        continue;
+                    }
                     self.process_manager
                         .terminate_process(process, std::time::Duration::from_secs(5))
                         .await?;
@@ -3169,10 +3248,53 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             }
         }
 
+        // Shared model worker (openspec: add-shared-model-workers): attach this
+        // session's lane to a worker that already holds the model, when both
+        // the host policy and the node class allow it. Otherwise (or when the
+        // class turns out not to be @shareable) spawn a process as usual.
+        #[cfg(feature = "multiprocess")]
+        let mut shared_lease = {
+            #[cfg(feature = "docker")]
+            let docker = use_docker;
+            #[cfg(not(feature = "docker"))]
+            let docker = false;
+            let policy = self.config.worker_sharing.clone().with_env_overrides();
+            if !docker && policy.applies_to(&ctx.node_type, &ctx.params) {
+                let spawn = self.process_manager.spawn_config().read().await.clone();
+                let authority = self
+                    .initial_copies
+                    .clone()
+                    .map(|copies| super::copy_authority::CopyAuthority::start(copies, &ctx.node_id, &session_id))
+                    .transpose()
+                    .map_err(|e| Error::Execution(format!("Copy authority startup failed: {e}")))?;
+                match super::shared_workers::pool()
+                    .reserve(&ctx.node_type, &ctx.params, spawn, &policy, &self.config)
+                    .await?
+                {
+                    Some(worker) => Some(
+                        worker
+                            .attach(
+                                &session_id,
+                                &ctx.node_id,
+                                &ctx.params,
+                                authority,
+                                std::time::Duration::from_secs(self.config.init_timeout_secs),
+                            )
+                            .await?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            }
+        };
+
         // NOW spawn process or container (channels already exist)
         #[cfg(feature = "multiprocess")]
         {
-            let process = {
+            let process = if let Some(lease) = &shared_lease {
+                lease.worker.process.clone()
+            } else {
                 #[cfg(feature = "docker")]
                 {
                     if use_docker {
@@ -3275,6 +3397,9 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                     .channels
                     .insert(output_channel_name.clone(), output_channel);
                 session.ipc_threads.insert(ctx.node_id.clone(), ipc_thread);
+                if let Some(lease) = shared_lease.take() {
+                    session.shared_lanes.insert(ctx.node_id.clone(), lease);
+                }
 
                 tracing::debug!(
                     "Created IPC thread and channels for node {}: {}, {}",
@@ -3320,6 +3445,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             tracing::debug!(
                 "✅ Received READY signal - Python subscriber is ready to receive data"
             );
+            self.watch_shared_lane(&session_id, &ctx.node_id).await;
 
             // No settling delay is needed here. The worker creates its input
             // subscriber when it connects, before it loads its model and long
@@ -3712,3 +3838,7 @@ except Exception as e:
 #[cfg(all(test, feature = "multiprocess"))]
 #[path = "legacy_ipc_tests.rs"]
 mod legacy_ipc_tests;
+
+#[cfg(all(test, feature = "multiprocess"))]
+#[path = "shared_workers_tests.rs"]
+mod shared_workers_tests;

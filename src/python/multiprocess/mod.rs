@@ -13,6 +13,8 @@ mod legacy_call;
 pub mod multiprocess_executor;
 #[cfg(feature = "multiprocess")]
 pub mod process_manager;
+#[cfg(feature = "multiprocess")]
+pub mod shared_workers;
 // In-process channel for Android (and opt-in on Linux/macOS)
 #[cfg(feature = "inprocess-python")]
 pub mod inprocess_channel;
