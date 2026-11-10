@@ -157,14 +157,13 @@ impl ChannelRegistry {
         // with their ports and shared memory, so a crashed run's samples are
         // never delivered to the next run's identically named
         // `session_0_*` ports.
-        let state = iceoryx2::node::Node::<iceoryx2::service::ipc::Service>::try_cleanup_dead_nodes(
-            iceoryx2::config::Config::global_config(),
-        );
-        if state.cleanups + state.failed_cleanups > 0 {
+        let (cleanups, failed_cleanups) =
+            super::runner::cleanup_dead_nodes(iceoryx2::config::Config::global_config());
+        if cleanups + failed_cleanups > 0 {
             tracing::info!(
                 "iceoryx2: removed {} dead node(s), {} could not be removed",
-                state.cleanups,
-                state.failed_cleanups
+                cleanups,
+                failed_cleanups
             );
         }
 

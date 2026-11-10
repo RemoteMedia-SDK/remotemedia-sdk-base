@@ -227,7 +227,8 @@ pub(super) type NativeSubscriber = iceoryx2::port::subscriber::Subscriber<ipc::S
 /// host IPC threads, with dead-node sweeps off.
 ///
 /// By default every iceoryx2 node scans all nodes on the machine and removes
-/// the ones it judges dead, when it is created and when it is dropped. On
+/// the ones it judges dead, when it is created, when it is dropped and when it
+/// opens a service. On
 /// Windows that liveness check emulates F_GETLK by briefly taking an exclusive
 /// lock, so processes checking the same node at once can judge a live node dead
 /// and iceoryx2 fatal-panics ("the Node is still alive"); every sweep also
@@ -238,6 +239,7 @@ pub(super) fn node_config_without_dead_node_sweeps() -> iceoryx2::config::Config
     let mut config = iceoryx2::config::Config::global_config().clone();
     config.global.node.cleanup_dead_nodes_on_creation = false;
     config.global.node.cleanup_dead_nodes_on_destruction = false;
+    config.global.service.cleanup_dead_nodes_on_open = false;
     config
 }
 
@@ -251,16 +253,42 @@ pub(super) fn sweep_dead_nodes_once() {
 }
 
 fn sweep_dead_nodes() {
-    let state = iceoryx2::node::Node::<ipc::Service>::try_cleanup_dead_nodes(
-        iceoryx2::config::Config::global_config(),
-    );
-    if state.cleanups + state.failed_cleanups > 0 {
+    let (cleanups, failed_cleanups) =
+        cleanup_dead_nodes(iceoryx2::config::Config::global_config());
+    if cleanups + failed_cleanups > 0 {
         tracing::info!(
             "iceoryx2: removed {} dead node(s), {} could not be removed",
-            state.cleanups,
-            state.failed_cleanups
+            cleanups,
+            failed_cleanups
         );
     }
+}
+
+/// Remove the stale resources of every dead iceoryx2 node, without creating a
+/// node. Returns `(removed, failed)`. A node another process is already
+/// cleaning, or one this process may not remove, counts as failed and is left
+/// for a later sweep.
+///
+/// iceoryx2 0.10 only offers this sweep as a method on a live node; this is
+/// the same loop over the public node list.
+pub(crate) fn cleanup_dead_nodes(config: &iceoryx2::config::Config) -> (u64, u64) {
+    use iceoryx2::node::NodeState;
+    use iceoryx2::prelude::CallbackProgression;
+
+    let (mut cleanups, mut failed_cleanups) = (0u64, 0u64);
+    let listed = iceoryx2::node::Node::<ipc::Service>::list(config, |state| {
+        if let NodeState::Dead(dead_node) = state {
+            match dead_node.blocking_remove_stale_resources(std::time::Duration::ZERO) {
+                Ok(_) => cleanups += 1,
+                Err(_) => failed_cleanups += 1,
+            }
+        }
+        CallbackProgression::Continue
+    });
+    if let Err(error) = listed {
+        tracing::debug!("iceoryx2: could not list nodes for the dead-node sweep: {error:?}");
+    }
+    (cleanups, failed_cleanups)
 }
 
 pub(super) fn open_channels(

@@ -2952,7 +2952,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
 
                     // Lock out the Python user-site (e.g. ~/.local) for managed-venv
                     // subprocesses. A stale `iceoryx2` in the host user-site (e.g.
-                    // 0.9.0) would shadow the venv's pinned `iceoryx2` (0.9.3) on
+                    // 0.9.3) would shadow the venv's pinned `iceoryx2` (0.10.0) on
                     // `import iceoryx2`. Any version skew between the venv's iceoryx2
                     // and the Rust server's iceoryx2 corrupts the shared-memory
                     // service the server pre-creates, surfacing as
