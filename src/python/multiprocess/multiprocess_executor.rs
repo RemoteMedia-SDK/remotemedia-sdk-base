@@ -362,8 +362,15 @@ fn default_max_processes() -> Option<usize> {
     Some(10)
 }
 
+/// Unread messages a channel holds before iceoryx2 overwrites the oldest.
+///
+/// Each publisher reserves `2 * (capacity + 2) + capacity` samples of its
+/// largest slice in shared memory, which Windows commits up front. At 64 that
+/// is about 3 MB for 16 KiB messages and about 99 MB for 512 KiB ones; the
+/// previous 1000 reserved 1.5 GB per channel. 64 messages of 20 ms audio is
+/// about 1.3 s of backlog.
 fn default_channel_capacity() -> usize {
-    1000 // Increased from 100 to handle audio flood during initialization (50 packets/sec * 5sec init = 250+)
+    64
 }
 
 fn default_init_timeout() -> u64 {

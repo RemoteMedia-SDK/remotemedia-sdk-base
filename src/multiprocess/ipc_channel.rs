@@ -29,6 +29,10 @@ static GLOBAL_REGISTRY: OnceLock<Arc<ChannelRegistry>> = OnceLock::new();
 /// Matches the global iceoryx2 config: publish_subscribe.max_slice_len = 1048576
 const MAX_SLICE_LEN: usize = 1 * 1024 * 1024;
 
+/// Initial slice size of a channel's publisher; see `create_publisher`.
+#[cfg(feature = "multiprocess")]
+const INITIAL_SLICE_LEN: usize = 16 * 1024;
+
 /// Subscriber ports a channel accepts. See `ChannelRegistry::create_channel`.
 #[cfg(feature = "multiprocess")]
 const CHANNEL_MAX_SUBSCRIBERS: usize = 2;
@@ -391,11 +395,13 @@ impl ChannelRegistry {
             .get(channel_name)
             .ok_or_else(|| Error::IpcError(format!("Channel not found: {}", channel_name)))?;
 
-        // Create publisher from service with dynamic allocation support
-        // Start with 512KB to handle typical audio buffers without reallocation
+        // Start small and let the publisher grow its data segment, by powers
+        // of two, when a larger message is actually sent. The segment holds
+        // the channel's full sample count at the largest slice size, so a
+        // large initial size is paid by every channel, including text-only ones.
         let publisher = service
             .publisher_builder()
-            .initial_max_slice_len(512 * 1024) // 512KB - large enough for most audio chunks
+            .initial_max_slice_len(INITIAL_SLICE_LEN)
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .create()
             .map_err(|e| Error::IpcError(format!("Failed to create publisher: {:?}", e)))?;
