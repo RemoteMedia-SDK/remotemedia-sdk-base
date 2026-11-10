@@ -11,8 +11,8 @@ description = "Python wrapper nodes for RemoteMedia pipelines"
 [dependencies]
 # Core dependency for traits
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../", default-features = false }
-remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3" }
-remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "44e02a9d24b1427cce48bc32ef837142787d0ba3" }
+remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "e8fc165eea4064717b6fb23de5f1a18d925533d4" }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "e8fc165eea4064717b6fb23de5f1a18d925533d4" }
 
 # Async runtime
 tokio.workspace = true
