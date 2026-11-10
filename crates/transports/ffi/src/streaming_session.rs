@@ -46,6 +46,8 @@ type HandleSlot = Arc<Mutex<Option<SessionHandle>>>;
 
 #[cfg(test)]
 mod input_policy_tests;
+#[cfg(test)]
+mod shared_session_tests;
 
 enum InputSender {
     Raw(SessionInputSender),
@@ -62,9 +64,11 @@ impl InputSender {
 }
 
 enum Outcome {
-    Got(&'static str, RuntimeData),
+    Got(&'static str, TransportData),
     Closed(&'static str),
 }
+
+type MembershipSlot = Arc<Mutex<Option<crate::shared_sessions::SharedMembership>>>;
 
 /// Long-lived streaming session handle, callable from Python.
 ///
@@ -80,6 +84,9 @@ pub struct PyStreamingSession {
     video_rx: RxSlot,
     data_rx: RxSlot,
     handle: HandleSlot,
+    /// This handle's membership of a shared session (`None` for a private
+    /// session); closing the last handle closes the shared session.
+    membership: MembershipSlot,
     /// Keep the executor alive for the session's lifetime. The scheduler
     /// task spawned at session creation holds `Arc` clones internally, but
     /// holding the executor here is a defensive cheap guarantee.
@@ -194,92 +201,28 @@ impl PyStreamingSession {
     /// `None` once every kind channel is closed. `kind` is one of
     /// `"audio" | "video" | "data"`.
     fn recv_output<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let audio = Arc::clone(&self.audio_rx);
-        let video = Arc::clone(&self.video_rx);
-        let data = Arc::clone(&self.data_rx);
-        let copies = self.input_copies.session.clone();
-        future_into_py(py, async move {
-            loop {
-                let mut a_guard = audio.lock().await;
-                let mut v_guard = video.lock().await;
-                let mut d_guard = data.lock().await;
+        self.next_output(py, false)
+    }
 
-                // Move receivers out for the select; put back after.
-                let mut a_taken = a_guard.take();
-                let mut v_taken = v_guard.take();
-                let mut d_taken = d_guard.take();
+    /// Await the next output across all kinds, with its attribution.
+    /// Resolves to `{"kind": "audio" | "video" | "data", "data": <as
+    /// recv_output>, "participant": {"id", "role", ...} | None}`, or `None`
+    /// once every kind channel is closed. In a shared session `participant`
+    /// names the participant whose input produced the output (openspec:
+    /// add-multi-participant-sessions).
+    fn recv_event<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.next_output(py, true)
+    }
 
-                let a_active = a_taken.is_some();
-                let v_active = v_taken.is_some();
-                let d_active = d_taken.is_some();
-                if !a_active && !v_active && !d_active {
-                    return Python::attach(|py| Ok(py.None()));
-                }
-
-                let outcome: Outcome = {
-                    let a_fut = async {
-                        match a_taken.as_mut() {
-                            Some(rx) => rx.recv().await.map(|out| out.data),
-                            None => std::future::pending().await,
-                        }
-                    };
-                    let v_fut = async {
-                        match v_taken.as_mut() {
-                            Some(rx) => rx.recv().await.map(|out| out.data),
-                            None => std::future::pending().await,
-                        }
-                    };
-                    let d_fut = async {
-                        match d_taken.as_mut() {
-                            Some(rx) => rx.recv().await.map(|out| out.data),
-                            None => std::future::pending().await,
-                        }
-                    };
-                    tokio::pin!(a_fut, v_fut, d_fut);
-                    tokio::select! {
-                        biased;
-                        v = &mut a_fut, if a_active => match v {
-                            Some(rd) => Outcome::Got("audio", rd),
-                            None => Outcome::Closed("audio"),
-                        },
-                        v = &mut v_fut, if v_active => match v {
-                            Some(rd) => Outcome::Got("video", rd),
-                            None => Outcome::Closed("video"),
-                        },
-                        v = &mut d_fut, if d_active => match v {
-                            Some(rd) => Outcome::Got("data", rd),
-                            None => Outcome::Closed("data"),
-                        },
-                    }
-                };
-
-                // Restore receivers. Drop any that closed.
-                match outcome {
-                    Outcome::Got(kind, rd) => {
-                        *a_guard = a_taken;
-                        *v_guard = v_taken;
-                        *d_guard = d_taken;
-                        return Python::attach(|py| pack_kind(py, kind, rd, &copies));
-                    }
-                    Outcome::Closed("audio") => {
-                        *a_guard = None;
-                        *v_guard = v_taken;
-                        *d_guard = d_taken;
-                    }
-                    Outcome::Closed("video") => {
-                        *a_guard = a_taken;
-                        *v_guard = None;
-                        *d_guard = d_taken;
-                    }
-                    Outcome::Closed("data") => {
-                        *a_guard = a_taken;
-                        *v_guard = v_taken;
-                        *d_guard = None;
-                    }
-                    Outcome::Closed(_) => unreachable!(),
-                }
+    /// Try to take the next output without waiting; see `recv_event`.
+    fn try_recv_event(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        for (kind, rx) in [("audio", &self.audio_rx), ("video", &self.video_rx), ("data", &self.data_rx)] {
+            let Ok(mut guard) = rx.try_lock() else { continue };
+            if let Some(Ok(out)) = guard.as_mut().map(|rx| rx.try_recv()) {
+                return pack_event(py, kind, out, &self.input_copies.session);
             }
-        })
+        }
+        Ok(py.None())
     }
 
     /// Non-blocking peek on audio. Returns the next frame, or `None` if
@@ -313,13 +256,21 @@ impl PyStreamingSession {
         let audio = Arc::clone(&self.audio_rx);
         let video = Arc::clone(&self.video_rx);
         let data = Arc::clone(&self.data_rx);
+        let membership = Arc::clone(&self.membership);
         future_into_py(py, async move {
-            *input_sender.lock().await = None;
+            // A participant leaves its shared session: its per-participant
+            // node instances drain and stop.
+            if let Some(InputSender::Participant(participant)) = input_sender.lock().await.take() {
+                let _ = participant.leave().await;
+            }
             *audio.lock().await = None;
             *video.lock().await = None;
             *data.lock().await = None;
             if let Some(mut h) = handle.lock().await.take() {
                 let _ = h.close().await;
+            }
+            if let Some(membership) = membership.lock().await.take() {
+                membership.leave().await;
             }
             Python::attach(|py| Ok(py.None()))
         })
@@ -338,6 +289,105 @@ impl PyStreamingSession {
 
     fn __repr__(&self) -> String {
         format!("PyStreamingSession(session_id='{}')", self.session_id)
+    }
+}
+
+impl PyStreamingSession {
+    /// Await the next output across all kinds: `(kind, data)` or, with
+    /// `attributed`, the `recv_event` dict.
+    fn next_output<'py>(&self, py: Python<'py>, attributed: bool) -> PyResult<Bound<'py, PyAny>> {
+        let audio = Arc::clone(&self.audio_rx);
+        let video = Arc::clone(&self.video_rx);
+        let data = Arc::clone(&self.data_rx);
+        let copies = self.input_copies.session.clone();
+        future_into_py(py, async move {
+            loop {
+                let mut a_guard = audio.lock().await;
+                let mut v_guard = video.lock().await;
+                let mut d_guard = data.lock().await;
+
+                // Move receivers out for the select; put back after.
+                let mut a_taken = a_guard.take();
+                let mut v_taken = v_guard.take();
+                let mut d_taken = d_guard.take();
+
+                let a_active = a_taken.is_some();
+                let v_active = v_taken.is_some();
+                let d_active = d_taken.is_some();
+                if !a_active && !v_active && !d_active {
+                    return Python::attach(|py| Ok(py.None()));
+                }
+
+                let outcome: Outcome = {
+                    let a_fut = async {
+                        match a_taken.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    let v_fut = async {
+                        match v_taken.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    let d_fut = async {
+                        match d_taken.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::pin!(a_fut, v_fut, d_fut);
+                    tokio::select! {
+                        biased;
+                        v = &mut a_fut, if a_active => match v {
+                            Some(rd) => Outcome::Got("audio", rd),
+                            None => Outcome::Closed("audio"),
+                        },
+                        v = &mut v_fut, if v_active => match v {
+                            Some(rd) => Outcome::Got("video", rd),
+                            None => Outcome::Closed("video"),
+                        },
+                        v = &mut d_fut, if d_active => match v {
+                            Some(rd) => Outcome::Got("data", rd),
+                            None => Outcome::Closed("data"),
+                        },
+                    }
+                };
+
+                // Restore receivers. Drop any that closed.
+                match outcome {
+                    Outcome::Got(kind, out) => {
+                        *a_guard = a_taken;
+                        *v_guard = v_taken;
+                        *d_guard = d_taken;
+                        return Python::attach(|py| {
+                            if attributed {
+                                pack_event(py, kind, out, &copies)
+                            } else {
+                                pack_kind(py, kind, out.data, &copies)
+                            }
+                        });
+                    }
+                    Outcome::Closed("audio") => {
+                        *a_guard = None;
+                        *v_guard = v_taken;
+                        *d_guard = d_taken;
+                    }
+                    Outcome::Closed("video") => {
+                        *a_guard = a_taken;
+                        *v_guard = None;
+                        *d_guard = d_taken;
+                    }
+                    Outcome::Closed("data") => {
+                        *a_guard = a_taken;
+                        *v_guard = v_taken;
+                        *d_guard = None;
+                    }
+                    Outcome::Closed(_) => unreachable!(),
+                }
+            }
+        })
     }
 }
 
@@ -389,6 +439,27 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot, copies: &CopyContext) -> PyRe
             Ok(py.None())
         }
     }
+}
+
+/// `{"kind", "data", "participant"}` for one output.
+fn pack_event(py: Python<'_>, kind: &str, out: TransportData, copies: &CopyContext) -> PyResult<Py<PyAny>> {
+    let event = pyo3::types::PyDict::new(py);
+    event.set_item("kind", kind)?;
+    event.set_item(
+        "data",
+        runtime_data_to_python_with_context(py, &out.data.into_shared(), copies)?,
+    )?;
+    match crate::shared_sessions::participant_fields(&out.metadata) {
+        Some(fields) => {
+            let who = pyo3::types::PyDict::new(py);
+            for (field, value) in fields {
+                who.set_item(field, value)?;
+            }
+            event.set_item("participant", who)?;
+        }
+        None => event.set_item("participant", py.None())?,
+    }
+    Ok(event.into_any().unbind())
 }
 
 fn pack_kind(
@@ -460,11 +531,11 @@ pub fn create_streaming_session(
 
 /// Create or join a shared streaming session for a participant.
 ///
-/// `shared_session_key` is the logical room/conversation key. Calls with the
-/// same key and executor share one core pipeline session; this FFI constructor
-/// creates an executor scoped to the returned Python object, so share the
-/// returned session object in-process when multiple Python tasks should attach
-/// to the same runtime instance.
+/// `shared_session_key` is the logical room/conversation key. Calls in one
+/// process with the same key (and the same `pipeline_buffers`) join one
+/// pipeline session, each as its own participant; `recv_event()` reports which
+/// participant produced each output. `close()` leaves the session; the last
+/// handle to close shuts it down.
 #[pyfunction]
 #[pyo3(signature = (
     manifest_json,
@@ -496,12 +567,13 @@ pub fn create_shared_streaming_session(
         .transpose()?
         .unwrap_or_default();
     future_into_py(py, async move {
-        let executor = PipelineExecutor::with_config(config)
+        // One executor per configuration for the whole process, so the same
+        // key really is the same session.
+        let executor = crate::shared_sessions::shared_executor(config)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create executor: {}", e)))?;
         for factory in crate::plugins::collect_registered_factories() {
             executor.register_factory(factory).await;
         }
-        let executor = Arc::new(executor);
         let sess = build_shared_session(
             executor,
             manifest_json,
@@ -548,6 +620,7 @@ pub(crate) async fn build_session(
         video_rx: Arc::new(Mutex::new(Some(receivers.video_rx))),
         data_rx: Arc::new(Mutex::new(Some(receivers.data_rx))),
         handle: Arc::new(Mutex::new(Some(handle))),
+        membership: Arc::new(Mutex::new(None)),
         _executor: executor,
     })
 }
@@ -584,6 +657,7 @@ pub(crate) async fn build_shared_session(
     }
     let participant = shared.participant_handle(participant);
     let receivers = bridge_shared_outputs(shared.subscribe_outputs());
+    let membership = crate::shared_sessions::SharedMembership::join(Arc::clone(&shared));
 
     Ok(PyStreamingSession {
         output_allocator: shared.output_allocator().await,
@@ -595,6 +669,7 @@ pub(crate) async fn build_shared_session(
         video_rx: Arc::new(Mutex::new(Some(receivers.1))),
         data_rx: Arc::new(Mutex::new(Some(receivers.2))),
         handle: Arc::new(Mutex::new(None)),
+        membership: Arc::new(Mutex::new(Some(membership))),
         _executor: executor,
     })
 }
