@@ -29,6 +29,10 @@ static GLOBAL_REGISTRY: OnceLock<Arc<ChannelRegistry>> = OnceLock::new();
 /// Matches the global iceoryx2 config: publish_subscribe.max_slice_len = 1048576
 const MAX_SLICE_LEN: usize = 1 * 1024 * 1024;
 
+/// Subscriber ports a channel accepts. See `ChannelRegistry::create_channel`.
+#[cfg(feature = "multiprocess")]
+const CHANNEL_MAX_SUBSCRIBERS: usize = 2;
+
 /// Channel statistics
 #[derive(Debug, Default, Clone)]
 pub struct ChannelStats {
@@ -294,7 +298,13 @@ impl ChannelRegistry {
             .service_builder(&service_name)
             .publish_subscribe::<[u8]>()
             .max_publishers(10)
-            .max_subscribers(10)
+            // One peer reads each channel; the second slot covers a restarted
+            // peer while its predecessor's port is still registered.
+            // iceoryx2 sizes every publisher's data segment for
+            // `max_subscribers * (buffer + 2) + history` samples, and Windows
+            // commits that shared memory up front: with 10 subscribers, a
+            // capacity of 1000 and 512 KiB slices one channel reserved 5.4 GB.
+            .max_subscribers(CHANNEL_MAX_SUBSCRIBERS)
             .history_size(capacity)
             .subscriber_max_buffer_size(capacity)
             .open_or_create()
