@@ -33,6 +33,22 @@ const MAX_SLICE_LEN: usize = 1 * 1024 * 1024;
 #[cfg(feature = "multiprocess")]
 const INITIAL_SLICE_LEN: usize = 16 * 1024;
 
+#[cfg(feature = "multiprocess")]
+type WakeEventFactory = iceoryx2::service::port_factory::event::PortFactory<ipc::Service>;
+
+/// Port that signals a channel's reader that a message was published.
+#[cfg(feature = "multiprocess")]
+pub type WakeNotifier = iceoryx2::port::notifier::Notifier<ipc::Service>;
+
+/// Port a channel's reader blocks on until the writer signals.
+#[cfg(feature = "multiprocess")]
+pub type WakeListener = iceoryx2::port::listener::Listener<ipc::Service>;
+
+/// Name of the event service that accompanies a channel.
+pub fn wake_event_name(channel_name: &str) -> String {
+    format!("{channel_name}_event")
+}
+
 /// Subscriber ports a channel accepts. See `ChannelRegistry::create_channel`.
 #[cfg(feature = "multiprocess")]
 const CHANNEL_MAX_SUBSCRIBERS: usize = 2;
@@ -74,6 +90,11 @@ pub struct ChannelRegistry {
     #[cfg(feature = "multiprocess")]
     /// Active services (must be kept alive or they get dropped/deleted)
     services: Arc<RwLock<HashMap<String, PortFactory<ipc::Service, [u8], ()>>>>,
+
+    #[cfg(feature = "multiprocess")]
+    /// Wake-event services, keyed by the channel they belong to. See
+    /// [`ChannelRegistry::create_wake_event`].
+    wake_events: Arc<RwLock<HashMap<String, WakeEventFactory>>>,
 }
 
 impl ChannelRegistry {
@@ -95,6 +116,7 @@ impl ChannelRegistry {
                                 node: Some(node),
                                 channels: Arc::new(RwLock::new(HashMap::new())),
                                 services: Arc::new(RwLock::new(HashMap::new())),
+                                wake_events: Arc::new(RwLock::new(HashMap::new())),
                             })
                         }
                         Err(e) => {
@@ -104,6 +126,7 @@ impl ChannelRegistry {
                                 node: None,
                                 channels: Arc::new(RwLock::new(HashMap::new())),
                                 services: Arc::new(RwLock::new(HashMap::new())),
+                                wake_events: Arc::new(RwLock::new(HashMap::new())),
                             })
                         }
                     }
@@ -126,6 +149,8 @@ impl ChannelRegistry {
             channels: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "multiprocess")]
             services: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "multiprocess")]
+            wake_events: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -337,6 +362,63 @@ impl ChannelRegistry {
         Ok(handle)
     }
 
+    /// Create the wake event of an existing channel.
+    ///
+    /// A channel's writer notifies it after each publish and the reader
+    /// blocks on it, so neither side polls. Notifications latch: one that
+    /// arrives before the reader starts waiting is delivered when it does.
+    #[cfg(feature = "multiprocess")]
+    pub async fn create_wake_event(&self, channel_name: &str) -> Result<()> {
+        let node = self
+            .node
+            .as_ref()
+            .ok_or_else(|| Error::IpcError("Node not initialized".to_string()))?;
+        let name = wake_event_name(channel_name);
+        let service_name = ServiceName::new(&name)
+            .map_err(|e| Error::IpcError(format!("Invalid event service name: {:?}", e)))?;
+        let service = node
+            .service_builder(&service_name)
+            .event()
+            // The writer, plus a restarted peer whose old port is still registered.
+            .max_notifiers(4)
+            .max_listeners(2)
+            .open_or_create()
+            .map_err(|e| Error::IpcError(format!("Failed to create wake event: {:?}", e)))?;
+        self.wake_events
+            .write()
+            .await
+            .insert(channel_name.to_string(), service);
+        Ok(())
+    }
+
+    /// Create the port that wakes `channel_name`'s reader. The port is not
+    /// `Send`: create it on the thread that publishes.
+    #[cfg(feature = "multiprocess")]
+    pub async fn create_wake_notifier(&self, channel_name: &str) -> Result<WakeNotifier> {
+        let events = self.wake_events.read().await;
+        let service = events.get(channel_name).ok_or_else(|| {
+            Error::IpcError(format!("Wake event not found for channel: {}", channel_name))
+        })?;
+        service
+            .notifier_builder()
+            .create()
+            .map_err(|e| Error::IpcError(format!("Failed to create wake notifier: {:?}", e)))
+    }
+
+    /// Create the port `channel_name`'s reader blocks on. The port is not
+    /// `Send`: create it on the thread that waits.
+    #[cfg(feature = "multiprocess")]
+    pub async fn create_wake_listener(&self, channel_name: &str) -> Result<WakeListener> {
+        let events = self.wake_events.read().await;
+        let service = events.get(channel_name).ok_or_else(|| {
+            Error::IpcError(format!("Wake event not found for channel: {}", channel_name))
+        })?;
+        service
+            .listener_builder()
+            .create()
+            .map_err(|e| Error::IpcError(format!("Failed to create wake listener: {:?}", e)))
+    }
+
     /// Destroy a channel and cleanup resources
     ///
     /// This method:
@@ -356,6 +438,7 @@ impl ChannelRegistry {
                 // Service is dropped here, which triggers iceoryx2 cleanup
             }
         }
+        self.wake_events.write().await.remove(&channel_name);
 
         // Then remove the channel handle
         let mut channels = self.channels.write().await;

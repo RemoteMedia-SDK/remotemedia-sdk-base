@@ -75,6 +75,84 @@ fn global_sessions(
 }
 
 /// Commands sent to the dedicated IPC thread
+/// How often the wake thread polls on the node's behalf until the node has
+/// signalled once. A node that never signals is served at this interval.
+#[cfg(feature = "multiprocess")]
+const WAKE_FALLBACK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How often the wake thread checks for shutdown once the node signals.
+#[cfg(feature = "multiprocess")]
+const WAKE_IDLE_CHECK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Block on a node's output wake event and turn each signal into
+/// `IpcCommand::Wake` for the node's IPC thread.
+///
+/// The listener is not `Send`, so it lives on this thread. Returns `None`
+/// when the listener cannot be created; the IPC thread then keeps polling.
+#[cfg(feature = "multiprocess")]
+fn spawn_wake_thread(
+    registry: Arc<ChannelRegistry>,
+    output_channel: String,
+    node_id: String,
+    wake_tx: tokio::sync::mpsc::WeakSender<IpcCommand>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    use std::sync::atomic::Ordering;
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+    let thread = std::thread::Builder::new()
+        .name(format!("ipc-wake-{node_id}"))
+        .spawn(move || {
+            let listener = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|rt| {
+                    rt.block_on(registry.create_wake_listener(&output_channel))
+                        .map_err(|e| e.to_string())
+                });
+            let listener = match listener {
+                Ok(listener) => listener,
+                Err(e) => {
+                    tracing::debug!("No output wake listener for node {node_id}: {e}");
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+            };
+            let _ = ready_tx.send(true);
+            let mut signalled = false;
+            while !stop.load(Ordering::Acquire) {
+                let interval = if signalled {
+                    WAKE_IDLE_CHECK
+                } else {
+                    WAKE_FALLBACK_POLL
+                };
+                match listener.timed_wait(|_| {}, interval) {
+                    Ok(events) => signalled |= events > 0,
+                    Err(e) => {
+                        tracing::warn!("Wake wait failed for node {node_id}: {e:?}");
+                        std::thread::sleep(interval);
+                    }
+                }
+                // A timeout wakes the IPC thread too: it is the poll for a
+                // node that does not signal, and harmless otherwise.
+                let Some(tx) = wake_tx.upgrade() else { break };
+                if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+                    tx.try_send(IpcCommand::Wake)
+                {
+                    break;
+                }
+            }
+        })
+        .ok()?;
+    match ready_rx.recv() {
+        Ok(true) => Some(thread),
+        _ => {
+            let _ = thread.join();
+            None
+        }
+    }
+}
+
 #[cfg(feature = "multiprocess")]
 enum IpcCommand {
     /// Send data to the node's input channel (serialized Python wire bytes)
@@ -95,6 +173,9 @@ enum IpcCommand {
         callback_tx: tokio::sync::mpsc::Sender<SharedBytes>,
         copies: CopyContext,
     },
+    /// The node published an output or control message (or the fallback
+    /// interval elapsed): poll the subscribers. Sent by the wake thread.
+    Wake,
     /// Request graceful shutdown of the IPC thread
     Shutdown,
 }
@@ -2149,6 +2230,8 @@ sys.stdout.flush()
     ) -> Result<NodeIpcThread> {
         // Create channels for async <-> thread communication
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<IpcCommand>(100);
+        // The wake thread must not keep the command channel open on its own.
+        let wake_tx = cmd_tx.downgrade();
         let (resp_tx, resp_rx) = tokio::sync::mpsc::channel::<IpcResponse>(100);
 
         let registry = self.channel_registry.clone();
@@ -2225,6 +2308,35 @@ sys.stdout.flush()
                 node_id_clone
             );
 
+            // Event-driven wake. Without it this thread spins and the node
+            // polls. `input_wake` signals the node after each publish; the wake
+            // thread turns the node's signals into `IpcCommand::Wake`, so this
+            // thread can block on its command channel while idle.
+            let input_wake = rt.block_on(registry.create_wake_notifier(&input_ch)).ok();
+            let stop_wake = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let wake_thread = input_wake.as_ref().and_then(|_| {
+                spawn_wake_thread(
+                    registry.clone(),
+                    output_ch.clone(),
+                    node_id_clone.clone(),
+                    wake_tx,
+                    stop_wake.clone(),
+                )
+            });
+            let event_driven = wake_thread.is_some();
+            if !event_driven {
+                tracing::debug!("IPC thread for node {} polls (no wake events)", node_id_clone);
+            }
+            let notify_node = |what: &str| {
+                if let Some(notifier) = &input_wake {
+                    if let Err(e) = notifier.notify() {
+                        tracing::trace!("wake after {what} failed: {e:?}");
+                    }
+                }
+            };
+            // A command taken while blocked, handled on the next iteration.
+            let mut pending: Option<IpcCommand> = None;
+
             // Optional bounded callback for continuous output forwarding.
             // Uses blocking_send from this sync OS thread so a full queue
             // naturally stalls the iceoryx2 subscriber loop below.
@@ -2236,7 +2348,11 @@ sys.stdout.flush()
             // Main loop: process commands using persistent publishers/subscribers
             loop {
                 // Check for commands (non-blocking poll)
-                match cmd_rx.try_recv() {
+                let next = match pending.take() {
+                    Some(command) => Ok(command),
+                    None => cmd_rx.try_recv(),
+                };
+                match next {
                     Ok(IpcCommand::SendData { bytes, copies }) => {
                         // Per-frame hot path: keep tracing at trace!/debug! to avoid
                         // allocating a format-args record per audio frame. Use
@@ -2250,6 +2366,7 @@ sys.stdout.flush()
 
                         match publisher.send_with_copy_context(&bytes, &copies) {
                             Ok(_) => {
+                                notify_node("input");
                                 tracing::trace!(
                                     "[IPC Thread] Node '{}': Successfully published data to iceoryx2",
                                     node_id_clone
@@ -2277,14 +2394,17 @@ sys.stdout.flush()
                         // to ensure we capture all output from streaming nodes
                     }
                     Ok(IpcCommand::SendDataNoAck { bytes }) => {
-                        if let Err(e) = publisher.send(&bytes) {
-                            tracing::warn!(
+                        match publisher.send(&bytes) {
+                            Ok(_) => notify_node("out-of-band input"),
+                            Err(e) => tracing::warn!(
                                 "[IPC Thread] Node '{}': out-of-band publish failed: {}",
                                 node_id_clone,
                                 e
-                            );
+                            ),
                         }
                     }
+                    // Nothing to do here: the next iteration polls the subscribers.
+                    Ok(IpcCommand::Wake) => {}
                     Ok(IpcCommand::RegisterOutputCallback {
                         callback_tx,
                         copies,
@@ -2337,8 +2457,22 @@ sys.stdout.flush()
                             Ok(Some(output_data)) => {
                                 deliver_ipc_output(output_data, &mut output_callback, &resp_tx);
                             }
+                            Ok(None) if event_driven => {
+                                // Idle: block until a command arrives or the
+                                // wake thread reports that the node published.
+                                match cmd_rx.blocking_recv() {
+                                    Some(command) => pending = Some(command),
+                                    None => {
+                                        tracing::debug!(
+                                            "Command channel closed for node: {}",
+                                            node_id_clone
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
                             Ok(None) => {
-                                // No data, yield to scheduler (avoids 100% CPU but minimal latency)
+                                // No wake events: yield to the scheduler and poll again.
                                 std::thread::yield_now();
                             }
                             Err(e) => {
@@ -2353,6 +2487,10 @@ sys.stdout.flush()
                 }
             }
 
+            stop_wake.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = wake_thread {
+                let _ = thread.join();
+            }
             tracing::debug!("IPC thread exited for node: {}", node_id_clone);
         });
 
@@ -2709,6 +2847,21 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                     false, // No backpressure for control
                 )
                 .await?;
+
+            // Wake events, so neither side polls: the host signals the input
+            // event after publishing an input, and the node signals the output
+            // event after publishing an output or a control message. A side
+            // that cannot open them falls back to polling.
+            // `REMOTEMEDIA_IPC_WAKE_EVENTS=0` turns them off (both sides poll).
+            let wake_events = std::env::var("REMOTEMEDIA_IPC_WAKE_EVENTS").map_or(true, |v| v != "0");
+            for channel in [&input_channel_name, &output_channel_name] {
+                if !wake_events {
+                    break;
+                }
+                if let Err(e) = self.channel_registry.create_wake_event(channel).await {
+                    tracing::warn!("No wake event for {channel}; that side will poll: {e}");
+                }
+            }
 
             tracing::debug!(
                 "Pre-created IPC channels for node {}: {}, {}, {}",
