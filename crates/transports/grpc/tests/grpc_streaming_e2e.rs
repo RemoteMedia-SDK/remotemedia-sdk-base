@@ -188,6 +188,8 @@ async fn test_grpc_streaming_video_pipeline() {
             output_taps: Vec::new(),
             embedded_plugins: Vec::new(),
             embedded_python_env: None,
+            shared_session_key: String::new(),
+            participant: None,
         })),
     };
 
@@ -400,6 +402,8 @@ async fn test_grpc_streaming_multiple_sessions() {
                     output_taps: Vec::new(),
                     embedded_plugins: Vec::new(),
                     embedded_python_env: None,
+                    shared_session_key: String::new(),
+                    participant: None,
                 })),
             })
             .await
@@ -465,6 +469,8 @@ async fn test_grpc_streaming_multiple_sessions() {
                     output_taps: Vec::new(),
                     embedded_plugins: Vec::new(),
                     embedded_python_env: None,
+                    shared_session_key: String::new(),
+                    participant: None,
                 })),
             })
             .await

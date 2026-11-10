@@ -142,6 +142,10 @@ message Hello {
   // Optional: client-chosen identifier, echoed in every event for
   // multi-attach scenarios where the same client attaches more than once.
   string attach_id = 2;
+  // Optional: who this attach speaks for (openspec:
+  // add-multi-participant-sessions). Frames it publishes are stamped with
+  // these `participant.*` fields unless the frame's own metadata sets them.
+  ParticipantInfo participant = 3;
 }
 
 message Subscribe       { ControlAddress addr = 1; }

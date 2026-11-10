@@ -104,6 +104,7 @@ async fn open_attach(
         op: Some(PbOp::Hello(Hello {
             session_id: session_id.to_string(),
             attach_id: "test-attach".to_string(),
+            participant: None,
         })),
     })
     .await
@@ -177,6 +178,7 @@ async fn attach_reports_session_not_found_for_bogus_id() {
         op: Some(PbOp::Hello(Hello {
             session_id: "no-such-session".to_string(),
             attach_id: "x".to_string(),
+            participant: None,
         })),
     })
     .await

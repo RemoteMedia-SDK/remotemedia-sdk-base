@@ -747,3 +747,14 @@ message NodeResult {
   // Example: {"output_format": "f32", "channels": 2}
   string output_metadata = 4;
 }
+
+// Who a stream or frame belongs to in a multi-participant session (openspec:
+// add-multi-participant-sessions). Each field maps to a `participant.*`
+// metadata key (`participant.id`, `participant.role`, ...); empty means unset.
+message ParticipantInfo {
+  string id = 1;
+  string role = 2;
+  string track_id = 3;
+  string modality = 4;
+  string display_name = 5;
+}

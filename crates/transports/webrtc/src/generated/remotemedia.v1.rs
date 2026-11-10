@@ -565,6 +565,23 @@ pub struct NodeResult {
     #[prost(string, tag = "4")]
     pub output_metadata: ::prost::alloc::string::String,
 }
+/// Who a stream or frame belongs to in a multi-participant session (openspec:
+/// add-multi-participant-sessions). Each field maps to a `participant.*`
+/// metadata key (`participant.id`, `participant.role`, ...); empty means unset.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ParticipantInfo {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub track_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub modality: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub display_name: ::prost::alloc::string::String,
+}
 /// Audio sample encoding format
 #[allow(clippy::all)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -1051,6 +1068,11 @@ pub struct Hello {
     /// multi-attach scenarios where the same client attaches more than once.
     #[prost(string, tag = "2")]
     pub attach_id: ::prost::alloc::string::String,
+    /// Optional: who this attach speaks for (openspec:
+    /// add-multi-participant-sessions). Frames it publishes are stamped with
+    /// these `participant.*` fields unless the frame's own metadata sets them.
+    #[prost(message, optional, tag = "3")]
+    pub participant: ::core::option::Option<ParticipantInfo>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
