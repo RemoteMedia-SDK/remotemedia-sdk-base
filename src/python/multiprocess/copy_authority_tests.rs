@@ -35,7 +35,7 @@ fn counts(copies: &CopyContext, reason: CopyReason) -> remotemedia_types::CopyCo
 #[test]
 fn legacy_copy_protocol_retains_host_authority_and_failed_disconnect() {
     let copies = CopyContext::new(CopyPolicy::AllowCopies, "original");
-    let server = CopyAuthority::start(copies.clone(), "node", "session").unwrap();
+    let server = CopyAuthority::start_with_version(copies.clone(), "node", "session", 1).unwrap();
     let mut client = connect(&server);
     assert_eq!(
         request(
@@ -69,7 +69,7 @@ fn legacy_copy_protocol_retains_host_authority_and_failed_disconnect() {
 #[test]
 fn legacy_copy_protocol_rejects_strict_before_authorization_and_closes_cleanly() {
     let copies = CopyContext::new(CopyPolicy::RequireZeroCopy, "strict");
-    let server = CopyAuthority::start(copies.clone(), "node", "session").unwrap();
+    let server = CopyAuthority::start_with_version(copies.clone(), "node", "session", 1).unwrap();
     let mut client = connect(&server);
     assert_eq!(
         request(
@@ -98,7 +98,7 @@ fn legacy_copy_protocol_faults_preserve_unfinished_attempts() {
         (2, json!({"op":"fail","unexpected":true})),
     ] {
         let copies = CopyContext::new(CopyPolicy::AllowCopies, "fault");
-        let server = CopyAuthority::start(copies.clone(), "node", "session").unwrap();
+        let server = CopyAuthority::start_with_version(copies.clone(), "node", "session", 1).unwrap();
         let mut client = connect(&server);
         request(
             &mut client,
@@ -127,7 +127,7 @@ fn legacy_copy_protocol_faults_preserve_unfinished_attempts() {
 #[test]
 fn legacy_copy_protocol_authentication_and_frame_bounds_precede_ledger_access() {
     let copies = CopyContext::new(CopyPolicy::AllowCopies, "authenticated");
-    let server = CopyAuthority::start(copies.clone(), "node", "session").unwrap();
+    let server = CopyAuthority::start_with_version(copies.clone(), "node", "session", 1).unwrap();
     let mut imposter = TcpStream::connect(&server.bootstrap.address).unwrap();
     imposter
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -203,8 +203,12 @@ fn legacy_copy_python_hooks_report_to_real_host_context() {
                 );
             }
             "abandon" => {
+                // Version 2: the abandoned copy was never reported, so the host
+                // records one failed operation of unknown reason and size.
                 assert!(result.is_err());
-                assert_eq!((ingress.failed_requested_bytes, ingress.in_flight), (77, 0));
+                assert_eq!(ingress.in_flight, 0);
+                let unreported = counts(&copies, CopyReason::BorrowedInput);
+                assert_eq!((unreported.failed, unreported.in_flight), (1, 0));
             }
             "strict" => {
                 assert!(result.is_err());
@@ -282,6 +286,8 @@ async fn run_native_launcher(abort_reporting: bool) {
                 );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            // Version 2: the copy begun before the disconnect was never
+            // reported; the host records one failed operation of unknown size.
             let failed = counts(&copies, CopyReason::BorrowedInput);
             assert_eq!(
                 (
@@ -289,7 +295,7 @@ async fn run_native_launcher(abort_reporting: bool) {
                     failed.failed_requested_bytes,
                     failed.in_flight
                 ),
-                (1, 11, 0)
+                (1, 0, 0)
             );
             return Vec::new();
         }
@@ -320,6 +326,10 @@ async fn run_native_launcher(abort_reporting: bool) {
         let mut outputs = Vec::new();
         loop {
             while let Some(frame) = output.receive_bytes().unwrap() {
+                // The host's IPC thread does this in production.
+                if frame[0] == END_OF_INPUT {
+                    replay_end_of_input(&copies, &frame).unwrap();
+                }
                 outputs.push(frame);
             }
             if *process.status.read().await == ProcessStatus::Stopped {
@@ -333,6 +343,9 @@ async fn run_native_launcher(abort_reporting: bool) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         while let Some(frame) = output.receive_bytes().unwrap() {
+            if frame[0] == END_OF_INPUT {
+                replay_end_of_input(&copies, &frame).unwrap();
+            }
             outputs.push(frame);
         }
         assert_eq!(
@@ -377,5 +390,88 @@ async fn run_native_launcher(abort_reporting: bool) {
             }
         }
         Err(error) => std::panic::resume_unwind(error),
+    }
+}
+
+fn end_of_input(report: &[u8]) -> Vec<u8> {
+    let mut frame = vec![END_OF_INPUT];
+    frame.extend(7u16.to_le_bytes());
+    frame.extend(b"session");
+    frame.extend(42u64.to_le_bytes());
+    frame.extend((report.len() as u32).to_le_bytes());
+    frame.extend(report);
+    frame
+}
+
+#[test]
+fn copy_report_v2_close_replays_totals() {
+    let copies = CopyContext::new(CopyPolicy::AllowCopies, "v2");
+    let server = CopyAuthority::start(copies.clone(), "node", "session").unwrap();
+    assert_eq!(server.bootstrap().version, 2);
+    let mut client = connect(&server);
+    let reply = request(
+        &mut client,
+        1,
+        json!({"op":"close","totals":{"v":2,"reasons":[
+            ["borrowed_input",[3,30,1,5]],["private_ipc_ingress",[1,7,0,0]]]}}),
+    );
+    assert_eq!(reply, json!({"seq":1,"ok":true}));
+    server.finish().unwrap();
+    let sent = counts(&copies, CopyReason::BorrowedInput);
+    assert_eq!(
+        (sent.completed, sent.copied_bytes, sent.failed, sent.failed_requested_bytes, sent.in_flight),
+        (3, 30, 1, 5, 0)
+    );
+    assert_eq!(counts(&copies, CopyReason::PrivateIpcIngress).copied_bytes, 7);
+}
+
+#[test]
+fn copy_report_v2_accepts_only_close_and_records_unreported_loss() {
+    for action in [
+        json!({"op":"begin","reason":"borrowed_input","bytes":4}),
+        json!({"op":"close","totals":{"v":2,"reasons":[["vec_materialization",[1,1,0,0]]]}}),
+    ] {
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "v2");
+        let server = CopyAuthority::start(copies.clone(), "node", "session").unwrap();
+        let mut client = connect(&server);
+        write_frame(&mut client, &json!({"seq":1,"action":action})).unwrap();
+        assert!(read_frame::<Value>(&mut client).is_err(), "accepted {action}");
+        assert!(server.finish().is_err());
+        let lost = counts(&copies, CopyReason::BorrowedInput);
+        assert_eq!((lost.failed, lost.copied_bytes, lost.in_flight), (1, 0, 0));
+    }
+    // A worker that disconnects without closing loses its unreported copies.
+    let copies = CopyContext::new(CopyPolicy::AllowCopies, "v2");
+    let server = CopyAuthority::start(copies.clone(), "node", "session").unwrap();
+    drop(connect(&server));
+    assert!(server.finish().is_err());
+    assert_eq!(counts(&copies, CopyReason::BorrowedInput).failed, 1);
+}
+
+#[test]
+fn copy_report_v2_end_of_input_replays_or_rejects() {
+    let copies = CopyContext::new(CopyPolicy::AllowCopies, "v2");
+    replay_end_of_input(&copies, &end_of_input(b"")).unwrap();
+    assert!(copies.report().entries.iter().all(|(_, c)| c.completed == 0 && c.failed == 0));
+    replay_end_of_input(
+        &copies,
+        &end_of_input(br#"{"v":2,"reasons":[["portable_serialization",[2,24,0,0]]]}"#),
+    )
+    .unwrap();
+    let serialized = counts(&copies, CopyReason::PortableSerialization);
+    assert_eq!((serialized.completed, serialized.copied_bytes, serialized.in_flight), (2, 24, 0));
+
+    for malformed in [
+        end_of_input(br#"{"v":3,"reasons":[]}"#),
+        end_of_input(br#"{"v":2,"reasons":[["borrowed_input",[0,5,0,0]]]}"#),
+        end_of_input(br#"{"v":2,"reasons":[["borrowed_input",[1,1,0,0]],["borrowed_input",[1,1,0,0]]]}"#),
+        end_of_input(br#"{"v":2,"reasons":[["borrowed_input",[2000000,1,0,0]]]}"#),
+        end_of_input(b"not json"),
+        end_of_input(b"{}")[..20].to_vec(),
+    ] {
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "v2");
+        assert!(replay_end_of_input(&copies, &malformed).is_err());
+        let lost = counts(&copies, CopyReason::BorrowedInput);
+        assert_eq!((lost.failed, lost.completed, lost.in_flight), (1, 0, 0));
     }
 }

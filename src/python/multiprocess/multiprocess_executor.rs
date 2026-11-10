@@ -2462,6 +2462,25 @@ sys.stdout.flush()
                             initial_copies.as_ref().unwrap_or(&callback_copies),
                         ) {
                             Ok(Some(output_data)) => {
+                                // A version 2 worker reports its copies in its
+                                // end-of-input frame: account them before the
+                                // frame completes the turn.
+                                if let Some(copies) = &initial_copies {
+                                    if output_data.as_slice().first()
+                                        == Some(&super::copy_authority::END_OF_INPUT)
+                                    {
+                                        if let Err(error) = super::copy_authority::replay_end_of_input(
+                                            copies,
+                                            output_data.as_slice(),
+                                        ) {
+                                            tracing::error!(
+                                                "Copy report from node {} rejected: {}",
+                                                node_id_clone,
+                                                error
+                                            );
+                                        }
+                                    }
+                                }
                                 deliver_ipc_output(output_data, &mut output_callback, &resp_tx);
                             }
                             Ok(None) if event_driven => {
