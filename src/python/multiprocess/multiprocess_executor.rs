@@ -2314,7 +2314,14 @@ sys.stdout.flush()
             // thread can block on its command channel while idle.
             let input_wake = rt.block_on(registry.create_wake_notifier(&input_ch)).ok();
             let stop_wake = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let wake_thread = input_wake.as_ref().and_then(|_| {
+            // `REMOTEMEDIA_IPC_HOST_SPIN=1` keeps this thread spinning (one core
+            // per Python node) while the node still blocks on its input event.
+            // Measured on Windows, a spinning host thread makes the node's own
+            // model time faster and steadier (first audio about 126 ms against
+            // about 138 ms); why is not understood. Spinning only while a turn
+            // is in flight did not help.
+            let host_spin = std::env::var("REMOTEMEDIA_IPC_HOST_SPIN").is_ok_and(|v| v == "1");
+            let wake_thread = input_wake.as_ref().filter(|_| !host_spin).and_then(|_| {
                 spawn_wake_thread(
                     registry.clone(),
                     output_ch.clone(),
