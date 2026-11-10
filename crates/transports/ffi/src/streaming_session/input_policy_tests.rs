@@ -144,7 +144,7 @@ fn ffi_input_policy_compatibility_conversion_is_attributed_to_session() {
                 .recv()
                 .await
                 .unwrap();
-            assert!(matches!(output, RuntimeData::Binary(bytes) if &*bytes == [1, 2, 3, 4]));
+            assert!(matches!(output.data, RuntimeData::Binary(bytes) if &*bytes == [1, 2, 3, 4]));
             assert_eq!(counts(&copies).copied_bytes, 4);
             assert_eq!(counts(&copies).rejected_bytes, 4);
             finish(&session).await;
@@ -264,7 +264,7 @@ fn ffi_input_policy_shared_participants_use_one_authority_and_keep_owners() {
                     })
                     .await
                     .unwrap();
-                    if let RuntimeData::Binary(bytes) = output {
+                    if let RuntimeData::Binary(bytes) = output.data {
                         if bytes.len() == 5 {
                             break bytes;
                         }

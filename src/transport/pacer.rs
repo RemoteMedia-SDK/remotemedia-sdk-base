@@ -255,7 +255,7 @@ pub struct Pacer {
     node_id: String,
     node: Arc<dyn StreamingNode>,
     ctx: NodeRuntimeContext,
-    fan_tx: mpsc::Sender<RuntimeData>,
+    fan_tx: mpsc::Sender<crate::transport::origin::Routed>,
     source: Box<dyn TickSource>,
     on_miss: OnMiss,
     /// Optional perf aggregator. When set, every callback emit from
@@ -279,7 +279,7 @@ impl Pacer {
         node_id: impl Into<String>,
         node: Arc<dyn StreamingNode>,
         ctx: NodeRuntimeContext,
-        fan_tx: mpsc::Sender<RuntimeData>,
+        fan_tx: mpsc::Sender<crate::transport::origin::Routed>,
         source: Box<dyn TickSource>,
         on_miss: OnMiss,
     ) -> Self {
@@ -378,7 +378,11 @@ impl Pacer {
                     // emitted once at miss-detection time.
                     return Ok(());
                 }
-                crate::transport::output_delivery::send_output(&cb_fan_tx, &cb_node_id, out)?;
+                crate::transport::output_delivery::send_output(
+                    &cb_fan_tx,
+                    &cb_node_id,
+                    crate::transport::origin::Routed::unattributed(out),
+                )?;
                 // Perf instrumentation: record one output per
                 // emit, with latency measured from the start of
                 // this tick. Without this, paced nodes
@@ -579,7 +583,7 @@ mod tests {
         });
         let ctx = NodeRuntimeContext::for_test("sess-1", "tick");
 
-        let (fan_tx, mut fan_rx) = mpsc::channel::<RuntimeData>(16);
+        let (fan_tx, mut fan_rx) = mpsc::channel::<crate::transport::origin::Routed>(16);
 
         let mut ticks = std::collections::VecDeque::new();
         for i in 0..3 {
@@ -599,7 +603,7 @@ mod tests {
         // and the Pacer drops the fan_tx clone via run() returning.
         let mut frames = Vec::new();
         while let Some(out) = fan_rx.recv().await {
-            if let RuntimeData::Json(v) = out {
+            if let RuntimeData::Json(v) = out.data {
                 frames.push(v.get("frame_idx").and_then(|x| x.as_u64()).unwrap());
             }
         }
@@ -616,8 +620,10 @@ mod tests {
                 first_error: None,
             });
             let (tx, rx) = mpsc::channel(1);
-            tx.try_send(RuntimeData::Json(serde_json::json!("already full")))
-                .unwrap();
+            tx.try_send(crate::transport::origin::Routed::unattributed(RuntimeData::Json(
+                serde_json::json!("already full"),
+            )))
+            .unwrap();
             let _receiver = if closed {
                 drop(rx);
                 None
@@ -686,7 +692,10 @@ mod tests {
             .unwrap();
             if transient {
                 result.unwrap();
-                assert!(matches!(rx.recv().await, Some(RuntimeData::Json(_))));
+                assert!(matches!(
+                    rx.recv().await.map(|out| out.data),
+                    Some(RuntimeData::Json(_))
+                ));
             } else {
                 assert!(result.unwrap_err().to_string().contains(message));
             }

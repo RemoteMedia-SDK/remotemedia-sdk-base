@@ -17,7 +17,9 @@ async fn drains_every_buffered_kind_after_other_kinds_close() {
             let (tx, rx) = mpsc::channel(32);
             let bytes: remotemedia_types::SharedBytes = vec![1, 2, 3, 4].into();
             for _ in 0..32 {
-                tx.send(RuntimeData::Binary(bytes.clone())).await.unwrap();
+                tx.send(TransportData::new(RuntimeData::Binary(bytes.clone())))
+                    .await
+                    .unwrap();
             }
             drop(tx);
             let mut receivers = [None, None, None];
@@ -75,7 +77,7 @@ async fn waits_for_live_kind_and_preserves_cancelled_receive() {
             .await
             .is_err()
     );
-    tx.send(RuntimeData::Text("after cancellation".into()))
+    tx.send(TransportData::new(RuntimeData::Text("after cancellation".into())))
         .await
         .unwrap();
     drop(tx);

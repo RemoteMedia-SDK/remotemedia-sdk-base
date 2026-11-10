@@ -127,7 +127,7 @@ impl Drop for HttpSession {
 
 struct Drain {
     guard: Guard,
-    outputs: futures::stream::SelectAll<ReceiverStream<RuntimeData>>,
+    outputs: futures::stream::SelectAll<ReceiverStream<TransportData>>,
     errors: broadcast::Receiver<RuntimeData>,
 }
 
@@ -145,8 +145,9 @@ impl Drain {
                 error = failure(&mut self.errors) => break Err(error),
                 data = self.outputs.next() => {
                     let Some(data) = data else { break Ok(()); };
-                    let payload = data.bulk_payload_bytes();
-                    match codec::encode(&TransportData::new(data), payload, &copies) {
+                    // Metadata carries the producing participant (provenance).
+                    let payload = data.data.bulk_payload_bytes();
+                    match codec::encode(&data, payload, &copies) {
                         Ok(wire) => { let _ = output.send(Bytes::from(wire)); }
                         Err(error) => break Err(error),
                     }

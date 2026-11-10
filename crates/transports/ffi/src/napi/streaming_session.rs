@@ -57,7 +57,8 @@ use super::output_loans::NapiOutputAllocator;
 use super::pipeline::NapiRuntimeData;
 
 type InputSlot = Arc<Mutex<Option<SessionInputSender>>>;
-type RxSlot = Arc<Mutex<Option<mpsc::Receiver<RuntimeData>>>>;
+/// Session outputs; metadata carries the producing participant.
+type RxSlot = Arc<Mutex<Option<mpsc::Receiver<TransportData>>>>;
 type HandleSlot = Arc<Mutex<Option<SessionHandle>>>;
 
 /// A `{kind, data}` pair returned from `recvOutput()`.
@@ -206,19 +207,19 @@ impl NapiStreamingSession {
             let outcome: Outcome = {
                 let a_fut = async {
                     match a_taken.as_mut() {
-                        Some(rx) => rx.recv().await,
+                        Some(rx) => rx.recv().await.map(|out| out.data),
                         None => std::future::pending().await,
                     }
                 };
                 let v_fut = async {
                     match v_taken.as_mut() {
-                        Some(rx) => rx.recv().await,
+                        Some(rx) => rx.recv().await.map(|out| out.data),
                         None => std::future::pending().await,
                     }
                 };
                 let d_fut = async {
                     match d_taken.as_mut() {
-                        Some(rx) => rx.recv().await,
+                        Some(rx) => rx.recv().await.map(|out| out.data),
                         None => std::future::pending().await,
                     }
                 };
@@ -308,7 +309,7 @@ async fn recv_kind(
 ) -> Result<Option<NapiRuntimeData>> {
     let mut guard = rx_arc.lock().await;
     let result = match guard.as_mut() {
-        Some(rx) => rx.recv().await,
+        Some(rx) => rx.recv().await.map(|out| out.data),
         None => None,
     };
     if result.is_none() {

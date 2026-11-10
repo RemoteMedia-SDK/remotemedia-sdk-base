@@ -40,7 +40,8 @@ mod input_copies;
 use input_copies::InputCopies;
 
 type InputSlot = Arc<Mutex<Option<InputSender>>>;
-type RxSlot = Arc<Mutex<Option<mpsc::Receiver<RuntimeData>>>>;
+/// Session outputs; metadata carries the producing participant.
+type RxSlot = Arc<Mutex<Option<mpsc::Receiver<TransportData>>>>;
 type HandleSlot = Arc<Mutex<Option<SessionHandle>>>;
 
 #[cfg(test)]
@@ -218,19 +219,19 @@ impl PyStreamingSession {
                 let outcome: Outcome = {
                     let a_fut = async {
                         match a_taken.as_mut() {
-                            Some(rx) => rx.recv().await,
+                            Some(rx) => rx.recv().await.map(|out| out.data),
                             None => std::future::pending().await,
                         }
                     };
                     let v_fut = async {
                         match v_taken.as_mut() {
-                            Some(rx) => rx.recv().await,
+                            Some(rx) => rx.recv().await.map(|out| out.data),
                             None => std::future::pending().await,
                         }
                     };
                     let d_fut = async {
                         match d_taken.as_mut() {
-                            Some(rx) => rx.recv().await,
+                            Some(rx) => rx.recv().await.map(|out| out.data),
                             None => std::future::pending().await,
                         }
                     };
@@ -348,7 +349,7 @@ fn recv_kind_async(
     future_into_py(py, async move {
         let mut guard = rx_arc.lock().await;
         let result = match guard.as_mut() {
-            Some(rx) => rx.recv().await,
+            Some(rx) => rx.recv().await.map(|out| out.data),
             None => None,
         };
         if result.is_none() {
@@ -373,7 +374,7 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot, copies: &CopyContext) -> PyRe
     };
     use tokio::sync::mpsc::error::TryRecvError;
     let outcome = match guard.as_mut() {
-        Some(rx) => rx.try_recv(),
+        Some(rx) => rx.try_recv().map(|out| out.data),
         None => return Ok(py.None()),
     };
     match outcome {
@@ -601,9 +602,9 @@ pub(crate) async fn build_shared_session(
 fn bridge_shared_outputs(
     mut outputs: SharedPipelineOutputReceivers,
 ) -> (
-    mpsc::Receiver<RuntimeData>,
-    mpsc::Receiver<RuntimeData>,
-    mpsc::Receiver<RuntimeData>,
+    mpsc::Receiver<TransportData>,
+    mpsc::Receiver<TransportData>,
+    mpsc::Receiver<TransportData>,
 ) {
     let (audio_tx, audio_rx) = mpsc::channel(128);
     let (video_tx, video_rx) = mpsc::channel(128);
@@ -614,11 +615,11 @@ fn bridge_shared_outputs(
             let Ok(Some(output)) = outputs.recv_output().await else {
                 break;
             };
-            let runtime = output.data;
-            let result = match &runtime {
-                RuntimeData::Audio { .. } => audio_tx.send(runtime).await,
-                RuntimeData::Video { .. } => video_tx.send(runtime).await,
-                _ => data_tx.send(runtime).await,
+            // Keep the whole output: its metadata attributes it to a participant.
+            let result = match &output.data {
+                RuntimeData::Audio { .. } => audio_tx.send(output).await,
+                RuntimeData::Video { .. } => video_tx.send(output).await,
+                _ => data_tx.send(output).await,
             };
             if matches!(result, Err(mpsc::error::SendError(_))) {
                 break;

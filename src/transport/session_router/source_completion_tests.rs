@@ -89,7 +89,7 @@ struct Fixture {
     sources: Vec<Arc<FiniteSource>>,
     input: crate::transport::SessionPacketSender,
     shutdown: mpsc::Sender<()>,
-    outputs: mpsc::Receiver<RuntimeData>,
+    outputs: mpsc::Receiver<crate::transport::TransportData>,
     retained_outputs: Vec<remotemedia_types::SharedBytes>,
     running: JoinHandle<Result<()>>,
 }
@@ -167,6 +167,7 @@ impl Fixture {
                 .await
                 .unwrap()
                 .unwrap()
+                .data
         else {
             panic!("expected retained binary owner");
         };

@@ -1,5 +1,6 @@
 //! Admit owners before they enter a node's input/filter/control queues.
 use super::{RuntimeData, SessionControl};
+use crate::transport::origin::Routed;
 use crate::{
     telemetry::{approx_payload_bytes, EdgeCell, SessionTelemetry},
     Error, Result,
@@ -13,7 +14,7 @@ pub(super) fn channels<'a>(
     allocators: &HashMap<String, Arc<remotemedia_types::BoundOutputAllocator>>,
 ) -> (
     HashMap<String, InputQueue>,
-    HashMap<String, mpsc::Receiver<RuntimeData>>,
+    HashMap<String, mpsc::Receiver<Routed>>,
 ) {
     let mut senders = HashMap::new();
     let mut receivers = HashMap::new();
@@ -37,7 +38,7 @@ pub(super) fn channels<'a>(
 
 #[derive(Clone)]
 pub(super) struct InputQueue {
-    pub(super) sender: mpsc::Sender<RuntimeData>,
+    pub(super) sender: mpsc::Sender<Routed>,
     pub(super) budget: Option<BufferBudget>,
     pub(super) node_id: String,
 }
@@ -45,7 +46,8 @@ pub(super) struct InputQueue {
 impl InputQueue {
     // Receipts survive dequeue, filtering, execution and downstream retention.
     // A cancelled send drops its receipt; it never waits for budget capacity.
-    async fn send_observed(&self, data: RuntimeData, edge: Option<&EdgeCell>) -> Result<bool> {
+    async fn send_observed(&self, routed: Routed, edge: Option<&EdgeCell>) -> Result<bool> {
+        let Routed { data, origin } = routed;
         let data = match &self.budget {
             Some(budget) => budget.admit(data).map_err(|error| {
                 Error::Execution(format!(
@@ -57,7 +59,7 @@ impl InputQueue {
             // input, which must never deep-copy legacy Vec audio.
             None => data.into_shared(),
         };
-        match self.sender.try_send(data) {
+        match self.sender.try_send(Routed::new(data, origin)) {
             Ok(()) => Ok(true),
             Err(mpsc::error::TrySendError::Closed(_)) => Ok(false),
             Err(mpsc::error::TrySendError::Full(data)) => {
@@ -71,12 +73,12 @@ impl InputQueue {
     /// fan-out destinations can still receive the frame, and release permits a retry.
     pub(super) async fn deliver(
         &self,
-        data: RuntimeData,
+        data: Routed,
         telemetry: &SessionTelemetry,
         edge_index: Option<usize>,
         control: Option<&SessionControl>,
     ) -> bool {
-        let bytes = approx_payload_bytes(&data);
+        let bytes = approx_payload_bytes(&data.data);
         let edge = edge_index.and_then(|index| telemetry.edge(index));
         let delivered = match self.send_observed(data, edge).await {
             Ok(delivered) => delivered,
@@ -104,7 +106,7 @@ impl InputQueue {
 
     #[cfg(test)]
     pub(super) async fn send(&self, data: RuntimeData) -> Result<bool> {
-        self.send_observed(data, None).await
+        self.send_observed(Routed::unattributed(data), None).await
     }
 }
 
@@ -135,7 +137,7 @@ mod tests {
     };
     use std::sync::Arc;
 
-    fn queue(owners: u64, bytes: u64) -> (InputQueue, mpsc::Receiver<RuntimeData>, BufferBudget) {
+    fn queue(owners: u64, bytes: u64) -> (InputQueue, mpsc::Receiver<Routed>, BufferBudget) {
         let (sender, receiver) = mpsc::channel(1);
         let budget = BufferBudget::new(owners, bytes);
         (
@@ -169,7 +171,7 @@ mod tests {
             metadata: None,
         };
         assert!(queue.send(audio).await.unwrap());
-        let RuntimeData::Audio { samples, .. } = receiver.recv().await.unwrap() else {
+        let RuntimeData::Audio { samples, .. } = receiver.recv().await.unwrap().data else {
             panic!("expected audio")
         };
         assert!(!matches!(samples, crate::data::AudioSamples::Vec(_)));
@@ -188,7 +190,7 @@ mod tests {
         let original = owner.as_ptr();
         assert!(queue.send(RuntimeData::Binary(owner)).await.unwrap());
         assert_eq!(budget.usage().owners, 1);
-        let RuntimeData::Binary(retained) = receiver.recv().await.unwrap() else {
+        let RuntimeData::Binary(retained) = receiver.recv().await.unwrap().data else {
             panic!()
         };
         assert_eq!(retained.as_ptr(), original);
@@ -227,8 +229,10 @@ mod tests {
             .send(RuntimeData::Binary(vec![1; 8].into()))
             .await
             .unwrap();
-        let mut pending =
-            Box::pin(queue.send_observed(RuntimeData::Binary(vec![2; 8].into()), Some(edge)));
+        let mut pending = Box::pin(queue.send_observed(
+            Routed::unattributed(RuntimeData::Binary(vec![2; 8].into())),
+            Some(edge),
+        ));
         assert!(matches!(
             futures::poll!(pending.as_mut()),
             std::task::Poll::Pending

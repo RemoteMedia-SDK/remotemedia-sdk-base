@@ -1,15 +1,11 @@
 //! Bounded ownership transfer from synchronous node callbacks to async fan-out.
-use crate::{data::RuntimeData, Error, Result};
+use crate::{Error, Result};
 use tokio::sync::mpsc::{error::TrySendError, Sender};
 
 /// Success means the queue owns the output. Never acknowledge a discarded frame.
 /// Current-thread runtimes cannot block a synchronous callback waiting for their
 /// own consumer; a full queue there is an explicit execution error.
-pub(super) fn send_output(
-    sender: &Sender<RuntimeData>,
-    node: &str,
-    output: RuntimeData,
-) -> Result<()> {
+pub(super) fn send_output<T>(sender: &Sender<T>, node: &str, output: T) -> Result<()> {
     let output = match sender.try_send(output) {
         Ok(()) => return Ok(()),
         Err(TrySendError::Full(output)) => output,
