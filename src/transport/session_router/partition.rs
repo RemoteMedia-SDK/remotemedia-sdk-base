@@ -142,6 +142,7 @@ impl Dispatcher {
                 event = self.lifecycle.recv() => match event {
                     Ok(ParticipantEvent::Left(id)) => {
                         if instances.remove(&id).is_some() {
+                            self.telemetry.set_instances(self.node_index, instances.len());
                             tracing::info!(
                                 session_id = %self.session_id,
                                 node_id = %self.node_id,
@@ -161,6 +162,7 @@ impl Dispatcher {
         }
         // Closing the instance queues lets each instance drain and stop.
         drop(instances);
+        self.telemetry.set_instances(self.node_index, 0);
         let mut failures = Vec::new();
         for (label, task) in tasks {
             match task.await {
@@ -210,11 +212,13 @@ impl Dispatcher {
             }
             let instance = self.open(&key, tasks, created);
             instances.insert(key.clone(), instance);
+            self.telemetry.set_instances(self.node_index, instances.len());
         }
         let tx = instances[&key].tx.clone();
         if tx.send(frame).await.is_err() {
             // The instance failed to start or stopped; its error was reported.
             instances.remove(&key);
+            self.telemetry.set_instances(self.node_index, instances.len());
         }
     }
 

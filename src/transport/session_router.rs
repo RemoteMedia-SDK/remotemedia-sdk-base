@@ -1232,6 +1232,15 @@ impl SessionRouter {
             })
             .collect();
         self.descriptor.set_pacing(&pacing);
+        let scopes: HashMap<String, String> = self
+            .cached_nodes
+            .iter()
+            .map(|(id, node)| {
+                let spec = self.manifest.nodes.iter().find(|n| &n.id == id);
+                (id.clone(), self.instance_scope(spec, node.as_ref()).as_str().to_string())
+            })
+            .collect();
+        self.descriptor.set_instance_scopes(&scopes);
         if let Some(ctrl) = &self.control {
             ctrl.set_descriptor(Arc::new(self.descriptor.clone()));
         }

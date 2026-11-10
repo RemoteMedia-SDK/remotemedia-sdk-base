@@ -139,6 +139,10 @@ pub struct NodeTelemetry {
     pub last_error: Option<ErrorInfo>,
     /// Turns re-issued to an LLM fallback provider (cumulative).
     pub llm_fallbacks: u64,
+    /// Live per-participant instances of the node (openspec:
+    /// add-multi-participant-sessions); absent for shared nodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instances: Option<u32>,
     /// Log records the node produced, per level (when the host captures
     /// node logs; see `telemetry::node_logs`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +168,7 @@ impl Default for NodeTelemetry {
             circuit_open: false,
             last_error: None,
             llm_fallbacks: 0,
+            instances: None,
             logs: None,
         }
     }

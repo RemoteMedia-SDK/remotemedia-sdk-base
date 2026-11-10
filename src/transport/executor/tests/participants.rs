@@ -408,3 +408,56 @@ fn built_in_stateful_audio_nodes_run_per_participant() {
         .unwrap();
     assert_eq!(node.instance_scope(), None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_descriptor_shows_scope_and_telemetry_counts_live_instances() {
+    let f = fixture().await;
+    let mut session = f
+        .executor
+        .create_session(manifest(
+            &[("count", "ParticipantCounter", None, None), ("echo", "PassThrough", None, None)],
+            &[("count", "echo")],
+        ))
+        .await
+        .unwrap();
+    let control = f.executor.control_bus().get(&session.session_id).expect("session control");
+    let descriptor = control.descriptor().expect("descriptor");
+    let scope = |id: &str| {
+        descriptor
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.instance_scope.clone())
+    };
+    assert_eq!(scope("count").as_deref(), Some("per_participant"));
+    assert_eq!(scope("echo").as_deref(), Some("shared"));
+
+    let telemetry = control.telemetry().expect("telemetry");
+    let instances = |id: &str| {
+        let snapshot = crate::telemetry::publisher::build_snapshot(
+            &telemetry,
+            &mut crate::telemetry::publisher::PublisherState::default(),
+            &std::collections::HashMap::new(),
+            false,
+            false,
+        );
+        snapshot.nodes.iter().find(|n| n.id == id).and_then(|n| n.instances)
+    };
+    assert_eq!(instances("count"), None, "no participant yet");
+
+    let alice = session.join_participant(user("alice")).unwrap();
+    let bob = session.join_participant(user("bob")).unwrap();
+    text(&alice, "a1").await;
+    text(&bob, "b1").await;
+    collect(&mut session, 2).await;
+    assert_eq!(instances("count"), Some(2));
+    assert_eq!(instances("echo"), None, "shared nodes report no instance count");
+
+    alice.leave().await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while instances("count") != Some(1) {
+        assert!(std::time::Instant::now() < deadline, "count stayed {:?}", instances("count"));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    session.close().await.unwrap();
+}

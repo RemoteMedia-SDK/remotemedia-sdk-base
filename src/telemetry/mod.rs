@@ -174,6 +174,8 @@ pub struct NodeCell {
     pub(crate) busy_us: AtomicU64,
     /// Turns this node re-issued to an LLM fallback provider.
     pub(crate) llm_fallbacks: AtomicU64,
+    /// Live per-participant instances; 0 for shared nodes.
+    pub(crate) instances: std::sync::atomic::AtomicU32,
     /// Microseconds since the telemetry epoch at which the in-flight
     /// dispatch started, **plus one** so that `0` means idle.
     pub(crate) in_flight_since_us: AtomicU64,
@@ -215,6 +217,7 @@ impl NodeCell {
             discarded: AtomicU64::new(0),
             busy_us: AtomicU64::new(0),
             llm_fallbacks: AtomicU64::new(0),
+            instances: std::sync::atomic::AtomicU32::new(0),
             in_flight_since_us: AtomicU64::new(0),
             last_error_at_us: AtomicU64::new(0),
             alive: AtomicBool::new(false),
@@ -562,6 +565,13 @@ impl SessionTelemetry {
             }
         }
         out
+    }
+
+    /// Set the number of live per-participant instances of node `idx`.
+    pub fn set_instances(&self, idx: usize, count: usize) {
+        if let Some(cell) = self.nodes.get(idx) {
+            cell.instances.store(count.min(u32::MAX as usize) as u32, Relaxed);
+        }
     }
 
     /// Count one LLM fallback on `node_id` (unknown ids are ignored).
