@@ -315,7 +315,7 @@ impl Pacer {
     /// Returns the `JoinHandle` so the caller can `.abort()` it on
     /// shutdown. The owner must join and propagate the returned node error.
     pub fn spawn(self) -> JoinHandle<Result<()>> {
-        tokio::spawn(self.run(None))
+        tokio::spawn(tracing::Instrument::in_current_span(self.run(None)))
     }
 
     /// Stop between ticks when the returned sender requests draining. An active
@@ -325,13 +325,13 @@ impl Pacer {
         mut shutdown: watch::Receiver<bool>,
     ) -> (JoinHandle<Result<()>>, watch::Sender<bool>) {
         let (stop, stopping) = watch::channel(false);
-        let handle = tokio::spawn(async move {
+        let handle = tokio::spawn(tracing::Instrument::in_current_span(async move {
             tokio::select! {
                 biased;
                 _ = shutdown.wait_for(|requested| *requested) => Ok(()),
                 result = self.run(Some(stopping)) => result,
             }
-        });
+        }));
         (handle, stop)
     }
 

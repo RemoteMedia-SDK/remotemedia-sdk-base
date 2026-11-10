@@ -12,8 +12,8 @@
 //! # Example
 //!
 //! ```
-//! use remotemedia_core::transport::{PipelineExecutor, TransportData};
-//! use remotemedia_core::data::RuntimeData;
+//! use remotemedia_sdk_base::transport::{PipelineExecutor, TransportData};
+//! use remotemedia_sdk_base::data::RuntimeData;
 //!
 //! let executor = PipelineExecutor::new().unwrap();
 //! let input = TransportData::new(RuntimeData::Text("hello".into()));
@@ -29,6 +29,8 @@ use std::sync::Arc;
 pub mod avatar_session;
 pub mod buffer_preflight;
 pub mod buffer_validation;
+mod call_routing;
+pub mod caps_handshake;
 pub mod cancel_gate;
 pub(crate) mod device_delivery;
 pub mod client;
@@ -37,6 +39,7 @@ pub mod data;
 pub mod embedded_python_env;
 mod ingress;
 pub use ingress::{IngressSendError, SessionPacketPermit, SessionPacketSender};
+pub mod endpoint;
 mod managed_ardy;
 #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
 mod mapped_placement;
@@ -61,8 +64,13 @@ pub mod executor;
 pub use cancel_gate::{CancelGate, ProtectGuard};
 pub use client::{ClientStreamSession, PipelineClient, TransportType};
 pub use control_transport::{
-    ControlTransport, InProcControlTransport, InterceptReplyHandle, InterceptRequest,
-    InterceptSession,
+    ControlTransport, EndpointHostSession, InProcControlTransport, InterceptReplyHandle,
+    InterceptRequest, InterceptSession,
+};
+pub use endpoint::{
+    CallOptions, CancelReason, EndpointCallError, EndpointCallStream, EndpointError, EndpointHost,
+    EndpointInfo, EndpointMethodInfo, EndpointPresence, EndpointReplier, EndpointSpec, HostEvent,
+    HostKind, IncomingCall,
 };
 pub use data::{Participant, TransportData};
 pub use executor::{

@@ -247,10 +247,72 @@ impl PythonStreamingNode {
     }
 }
 
+/// Text JSON aux frame carrying one endpoint-call reply chunk to a Python
+/// node: `{"__aux_port__":"__call_reply__","payload":{"corr_id",
+/// "args":[<CallReplyEnvelope>],"kwargs":{}}}` (typed-RPC ff request shape).
+pub(crate) fn call_reply_frame(request: &remotemedia_traits::rpc::RpcRequest) -> String {
+    serde_json::json!({
+        "__aux_port__": remotemedia_traits::call::CALL_REPLY_METHOD,
+        "payload": {
+            "corr_id": request.corr_id,
+            "args": request.args,
+            "kwargs": request.kwargs,
+        },
+    })
+    .to_string()
+}
+
 #[async_trait::async_trait]
 impl AsyncStreamingNode for PythonStreamingNode {
     fn node_type(&self) -> &str {
         &self.node_type
+    }
+
+    /// Only the runtime-delivered `__call_reply__` uses the native lane;
+    /// every other typed-RPC method keeps reaching the Python dispatcher
+    /// through the input path (call-reply-only lane).
+    fn rpc_methods(&self) -> Vec<remotemedia_traits::rpc::RpcMethod> {
+        vec![remotemedia_traits::call::call_reply_method()]
+    }
+
+    /// Forward a `__call_reply__` chunk to the Python process out of band
+    /// (no ack, no `EndOfInput`, does not contend with an in-flight
+    /// `process()` collector), so a node awaiting an endpoint reply inside
+    /// `process()` receives it.
+    async fn call_rpc(
+        &self,
+        request: remotemedia_traits::rpc::RpcRequest,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+        _replies: &mut remotemedia_traits::rpc::RpcResponder,
+    ) -> Result<(), Error> {
+        if request.method != remotemedia_traits::call::CALL_REPLY_METHOD {
+            return Err(Error::Execution(format!(
+                "unknown RPC method: {}",
+                request.method
+            )));
+        }
+        let session_id = Some(ctx.session_id())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| self.session_id.clone())
+            .ok_or_else(|| Error::Execution("no session for __call_reply__ delivery".into()))?;
+        let frame = RuntimeData::Text(call_reply_frame(&request));
+        #[cfg(feature = "multiprocess")]
+        {
+            crate::python::multiprocess::MultiprocessExecutor::send_out_of_band(
+                &session_id,
+                &self.node_id,
+                frame,
+            )
+            .await
+        }
+        #[cfg(not(feature = "multiprocess"))]
+        {
+            let _ = (session_id, frame);
+            Err(Error::Execution(
+                "__call_reply__ delivery requires the multiprocess feature".into(),
+            ))
+        }
     }
 
     async fn process_control_message(

@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use remotemedia_core::nodes::StreamingNodeRegistry;
+//! use remotemedia_sdk_base::nodes::StreamingNodeRegistry;
 //!
 //! let registry = StreamingNodeRegistry::builder()
 //!     // Start with all default nodes from registered providers

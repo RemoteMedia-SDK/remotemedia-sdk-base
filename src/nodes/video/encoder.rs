@@ -81,8 +81,8 @@ impl Default for VideoEncoderConfig {
 /// # Example
 ///
 /// ```
-/// use remotemedia_core::nodes::video::encoder::VideoEncoderConfig;
-/// use remotemedia_core::data::VideoCodec;
+/// use remotemedia_sdk_base::nodes::video::encoder::VideoEncoderConfig;
+/// use remotemedia_sdk_base::data::VideoCodec;
 ///
 /// let config = VideoEncoderConfig {
 ///     codec: VideoCodec::Vp8,

@@ -14,7 +14,7 @@
 //! The FileIngestPlugin is automatically registered with the global registry:
 //!
 //! ```ignore
-//! use remotemedia_core::ingestion::{global_ingest_registry, IngestConfig};
+//! use remotemedia_sdk_base::ingestion::{global_ingest_registry, IngestConfig};
 //!
 //! let config = IngestConfig::from_url("./test.wav");
 //! let source = global_ingest_registry().create_from_uri(&config)?;

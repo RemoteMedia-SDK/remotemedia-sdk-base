@@ -27,10 +27,13 @@ use crate::generated::session_lifecycle::Event as PbLifecycle;
 use crate::generated::{
     Attached, CloseReasonCode, ControlAddress as PbAddress, ControlDirection, ControlErrorCode,
     ControlEvent, ControlFrame, DescribeSessionRequest, DescribeSessionResponse, Empty,
-    ErrorEvent, InterceptRequest as PbInterceptRequest, ListSessionsRequest,
-    ListSessionsResponse, NodeState as PbNodeState, SessionClosed, SessionClosedInfo,
-    SessionLifecycle, SessionSummaryPb, TapEvent, WatchSessionsRequest,
+    EndpointCall as PbEndpointCall, EndpointCancelled as PbEndpointCancelled,
+    EndpointHosted as PbEndpointHosted, EndpointPresenceEvent as PbEndpointPresence,
+    EndpointReplyAck as PbEndpointReplyAck, ErrorEvent, InterceptRequest as PbInterceptRequest,
+    ListSessionsRequest, ListSessionsResponse, NodeState as PbNodeState, SessionClosed,
+    SessionClosedInfo, SessionLifecycle, SessionSummaryPb, TapEvent, WatchSessionsRequest,
 };
+use remotemedia_core::transport::endpoint::{EndpointReplier, EndpointSpec, HostEvent, HostKind};
 
 use remotemedia_core::telemetry::{TelemetryLevel, SCHEMA_VERSION as OBSERVER_SCHEMA_VERSION};
 use remotemedia_core::transport::session_control::{
@@ -63,11 +66,26 @@ pub struct ControlServiceImpl {
     /// (`authorization: Bearer <token>`). `None` = unauthenticated, which
     /// matches the historical behaviour of `Attach`.
     token: Option<Arc<str>>,
+    /// Whether attaches may host endpoints (a control operation). When a
+    /// bearer token is configured, every attach — and so every host —
+    /// must carry it.
+    allow_hosting: bool,
 }
 
 impl ControlServiceImpl {
     pub fn new(bus: Arc<SessionControlBus>) -> Self {
-        Self { bus, token: None }
+        Self {
+            bus,
+            token: None,
+            allow_hosting: true,
+        }
+    }
+
+    /// Allow or refuse `HostEndpoint` frames (refused ⇒ `forbidden`). Use
+    /// `false` for observe-only control servers.
+    pub fn with_endpoint_hosting(mut self, allow: bool) -> Self {
+        self.allow_hosting = allow;
+        self
     }
 
     /// Require `authorization: Bearer <token>` on every RPC.
@@ -85,7 +103,10 @@ impl ControlServiceImpl {
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
+            .and_then(|v| {
+                v.strip_prefix("Bearer ")
+                    .or_else(|| v.strip_prefix("bearer "))
+            });
         match got {
             Some(t) if t == expected.as_ref() => Ok(()),
             _ => Err(Status::unauthenticated("missing or invalid bearer token")),
@@ -116,6 +137,7 @@ fn summary_to_pb(s: SessionSummary) -> SessionSummaryPb {
         node_count: s.node_count,
         origin: s.origin.unwrap_or_default(),
         has_telemetry: s.has_telemetry,
+        agent_backed: s.agent_backed,
     }
 }
 
@@ -270,9 +292,12 @@ impl PipelineControl for ControlServiceImpl {
         .await;
 
         // Spawn the inbound-frame dispatch + outbound-event forwarding loop.
+        // Hosting requires an authorized attach: `check_auth` above already
+        // enforced the bearer token when one is configured.
         let bus = self.bus.clone();
+        let can_host = self.allow_hosting;
         tokio::spawn(async move {
-            run_attach_loop(ctrl, bus, session_id, in_stream, out_tx).await;
+            run_attach_loop(ctrl, bus, session_id, in_stream, out_tx, can_host).await;
         });
 
         let stream: EventStream = Box::pin(ReceiverStream::new(out_rx));
@@ -288,10 +313,17 @@ async fn run_attach_loop(
     session_id: String,
     mut in_stream: Streaming<ControlFrame>,
     out_tx: mpsc::Sender<Result<ControlEvent, Status>>,
+    can_host: bool,
 ) {
     // Watch for session-close. First fire ends this attach.
     let mut close_rx = ctrl.close_subscriber();
     let rpc_scope = RpcCallScope::default();
+    // Endpoints hosted by this attach; dropped (⇒ unregistered, pending
+    // calls fail with `responder_gone`) when the attach ends.
+    let mut hosted = HostedEndpoints {
+        can_host,
+        map: HashMap::new(),
+    };
 
     // Dedicated forwarder tasks for taps/intercepts. We hold their
     // JoinHandles so we can abort on shutdown / unsubscribe.
@@ -320,6 +352,7 @@ async fn run_attach_loop(
                     &out_tx,
                     &mut forwarders,
                     &rpc_scope,
+                    &mut hosted,
                 )
                 .await
                 {
@@ -355,8 +388,272 @@ async fn run_attach_loop(
         }
     }
 
+    hosted.release_all();
     forwarders.abort_all();
     tracing::debug!(session=%session_id, "attach loop exited");
+}
+
+/// One endpoint hosted by an attach. The forwarder task owns the core
+/// `EndpointHost`; aborting it drops the host, which unregisters it.
+struct HostedEndpoint {
+    replier: EndpointReplier,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct HostedEndpoints {
+    can_host: bool,
+    map: HashMap<String, HostedEndpoint>,
+}
+
+impl HostedEndpoints {
+    fn release(&mut self, name: &str) {
+        if let Some(h) = self.map.remove(name) {
+            h.task.abort();
+        }
+    }
+
+    fn release_all(&mut self) {
+        for (_, h) in self.map.drain() {
+            h.task.abort();
+        }
+    }
+}
+
+fn mode_str(mode: remotemedia_core::transport::endpoint::RpcMode) -> &'static str {
+    match mode {
+        remotemedia_core::transport::endpoint::RpcMode::FireAndForget => "ff",
+        remotemedia_core::transport::endpoint::RpcMode::Reply => "reply",
+        remotemedia_core::transport::endpoint::RpcMode::Stream => "stream",
+    }
+}
+
+fn parse_mode(s: &str) -> Option<remotemedia_core::transport::endpoint::RpcMode> {
+    match s {
+        "ff" | "fire_and_forget" => {
+            Some(remotemedia_core::transport::endpoint::RpcMode::FireAndForget)
+        }
+        "reply" | "" => Some(remotemedia_core::transport::endpoint::RpcMode::Reply),
+        "stream" => Some(remotemedia_core::transport::endpoint::RpcMode::Stream),
+        _ => None,
+    }
+}
+
+fn hosted_event(name: &str, result: Result<(), (&str, String)>) -> ControlEvent {
+    let (ok, error, message) = match result {
+        Ok(()) => (true, String::new(), String::new()),
+        Err((kind, msg)) => (false, kind.to_string(), msg),
+    };
+    ControlEvent {
+        event: Some(PbEvent::EndpointHosted(PbEndpointHosted {
+            name: name.to_string(),
+            ok,
+            error,
+            message,
+        })),
+    }
+}
+
+fn reply_ack(name: &str, call_id: &str, result: Result<(), &str>) -> ControlEvent {
+    ControlEvent {
+        event: Some(PbEvent::EndpointReplyAck(PbEndpointReplyAck {
+            name: name.to_string(),
+            call_id: call_id.to_string(),
+            accepted: result.is_ok(),
+            reason: result.err().unwrap_or_default().to_string(),
+        })),
+    }
+}
+
+async fn host_endpoint_frame(
+    ctrl: &Arc<SessionControl>,
+    req: crate::generated::HostEndpoint,
+    out_tx: &mpsc::Sender<Result<ControlEvent, Status>>,
+    hosted: &mut HostedEndpoints,
+) {
+    let name = req.name.clone();
+    if !hosted.can_host {
+        send_event(
+            out_tx,
+            hosted_event(
+                &name,
+                Err((
+                    "forbidden",
+                    "endpoint hosting is disabled on this control server".into(),
+                )),
+            ),
+        )
+        .await;
+        return;
+    }
+    let Some(host_kind) = HostKind::parse(&req.host_kind) else {
+        send_event(
+            out_tx,
+            hosted_event(
+                &name,
+                Err(("invalid", format!("unknown host_kind '{}'", req.host_kind))),
+            ),
+        )
+        .await;
+        return;
+    };
+    let mut methods = Vec::with_capacity(req.methods.len());
+    for m in &req.methods {
+        let Some(mode) = parse_mode(&m.mode) else {
+            send_event(
+                out_tx,
+                hosted_event(
+                    &name,
+                    Err((
+                        "invalid",
+                        format!("unknown mode '{}' for method '{}'", m.mode, m.name),
+                    )),
+                ),
+            )
+            .await;
+            return;
+        };
+        methods.push(remotemedia_core::transport::endpoint::RpcMethod::new(
+            m.name.clone(),
+            mode,
+        ));
+    }
+    let spec = EndpointSpec {
+        name: name.clone(),
+        methods,
+        host_kind,
+        adapter: (!req.adapter.is_empty()).then(|| req.adapter.clone()),
+        queue_capacity: req.queue_capacity as usize,
+    };
+    // Re-hosting a name this attach already hosts replaces our own slot.
+    let own = hosted.map.contains_key(&name);
+    if own {
+        hosted.release(&name);
+    }
+    let takeover = req.takeover || own;
+    let mut host = match ctrl.host_endpoint(spec, takeover) {
+        Ok(h) => h,
+        Err(e) => {
+            send_event(
+                out_tx,
+                hosted_event(&name, Err((e.as_str(), e.to_string()))),
+            )
+            .await;
+            return;
+        }
+    };
+    let replier = host.replier();
+    // Acknowledge before the forwarder can emit calls for this endpoint.
+    send_event(out_tx, hosted_event(&name, Ok(()))).await;
+    let tx = out_tx.clone();
+    let ev_name = name.clone();
+    let task = tokio::spawn(async move {
+        while let Some(ev) = host.next().await {
+            let event = match ev {
+                HostEvent::Call(call) => PbEvent::EndpointCall(PbEndpointCall {
+                    name: ev_name.clone(),
+                    call_id: call.call_id,
+                    caller_node: call.caller_node,
+                    session_id: call.session_id,
+                    method: call.method,
+                    mode: mode_str(call.mode).to_string(),
+                    args_json: serde_json::to_string(&call.args).unwrap_or_else(|_| "[]".into()),
+                    kwargs_json: serde_json::to_string(&call.kwargs)
+                        .unwrap_or_else(|_| "{}".into()),
+                    deadline_ms: call.deadline_ms,
+                    route_hint: call.route_hint.unwrap_or_default(),
+                    adapter_hint: call.adapter_hint.unwrap_or_default(),
+                }),
+                HostEvent::Cancelled { call_id, reason } => {
+                    PbEvent::EndpointCancelled(PbEndpointCancelled {
+                        name: ev_name.clone(),
+                        call_id,
+                        reason: reason.as_str().to_string(),
+                    })
+                }
+            };
+            if tx
+                .send(Ok(ControlEvent { event: Some(event) }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        // Registration ended without this attach asking (takeover / close).
+        let _ = tx
+            .send(Ok(ControlEvent {
+                event: Some(PbEvent::EndpointPresence(PbEndpointPresence {
+                    name: ev_name.clone(),
+                    hosted: false,
+                    reason: host.end_reason().unwrap_or("unhosted").to_string(),
+                })),
+            }))
+            .await;
+    });
+    hosted.map.insert(name, HostedEndpoint { replier, task });
+}
+
+async fn endpoint_reply_frame(
+    reply: crate::generated::EndpointReply,
+    out_tx: &mpsc::Sender<Result<ControlEvent, Status>>,
+    hosted: &HostedEndpoints,
+) {
+    use remotemedia_core::transport::endpoint::{CallErrorKind, CallReplyEvent};
+    let Some(h) = hosted.map.get(&reply.name) else {
+        send_event(
+            out_tx,
+            reply_ack(&reply.name, &reply.call_id, Err("responder_gone")),
+        )
+        .await;
+        return;
+    };
+    let parse_json = |s: &str| -> Result<serde_json::Value, ()> {
+        if s.is_empty() {
+            Ok(serde_json::Value::Null)
+        } else {
+            serde_json::from_str(s).map_err(|_| ())
+        }
+    };
+    let event = match reply.kind.as_str() {
+        "value" => match parse_json(&reply.data_json) {
+            Ok(data) => CallReplyEvent::Value { data },
+            Err(()) => {
+                send_event(
+                    out_tx,
+                    reply_ack(&reply.name, &reply.call_id, Err("invalid")),
+                )
+                .await;
+                return;
+            }
+        },
+        "end" => CallReplyEvent::End,
+        "error" => CallReplyEvent::Error {
+            error: CallErrorKind::parse(&reply.error).unwrap_or(CallErrorKind::Error),
+            message: reply.message.clone(),
+        },
+        _ => {
+            send_event(
+                out_tx,
+                reply_ack(&reply.name, &reply.call_id, Err("invalid")),
+            )
+            .await;
+            return;
+        }
+    };
+    let meta = (!reply.meta_json.is_empty())
+        .then(|| serde_json::from_str(&reply.meta_json).ok())
+        .flatten();
+    let result = h
+        .replier
+        .send(&reply.call_id, event, meta)
+        .map_err(|k| match k {
+            CallErrorKind::Timeout => "late",
+            CallErrorKind::Cancelled => "cancelled",
+            CallErrorKind::NotFound => "unknown_call",
+            CallErrorKind::ResponderGone => "responder_gone",
+            _ => "invalid",
+        });
+    send_event(out_tx, reply_ack(&reply.name, &reply.call_id, result)).await;
 }
 
 /// Forwarder tasks owned by one attach. Tap forwarders are keyed by
@@ -388,8 +685,60 @@ async fn handle_inbound_frame(
     out_tx: &mpsc::Sender<Result<ControlEvent, Status>>,
     forwarders: &mut Forwarders,
     rpc_scope: &RpcCallScope,
+    hosted: &mut HostedEndpoints,
 ) -> Result<(), ErrorEvent> {
     match frame.op {
+        Some(PbOp::HostEndpoint(req)) => {
+            host_endpoint_frame(ctrl, req, out_tx, hosted).await;
+            Ok(())
+        }
+
+        Some(PbOp::UnhostEndpoint(req)) => {
+            hosted.release(&req.name);
+            Ok(())
+        }
+
+        Some(PbOp::EndpointReply(reply)) => {
+            endpoint_reply_frame(reply, out_tx, hosted).await;
+            Ok(())
+        }
+
+        Some(PbOp::WatchEndpoints(_)) => {
+            // Subscribe before listing so no change is missed.
+            let mut rx = ctrl.watch_endpoints();
+            let initial = ctrl.endpoints();
+            let tx = out_tx.clone();
+            let task = tokio::spawn(async move {
+                for info in initial {
+                    let ev = PbEvent::EndpointPresence(PbEndpointPresence {
+                        name: info.name,
+                        hosted: true,
+                        reason: String::new(),
+                    });
+                    if tx.send(Ok(ControlEvent { event: Some(ev) })).await.is_err() {
+                        return;
+                    }
+                }
+                loop {
+                    let p = match rx.recv().await {
+                        Ok(p) => p,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    };
+                    let ev = PbEvent::EndpointPresence(PbEndpointPresence {
+                        name: p.name,
+                        hosted: p.hosted,
+                        reason: String::new(),
+                    });
+                    if tx.send(Ok(ControlEvent { event: Some(ev) })).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            forwarders.other.push(task);
+            Ok(())
+        }
+
         Some(PbOp::Hello(_)) => Err(error(
             ControlErrorCode::Protocol,
             "Hello may only appear as the first frame",
@@ -753,7 +1102,6 @@ fn error(
 async fn send_event(tx: &mpsc::Sender<Result<ControlEvent, Status>>, event: ControlEvent) {
     let _ = tx.send(Ok(event)).await;
 }
-
 
 /// Serve **only** the `PipelineControl` service for `bus` on `addr` (with
 /// gRPC-Web enabled). Lets processes that serve WebRTC / HTTP accept remote

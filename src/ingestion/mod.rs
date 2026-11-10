@@ -23,7 +23,7 @@
 //! The simplest way to use ingestion is through the global registry:
 //!
 //! ```ignore
-//! use remotemedia_core::ingestion::{global_ingest_registry, IngestConfig};
+//! use remotemedia_sdk_base::ingestion::{global_ingest_registry, IngestConfig};
 //!
 //! // Create config from URI
 //! let config = IngestConfig::from_url("./test.wav");
@@ -44,7 +44,7 @@
 //! To add support for a new protocol:
 //!
 //! ```ignore
-//! use remotemedia_core::ingestion::{IngestPlugin, IngestSource, IngestConfig};
+//! use remotemedia_sdk_base::ingestion::{IngestPlugin, IngestSource, IngestConfig};
 //!
 //! pub struct MyProtocolPlugin;
 //!
@@ -126,7 +126,7 @@ pub use stream::{
 /// # Implementing a Plugin
 ///
 /// ```ignore
-/// use remotemedia_core::ingestion::{IngestPlugin, IngestSource, IngestConfig};
+/// use remotemedia_sdk_base::ingestion::{IngestPlugin, IngestSource, IngestConfig};
 ///
 /// pub struct RtmpIngestPlugin;
 ///

@@ -247,3 +247,61 @@ fn hot_path_budget() {
         "telemetry per-hop cost {per_hop_ns:.2} ns exceeds the 30 ns budget"
     );
 }
+
+struct NamedFactory(&'static str);
+
+impl crate::nodes::StreamingNodeFactory for NamedFactory {
+    fn create(
+        &self,
+        _node_id: String,
+        _params: &serde_json::Value,
+        _session_id: Option<String>,
+    ) -> Result<Box<dyn crate::nodes::StreamingNode>, crate::error::Error> {
+        Err(crate::error::Error::Execution("test factory".into()))
+    }
+
+    fn node_type(&self) -> &str {
+        self.0
+    }
+}
+
+#[test]
+fn descriptor_reports_build_identity_and_params_hash() {
+    let mut a = manifest(&["n"], &[]);
+    a.nodes[0].node_type = "Plugged".into();
+    a.nodes[0].params =
+        serde_json::from_str(r#"{"gain":2,"opts":{"x":1,"y":2},"api_key":"k1"}"#).unwrap();
+    let mut b = a.clone();
+    b.nodes[0].params =
+        serde_json::from_str(r#"{"opts":{"y":2,"x":1},"api_key":"k2","gain":2}"#).unwrap();
+
+    let mut registry = StreamingNodeRegistry::new();
+    let plugin = NodeImplementation {
+        kind: ImplementationKind::Loadable,
+        plugin_name: Some("demo".into()),
+        plugin_version: Some("0.1.0".into()),
+        digest: Some("sha256:abc".into()),
+        loaded_at_ms: Some(1),
+    };
+    registry.register_with_implementation(Arc::new(NamedFactory("Plugged")), plugin.clone());
+
+    let describe = |m: &Manifest, registry: &StreamingNodeRegistry| {
+        let graph = PipelineGraph::from_manifest(m).unwrap();
+        SessionDescriptor::build("s", m, &graph, registry, QueueCapacity::default())
+    };
+    let (da, db) = (describe(&a, &registry), describe(&b, &registry));
+    assert_eq!(da.nodes[0].implementation, plugin);
+    assert_eq!(da.nodes[0].params_hash, db.nodes[0].params_hash);
+    assert!(da.nodes[0].params_hash.starts_with("sha256:"));
+
+    // Re-registering without identity reverts to builtin.
+    registry.register(Arc::new(NamedFactory("Plugged")));
+    let dc = describe(&a, &registry);
+    assert_eq!(dc.nodes[0].implementation.kind, ImplementationKind::Builtin);
+    let json = serde_json::to_value(&dc.nodes[0]).unwrap();
+    assert_eq!(
+        json["implementation"],
+        serde_json::json!({"kind":"builtin"})
+    );
+    assert!(json["params_hash"].is_string());
+}

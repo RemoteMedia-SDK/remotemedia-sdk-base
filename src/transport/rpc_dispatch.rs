@@ -50,11 +50,73 @@ impl RpcReplySink for BusReplies {
     }
 }
 
+/// Upper bound for one `__call_reply__` handler invocation. Handlers are
+/// expected to hand the chunk to a waiting caller and return.
+const CALL_REPLY_HANDLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct DiscardReplies;
+
+#[async_trait::async_trait]
+impl RpcReplySink for DiscardReplies {
+    async fn send(&self, _reply: RpcReply) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+async fn next_call_reply(
+    rx: &mut Option<mpsc::Receiver<remotemedia_traits::call::CallReplyEnvelope>>,
+) -> Option<remotemedia_traits::call::CallReplyEnvelope> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Invoke the node's `__call_reply__` (fire-and-forget) with
+/// `args = [CallReplyEnvelope]`. Serial per node so stream chunks keep their
+/// order.
+async fn deliver_call_reply(
+    node: &dyn StreamingNode,
+    ctx: &NodeRuntimeContext,
+    env: remotemedia_traits::call::CallReplyEnvelope,
+) {
+    let corr = env.corr_id.clone();
+    let arg = match serde_json::to_value(&env) {
+        Ok(v) => v,
+        Err(error) => {
+            tracing::warn!(%error, "call reply serialization failed");
+            return;
+        }
+    };
+    let request = RpcRequest {
+        method: remotemedia_traits::call::CALL_REPLY_METHOD.to_string(),
+        corr_id: RpcId::String(corr),
+        args: vec![arg],
+        kwargs: Default::default(),
+    };
+    let mut replies = RpcResponder::new(
+        Arc::new(DiscardReplies),
+        request.corr_id.clone(),
+        RpcMode::FireAndForget,
+    );
+    let call =
+        std::panic::AssertUnwindSafe(node.call_rpc(request, ctx, &mut replies)).catch_unwind();
+    match tokio::time::timeout(CALL_REPLY_HANDLER_TIMEOUT, call).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            tracing::debug!(node = ctx.node_id(), %error, "__call_reply__ handler failed")
+        }
+        Ok(Err(_)) => tracing::warn!(node = ctx.node_id(), "__call_reply__ handler panicked"),
+        Err(_) => tracing::warn!(node = ctx.node_id(), "__call_reply__ handler exceeded 5 s"),
+    }
+}
+
 /// Runs until input/session closure. Dropping this future aborts all child calls.
 pub(super) async fn run(
     node: Arc<dyn StreamingNode>,
     ctx: NodeRuntimeContext,
     mut rx: mpsc::Receiver<RpcInvocation>,
+    mut call_replies: Option<mpsc::Receiver<remotemedia_traits::call::CallReplyEnvelope>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let methods = node.rpc_methods();
@@ -70,6 +132,9 @@ pub(super) async fn run(
             _ = shutdown.changed() => break,
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {
                 active.retain(|_, call| !call.abort.is_finished());
+            },
+            Some(env) = next_call_reply(&mut call_replies) => {
+                deliver_call_reply(&*node, &ctx, env).await;
             },
             input = rx.recv() => {
                 let Some(RpcInvocation { method, data, mut caller }) = input else { break };

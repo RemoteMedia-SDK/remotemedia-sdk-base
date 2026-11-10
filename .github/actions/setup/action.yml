@@ -1,0 +1,37 @@
+name: Set up sdk-base build
+description: Sibling plugin-sdk checkout, system packages, Rust toolchain and build cache.
+
+inputs:
+  cache-key:
+    description: Build cache key, one per job configuration
+    required: true
+  plugin-sdk-rev:
+    description: remotemedia-plugin-sdk commit to build against
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Removing these takes minutes, so it runs in the background.
+    - name: Free runner disk
+      shell: bash
+      run: nohup sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL >/dev/null 2>&1 &
+
+    - name: Check out plugin-sdk
+      shell: bash
+      run: |
+        git clone https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk ../remotemedia-plugin-sdk
+        git -C ../remotemedia-plugin-sdk checkout "${{ inputs.plugin-sdk-rev }}"
+
+    - name: Install system packages
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config nasm libclang-dev libssl-dev libasound2-dev libudev-dev
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        cache-on-failure: true

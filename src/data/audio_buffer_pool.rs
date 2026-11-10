@@ -30,7 +30,7 @@
 //! # Example
 //!
 //! ```
-//! use remotemedia_core::data::audio_buffer_pool::AudioBufferPool;
+//! use remotemedia_sdk_base::data::audio_buffer_pool::AudioBufferPool;
 //! use std::sync::Arc;
 //!
 //! let pool = Arc::new(AudioBufferPool::new(16, 960));

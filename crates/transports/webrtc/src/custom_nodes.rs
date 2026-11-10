@@ -35,9 +35,11 @@
 //! assert!(registry.has_node_type("MyPythonNode"));
 //! ```
 
+#[cfg(feature = "multiprocess")]
+use remotemedia_core::nodes::python_streaming::PythonStreamingNode;
 use remotemedia_core::nodes::streaming_registry::create_default_streaming_registry;
 #[cfg(feature = "multiprocess")]
-use remotemedia_core::nodes::{python_streaming::PythonStreamingNode, AsyncNodeWrapper};
+use remotemedia_core::nodes::AsyncNodeWrapper;
 use remotemedia_core::nodes::{StreamingNode, StreamingNodeFactory, StreamingNodeRegistry};
 use remotemedia_core::Error;
 use serde_json::Value;
@@ -87,13 +89,6 @@ impl StreamingNodeFactory for PythonNodeFactory {
         params: &Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        #[cfg(not(feature = "multiprocess"))]
-        {
-            let _ = (node_id, params, session_id);
-            return Err(Error::Execution(
-                "PythonNodeFactory requires the WebRTC multiprocess feature".into(),
-            ));
-        }
         #[cfg(feature = "multiprocess")]
         {
             let node = if let Some(sid) = session_id {
@@ -102,6 +97,16 @@ impl StreamingNodeFactory for PythonNodeFactory {
                 PythonStreamingNode::new(node_id, &self.node_type_name, params)?
             };
             Ok(Box::new(AsyncNodeWrapper(Arc::new(node))))
+        }
+        // Without `multiprocess` there is no Python runtime to host the node;
+        // registration still works so registries build the same either way.
+        #[cfg(not(feature = "multiprocess"))]
+        {
+            let _ = (node_id, params, session_id);
+            Err(Error::Execution(format!(
+                "Python node '{}' requires remotemedia-webrtc to be built with the `multiprocess` feature",
+                self.node_type_name
+            )))
         }
     }
 
@@ -210,7 +215,7 @@ mod tests {
         };
         assert!(error
             .to_string()
-            .contains("requires the WebRTC multiprocess feature"));
+            .contains("to be built with the `multiprocess` feature"));
     }
 
     #[test]

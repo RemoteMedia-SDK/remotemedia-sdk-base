@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::data::RuntimeData;
+use crate::transport::endpoint::{EndpointHost, EndpointReplier, EndpointSpec, HostEvent};
 use crate::transport::session_control::{
     self, ControlAddress, ControlEvent, InterceptDecision, NodeState, SessionControl,
 };
@@ -95,6 +96,43 @@ impl InterceptReplyBackend for InProcReplyBackend {
     }
 }
 
+/// An endpoint hosted through a [`ControlTransport`]. Dropping it
+/// unregisters the endpoint; every pending call then fails with
+/// `responder_gone`.
+pub struct EndpointHostSession {
+    inner: EndpointHost,
+}
+
+impl EndpointHostSession {
+    pub fn new(inner: EndpointHost) -> Self {
+        Self { inner }
+    }
+
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    /// Next call / cancellation; `None` once the registration ended (see
+    /// [`Self::end_reason`]).
+    pub async fn next(&mut self) -> Option<HostEvent> {
+        self.inner.next().await
+    }
+
+    /// `"taken_over"`, `"session_closed"` or `"unhosted"` after `next`
+    /// returned `None`.
+    pub fn end_reason(&self) -> Option<&'static str> {
+        self.inner.end_reason()
+    }
+
+    pub fn replier(&self) -> EndpointReplier {
+        self.inner.replier()
+    }
+
+    pub fn into_inner(self) -> EndpointHost {
+        self.inner
+    }
+}
+
 /// Async surface every control transport implements.
 ///
 /// Lossy on backpressure (broadcast lag drops oldest) — matches the
@@ -157,6 +195,21 @@ pub trait ControlTransport: Send + Sync {
 
     /// Remove the intercept installed at `addr`. No-op if none is installed.
     async fn remove_intercept(&self, addr: &ControlAddress) -> Result<(), Error>;
+
+    /// Host a client endpoint (openspec: add-agent-harness-integration).
+    /// Error messages start with the machine-readable kind
+    /// (`already_hosted`, `name_conflict`, `forbidden`, `session_closed`,
+    /// `unsupported`).
+    async fn host_endpoint(
+        &self,
+        spec: EndpointSpec,
+        takeover: bool,
+    ) -> Result<EndpointHostSession, Error> {
+        let _ = (spec, takeover);
+        Err(Error::Execution(
+            "unsupported: endpoint hosting is not available on this transport".into(),
+        ))
+    }
 }
 
 /// In-process transport — holds an `Arc<SessionControl>` resolved at open
@@ -311,6 +364,18 @@ impl ControlTransport for InProcControlTransport {
     async fn remove_intercept(&self, addr: &ControlAddress) -> Result<(), Error> {
         self.control.remove_intercept(addr);
         Ok(())
+    }
+
+    async fn host_endpoint(
+        &self,
+        spec: EndpointSpec,
+        takeover: bool,
+    ) -> Result<EndpointHostSession, Error> {
+        let name = spec.name.clone();
+        self.control
+            .host_endpoint(spec, takeover)
+            .map(EndpointHostSession::new)
+            .map_err(|e| Error::Execution(format!("{e}: cannot host endpoint '{name}'")))
     }
 }
 

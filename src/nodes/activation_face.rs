@@ -1103,7 +1103,7 @@ mod tests {
     fn tap_envelope(hidden: &[f32], phase: &str, token_index: u32) -> crate::data::RuntimeData {
         let bytes: Vec<u8> = hidden.iter().flat_map(|f| f.to_le_bytes()).collect();
         crate::data::RuntimeData::Tensor {
-            data: bytes,
+            data: bytes.into(),
             shape: vec![hidden.len() as i32],
             dtype: 1,
             metadata: Some(serde_json::json!({

@@ -28,7 +28,10 @@
 use crate::data::{RuntimeData, TEXT_CHANNEL_DEFAULT};
 use crate::error::Error;
 use crate::llm::audio_encode::audio_to_wav_base64;
-use crate::llm::{data_url::image_to_data_url, ChatBackend, ChatBackendConfig, ProviderKind};
+use crate::llm::{
+    data_url::image_to_data_url, ChatBackend, ChatBackendConfig, ChatTurnContext,
+    LlmFallbackConfig, ProviderKind,
+};
 use crate::nodes::AsyncStreamingNode;
 use parking_lot::Mutex;
 use remotemedia_traits::runtime_context::{InitializeContextRead, NodeRuntimeContextRead};
@@ -187,6 +190,19 @@ pub struct MultimodalLLMConfig {
     /// Default 0 (only the chosen token's logprob).
     #[serde(default, alias = "topLogprobs")]
     pub top_logprobs: u8,
+
+    // ── Deadline + fallback (llm-backend-fallback) ──────────────────
+    /// Cancel the primary request and treat the turn as failed
+    /// (reason `deadline`) when no visible text or tool-call delta has
+    /// arrived this many milliseconds after the request was issued.
+    #[serde(default, alias = "firstOutputDeadlineMs")]
+    pub first_output_deadline_ms: Option<u64>,
+
+    /// Provider to re-issue the turn to when the primary fails with
+    /// `deadline`, `connect`, `http_status`, or `stream_error` before
+    /// any visible output. Never used once output has started.
+    #[serde(default)]
+    pub fallback: Option<LlmFallbackConfig>,
 }
 
 impl Default for MultimodalLLMConfig {
@@ -214,6 +230,8 @@ impl Default for MultimodalLLMConfig {
             embedding_model: None,
             logprobs: false,
             top_logprobs: 0,
+            first_output_deadline_ms: None,
+            fallback: None,
         }
     }
 }
@@ -231,6 +249,8 @@ pub struct MultimodalLLMNode {
     coalesce_buffers: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     /// HTTP client for embedding requests (lazy-initialized).
     embedding_client: std::sync::OnceLock<Arc<reqwest::Client>>,
+    /// Manifest node id (from the factory) for `llm_fallback` events.
+    node_id: Option<String>,
 }
 
 impl MultimodalLLMNode {
@@ -241,7 +261,14 @@ impl MultimodalLLMNode {
             backend: Arc::new(ChatBackend::new(profile)),
             coalesce_buffers: Arc::new(Mutex::new(HashMap::new())),
             embedding_client: std::sync::OnceLock::new(),
+            node_id: None,
         }
+    }
+
+    /// Set the manifest node id reported in fallback events.
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.node_id = Some(node_id.into());
+        self
     }
 
     /// Get the embedding HTTP client (lazy-initialized).
@@ -430,6 +457,8 @@ impl MultimodalLLMNode {
                 .filter(|s| !s.is_empty()),
             tools: self.build_tool_registry(),
             tool_choice: self.config.tool_choice.clone(),
+            first_output_deadline_ms: self.config.first_output_deadline_ms,
+            fallback: self.config.fallback.clone(),
         }
     }
 
@@ -602,7 +631,11 @@ impl AsyncStreamingNode for MultimodalLLMNode {
         // suppress barge for non-cancelable tools. Production
         // dispatch goes through `process_streaming_with_ctx` below
         // which feeds the real gate.
-        self.dispatch_streaming(data, session_id, None, callback)
+        let turn = ChatTurnContext {
+            node_id: self.node_id.clone(),
+            ..Default::default()
+        };
+        self.dispatch_streaming(data, session_id, turn, callback)
             .await
     }
 
@@ -626,21 +659,25 @@ impl AsyncStreamingNode for MultimodalLLMNode {
         // `OpenAIChatNode::process_streaming_with_ctx`. Reaches through
         // the read-trait `as_any` escape hatch — plugins can't do this
         // and don't need to.
-        let cancel_gate = ctx
+        let runtime = ctx
             .as_any()
-            .downcast_ref::<crate::nodes::NodeRuntimeContext>()
-            .map(|c| Arc::clone(&c.cancel_gate));
-        if let Some(context) = ctx
-            .as_any()
-            .downcast_ref::<crate::nodes::NodeRuntimeContext>()
-        {
+            .downcast_ref::<crate::nodes::NodeRuntimeContext>();
+        let mut turn = ChatTurnContext {
+            cancel_gate: runtime.map(|c| Arc::clone(&c.cancel_gate)),
+            node_id: self.node_id.clone(),
+            control: None,
+        };
+        if !ctx.node_id().is_empty() {
+            turn.node_id = Some(ctx.node_id().to_string());
+        }
+        if let Some(context) = runtime {
             self.backend.refresh_office_observation(
                 sid.as_deref().unwrap_or("default"),
                 &context.control,
             )?;
+            turn.control = Some(Arc::clone(&context.control));
         }
-        self.dispatch_streaming(data, sid, cancel_gate, callback)
-            .await
+        self.dispatch_streaming(data, sid, turn, callback).await
     }
 }
 
@@ -649,7 +686,7 @@ impl MultimodalLLMNode {
         &self,
         data: RuntimeData,
         session_id: Option<String>,
-        cancel_gate: Option<Arc<crate::transport::CancelGate>>,
+        turn: ChatTurnContext,
         mut callback: F,
     ) -> Result<usize, Error>
     where
@@ -686,7 +723,7 @@ impl MultimodalLLMNode {
             (AggregationMode::PerInput, InputPart::Part(p)) => {
                 let user_msg = Self::user_message(vec![p]);
                 self.backend
-                    .run(&sid, user_msg, &cfg, cancel_gate.clone(), &mut wrapped_cb)
+                    .run_turn(&sid, user_msg, &cfg, &turn, &mut wrapped_cb)
                     .await
             }
             (AggregationMode::PerInput, InputPart::Sentinel) => {
@@ -715,7 +752,7 @@ impl MultimodalLLMNode {
                     );
                     let user_msg = Self::user_message(parts);
                     self.backend
-                        .run(&sid, user_msg, &cfg, cancel_gate.clone(), &mut wrapped_cb)
+                        .run_turn(&sid, user_msg, &cfg, &turn, &mut wrapped_cb)
                         .await
                 } else {
                     return Ok(0);
@@ -736,7 +773,7 @@ impl MultimodalLLMNode {
                 }
                 let user_msg = Self::user_message(parts);
                 self.backend
-                    .run(&sid, user_msg, &cfg, cancel_gate, &mut wrapped_cb)
+                    .run_turn(&sid, user_msg, &cfg, &turn, &mut wrapped_cb)
                     .await
             }
         };
@@ -766,13 +803,13 @@ pub struct MultimodalLLMNodeFactory;
 impl crate::nodes::StreamingNodeFactory for MultimodalLLMNodeFactory {
     fn create(
         &self,
-        _node_id: String,
+        node_id: String,
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn crate::nodes::StreamingNode>, Error> {
         let config: MultimodalLLMConfig =
             serde_json::from_value(params.clone()).unwrap_or_default();
-        let node = MultimodalLLMNode::with_config(config);
+        let node = MultimodalLLMNode::with_config(config).with_node_id(node_id);
         Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(node))))
     }
 
@@ -866,6 +903,23 @@ mod tests {
             }
             _ => panic!("expected CoalesceUntil"),
         }
+    }
+
+    #[test]
+    fn fallback_settings_reach_backend_config() {
+        let cfg: MultimodalLLMConfig = serde_json::from_value(serde_json::json!({
+            "first_output_deadline_ms": 900,
+            "fallback": {"base_url": "http://127.0.0.1:8080/v1"}
+        }))
+        .unwrap();
+        let backend_cfg = MultimodalLLMNode::with_config(cfg).backend_config();
+        assert_eq!(backend_cfg.first_output_deadline_ms, Some(900));
+        let fb = backend_cfg.fallback.unwrap();
+        assert_eq!(fb.provider, ProviderKind::OpenAI);
+        assert_eq!(fb.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+        let default_cfg =
+            MultimodalLLMNode::with_config(MultimodalLLMConfig::default()).backend_config();
+        assert!(default_cfg.fallback.is_none() && default_cfg.first_output_deadline_ms.is_none());
     }
 
     #[test]

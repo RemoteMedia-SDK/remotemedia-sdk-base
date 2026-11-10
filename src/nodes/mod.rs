@@ -44,6 +44,16 @@ pub use runtime_context::{AnySessionState, NodeRuntimeContext, SnapshotPort};
 // Video codec support (spec 012)
 #[cfg(feature = "video")]
 pub mod video;
+// Raw video resizing (pure Rust; available without the `video` feature).
+pub mod video_scaler;
+
+// Self-driven video sources: screen / app window and webcam capture.
+#[cfg(any(feature = "microphone", feature = "screen-capture", feature = "webcam"))]
+pub mod capture;
+
+// Speaker playback sink.
+#[cfg(feature = "speaker")]
+pub mod playback;
 
 // Temporarily disabled - incomplete implementation
 // pub mod sync_av;
@@ -290,8 +300,8 @@ use crate::data::RuntimeData;
 /// # Example
 ///
 /// ```ignore
-/// use remotemedia_core::data::RuntimeData;
-/// use remotemedia_core::nodes::{process_sync, SyncStreamingNode};
+/// use remotemedia_sdk_base::data::RuntimeData;
+/// use remotemedia_sdk_base::nodes::{process_sync, SyncStreamingNode};
 ///
 /// extern "C" fn hal_io_proc(
 ///     _device: AudioDeviceID,

@@ -187,10 +187,8 @@ impl StreamingNodeFactory for VideoDecoderNodeFactory {
     }
 }
 
-#[cfg(feature = "video")]
 pub(crate) struct VideoScalerNodeFactory;
 
-#[cfg(feature = "video")]
 impl StreamingNodeFactory for VideoScalerNodeFactory {
     fn create(
         &self,
@@ -198,10 +196,11 @@ impl StreamingNodeFactory for VideoScalerNodeFactory {
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        use crate::nodes::video::{VideoScalerConfig, VideoScalerNode};
-        let config: VideoScalerConfig = serde_json::from_value(params.clone()).unwrap_or_default();
+        use crate::nodes::video_scaler::{VideoScalerConfig, VideoScalerNode};
+        let config: VideoScalerConfig = serde_json::from_value(params.clone())
+            .map_err(|e| Error::Execution(format!("VideoScaler params: {e}")))?;
         let node = VideoScalerNode::new(config)
-            .map_err(|e| Error::Execution(format!("Failed to create VideoScaler: {}", e)))?;
+            .map_err(|e| Error::Execution(format!("VideoScaler: {e}")))?;
         Ok(Box::new(AsyncNodeWrapper(Arc::new(node))))
     }
 
@@ -211,10 +210,10 @@ impl StreamingNodeFactory for VideoScalerNodeFactory {
 
     fn schema(&self) -> Option<crate::nodes::schema::NodeSchema> {
         use crate::nodes::schema::{NodeSchema, RuntimeDataType};
-        use crate::nodes::video::VideoScalerConfig;
+        use crate::nodes::video_scaler::VideoScalerConfig;
         Some(
             NodeSchema::new("VideoScaler")
-                .description("Scales/resizes video frames")
+                .description("Resizes raw video frames (rgb24, rgba32, yuv420p, i420, nv12), keeping their format: to target_width x target_height, one side 0 to follow the aspect ratio, or fit inside both with maintain_aspect_ratio. only_downscale passes smaller frames through. Encoded video must be decoded first.")
                 .category("video")
                 .accepts([RuntimeDataType::Video])
                 .produces([RuntimeDataType::Video])

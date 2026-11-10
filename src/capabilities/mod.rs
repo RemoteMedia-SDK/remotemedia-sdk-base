@@ -15,7 +15,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use remotemedia_core::capabilities::{
+//! use remotemedia_sdk_base::capabilities::{
 //!     MediaCapabilities, MediaConstraints, AudioConstraints, ConstraintValue,
 //! };
 //!
@@ -59,6 +59,12 @@ pub mod resolver;
 // Manifest-level negotiation entry point (ties registry + negotiation together)
 pub mod manifest_negotiation;
 
+// Agent-facing validation report (add-agent-harness-integration)
+pub mod report;
+
+/// Agent-facing hints: near-miss node types, params checks, ingress, catalog.
+pub mod hints;
+
 // Re-export main types for convenience
 pub use constraints::{
     AudioConstraints, AudioSampleFormat, ConstraintValue, FileConstraints, JsonConstraints,
@@ -83,4 +89,9 @@ pub use resolver::{CapabilityHints, CapabilityResolver, NodeHints};
 
 pub use manifest_negotiation::{
     negotiate_manifest, strict_capabilities_enabled, NegotiationOutcome,
+};
+
+pub use report::{
+    validate_manifest_report, ConnectionReport, IngressEntry, ManifestReport, MismatchReport,
+    ReportIssue, ResolvedConnection,
 };

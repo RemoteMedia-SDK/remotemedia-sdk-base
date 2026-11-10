@@ -1,20 +1,77 @@
-// Build script for gRPC code generation
+// Build script for remotemedia-webrtc.
+//
+// The protobuf bindings in `src/generated/` (used by the `grpc-signaling`
+// feature) are committed. A normal build uses them as they are: it does not
+// build protoc (protobuf-src), does not run it, and writes nothing into
+// `src/`. It only hashes the `.proto` files and warns when they no longer
+// match `src/generated/protos.stamp`.
+//
+// Code generation sits behind the `regen-protos` feature, which pulls in
+// protobuf-src (builds protoc from source; needs CMake and a C++ compiler)
+// and tonic-prost-build. From the sdk-base workspace root:
+//
+//   Check that the committed bindings match the .proto files (writes
+//   nothing to `src/`, fails the build on any difference; CI-friendly):
+//     cargo check -p remotemedia-webrtc --features regen-protos
+//
+//   Regenerate after editing `proto/*.proto`:
+//     REMOTEMEDIA_REGEN_PROTOS=1 cargo check -p remotemedia-webrtc --features regen-protos
+//     (PowerShell: $env:REMOTEMEDIA_REGEN_PROTOS=1; cargo check ...)
+//
+// `crates/transports/grpc` compiles a superset of these protos into its own
+// `src/generated/`; regenerate it too.
 
-#[cfg(feature = "grpc-signaling")]
+include!("../../../proto/codegen_support.rs");
+
+const PROTOS: &[&str] = &[
+    "../../../proto/webrtc_signaling.proto",
+    "../../../proto/common.proto",
+    "../../../proto/control.proto",
+];
+
 fn main() {
-    // Use vendored protoc from protobuf-src
-    std::env::set_var("PROTOC", protobuf_src::protoc());
+    let crate_dir = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let generated_dir = crate_dir.join("src").join("generated");
 
-    compile_protos();
-    stage_llama_libs();
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=../../../proto/");
-}
+    println!("cargo:rerun-if-changed=../../../proto/codegen_support.rs");
 
-#[cfg(not(feature = "grpc-signaling"))]
-fn main() {
+    #[cfg(not(feature = "regen-protos"))]
+    proto_codegen::default_build("remotemedia-webrtc", &crate_dir, &generated_dir, PROTOS);
+
+    #[cfg(feature = "regen-protos")]
+    {
+        let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        proto_codegen::regen_build(
+            "remotemedia-webrtc",
+            &crate_dir,
+            &generated_dir,
+            &out_dir,
+            PROTOS,
+            |fresh_dir| {
+                // Vendored protoc, so the output does not depend on a system install.
+                std::env::set_var("PROTOC", protobuf_src::protoc());
+                // Bulk payload fields are `bytes::Bytes`, so decoded frames
+                // keep the received buffer instead of copying it into a Vec.
+                tonic_prost_build::configure()
+                    .build_server(true)
+                    .build_client(true)
+                    .bytes(".remotemedia.v1.AudioBuffer.samples")
+                    .bytes(".remotemedia.v1.VideoFrame.pixel_data")
+                    .bytes(".remotemedia.v1.TensorBuffer.data")
+                    .bytes(".remotemedia.v1.NumpyBuffer.data")
+                    .bytes(".remotemedia.v1.BinaryBuffer.data")
+                    .bytes(".remotemedia.v1.webrtc.BinaryFrame.data")
+                    .bytes(".remotemedia.v1.webrtc.RuntimeDataFrame.data_buffer")
+                    .bytes(".remotemedia.v1.webrtc.ChunkFrame.data")
+                    .out_dir(fresh_dir)
+                    .compile_protos(PROTOS, &["../../../proto/"])
+                    .unwrap_or_else(|e| panic!("Failed to compile protos: {}", e));
+            },
+        );
+    }
+
     stage_llama_libs();
-    println!("cargo:rerun-if-changed=build.rs");
 }
 
 // Work around llama-cpp-sys-4 bug: its post-build only globs `*.so` and
@@ -118,31 +175,4 @@ fn stage_llama_libs() {
         }
     }
     println!("cargo:rerun-if-changed={}", cache_lib.display());
-}
-
-#[cfg(feature = "grpc-signaling")]
-fn compile_protos() {
-    tonic_prost_build::configure()
-        .build_server(true)
-        .build_client(true)
-        .bytes(".remotemedia.v1.AudioBuffer.samples")
-        .bytes(".remotemedia.v1.VideoFrame.pixel_data")
-        .bytes(".remotemedia.v1.TensorBuffer.data")
-        .bytes(".remotemedia.v1.NumpyBuffer.data")
-        .bytes(".remotemedia.v1.BinaryBuffer.data")
-        .bytes(".remotemedia.v1.webrtc.BinaryFrame.data")
-        .bytes(".remotemedia.v1.webrtc.RuntimeDataFrame.data_buffer")
-        .bytes(".remotemedia.v1.webrtc.ChunkFrame.data")
-        .out_dir("src/generated")
-        .compile_protos(
-            &[
-                "../../../proto/webrtc_signaling.proto",
-                "../../../proto/common.proto",
-                "../../../proto/control.proto",
-            ],
-            &["../../../proto/"],
-        )
-        .unwrap_or_else(|e| panic!("Failed to compile protos: {}", e));
-
-    println!("cargo:warning=Successfully compiled protocol buffers");
 }

@@ -20,7 +20,7 @@
 //! their own routing logic:
 //!
 //! ```ignore
-//! use remotemedia_core::transport::SessionRouter;
+//! use remotemedia_sdk_base::transport::SessionRouter;
 //!
 //! let router = SessionRouter::new(
 //!     session_id,
@@ -56,13 +56,14 @@ mod source_drain_tests;
 #[cfg(test)]
 mod task_failure_tests;
 
-use crate::capabilities::{CapabilityBehavior, CapabilityResolver, ResolutionContext};
+use crate::capabilities::ResolutionContext;
 use crate::data::RuntimeData;
 use crate::executor::{
     DriftMetrics, DriftThresholds, NodeStats, PipelineGraph, SchedulerConfig, StreamingScheduler,
 };
 use crate::manifest::Manifest;
 use crate::nodes::{InitializeContext, StreamingNode, StreamingNodeRegistry};
+use crate::telemetry::node_logs::node_span;
 use crate::telemetry::{approx_payload_bytes, QueueCapacity, SessionDescriptor, SessionTelemetry};
 use crate::transport::perf_aggregator::PerfAggregator;
 use crate::transport::session_control::{aux_port_of, CloseReason, SessionControl, BARGE_IN_PORT};
@@ -73,6 +74,12 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
+
+/// After a node fails to initialize, how long the other nodes get to finish
+/// (or fail too, so their errors are reported together) before startup is
+/// aborted and the rest are cancelled.
+pub const INIT_FAILURE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Default capacity for the router's internal input channel.
 ///
@@ -487,6 +494,40 @@ struct NodeTelemetryHandle {
     input_weak: mpsc::WeakSender<RuntimeData>,
 }
 
+/// Publish a per-node loading event (`{kind: "loading", status, node,
+/// message, ts_ms}`) on the session's `__system__` tap.
+fn publish_node_loading(
+    control: Option<&Arc<SessionControl>>,
+    status: &str,
+    node_id: &str,
+    message: &str,
+) {
+    if let Some(ctrl) = control {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let event = RuntimeData::Json(serde_json::json!({
+            "kind": "loading",
+            "status": status,
+            "node": node_id,
+            "message": message,
+            "ts_ms": ts,
+        }));
+        ctrl.publish_tap("__system__", None, event);
+    }
+}
+
+/// The message of a caught panic payload (`&str` or `String`; anything else
+/// is reported generically).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
 impl SessionRouter {
     /// Create a new session router
     ///
@@ -848,7 +889,7 @@ impl SessionRouter {
     /// This pre-creates and caches all nodes before streaming starts,
     /// eliminating cold-start latency.
     pub async fn initialize_nodes(&mut self) -> Result<()> {
-        use futures::future::try_join_all;
+        use futures::stream::{FuturesUnordered, StreamExt};
         self.snapshot_bindings = None;
         self.bound_output_allocators.clear();
 
@@ -872,13 +913,25 @@ impl SessionRouter {
             })
             .collect::<Result<Vec<_>>>()?;
         let mut created: Vec<(String, String, Box<dyn StreamingNode>)> = Vec::with_capacity(total);
+        // Every node that cannot be created, not just the first: a manifest
+        // with two bad nodes should not take two attempts to learn that.
+        let mut create_failures: Vec<(String, String, Error)> = Vec::new();
         for (node_spec, params) in prepared {
-            let mut node = self.registry.create_node(
-                &node_spec.node_type,
-                node_spec.id.clone(),
-                &params,
-                Some(self.session_id.clone()),
-            )?;
+            let made = node_span(&self.session_id, &node_spec.id).in_scope(|| {
+                self.registry.create_node(
+                    &node_spec.node_type,
+                    node_spec.id.clone(),
+                    &params,
+                    Some(self.session_id.clone()),
+                )
+            });
+            let mut node = match made {
+                Ok(node) => node,
+                Err(e) => {
+                    create_failures.push((node_spec.id.clone(), node_spec.node_type.clone(), e));
+                    continue;
+                }
+            };
             if let Some(contract) = self
                 .buffer_contracts
                 .as_ref()
@@ -912,6 +965,31 @@ impl SessionRouter {
             }
             created.push((node_spec.id.clone(), node_spec.node_type.clone(), node));
         }
+        if !create_failures.is_empty() {
+            for (id, ty, e) in &create_failures {
+                tracing::error!(
+                    session_id = %self.session_id,
+                    node_id = %id,
+                    node_type = %ty,
+                    error = %e,
+                    "Node creation failed; aborting session startup"
+                );
+            }
+            // One failure keeps its original error (and message).
+            if create_failures.len() == 1 {
+                return Err(create_failures.pop().expect("one").2);
+            }
+            let lines: Vec<String> = create_failures
+                .iter()
+                .map(|(id, ty, e)| format!("- Node '{id}' ({ty}): {e}"))
+                .collect();
+            return Err(Error::Execution(format!(
+                "{} of {} nodes could not be created:\n{}",
+                create_failures.len(),
+                total,
+                lines.join("\n")
+            )));
+        }
 
         // Phase 2: emit `loading_node` for every node up front so the
         // UI sees the full initialising set immediately. With parallel
@@ -937,6 +1015,15 @@ impl SessionRouter {
         // Box<dyn StreamingNode>; for Python multiprocess nodes that
         // chains into ProcessManager::Drop and SIGKILLs the spawned
         // child, so we don't leak partially-initialised processes.
+        //
+        // A node whose initialize() panics (a device API asserting on an
+        // unsupported config, say) fails the session like any other init
+        // error. Uncaught, the panic unwinds the caller's task, so session
+        // creation never returns and the session stays "initializing".
+        //
+        // `node_ready` goes out as each node finishes, so an observer can
+        // tell which nodes are still loading while a slow one holds up the
+        // pipeline.
         let session_id = self.session_id.clone();
         let control = self.control.clone();
         let node_materialization = self.node_materialization.clone();
@@ -947,19 +1034,82 @@ impl SessionRouter {
                 node_id: id.clone(),
                 control: control.clone(),
             };
+            let control = control.clone();
+            let span = node_span(&session_id, &id);
             async move {
                 let copies = copies.map_err(|error| (id.clone(), ty.clone(), error))?;
                 let init_ctx = init_ctx.with_copy_context(copies);
-                match node.initialize(&init_ctx).await {
-                    Ok(()) => Ok((id, ty, node)),
+                use futures::FutureExt;
+                let result = std::panic::AssertUnwindSafe(node.initialize(&init_ctx))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|panic| {
+                        Err(Error::Execution(format!(
+                            "initialize panicked: {}",
+                            panic_message(panic.as_ref())
+                        )))
+                    });
+                match result {
+                    Ok(()) => {
+                        publish_node_loading(
+                            control.as_ref(),
+                            "node_ready",
+                            &id,
+                            &format!("Node '{}' ({}) ready", id, ty),
+                        );
+                        Ok((id, ty, node))
+                    }
                     Err(e) => Err((id, ty, e)),
                 }
             }
+            .instrument(span)
         });
 
-        let initialised = match try_join_all(init_futures).await {
-            Ok(v) => v,
-            Err((id, ty, e)) => {
+        // Collect every node's result. After the first failure the others
+        // get INIT_FAILURE_GRACE to finish (a misconfigured device fails in
+        // milliseconds, so its error is reported alongside the first) before
+        // the rest are dropped, which cancels them: a slow model load must
+        // not delay the report.
+        let mut pending: FuturesUnordered<_> = init_futures.collect();
+        let mut initialised = Vec::with_capacity(total);
+        let mut failures: Vec<(String, String, Error)> = Vec::new();
+        let mut deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let next = match deadline {
+                None => pending.next().await,
+                Some(d) => match tokio::time::timeout_at(d, pending.next()).await {
+                    Ok(n) => n,
+                    Err(_) => break,
+                },
+            };
+            match next {
+                None => break,
+                Some(Ok(done)) => initialised.push(done),
+                Some(Err(failed)) => {
+                    deadline
+                        .get_or_insert_with(|| tokio::time::Instant::now() + INIT_FAILURE_GRACE);
+                    failures.push(failed);
+                }
+            }
+        }
+        if !failures.is_empty() {
+            let done: std::collections::HashSet<&str> = initialised
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .chain(failures.iter().map(|(id, _, _)| id.as_str()))
+                .collect();
+            let unchecked: Vec<String> = self
+                .manifest
+                .nodes
+                .iter()
+                .filter(|n| !done.contains(n.id.as_str()))
+                .map(|n| format!("'{}' ({})", n.id, n.node_type))
+                .collect();
+            drop(pending);
+            // Report in manifest order.
+            let order = |id: &str| self.manifest.nodes.iter().position(|n| n.id == id);
+            failures.sort_by_key(|(id, _, _)| order(id));
+            for (id, ty, e) in &failures {
                 tracing::error!(
                     session_id = %self.session_id,
                     node_id = %id,
@@ -969,27 +1119,43 @@ impl SessionRouter {
                 );
                 self.emit_node_loading_event(
                     "error",
-                    &id,
+                    id,
                     &format!("Node '{}' ({}) failed to initialize: {}", id, ty, e),
                 );
+            }
+            let still = if unchecked.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\nNot checked (still initializing when startup was aborted): {}",
+                    unchecked.join(", ")
+                )
+            };
+            if failures.len() == 1 {
+                let (id, ty, e) = &failures[0];
                 return Err(Error::Execution(format!(
-                    "Node '{}' ({}) failed to initialize: {}",
-                    id, ty, e
+                    "Node '{}' ({}) failed to initialize: {}{}",
+                    id, ty, e, still
                 )));
             }
-        };
+            let lines: Vec<String> = failures
+                .iter()
+                .map(|(id, ty, e)| format!("- Node '{id}' ({ty}): {e}"))
+                .collect();
+            return Err(Error::Execution(format!(
+                "{} of {} nodes failed to initialize:\n{}{}",
+                failures.len(),
+                total,
+                lines.join("\n"),
+                still
+            )));
+        }
 
-        // Phase 4: stamp authoritative `node_ready` for each
-        // successfully initialised node, then move it into
-        // `cached_nodes`. The router emits `node_ready` itself so the
-        // frontend has a reliable transition signal even if a node
-        // doesn't bother calling `ctx.emit_progress("ready", …)`.
+        // Phase 4: move every initialised node into `cached_nodes`. The
+        // router emitted an authoritative `node_ready` for each as it
+        // finished (above), so the frontend has a reliable transition
+        // signal even if a node doesn't call `ctx.emit_progress("ready", …)`.
         for (id, ty, node) in initialised {
-            self.emit_node_loading_event(
-                "node_ready",
-                &id,
-                &format!("Node '{}' ({}) ready", id, ty),
-            );
             tracing::debug!(
                 "Session {}: Initialized node '{}' (type: {})",
                 self.session_id,
@@ -1024,12 +1190,12 @@ impl SessionRouter {
             ctrl.set_descriptor(Arc::new(self.descriptor.clone()));
         }
 
+        // Settle each connection's format from what the nodes discovered
+        // (spec 025 handshake) before declaring the pipeline ready.
+        self.propagate_runtime_capabilities().await?;
+
         // Pipeline-level "ready": every node is up.
         self.emit_loading_event("ready", Some("Pipeline ready".to_string()));
-
-        // Spec 025: After initialization, propagate actual capabilities from
-        // RuntimeDiscovered nodes to downstream Adaptive/Passthrough nodes
-        self.propagate_runtime_capabilities().await?;
 
         Ok(())
     }
@@ -1066,93 +1232,52 @@ impl SessionRouter {
     ///                    itself called `ctx.emit_progress("ready", …)`)
     /// - `error`        — node init returned `Err`
     fn emit_node_loading_event(&self, status: &str, node_id: &str, message: &str) {
-        if let Some(ctrl) = &self.control {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let event = RuntimeData::Json(serde_json::json!({
-                "kind": "loading",
-                "status": status,
-                "node": node_id,
-                "message": message,
-                "ts_ms": ts,
-            }));
-            ctrl.publish_tap("__system__", None, event);
-        }
+        publish_node_loading(self.control.as_ref(), status, node_id, message);
     }
 
-    /// Propagate capabilities from RuntimeDiscovered nodes after initialization (spec 025).
-    ///
-    /// This method is called after all nodes are initialized. For each node with
-    /// `RuntimeDiscovered` behavior that reports actual capabilities, we:
-    /// 1. Call `revalidate_and_propagate()` to update resolution context
-    /// 2. Apply pending updates to downstream nodes via `configure_from_upstream()`
+    /// Runtime capability handshake after initialization (spec 025): see
+    /// [`super::caps_handshake`]. Sources' discovered outputs flow forward,
+    /// sinks' discovered inputs flow back to the nearest Adaptive node
+    /// (a resampler takes its target from the speaker after it), each node
+    /// keeps its upstream format where the next one accepts it, and every
+    /// connection is checked. Mismatches involving a discovered (device)
+    /// format fail startup, all of them in one error.
     async fn propagate_runtime_capabilities(&mut self) -> Result<()> {
-        // Build resolution context from manifest if not already present
-        if self.resolution_ctx.is_none() {
-            let mut ctx = ResolutionContext::new();
-
-            // Add node types and connections from manifest
-            for node_spec in &self.manifest.nodes {
-                ctx.node_types
-                    .insert(node_spec.id.clone(), node_spec.node_type.clone());
-            }
-            for conn in &self.manifest.connections {
-                ctx.add_connection(&conn.from, &conn.to);
-            }
-
-            // Set behaviors from cached nodes
-            for (node_id, node) in &self.cached_nodes {
-                ctx.set_behavior(node_id, node.capability_behavior());
-            }
-
-            self.resolution_ctx = Some(ctx);
+        let outcome = super::caps_handshake::negotiate(
+            &self.session_id,
+            &self.manifest,
+            &self.cached_nodes,
+        );
+        for w in &outcome.warnings {
+            tracing::warn!(session_id = %self.session_id, "capability handshake: {w}");
         }
-
-        let ctx = self.resolution_ctx.as_mut().unwrap();
-        let resolver = CapabilityResolver::new(&self.registry);
-
-        // Find RuntimeDiscovered nodes that have actual capabilities
-        let runtime_discovered_nodes: Vec<String> = self
-            .cached_nodes
-            .iter()
-            .filter(|(_, node)| {
-                matches!(
-                    node.capability_behavior(),
-                    CapabilityBehavior::RuntimeDiscovered
-                )
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        for node_id in runtime_discovered_nodes {
-            if let Some(node) = self.cached_nodes.get(&node_id) {
-                // Get actual capabilities from the node after initialization
-                if let Some(actual_caps) = node.actual_capabilities() {
-                    tracing::info!(
-                        "Session {}: Node '{}' reported actual capabilities, propagating to downstream nodes",
-                        self.session_id,
-                        node_id
-                    );
-
-                    // Update resolution context with actual capabilities and create pending updates
-                    if let Err(e) = resolver.revalidate_and_propagate(ctx, &node_id, actual_caps) {
-                        tracing::warn!(
-                            "Session {}: Failed to propagate capabilities from '{}': {}",
-                            self.session_id,
-                            node_id,
-                            e
-                        );
-                    }
-                }
-            }
+        for (node, f) in &outcome.formats {
+            tracing::debug!(
+                session_id = %self.session_id,
+                node_id = %node,
+                sample_rate = ?f.sample_rate,
+                channels = ?f.channels,
+                "negotiated output format"
+            );
         }
-
-        // Apply pending updates to downstream nodes
-        self.apply_pending_updates().await?;
-
-        Ok(())
+        if outcome.errors.is_empty() {
+            return Ok(());
+        }
+        for e in &outcome.errors {
+            tracing::error!(session_id = %self.session_id, "capability handshake: {e}");
+        }
+        self.emit_loading_event("error", Some(outcome.errors.join("; ")));
+        Err(Error::Execution(if outcome.errors.len() == 1 {
+            format!("Pipeline formats do not fit: {}", outcome.errors[0])
+        } else {
+            format!(
+                "Pipeline formats do not fit ({} problems):
+- {}",
+                outcome.errors.len(),
+                outcome.errors.join("
+- ")
+            )
+        }))
     }
 
     /// Apply pending capability updates to downstream nodes (spec 025).
@@ -1563,6 +1688,15 @@ impl SessionRouter {
         // transferred under this node's copy policy (device_delivery).
         let egress_copies = materialization.clone();
         let device_copies = materialization.clone();
+        // Every task of this node logs inside its span (`rm_node_logs`).
+        let span = node_span(&session_id, &node_id);
+        // Endpoint-call opt-in (openspec: add-agent-harness-integration).
+        let rpc_methods = node.rpc_methods();
+        // Latest-input-wins opt-in (e.g. `OpenAIChatNode.supersede_on_new_input`):
+        // a newer data input cancels the node's in-flight call.
+        let supersede_on_new_input = node.supersede_on_new_input();
+        let call_mode = super::call_routing::call_mode(&rpc_methods, control.is_some());
+        let envelope_calls: super::call_routing::EnvelopeCalls = Default::default();
         let NodeTelemetryHandle {
             tel,
             idx: node_idx,
@@ -1577,10 +1711,31 @@ impl SessionRouter {
         let fan_probes = probes.clone();
         let fan_tel = tel.clone();
         let mut fan_shutdown = shutdown.clone();
-        let fan_handle = tokio::spawn(async move {
+        let fan_envelope_calls = envelope_calls.clone();
+        let fan_task = async move {
             let forward = async move {
                 let tel = fan_tel;
+                // Dropped with this task: aborts reply forwarders, which
+                // cancels their in-flight endpoint calls.
+                let mut call_tasks = super::call_routing::CallTasks::default();
                 while let Some(out) = fan_rx.recv().await {
+                    // `__call__` envelopes from opted-in nodes become endpoint
+                    // calls and never reach taps, intercepts or successors.
+                    if call_mode != super::call_routing::CallMode::Legacy {
+                        if let Some(ctrl) = &fan_control {
+                            if let Some(parsed) = super::call_routing::parse_call_envelope(&out) {
+                                super::call_routing::start_envelope_call(
+                                    ctrl,
+                                    &fan_node_id,
+                                    parsed,
+                                    call_mode,
+                                    &fan_envelope_calls,
+                                    &mut call_tasks,
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     tel.node(node_idx).outputs.fetch_add(1, RELAXED);
                     let kept = match &fan_control {
                         Some(ctrl) => ctrl.on_node_output(&fan_node_id, None, out).await,
@@ -1708,7 +1863,8 @@ impl SessionRouter {
                 _ = forward => {},
             }
             Ok(())
-        });
+        };
+        let fan_handle = tokio::spawn(fan_task.instrument(span.clone()));
 
         // ── Aux-port filter task ───────────────────────────────────────
         //
@@ -1748,12 +1904,12 @@ impl SessionRouter {
             Box::new(fan_tx.downgrade()),
         );
         let (control_tx, mut control_rx) = mpsc::channel::<RuntimeData>(16);
-        let rpc_rx = if node.rpc_methods().is_empty() {
+        let rpc_rx = if rpc_methods.is_empty() {
             None
         } else {
             control
                 .as_ref()
-                .map(|control| control.register_rpc(&node_id))
+                .map(|control| control.register_rpc(&node_id, &rpc_methods))
         };
         let input_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let filter_generation = input_generation.clone();
@@ -1761,7 +1917,7 @@ impl SessionRouter {
         let filter_node_id = node_id.clone();
         let filter_session_id = session_id.clone();
         let children = Children::default();
-        let filter_handle = tokio::spawn(async move {
+        let filter_task = async move {
             while let Some(input) = input_rx.recv().await {
                 if let Some(port) = aux_port_of(&input) {
                     if port == BARGE_IN_PORT {
@@ -1812,13 +1968,35 @@ impl SessionRouter {
                     // Other aux ports fall through — node-side aux
                     // handlers (e.g. `_handle_aux_port` in Python
                     // nodes) still receive them.
+                } else if supersede_on_new_input {
+                    // Latest input wins. A plain data input (aux envelopes
+                    // are excluded above) preempts the in-flight call
+                    // instead of queueing behind it. Unlike barge_in this
+                    // does NOT bump `input_generation`: the new input must
+                    // still run. `try_cancel` honours ProtectGuard, and is
+                    // a no-op when nothing is in flight.
+                    if filter_cancel.try_cancel() {
+                        tracing::info!(
+                            session_id = %filter_session_id,
+                            node_id = %filter_node_id,
+                            "Runtime: newer input arrived — superseding any in-flight call"
+                        );
+                    } else {
+                        tracing::info!(
+                            session_id = %filter_session_id,
+                            node_id = %filter_node_id,
+                            "Runtime: newer input arrived but supersede suppressed by \
+                             active ProtectGuard (non-cancelable tool call in progress)"
+                        );
+                    }
                 }
                 let generation = filter_generation.load(std::sync::atomic::Ordering::Acquire);
                 if filt_tx.send((generation, input)).await.is_err() {
                     break;
                 }
             }
-        });
+        };
+        let filter_handle = tokio::spawn(filter_task.instrument(span.clone()));
 
         // ── Main node task ─────────────────────────────────────────────
         children.add("input filter", filter_handle);
@@ -1876,7 +2054,7 @@ impl SessionRouter {
             .with_output_allocator(output_allocator)
             .with_copy_context(materialization);
 
-            if let Some(rx) = rpc_rx {
+            if let Some((rx, call_replies)) = rpc_rx {
                 let (rpc_shutdown, rpc_stop) = tokio::sync::watch::channel(false);
                 children.add_cooperative(
                     "RPC",
@@ -1885,8 +2063,10 @@ impl SessionRouter {
                         node.clone(),
                         bound_ctx.clone(),
                         rx,
+                        call_replies,
                         rpc_stop,
-                    )),
+                    )
+                    .in_current_span()),
                 );
             }
 
@@ -1936,7 +2116,8 @@ impl SessionRouter {
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         }
-                    }),
+                    }
+                    .in_current_span()),
                 );
             }
 
@@ -2285,6 +2466,15 @@ impl SessionRouter {
                             node_id = %main_node_id,
                             "Runtime: in-flight call cancelled by barge_in"
                         );
+                        // Envelope-originated endpoint calls belong to the
+                        // cancelled processing call: cancel them at the host.
+                        if let Some(ctrl) = &control {
+                            super::call_routing::cancel_envelope_calls(
+                                ctrl,
+                                &main_node_id,
+                                &envelope_calls,
+                            );
+                        }
                         // Dropping the dispatch_fut here cascades drop
                         // through every awaited future inside the
                         // node call (HTTP streams, IPC sends, etc.),
@@ -2377,7 +2567,8 @@ impl SessionRouter {
             let result = children::supervise(supervised_children, main_body).await;
             tel.set_alive(node_idx, false);
             result
-        });
+        }
+        .instrument(span));
 
         (main_handle, fan_handle)
     }
@@ -2895,6 +3086,212 @@ mod tests {
         SessionRouter::teardown_pipeline_tasks(pipeline, true)
             .await
             .unwrap();
+    }
+
+    /// A node whose `initialize` panics (cpal asserting on an unsupported
+    /// sample rate, say) or never returns.
+    struct InitNode {
+        panic: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::nodes::AsyncStreamingNode for InitNode {
+        fn node_type(&self) -> &str {
+            if self.panic {
+                "PanicInitNode"
+            } else {
+                "OkInitNode"
+            }
+        }
+        async fn initialize(
+            &self,
+            _ctx: &dyn crate::nodes::InitializeContextRead,
+        ) -> crate::Result<()> {
+            if self.panic {
+                panic!("sample rate out of range");
+            }
+            Ok(())
+        }
+        async fn process(&self, data: RuntimeData) -> crate::Result<RuntimeData> {
+            Ok(data)
+        }
+    }
+    struct InitNodeFactory(bool);
+    impl crate::nodes::StreamingNodeFactory for InitNodeFactory {
+        fn node_type(&self) -> &str {
+            if self.0 {
+                "PanicInitNode"
+            } else {
+                "OkInitNode"
+            }
+        }
+        fn create(
+            &self,
+            _node_id: String,
+            _params: &serde_json::Value,
+            _session_id: Option<String>,
+        ) -> crate::Result<Box<dyn StreamingNode>> {
+            Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(
+                InitNode { panic: self.0 },
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_initialize_fails_session_startup_instead_of_hanging() {
+        let mut registry = StreamingNodeRegistry::new();
+        registry.register(Arc::new(InitNodeFactory(false)));
+        registry.register(Arc::new(InitNodeFactory(true)));
+        let manifest = create_test_manifest(
+            vec![("ok", "OkInitNode"), ("mic", "PanicInitNode")],
+            vec![("ok", "mic")],
+        );
+        let (output, _rx) = ClientOutputRouter::new(8);
+        let (mut router, _) = SessionRouter::new(
+            "init-panic".into(),
+            Arc::new(manifest),
+            Arc::new(registry),
+            output,
+        )
+        .unwrap();
+        let err =
+            tokio::time::timeout(std::time::Duration::from_secs(5), router.initialize_nodes())
+                .await
+                .expect("initialize_nodes returned")
+                .expect_err("a panicking node fails initialisation");
+        let msg = err.to_string();
+        assert!(msg.contains("'mic' (PanicInitNode)"), "{msg}");
+        assert!(msg.contains("panicked: sample rate out of range"), "{msg}");
+    }
+
+    /// A node whose creation or initialization behaves as its type says.
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Ok,
+        FailInit(&'static str),
+        SlowInit,
+        FailCreate(&'static str),
+    }
+    struct ModeNode(Mode);
+    #[async_trait::async_trait]
+    impl crate::nodes::AsyncStreamingNode for ModeNode {
+        fn node_type(&self) -> &str {
+            "ModeNode"
+        }
+        async fn initialize(
+            &self,
+            _ctx: &dyn crate::nodes::InitializeContextRead,
+        ) -> crate::Result<()> {
+            match self.0 {
+                Mode::FailInit(why) => Err(Error::Execution(why.into())),
+                Mode::SlowInit => {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+        async fn process(&self, data: RuntimeData) -> crate::Result<RuntimeData> {
+            Ok(data)
+        }
+    }
+    struct ModeFactory(&'static str, Mode);
+    impl crate::nodes::StreamingNodeFactory for ModeFactory {
+        fn node_type(&self) -> &str {
+            self.0
+        }
+        fn create(
+            &self,
+            _node_id: String,
+            _params: &serde_json::Value,
+            _session_id: Option<String>,
+        ) -> crate::Result<Box<dyn StreamingNode>> {
+            if let Mode::FailCreate(why) = self.1 {
+                return Err(Error::Execution(why.into()));
+            }
+            Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(
+                ModeNode(self.1),
+            ))))
+        }
+    }
+
+    async fn start_err(nodes: Vec<(&str, &str)>, factories: Vec<ModeFactory>) -> String {
+        let mut registry = StreamingNodeRegistry::new();
+        for f in factories {
+            registry.register(Arc::new(f));
+        }
+        let manifest = create_test_manifest(nodes, vec![]);
+        let (output, _rx) = ClientOutputRouter::new(8);
+        let (mut router, _) = SessionRouter::new(
+            "init-errors".into(),
+            Arc::new(manifest),
+            Arc::new(registry),
+            output,
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), router.initialize_nodes())
+            .await
+            .expect("initialize_nodes returned")
+            .expect_err("startup fails")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn every_failing_node_is_reported_not_just_the_first() {
+        let msg = start_err(
+            vec![("mic", "FailA"), ("ok", "Fine"), ("speaker", "FailB")],
+            vec![
+                ModeFactory("FailA", Mode::FailInit("mic: 1 channel unsupported")),
+                ModeFactory("Fine", Mode::Ok),
+                ModeFactory("FailB", Mode::FailInit("speaker: 16000 Hz unsupported")),
+            ],
+        )
+        .await;
+        assert!(msg.contains("2 of 3 nodes failed to initialize:
+"), "{msg}");
+        let mic = msg.find("- Node 'mic' (FailA): ").expect("mic listed");
+        let spk = msg.find("- Node 'speaker' (FailB): ").expect("speaker listed");
+        assert!(mic < spk, "manifest order: {msg}");
+        assert!(msg.contains("1 channel unsupported") && msg.contains("16000 Hz unsupported"));
+        assert!(!msg.contains("Not checked"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_node_does_not_delay_the_report_and_is_named_unchecked() {
+        let t0 = std::time::Instant::now();
+        let msg = start_err(
+            vec![("mic", "FailA"), ("stt", "Slow")],
+            vec![
+                ModeFactory("FailA", Mode::FailInit("mic: unsupported")),
+                ModeFactory("Slow", Mode::SlowInit),
+            ],
+        )
+        .await;
+        assert!(t0.elapsed() < INIT_FAILURE_GRACE + std::time::Duration::from_secs(2));
+        // A single failure keeps the original message shape.
+        assert!(
+            msg.contains("Node 'mic' (FailA) failed to initialize:"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Not checked (still initializing when startup was aborted): 'stt' (Slow)"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_node_that_cannot_be_created_is_reported() {
+        let msg = start_err(
+            vec![("a", "BadA"), ("b", "Fine"), ("c", "BadC")],
+            vec![
+                ModeFactory("BadA", Mode::FailCreate("unknown param 'rate'")),
+                ModeFactory("Fine", Mode::Ok),
+                ModeFactory("BadC", Mode::FailCreate("unknown param 'chans'")),
+            ],
+        )
+        .await;
+        assert!(msg.contains("2 of 3 nodes could not be created:
+"), "{msg}");
+        assert!(msg.contains("- Node 'a' (BadA): ") && msg.contains("- Node 'c' (BadC): "));
     }
 
     #[tokio::test]

@@ -76,7 +76,8 @@ pub async fn tick(
     let Some(ctrl) = control else {
         // No bus → nobody can observe; still honour the env perf flag so
         // `SessionHandle::perf_aggregator().peek_snapshot()` tooling works.
-        tel.perf().set_enabled(perf_env || tel.level() == TelemetryLevel::Full);
+        tel.perf()
+            .set_enabled(perf_env || tel.level() == TelemetryLevel::Full);
         return;
     };
 
@@ -104,7 +105,11 @@ pub async fn tick(
         };
         let due = state
             .last_perf_flush
-            .map(|t| t.elapsed() >= Duration::from_millis(window as u64).saturating_sub(Duration::from_millis(20)))
+            .map(|t| {
+                t.elapsed()
+                    >= Duration::from_millis(window as u64)
+                        .saturating_sub(Duration::from_millis(20))
+            })
             .unwrap_or(true);
         // When histograms were just turned on, the first window is partial;
         // `last_perf_flush == None` handles that by flushing immediately
@@ -139,7 +144,8 @@ pub async fn tick(
         .map(|(k, v)| (k, v.circuit_breaker_open))
         .collect();
 
-    let snap = build_snapshot(tel, state, &circuit, want_hist, is_final);
+    let mut snap = build_snapshot(tel, state, &circuit, want_hist, is_final);
+    snap.endpoints = ctrl.endpoint_telemetry(want_hist);
     match serde_json::to_value(&snap) {
         Ok(v) => ctrl.publish_tap(TELEMETRY_PORT, None, RuntimeData::Json(v)),
         Err(e) => tracing::warn!("telemetry: failed to serialize snapshot: {}", e),
@@ -193,10 +199,11 @@ pub(crate) fn build_snapshot(
         .map(|(idx, id)| {
             let cell = tel.node(idx);
             let in_flight_since = cell.in_flight_since_us.load(Relaxed);
-            let in_flight_ms = (in_flight_since > 0)
-                .then(|| now_us.saturating_sub(in_flight_since - 1) / 1000);
+            let in_flight_ms =
+                (in_flight_since > 0).then(|| now_us.saturating_sub(in_flight_since - 1) / 1000);
             let last_err_at = cell.last_error_at_us.load(Relaxed);
-            let since_error_ms = (last_err_at > 0).then(|| now_us.saturating_sub(last_err_at) / 1000);
+            let since_error_ms =
+                (last_err_at > 0).then(|| now_us.saturating_sub(last_err_at) / 1000);
             let q = QueueDepth {
                 input: probe(&cell.q_input),
                 filter: probe(&cell.q_filter),
@@ -239,6 +246,8 @@ pub(crate) fn build_snapshot(
                 first_output_latency_us,
                 circuit_open,
                 last_error: tel.last_error(idx),
+                llm_fallbacks: cell.llm_fallbacks.load(Relaxed),
+                logs: super::node_logs::NodeLogStore::global().counts(tel.session_id(), id),
             }
         })
         .collect();
@@ -257,6 +266,7 @@ pub(crate) fn build_snapshot(
         is_final,
         nodes,
         edges,
+        endpoints: Vec::new(),
     }
 }
 
