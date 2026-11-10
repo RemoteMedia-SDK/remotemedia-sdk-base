@@ -197,9 +197,9 @@ pub struct SessionHandle {
     /// can consume them — needed when a transport (e.g. WebRTC peer) wants
     /// to drain each kind on its own task instead of multiplexing through
     /// `recv_output`.
-    output_audio_rx: Option<mpsc::Receiver<RuntimeData>>,
-    output_video_rx: Option<mpsc::Receiver<RuntimeData>>,
-    output_data_rx: Option<mpsc::Receiver<RuntimeData>>,
+    output_audio_rx: Option<mpsc::Receiver<TransportData>>,
+    output_video_rx: Option<mpsc::Receiver<TransportData>>,
+    output_data_rx: Option<mpsc::Receiver<TransportData>>,
     /// Shutdown signal sender
     shutdown_tx: mpsc::Sender<()>,
     /// Handle to the session router task
@@ -372,9 +372,9 @@ impl SessionHandle {
         // or have buffered owners. Pattern mismatch disables that closed arm for
         // this receive; `else` runs only after every present kind is exhausted.
         tokio::select! {
-            Some(v) = &mut audio_fut, if has_audio => Ok(Some(TransportData::new(v))),
-            Some(v) = &mut video_fut, if has_video => Ok(Some(TransportData::new(v))),
-            Some(v) = &mut data_fut, if has_data => Ok(Some(TransportData::new(v))),
+            Some(v) = &mut audio_fut, if has_audio => Ok(Some(v)),
+            Some(v) = &mut video_fut, if has_video => Ok(Some(v)),
+            Some(v) = &mut data_fut, if has_data => Ok(Some(v)),
             else => Ok(None),
         }
     }
@@ -389,17 +389,17 @@ impl SessionHandle {
     pub fn try_recv_output(&mut self) -> Result<Option<TransportData>> {
         if let Some(rx) = self.output_audio_rx.as_mut() {
             if let Ok(data) = rx.try_recv() {
-                return Ok(Some(TransportData::new(data)));
+                return Ok(Some(data));
             }
         }
         if let Some(rx) = self.output_video_rx.as_mut() {
             if let Ok(data) = rx.try_recv() {
-                return Ok(Some(TransportData::new(data)));
+                return Ok(Some(data));
             }
         }
         if let Some(rx) = self.output_data_rx.as_mut() {
             if let Ok(data) = rx.try_recv() {
-                return Ok(Some(TransportData::new(data)));
+                return Ok(Some(data));
             }
         }
         Ok(None)
@@ -586,6 +586,23 @@ impl ParticipantSessionHandle {
     pub async fn send(&self, data: TransportData) -> Result<()> {
         self.input
             .send(data.with_participant_descriptor(&self.participant))
+            .await
+    }
+
+    /// Tell the session this participant left: its per-participant node
+    /// instances drain their queued frames and shut down (openspec:
+    /// add-multi-participant-sessions). Frames sent before this are still
+    /// processed. Sending more input afterwards starts new instances.
+    pub async fn leave(&self) -> Result<()> {
+        self.input
+            .send(
+                TransportData::new(RuntimeData::Json(serde_json::json!({})))
+                    .with_participant_descriptor(&self.participant)
+                    .with_metadata(
+                        crate::transport::origin::LIFECYCLE.to_string(),
+                        crate::transport::origin::LEAVE.to_string(),
+                    ),
+            )
             .await
     }
 }
@@ -1735,6 +1752,8 @@ mod tests {
     use crate::manifest::{Connection, ManifestMetadata, NodeManifest};
 
     mod output_drain;
+    mod provenance;
+    mod participants;
 
     fn create_test_manifest() -> Manifest {
         Manifest {

@@ -138,6 +138,12 @@ impl SyncStreamingNode for AudioChunkerNode {
         "AudioChunkerNode"
     }
 
+    /// Keeps per-speaker state: one instance per participant (openspec:
+    /// add-multi-participant-sessions).
+    fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
+        Some(crate::nodes::InstanceScope::PerParticipant)
+    }
+
     fn process(&self, _data: RuntimeData) -> std::result::Result<RuntimeData, Error> {
         Err(Error::Execution(
             "AudioChunkerNode requires streaming mode - \

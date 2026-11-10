@@ -46,6 +46,7 @@ async fn live_control_case(policy: CopyPolicy) {
             PbOp::Hello(Hello {
                 session_id: session.session_id.clone(),
                 attach_id: "copy-test".into(),
+                participant: None,
             }),
             PbOp::Subscribe(Subscribe {
                 addr: Some(address()),

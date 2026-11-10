@@ -43,6 +43,10 @@ pub struct NodeDescriptor {
     /// `reactive`, `clocked_to_outbound_media`, `source_wall(30)`; `None`
     /// until nodes are initialized.
     pub pacing: Option<String>,
+    /// `shared` or `per_participant` (openspec:
+    /// add-multi-participant-sessions); `None` until nodes are initialized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_scope: Option<String>,
     /// `true` for nodes spliced in by capability negotiation (or other
     /// manifest rewriting) rather than written by the manifest author.
     pub inserted_by_negotiation: bool,
@@ -148,6 +152,7 @@ impl SessionDescriptor {
                     is_streaming: n.is_streaming,
                     is_output_node: n.is_output_node,
                     pacing: None,
+                    instance_scope: None,
                     inserted_by_negotiation: false,
                     input_ports,
                     capabilities,
@@ -242,6 +247,16 @@ impl SessionDescriptor {
         for n in &mut self.nodes {
             if let Some(p) = pacing.get(&n.id) {
                 n.pacing = Some(p.clone());
+            }
+        }
+    }
+
+    /// Record each node's effective instance scope (`shared` /
+    /// `per_participant`), resolved once nodes exist.
+    pub fn set_instance_scopes(&mut self, scopes: &HashMap<String, String>) {
+        for n in &mut self.nodes {
+            if let Some(scope) = scopes.get(&n.id) {
+                n.instance_scope = Some(scope.clone());
             }
         }
     }

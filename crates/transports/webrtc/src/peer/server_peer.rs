@@ -222,13 +222,13 @@ impl PerTrackDispatcher {
                         warn!("audio shard closed before speech_end (peer {})", self.peer_id);
                     }
                 }
-                if let Err(e) = Self::send_data_channel(&self.data_channel, &transport_data.data, &self.copies).await {
+                if let Err(e) = Self::send_data_channel(&self.data_channel, &transport_data, &self.copies).await {
                     error!("data channel send failed (peer {}): {}", self.peer_id, e);
                 }
             }
             RuntimeData::Json(_) | RuntimeData::Text(_) => {
                 if let Err(e) =
-                    Self::send_data_channel(&self.data_channel, &transport_data.data, &self.copies).await
+                    Self::send_data_channel(&self.data_channel, &transport_data, &self.copies).await
                 {
                     error!("data channel send failed (peer {}): {}", self.peer_id, e);
                 }
@@ -371,9 +371,11 @@ impl PerTrackDispatcher {
         tx
     }
 
+    /// Send a Json/Text output as a `DataBuffer` whose `metadata` carries the
+    /// output's attribution (`participant.*`).
     async fn send_data_channel(
         data_channel: &Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
-        runtime_data: &RuntimeData,
+        transport_data: &TransportData,
         copies: &remotemedia_types::CopyContext,
     ) -> Result<()> {
         let dc_guard = data_channel.read().await;
@@ -381,7 +383,7 @@ impl PerTrackDispatcher {
             trace!("no data channel available; dropping json/text output");
             return Ok(());
         };
-        let encoded = crate::adapters::encode_runtime_data_with_context(runtime_data, copies)
+        let encoded = crate::adapters::encode_transport_data_with_context(transport_data, copies)
             .map_err(|e| Error::Other(e.into()))?;
         if let Err(e) = dc.send(&bytes::Bytes::from(encoded)).await {
             return Err(Error::WebRtcError(format!(
@@ -1283,6 +1285,7 @@ impl ServerPeer {
             .with_track_id(format!("{peer_id}:webrtc"))
             .with_modality(participant::modality::CONTROL);
         let participant_session = shared_session.participant_handle(participant);
+        let participant_for_leave = participant_session.clone();
         let peer_id_for_input = peer_id.clone();
         tokio::spawn(async move {
             while let Some(transport_data) = dc_input_rx.recv().await {
@@ -1315,6 +1318,11 @@ impl ServerPeer {
         tokio::spawn(async move {
             let _ = shutdown_rx.recv().await;
             info!("Shutting down media routing for peer {}", peer_id);
+            // The peer leaves the session: its per-participant node
+            // instances drain and stop (openspec: add-multi-participant-sessions).
+            if let Err(e) = participant_for_leave.leave().await {
+                debug!("peer {} leave after session end: {}", peer_id, e);
+            }
             shared_session_for_shutdown.detach_peer(&peer_id).await;
             info!("Media routing task ended for peer {}", peer_id);
         });

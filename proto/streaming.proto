@@ -104,6 +104,18 @@ message StreamInit {
   // without a prior deploy or a resolvable filesystem path. See
   // ExecuteRequest.embedded_python_env for the contract. Optional.
   EmbeddedPythonEnv embedded_python_env = 8;
+
+  // Join a shared pipeline session instead of starting a private one
+  // (openspec: add-multi-participant-sessions). Every stream that opens with
+  // the same key while the session runs feeds the same session, each as the
+  // participant below; outputs go to every stream on the key, each carrying
+  // the producing participant in `DataBuffer.metadata`. Empty = private
+  // session (the default).
+  string shared_session_key = 9;
+
+  // Who this stream is. `participant.id` is required with
+  // `shared_session_key`; ignored without it.
+  ParticipantInfo participant = 10;
 }
 
 // ============================================================================

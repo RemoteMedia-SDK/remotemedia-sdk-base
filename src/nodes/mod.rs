@@ -248,7 +248,8 @@ pub use ports::{InputPort, OutputPort, PortKind, TimestampedSnapshot};
 pub use provider::{iter_providers, provider_count, NodeProvider};
 pub use registry::{CompositeRegistry, NodeFactory as NodeFactoryTrait, RuntimeHint};
 pub use streaming_node::{
-    AsyncNodeWrapper, AsyncStreamingNode, InitializeContext, PacingNature, StreamingNode,
+    AsyncNodeWrapper, AsyncStreamingNode, InitializeContext, InstanceScope, PacingNature,
+    StreamingNode,
     StreamingNodeFactory, StreamingNodeRegistry, SyncNodeWrapper, SyncStreamingNode, Tick,
 };
 

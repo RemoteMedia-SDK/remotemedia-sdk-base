@@ -104,7 +104,8 @@ pub struct VADResult {
     description = "Speculative VAD gate for low-latency voice interaction",
     accepts = "audio",
     produces = "audio,control",
-    multi_output
+    multi_output,
+    instance_scope = "per_participant"
 )]
 pub struct SpeculativeVADGate {
     /// Lookback window in milliseconds (how much audio to keep for cancellation)

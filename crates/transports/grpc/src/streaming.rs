@@ -643,6 +643,11 @@ async fn handle_stream(
                     }
 
                     debug!("Processing StreamInit");
+                    if !init.shared_session_key.is_empty() {
+                        // The rest of this stream belongs to a shared session.
+                        return run_shared_stream(init, stream, tx.clone(), &executor, &plugin_policy, &metrics)
+                            .await;
+                    }
                     let output_taps = validate_output_taps(&init.output_taps)?;
                     let (new_session_id, ready) =
                         handle_stream_init(init, &sessions, &executor, &plugin_policy).await?;
@@ -951,6 +956,214 @@ async fn handle_stream(
         info!(session_id = %session_id, "Session disconnected");
     }
 
+    result
+}
+
+/// Streams currently attached to each shared session key, so the last one to
+/// leave closes the session.
+fn shared_stream_clients() -> &'static std::sync::Mutex<HashMap<String, usize>> {
+    static CLIENTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    CLIENTS.get_or_init(Default::default)
+}
+
+/// Output key of shared-stream results: core sessions do not name the sink
+/// that produced an output.
+pub const SHARED_STREAM_OUTPUT_KEY: &str = "output";
+
+/// `StreamPipeline` on a shared session (openspec:
+/// add-multi-participant-sessions): join the core shared session for
+/// `init.shared_session_key` as `init.participant`, feed this stream's chunks
+/// in as that participant, and stream every session output back with its
+/// `participant.*` attribution in `DataBuffer.metadata`. Leaves the session
+/// when the stream ends; the last stream on a key closes the session.
+async fn run_shared_stream(
+    init: StreamInit,
+    stream: &mut Streaming<StreamRequest>,
+    tx: tokio::sync::mpsc::Sender<Result<StreamResponse, Status>>,
+    executor: &Arc<PipelineExecutor>,
+    plugin_policy: &PluginPolicy,
+    metrics: &Arc<ServiceMetrics>,
+) -> Result<(), ServiceError> {
+    use crate::adapters::{data_buffer_into_transport_data_with_context, participant_metadata};
+    use remotemedia_core::transport::{data::participant, Participant};
+
+    if init.client_version.is_empty() {
+        return Err(ServiceError::Validation("client_version required".to_string()));
+    }
+    let identity = init.participant.as_ref().map(participant_metadata).unwrap_or_default();
+    let Some(participant_id) = identity.get(participant::ID).cloned() else {
+        return Err(ServiceError::Validation(
+            "participant.id required with shared_session_key".to_string(),
+        ));
+    };
+    if !init.embedded_plugins.is_empty() || init.embedded_python_env.is_some() {
+        return Err(ServiceError::Validation(
+            "embedded plugins and Python environments are not supported on shared sessions".to_string(),
+        ));
+    }
+    if !init.output_taps.is_empty() {
+        return Err(ServiceError::Validation(
+            "output_taps are not supported on shared sessions; attach to the control bus instead".to_string(),
+        ));
+    }
+    let manifest_proto = init
+        .manifest
+        .ok_or_else(|| ServiceError::Validation("manifest required in StreamInit".to_string()))?;
+    let manifest = decode_manifest(&manifest_proto, plugin_policy)?;
+    executor
+        .ensure_plugins_loaded(&manifest)
+        .await
+        .map_err(|error| ServiceError::Validation(error.to_string()))?;
+
+    let key = format!("grpc:{}", init.shared_session_key);
+    let shared = executor
+        .get_or_create_shared_session(key.clone(), Arc::new(manifest))
+        .await
+        .map_err(|error| ServiceError::Internal(format!("shared session: {error}")))?;
+    *shared_stream_clients().lock().unwrap().entry(key.clone()).or_default() += 1;
+    let info = init.participant.unwrap_or_default();
+    let mut who = Participant::new(participant_id.clone(), if info.role.is_empty() { participant::role::CLIENT.to_string() } else { info.role.clone() });
+    if !info.track_id.is_empty() {
+        who = who.with_track_id(info.track_id.clone());
+    }
+    if !info.modality.is_empty() {
+        who = who.with_modality(info.modality.clone());
+    }
+    if !info.display_name.is_empty() {
+        who = who.with_display_name(info.display_name.clone());
+    }
+    let handle = shared.participant_handle(who);
+    let copies = shared.transport_copy_context().await;
+    info!(
+        session_id = %shared.session_id(),
+        key = %init.shared_session_key,
+        participant = %participant_id,
+        "gRPC stream joined a shared session"
+    );
+
+    // Every output of the session goes to every stream on the key.
+    let (audio_rx, video_rx, data_rx) = shared.subscribe_outputs().split();
+    let mut forwarders = Vec::new();
+    for mut rx in [audio_rx, video_rx, data_rx] {
+        let tx = tx.clone();
+        let copies = copies.clone();
+        forwarders.push(tokio::spawn(async move {
+            loop {
+                let output = match rx.recv().await {
+                    Ok(output) => output,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "shared gRPC stream lagged; outputs dropped");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                // The output's metadata (participant.*) rides in DataBuffer.metadata.
+                let buffer = match crate::adapters::transport_data_to_data_buffer_with_context(&output, &copies) {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        warn!(%error, "shared gRPC output not encoded");
+                        continue;
+                    }
+                };
+                let mut data_outputs = HashMap::new();
+                data_outputs.insert(SHARED_STREAM_OUTPUT_KEY.to_string(), buffer);
+                let response = StreamResponse {
+                    response: Some(StreamResponseType::Result(ChunkResult {
+                        sequence: output.sequence.unwrap_or(0),
+                        data_outputs,
+                        processing_time_ms: 0.0,
+                        total_items_processed: 0,
+                    })),
+                };
+                if tx.send(Ok(response)).await.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    metrics.record_stream_start();
+    tx.send(Ok(StreamResponse {
+        response: Some(StreamResponseType::Ready(StreamReady {
+            session_id: shared.session_id().to_string(),
+            recommended_chunk_size: if init.expected_chunk_size > 0 { init.expected_chunk_size } else { 4096 },
+            max_buffer_latency_ms: 100,
+        })),
+    }))
+    .await
+    .map_err(|_| ServiceError::Internal("Failed to send StreamReady".to_string()))?;
+
+    let result: Result<(), ServiceError> = async {
+        while let Some(request) = stream
+            .message()
+            .await
+            .map_err(|e| ServiceError::Internal(format!("Stream receive error: {}", e)))?
+        {
+            match request.request {
+                Some(StreamRequestType::DataChunk(chunk)) => {
+                    let buffer = match (chunk.buffer, chunk.named_buffers.into_iter().next()) {
+                        (Some(buffer), _) => buffer,
+                        (None, Some((_, buffer))) => buffer,
+                        (None, None) => {
+                            return Err(ServiceError::Validation(
+                                "DataChunk must have buffer or named_buffers".to_string(),
+                            ))
+                        }
+                    };
+                    let mut input = data_buffer_into_transport_data_with_context(buffer, &copies)
+                        .map_err(|rejected| ServiceError::Validation(rejected.to_string()))?
+                        .ok_or_else(|| ServiceError::Validation("Data conversion failed".to_string()))?;
+                    input.sequence = Some(chunk.sequence);
+                    handle
+                        .send(input)
+                        .await
+                        .map_err(|e| ServiceError::Internal(format!("shared session input: {e}")))?;
+                }
+                Some(StreamRequestType::Control(_)) => {
+                    tx.send(Ok(StreamResponse {
+                        response: Some(StreamResponseType::Closed(StreamClosed {
+                            session_id: handle.session_id().to_string(),
+                            final_metrics: None,
+                            reason: "client closed".to_string(),
+                        })),
+                    }))
+                    .await
+                    .map_err(|_| ServiceError::Internal("Failed to send StreamClosed".to_string()))?;
+                    break;
+                }
+                Some(StreamRequestType::Init(_)) => {
+                    return Err(ServiceError::Validation("StreamInit already received".to_string()))
+                }
+                None => warn!("Received empty StreamRequest"),
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    // This participant leaves; its per-participant node instances stop.
+    let _ = handle.leave().await;
+    for forwarder in forwarders {
+        forwarder.abort();
+    }
+    let last = {
+        let mut clients = shared_stream_clients().lock().unwrap();
+        let count = clients.entry(key.clone()).or_default();
+        *count = count.saturating_sub(1);
+        let last = *count == 0;
+        if last {
+            clients.remove(&key);
+        }
+        last
+    };
+    if last {
+        if let Err(error) = shared.close().await {
+            warn!(key = %key, "closing shared session: {error}");
+        }
+    }
+    metrics.record_stream_end();
+    info!(participant = %participant_id, "gRPC stream left its shared session");
     result
 }
 

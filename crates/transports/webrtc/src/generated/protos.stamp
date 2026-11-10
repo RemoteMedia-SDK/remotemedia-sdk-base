@@ -1,5 +1,5 @@
 # Hashes (FNV-1a 64, LF-normalized) of the .proto files these bindings were
 # generated from. Written by the `regen-protos` build; do not edit by hand.
 3d77b6736af6a726  webrtc_signaling.proto
-ba8f86591d84f8bb  common.proto
-5c383af8fde50f39  control.proto
+6ee65e10e3c7a4d4  common.proto
+f2e7e856635d7409  control.proto

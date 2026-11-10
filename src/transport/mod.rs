@@ -45,6 +45,7 @@ mod managed_ardy;
 mod mapped_placement;
 mod node_materialization;
 pub use node_materialization::NodeMaterializationCopies;
+pub mod origin;
 mod output_delivery;
 pub mod pacer;
 pub mod perf_aggregator;
@@ -73,6 +74,7 @@ pub use endpoint::{
     HostKind, IncomingCall,
 };
 pub use data::{Participant, TransportData};
+pub use origin::{Origin, Routed};
 pub use executor::{
     ExecutorConfig, ParticipantSessionHandle, PipelineExecutor, PipelineSessionHost, SessionHandle,
     SessionInputSender,

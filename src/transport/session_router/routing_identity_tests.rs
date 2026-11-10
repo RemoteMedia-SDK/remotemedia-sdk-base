@@ -68,7 +68,7 @@ struct Graph {
     emitter: Arc<VecEmitter>,
     control: Option<Arc<SessionControl>>,
     input: crate::transport::SessionPacketSender,
-    audio: mpsc::Receiver<RuntimeData>,
+    audio: mpsc::Receiver<crate::transport::TransportData>,
     shutdown: mpsc::Sender<()>,
     running: JoinHandle<Result<()>>,
 }
@@ -149,7 +149,8 @@ impl Graph {
                 tokio::time::timeout(Duration::from_secs(2), self.audio.recv())
                     .await
                     .expect("routed output")
-                    .expect("audio lane open"),
+                    .expect("audio lane open")
+                    .data,
             );
         }
         out
@@ -246,6 +247,6 @@ async fn client_output_router_promotes_direct_sends() {
     let samples = vec![1.0_f32; SAMPLES];
     let second = samples.as_ptr();
     router.send(legacy_audio(samples)).await.unwrap();
-    shared_samples_at(&receivers.audio_rx.recv().await.unwrap(), address, 1.0);
-    shared_samples_at(&receivers.audio_rx.recv().await.unwrap(), second, 1.0);
+    shared_samples_at(&receivers.audio_rx.recv().await.unwrap().data, address, 1.0);
+    shared_samples_at(&receivers.audio_rx.recv().await.unwrap().data, second, 1.0);
 }

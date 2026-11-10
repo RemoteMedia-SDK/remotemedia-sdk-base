@@ -78,6 +78,7 @@ use remotemedia_traits::call::{
     CallReplyEnvelope, CallReplyEvent, CallRequestEnvelope, CALL_REPLY_METHOD,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
@@ -1489,7 +1490,7 @@ impl SessionControl {
     /// `addr.port == None` means the main rail — payload is forwarded
     /// unchanged, preserving the existing wire behavior.
     pub async fn publish(&self, addr: &ControlAddress, data: RuntimeData) -> Result<()> {
-        self.publish_inner(addr, data, None).await
+        self.publish_inner(addr, data, None, HashMap::new()).await
     }
 
     /// Publish from a control attachment. Its RPCs end when the scope closes;
@@ -1500,7 +1501,21 @@ impl SessionControl {
         data: RuntimeData,
         scope: &RpcCallScope,
     ) -> Result<()> {
-        self.publish_inner(addr, data, Some(scope.caller())).await
+        self.publish_inner(addr, data, Some(scope.caller()), HashMap::new()).await
+    }
+
+    /// [`Self::publish_scoped`] with transport metadata for the injected
+    /// frame, e.g. the `participant.*` fields of the attach that published it
+    /// (openspec: add-multi-participant-sessions). The router attributes the
+    /// frame, and everything it produces, to that participant.
+    pub async fn publish_scoped_with_metadata(
+        &self,
+        addr: &ControlAddress,
+        data: RuntimeData,
+        scope: &RpcCallScope,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        self.publish_inner(addr, data, Some(scope.caller()), metadata).await
     }
 
     async fn publish_inner(
@@ -1508,6 +1523,7 @@ impl SessionControl {
         addr: &ControlAddress,
         data: RuntimeData,
         caller: Option<RpcCaller>,
+        metadata: HashMap<String, String>,
     ) -> Result<()> {
         if addr.direction != Direction::In {
             return Err(crate::Error::Execution(
@@ -1578,7 +1594,7 @@ impl SessionControl {
                 .inject_seq
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             sub_sequence: 0,
-            metadata: std::collections::HashMap::new(),
+            metadata,
         };
         tx.send(packet).await.map_err(|error| {
             crate::Error::Execution(format!("session {} ingress: {error}", self.session_id))

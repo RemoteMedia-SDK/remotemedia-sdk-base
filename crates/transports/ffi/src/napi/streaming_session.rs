@@ -48,7 +48,8 @@ use tokio::sync::{mpsc, Mutex};
 use remotemedia_core::data::RuntimeData;
 use remotemedia_core::manifest::Manifest;
 use remotemedia_core::transport::{
-    PipelineExecutor, SessionHandle, SessionInputSender, TransportData,
+    Participant, ParticipantSessionHandle, PipelineExecutor, SessionHandle, SessionInputSender,
+    TransportData,
 };
 
 use super::buffer_config::PipelineBufferConfig;
@@ -56,8 +57,37 @@ use super::control_session::NapiAttachedSession;
 use super::output_loans::NapiOutputAllocator;
 use super::pipeline::NapiRuntimeData;
 
-type InputSlot = Arc<Mutex<Option<SessionInputSender>>>;
-type RxSlot = Arc<Mutex<Option<mpsc::Receiver<RuntimeData>>>>;
+type InputSlot = Arc<Mutex<Option<InputSender>>>;
+type MembershipSlot = Arc<Mutex<Option<crate::shared_sessions::SharedMembership>>>;
+
+/// Where a session's input goes: straight in, or in as a participant of a
+/// shared session.
+enum InputSender {
+    Raw(SessionInputSender),
+    Participant(ParticipantSessionHandle),
+}
+
+impl InputSender {
+    async fn send(&self, data: TransportData) -> remotemedia_core::Result<()> {
+        match self {
+            Self::Raw(sender) => sender.send(data).await,
+            Self::Participant(sender) => sender.send(data).await,
+        }
+    }
+}
+
+/// Who a shared session's handle speaks for (`createSharedStreamingSession`).
+#[napi(object)]
+pub struct NapiParticipant {
+    pub id: String,
+    /// Defaults to `"user"`.
+    pub role: Option<String>,
+    pub track_id: Option<String>,
+    pub modality: Option<String>,
+    pub display_name: Option<String>,
+}
+/// Session outputs; metadata carries the producing participant.
+type RxSlot = Arc<Mutex<Option<mpsc::Receiver<TransportData>>>>;
 type HandleSlot = Arc<Mutex<Option<SessionHandle>>>;
 
 /// A `{kind, data}` pair returned from `recvOutput()`.
@@ -69,6 +99,7 @@ type HandleSlot = Arc<Mutex<Option<SessionHandle>>>;
 pub struct PipelineEvent {
     kind: String,
     data: NapiRuntimeData,
+    participant: Option<std::collections::HashMap<String, String>>,
 }
 
 #[napi]
@@ -82,6 +113,34 @@ impl PipelineEvent {
     pub fn data(&self) -> NapiRuntimeData {
         self.data.clone()
     }
+
+    /// The participant whose input produced this output (`{id, role,
+    /// trackId?, modality?, displayName?}`), or `null` when the output is not
+    /// attributed (openspec: add-multi-participant-sessions).
+    #[napi(getter, ts_return_type = "Record<string, string> | null")]
+    pub fn participant(&self) -> Option<std::collections::HashMap<String, String>> {
+        self.participant.clone()
+    }
+}
+
+/// `participant.*` output metadata as the JS `participant` object.
+fn participant_object(
+    metadata: &std::collections::HashMap<String, String>,
+) -> Option<std::collections::HashMap<String, String>> {
+    let fields = crate::shared_sessions::participant_fields(metadata)?;
+    Some(
+        fields
+            .into_iter()
+            .map(|(field, value)| {
+                let key = match field {
+                    "track_id" => "trackId",
+                    "display_name" => "displayName",
+                    other => other,
+                };
+                (key.to_string(), value)
+            })
+            .collect(),
+    )
 }
 
 /// Long-lived streaming session handle for Node.js.
@@ -99,6 +158,8 @@ pub struct NapiStreamingSession {
     video_rx: RxSlot,
     data_rx: RxSlot,
     handle: HandleSlot,
+    /// Membership of a shared session; `None` for a private session.
+    membership: MembershipSlot,
     _executor: Arc<PipelineExecutor>,
     output_allocator: Arc<dyn remotemedia_types::OutputAllocator>,
 }
@@ -199,7 +260,7 @@ impl NapiStreamingSession {
             }
 
             enum Outcome {
-                Got(&'static str, RuntimeData),
+                Got(&'static str, TransportData),
                 Closed(&'static str),
             }
 
@@ -241,13 +302,14 @@ impl NapiStreamingSession {
             };
 
             match outcome {
-                Outcome::Got(kind, rd) => {
+                Outcome::Got(kind, out) => {
                     *a_guard = a_taken;
                     *v_guard = v_taken;
                     *d_guard = d_taken;
                     return Ok(Some(PipelineEvent {
                         kind: kind.to_string(),
-                        data: NapiRuntimeData::from_runtime_with_context(rd, &self.copies),
+                        participant: participant_object(&out.metadata),
+                        data: NapiRuntimeData::from_runtime_with_context(out.data, &self.copies),
                     }));
                 }
                 Outcome::Closed("audio") => {
@@ -281,12 +343,19 @@ impl NapiStreamingSession {
     /// Gracefully tear down the session. Idempotent.
     #[napi]
     pub async fn close(&self) -> Result<()> {
-        *self.input_sender.lock().await = None;
+        // A participant leaves its shared session: its per-participant node
+        // instances drain and stop.
+        if let Some(InputSender::Participant(participant)) = self.input_sender.lock().await.take() {
+            let _ = participant.leave().await;
+        }
         *self.audio_rx.lock().await = None;
         *self.video_rx.lock().await = None;
         *self.data_rx.lock().await = None;
         if let Some(mut h) = self.handle.lock().await.take() {
             let _ = h.close().await;
+        }
+        if let Some(membership) = self.membership.lock().await.take() {
+            membership.leave().await;
         }
         Ok(())
     }
@@ -308,7 +377,7 @@ async fn recv_kind(
 ) -> Result<Option<NapiRuntimeData>> {
     let mut guard = rx_arc.lock().await;
     let result = match guard.as_mut() {
-        Some(rx) => rx.recv().await,
+        Some(rx) => rx.recv().await.map(|out| out.data),
         None => None,
     };
     if result.is_none() {
@@ -358,6 +427,12 @@ pub(crate) async fn plugin_executor(
     }
     let executor = PipelineExecutor::with_config(config)
         .map_err(|e| Error::from_reason(format!("Failed to create executor: {}", e)))?;
+    register_loaded_plugins(&executor).await;
+    Ok(Arc::new(executor))
+}
+
+/// Register every plugin loaded so far, so manifests can use its node types.
+async fn register_loaded_plugins(executor: &PipelineExecutor) {
     // Register every loaded plugin so the manifest can reference dynamic node
     // types. Mirrors `create_streaming_session` in the Python FFI. The
     // `plugins` module is python-feature-gated today (it sits under
@@ -368,7 +443,6 @@ pub(crate) async fn plugin_executor(
     for factory in crate::plugins::collect_registered_factories() {
         executor.register_factory(factory).await;
     }
-    Ok(Arc::new(executor))
 }
 
 #[doc(hidden)]
@@ -396,11 +470,106 @@ pub(crate) async fn build_session(
         output_allocator: handle.output_allocator(),
         copies: handle.transport_copy_context(),
         session_id,
-        input_sender: Arc::new(Mutex::new(Some(input_sender))),
+        input_sender: Arc::new(Mutex::new(Some(InputSender::Raw(input_sender)))),
         audio_rx: Arc::new(Mutex::new(Some(receivers.audio_rx))),
         video_rx: Arc::new(Mutex::new(Some(receivers.video_rx))),
         data_rx: Arc::new(Mutex::new(Some(receivers.data_rx))),
         handle: Arc::new(Mutex::new(Some(handle))),
+        membership: Arc::new(Mutex::new(None)),
         _executor: executor,
     })
+}
+
+/// Create or join the shared streaming session `sharedSessionKey` as
+/// `participant` (openspec: add-multi-participant-sessions).
+///
+/// Calls in one process with the same key (and the same `pipelineBuffers`)
+/// join one pipeline session; each handle's input enters as its participant
+/// and `recvOutput()` events carry the producing `participant`. `close()`
+/// leaves the session; the last handle to close shuts it down.
+///
+/// # JS Example
+/// ```javascript
+/// const alice = await createSharedStreamingSession(manifest, 'room1', { id: 'alice' });
+/// const bob = await createSharedStreamingSession(manifest, 'room1', { id: 'bob' });
+/// await alice.sendInput(NapiRuntimeData.text('hi'));
+/// const ev = await bob.recvOutput();   // ev.participant.id === 'alice'
+/// ```
+#[napi]
+pub async fn create_shared_streaming_session(
+    manifest_json: String,
+    shared_session_key: String,
+    participant: NapiParticipant,
+    pipeline_buffers: Option<PipelineBufferConfig>,
+) -> Result<NapiStreamingSession> {
+    ensure_tracing_initialized();
+    if participant.id.is_empty() {
+        return Err(Error::from_reason("participant.id is required"));
+    }
+    let config = pipeline_buffers
+        .as_ref()
+        .map(PipelineBufferConfig::to_executor_config)
+        .transpose()?
+        .unwrap_or_default();
+    let executor = crate::shared_sessions::shared_executor(config)
+        .map_err(|e| Error::from_reason(format!("Failed to create executor: {}", e)))?;
+    register_loaded_plugins(&executor).await;
+    let manifest: Manifest = serde_json::from_str(&manifest_json)
+        .map_err(|e| Error::from_reason(format!("Failed to parse manifest: {}", e)))?;
+    let shared = executor
+        .get_or_create_shared_session(shared_session_key, Arc::new(manifest))
+        .await
+        .map_err(|e| Error::from_reason(format!("create shared session failed: {}", e)))?;
+    let mut who = Participant::new(participant.id, participant.role.unwrap_or_else(|| "user".to_string()));
+    if let Some(track_id) = participant.track_id {
+        who = who.with_track_id(track_id);
+    }
+    if let Some(modality) = participant.modality {
+        who = who.with_modality(modality);
+    }
+    if let Some(display_name) = participant.display_name {
+        who = who.with_display_name(display_name);
+    }
+    let input = shared.participant_handle(who);
+    let (audio_rx, video_rx, data_rx) = bridge_outputs(shared.subscribe_outputs());
+    let membership = crate::shared_sessions::SharedMembership::join(Arc::clone(&shared));
+    Ok(NapiStreamingSession {
+        output_allocator: shared.output_allocator().await,
+        copies: shared.transport_copy_context().await,
+        session_id: shared.session_id().to_string(),
+        input_sender: Arc::new(Mutex::new(Some(InputSender::Participant(input)))),
+        audio_rx: Arc::new(Mutex::new(Some(audio_rx))),
+        video_rx: Arc::new(Mutex::new(Some(video_rx))),
+        data_rx: Arc::new(Mutex::new(Some(data_rx))),
+        handle: Arc::new(Mutex::new(None)),
+        membership: Arc::new(Mutex::new(Some(membership))),
+        _executor: executor,
+    })
+}
+
+/// Per-kind receivers fed from a shared session's output broadcast; outputs
+/// keep their metadata (the producing participant).
+fn bridge_outputs(
+    mut outputs: remotemedia_core::transport::SharedPipelineOutputReceivers,
+) -> (
+    mpsc::Receiver<TransportData>,
+    mpsc::Receiver<TransportData>,
+    mpsc::Receiver<TransportData>,
+) {
+    let (audio_tx, audio_rx) = mpsc::channel(128);
+    let (video_tx, video_rx) = mpsc::channel(128);
+    let (data_tx, data_rx) = mpsc::channel(128);
+    tokio::spawn(async move {
+        while let Ok(Some(output)) = outputs.recv_output().await {
+            let sent = match &output.data {
+                RuntimeData::Audio { .. } => audio_tx.send(output).await,
+                RuntimeData::Video { .. } => video_tx.send(output).await,
+                _ => data_tx.send(output).await,
+            };
+            if sent.is_err() {
+                break;
+            }
+        }
+    });
+    (audio_rx, video_rx, data_rx)
 }

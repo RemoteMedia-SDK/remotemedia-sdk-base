@@ -261,8 +261,16 @@ impl PipelineControl for ControlServiceImpl {
             .ok_or_else(|| Status::invalid_argument("attach closed before Hello"))?
             .map_err(|e| Status::internal(format!("stream error before Hello: {e}")))?;
 
-        let (session_id, attach_id) = match first.op {
-            Some(PbOp::Hello(hello)) => (hello.session_id, hello.attach_id),
+        let (session_id, attach_id, identity) = match first.op {
+            Some(PbOp::Hello(hello)) => (
+                hello.session_id,
+                hello.attach_id,
+                hello
+                    .participant
+                    .as_ref()
+                    .map(crate::adapters::participant_metadata)
+                    .unwrap_or_default(),
+            ),
             _ => {
                 return Err(Status::invalid_argument("first ControlFrame must be Hello"));
             }
@@ -297,7 +305,7 @@ impl PipelineControl for ControlServiceImpl {
         let bus = self.bus.clone();
         let can_host = self.allow_hosting;
         tokio::spawn(async move {
-            run_attach_loop(ctrl, bus, session_id, in_stream, out_tx, can_host).await;
+            run_attach_loop(ctrl, bus, session_id, in_stream, out_tx, can_host, identity).await;
         });
 
         let stream: EventStream = Box::pin(ReceiverStream::new(out_rx));
@@ -314,6 +322,7 @@ async fn run_attach_loop(
     mut in_stream: Streaming<ControlFrame>,
     out_tx: mpsc::Sender<Result<ControlEvent, Status>>,
     can_host: bool,
+    identity: HashMap<String, String>,
 ) {
     // Watch for session-close. First fire ends this attach.
     let mut close_rx = ctrl.close_subscriber();
@@ -353,6 +362,7 @@ async fn run_attach_loop(
                     &mut forwarders,
                     &rpc_scope,
                     &mut hosted,
+                    &identity,
                 )
                 .await
                 {
@@ -686,6 +696,7 @@ async fn handle_inbound_frame(
     forwarders: &mut Forwarders,
     rpc_scope: &RpcCallScope,
     hosted: &mut HostedEndpoints,
+    identity: &HashMap<String, String>,
 ) -> Result<(), ErrorEvent> {
     match frame.op {
         Some(PbOp::HostEndpoint(req)) => {
@@ -847,9 +858,13 @@ async fn handle_inbound_frame(
                     Some(core.clone()),
                 )
             })?;
+            // The frame's own metadata wins; the attach's declared
+            // participant (Hello.participant) fills the rest.
+            let mut metadata = identity.clone();
+            metadata.extend(data.metadata.iter().map(|(k, v)| (k.clone(), v.clone())));
             let rt = pb_to_runtime_data(data, &ctrl.transport_copy_context())
                 .map_err(|e| error(ControlErrorCode::Internal, e, Some(core.clone())))?;
-            ctrl.publish_scoped(&core, rt, rpc_scope)
+            ctrl.publish_scoped_with_metadata(&core, rt, rpc_scope, metadata)
                 .await
                 .map_err(|e| {
                     error(

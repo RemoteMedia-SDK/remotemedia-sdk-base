@@ -19,7 +19,7 @@ use remotemedia_types::{CopyContext, CopyReason, CopyRejected};
 
 mod owned;
 mod wire;
-pub use wire::encode_runtime_data_with_context;
+pub use wire::{encode_runtime_data_with_context, encode_transport_data_with_context};
 pub(crate) use wire::PreparedRuntimeData;
 pub use owned::{data_buffer_into_runtime_data, data_buffer_into_runtime_data_with_context};
 

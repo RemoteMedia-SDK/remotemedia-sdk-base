@@ -229,6 +229,12 @@ impl SyncStreamingNode for TextCollectorNode {
         "TextCollectorNode"
     }
 
+    /// Keeps per-speaker state: one instance per participant (openspec:
+    /// add-multi-participant-sessions).
+    fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
+        Some(crate::nodes::InstanceScope::PerParticipant)
+    }
+
     fn process(&self, _data: RuntimeData) -> Result<RuntimeData, Error> {
         Err(Error::Execution(
             "TextCollectorNode requires streaming mode - \
