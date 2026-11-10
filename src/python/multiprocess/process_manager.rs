@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
+/// How often a worker's monitor task checks for its exit.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 #[cfg(feature = "docker")]
 use bollard::Docker;
 
@@ -783,8 +786,10 @@ impl ProcessManager {
                     break;
                 }
 
-                // Check periodically
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                // Check periodically. This only bounds how quickly an exit or
+                // a lost reporting authority is noticed; a 1 ms period woke
+                // this task up to a thousand times a second per worker.
+                tokio::time::sleep(EXIT_POLL_INTERVAL).await;
             }
         });
     }

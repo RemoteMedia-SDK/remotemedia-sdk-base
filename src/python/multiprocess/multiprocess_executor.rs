@@ -3302,10 +3302,10 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 "✅ Received READY signal - Python subscriber is ready to receive data"
             );
 
-            // Small delay to ensure Python subscriber is fully registered with iceoryx2's routing tables
-            // The subscriber creation and READY signal are very close in time, but iceoryx2 needs a moment
-            // to complete the internal pub/sub connection registration
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // No settling delay is needed here. The worker creates its input
+            // subscriber when it connects, before it loads its model and long
+            // before it signals READY, and the channel keeps a history for a
+            // subscriber that joins late.
 
             tracing::debug!(
                 "✅ Node initialization complete, IPC thread ready with persistent publishers"
