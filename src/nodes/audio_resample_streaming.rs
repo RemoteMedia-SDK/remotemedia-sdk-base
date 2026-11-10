@@ -222,6 +222,12 @@ impl AsyncStreamingNode for ResampleStreamingNode {
     fn node_type(&self) -> &str {
         "FastResampleNode"
     }
+
+    /// Keeps per-stream filter history: one instance per participant
+    /// (openspec: add-multi-participant-sessions).
+    fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
+        Some(crate::nodes::InstanceScope::PerParticipant)
+    }
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
         self.process_allocated(data, &HeapOutputAllocator)
     }
@@ -482,6 +488,12 @@ impl AsyncStreamingNode for AutoResampleStreamingNode {
     fn node_type(&self) -> &str {
         "FastResampleNode"
     }
+
+    /// Keeps per-stream filter history: one instance per participant
+    /// (openspec: add-multi-participant-sessions).
+    fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
+        Some(crate::nodes::InstanceScope::PerParticipant)
+    }
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData> {
         self.process_allocated(data, &HeapOutputAllocator)
     }
@@ -561,6 +573,10 @@ impl AutoResampleStreamingNodeWrapper {
 impl StreamingNode for AutoResampleStreamingNodeWrapper {
     fn node_type(&self) -> &str {
         self.inner.node_type()
+    }
+
+    fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
+        self.inner.instance_scope()
     }
 
     fn node_id(&self) -> &str {

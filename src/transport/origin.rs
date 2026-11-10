@@ -16,6 +16,12 @@ use crate::data::RuntimeData;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Packet metadata key marking a participant lifecycle event; the router
+/// handles such packets itself and never routes them to a node.
+pub const LIFECYCLE: &str = "participant.lifecycle";
+/// [`LIFECYCLE`] value: the participant in `participant.id` left the session.
+pub const LEAVE: &str = "leave";
+
 /// Who produced a frame: the sender's canonical `participant.*` fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
@@ -30,7 +36,7 @@ impl Origin {
         let id = metadata.get(participant::ID)?.clone();
         let fields = metadata
             .iter()
-            .filter(|(key, _)| key.starts_with("participant."))
+            .filter(|(key, _)| key.starts_with("participant.") && key.as_str() != LIFECYCLE)
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         Some(Self { id, fields })

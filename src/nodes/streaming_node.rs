@@ -40,7 +40,7 @@ use std::sync::Arc;
 // `remotemedia-traits`. Historical `crate::nodes::*` paths keep working.
 pub use remotemedia_traits::runtime_context::{InitializeContextRead, NodeRuntimeContextRead};
 pub use remotemedia_traits::streaming::{
-    AsyncNodeWrapper, AsyncStreamingNode, NodeStatus, PacingNature, StreamingNode,
+    AsyncNodeWrapper, AsyncStreamingNode, InstanceScope, NodeStatus, PacingNature, StreamingNode,
     StreamingNodeFactory, SyncNodeWrapper, SyncStreamingNode, Tick,
 };
 

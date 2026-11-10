@@ -588,6 +588,23 @@ impl ParticipantSessionHandle {
             .send(data.with_participant_descriptor(&self.participant))
             .await
     }
+
+    /// Tell the session this participant left: its per-participant node
+    /// instances drain their queued frames and shut down (openspec:
+    /// add-multi-participant-sessions). Frames sent before this are still
+    /// processed. Sending more input afterwards starts new instances.
+    pub async fn leave(&self) -> Result<()> {
+        self.input
+            .send(
+                TransportData::new(RuntimeData::Json(serde_json::json!({})))
+                    .with_participant_descriptor(&self.participant)
+                    .with_metadata(
+                        crate::transport::origin::LIFECYCLE.to_string(),
+                        crate::transport::origin::LEAVE.to_string(),
+                    ),
+            )
+            .await
+    }
 }
 
 // Implement StreamSession for SessionHandle to allow use in PipelineTransport
@@ -1736,6 +1753,7 @@ mod tests {
 
     mod output_drain;
     mod provenance;
+    mod participants;
 
     fn create_test_manifest() -> Manifest {
         Manifest {

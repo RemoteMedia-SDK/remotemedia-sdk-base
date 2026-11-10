@@ -410,6 +410,9 @@ impl StreamingNode for BufferCheckedNode {
     fn pacing_nature(&self) -> PacingNature {
         self.inner.pacing_nature()
     }
+    fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
+        self.inner.instance_scope()
+    }
     fn capability_subscriptions(&self) -> Vec<String> {
         self.inner.capability_subscriptions()
     }

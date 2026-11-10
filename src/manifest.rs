@@ -309,6 +309,17 @@ pub struct NodeManifest {
     /// Python environment policy for this node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python_env: Option<NodePythonEnv>,
+
+    /// How many instances of this node a session runs when several
+    /// participants send input: `"shared"` or `"per_participant"`. Overrides
+    /// the node's own declaration (openspec: add-multi-participant-sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_scope: Option<crate::nodes::InstanceScope>,
+
+    /// For a per-participant node: the most instances it may run in one
+    /// session (default: `ExecutorConfig::max_participant_instances`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instances: Option<usize>,
 }
 
 /// Runtime hint for Python node execution (Phase 1.10.5)
