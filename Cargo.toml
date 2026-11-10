@@ -142,8 +142,8 @@ nokhwa = { version = "0.10", optional = true, features = ["input-native"] }
 # multi-minute CUDA C++ build in the default workspace cargo build).
 
 # IPC for multiprocess
-iceoryx2 = { version = "0.9.0", optional = true }
-iceoryx2-log = { version = "0.9.0", optional = true }
+iceoryx2 = { version = "0.10.0", optional = true }
+iceoryx2-log = { version = "0.10.0", optional = true }
 
 # Note: Python wrapper nodes are in a separate crate (remotemedia-nodes-python).
 # Users should add that crate as a dependency to get Python nodes.
@@ -376,13 +376,6 @@ embedded-python = ["bundled-uv", "remotemedia-py-env/embedded-python"]
 # NOTE: grpc-client is for RemotePipelineNode client functionality only
 # Full transport implementations belong in separate transport crates
 
-# Vendored iceoryx2 0.9.3 Windows repairs (from a9b23afd; see
-# crates/patches/README.md): dead-node port-tag cleanup so Windows node
-# directories are actually removed, plus enumeration/diagnostic fixes.
-[patch.crates-io]
-iceoryx2-pal-posix = { path = "../remotemedia-sdk/crates/patches/iceoryx2-pal-posix" }
-iceoryx2 = { path = "../remotemedia-sdk/crates/patches/iceoryx2" }
-
 [patch."https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk"]
 loadable-node-abi = { path = "../remotemedia-plugin-sdk/crates/loadable-node-abi" }
 remotemedia-types = { path = "../remotemedia-plugin-sdk/crates/types" }
@@ -489,8 +482,8 @@ pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 numpy = "0.28"
 
 # IPC for multiprocess
-iceoryx2 = "0.9.0"
-iceoryx2-log = "0.9.0"
+iceoryx2 = "0.10.0"
+iceoryx2-log = "0.10.0"
 
 # Logging and tracing
 tracing = "0.1"

@@ -75,6 +75,84 @@ fn global_sessions(
 }
 
 /// Commands sent to the dedicated IPC thread
+/// How often the wake thread polls on the node's behalf until the node has
+/// signalled once. A node that never signals is served at this interval.
+#[cfg(feature = "multiprocess")]
+const WAKE_FALLBACK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How often the wake thread checks for shutdown once the node signals.
+#[cfg(feature = "multiprocess")]
+const WAKE_IDLE_CHECK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Block on a node's output wake event and turn each signal into
+/// `IpcCommand::Wake` for the node's IPC thread.
+///
+/// The listener is not `Send`, so it lives on this thread. Returns `None`
+/// when the listener cannot be created; the IPC thread then keeps polling.
+#[cfg(feature = "multiprocess")]
+fn spawn_wake_thread(
+    registry: Arc<ChannelRegistry>,
+    output_channel: String,
+    node_id: String,
+    wake_tx: tokio::sync::mpsc::WeakSender<IpcCommand>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    use std::sync::atomic::Ordering;
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+    let thread = std::thread::Builder::new()
+        .name(format!("ipc-wake-{node_id}"))
+        .spawn(move || {
+            let listener = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|rt| {
+                    rt.block_on(registry.create_wake_listener(&output_channel))
+                        .map_err(|e| e.to_string())
+                });
+            let listener = match listener {
+                Ok(listener) => listener,
+                Err(e) => {
+                    tracing::debug!("No output wake listener for node {node_id}: {e}");
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+            };
+            let _ = ready_tx.send(true);
+            let mut signalled = false;
+            while !stop.load(Ordering::Acquire) {
+                let interval = if signalled {
+                    WAKE_IDLE_CHECK
+                } else {
+                    WAKE_FALLBACK_POLL
+                };
+                match listener.timed_wait(|_| {}, interval) {
+                    Ok(events) => signalled |= events > 0,
+                    Err(e) => {
+                        tracing::warn!("Wake wait failed for node {node_id}: {e:?}");
+                        std::thread::sleep(interval);
+                    }
+                }
+                // A timeout wakes the IPC thread too: it is the poll for a
+                // node that does not signal, and harmless otherwise.
+                let Some(tx) = wake_tx.upgrade() else { break };
+                if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+                    tx.try_send(IpcCommand::Wake)
+                {
+                    break;
+                }
+            }
+        })
+        .ok()?;
+    match ready_rx.recv() {
+        Ok(true) => Some(thread),
+        _ => {
+            let _ = thread.join();
+            None
+        }
+    }
+}
+
 #[cfg(feature = "multiprocess")]
 enum IpcCommand {
     /// Send data to the node's input channel (serialized Python wire bytes)
@@ -95,6 +173,9 @@ enum IpcCommand {
         callback_tx: tokio::sync::mpsc::Sender<SharedBytes>,
         copies: CopyContext,
     },
+    /// The node published an output or control message (or the fallback
+    /// interval elapsed): poll the subscribers. Sent by the wake thread.
+    Wake,
     /// Request graceful shutdown of the IPC thread
     Shutdown,
 }
@@ -344,6 +425,11 @@ pub struct MultiprocessConfig {
     /// Controls whether the SDK auto-provisions venvs via uv.
     #[serde(default)]
     pub python_env: crate::python::env_manager::PythonEnvConfig,
+
+    /// Shared model workers (off by default): sessions attach to one worker
+    /// per node type and model instead of each starting its own process.
+    #[serde(default)]
+    pub worker_sharing: super::shared_workers::WorkerSharingConfig,
 }
 
 /// Policy for handling Docker unavailability
@@ -362,8 +448,15 @@ fn default_max_processes() -> Option<usize> {
     Some(10)
 }
 
+/// Unread messages a channel holds before iceoryx2 overwrites the oldest.
+///
+/// Each publisher reserves `2 * (capacity + 2) + capacity` samples of its
+/// largest slice in shared memory, which Windows commits up front. At 64 that
+/// is about 3 MB for 16 KiB messages and about 99 MB for 512 KiB ones; the
+/// previous 1000 reserved 1.5 GB per channel. 64 messages of 20 ms audio is
+/// about 1.3 s of backlog.
 fn default_channel_capacity() -> usize {
-    1000 // Increased from 100 to handle audio flood during initialization (50 packets/sec * 5sec init = 250+)
+    64
 }
 
 fn default_init_timeout() -> u64 {
@@ -404,6 +497,7 @@ impl Default for MultiprocessConfig {
             docker_fallback_policy: default_docker_fallback_policy(),
             python_path: Vec::new(),
             python_env: Default::default(),
+            worker_sharing: Default::default(),
         }
     }
 }
@@ -537,6 +631,11 @@ pub struct SessionState {
 
     /// Initialization progress for each node (node_id -> progress)
     pub init_progress: HashMap<String, InitProgress>,
+
+    /// Nodes whose lane is attached to a shared model worker (node_id ->
+    /// lease). Their `node_processes` entry is the shared worker, which is
+    /// detached from, not terminated, when the session ends.
+    pub shared_lanes: HashMap<String, super::shared_workers::Lease>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1733,6 +1832,52 @@ sys.stdout.flush()
         });
     }
 
+    /// For a lane attached to a shared worker: when the lane fails or the
+    /// worker dies, fail the node and end the session, as a crash of an
+    /// unshared node's process does.
+    async fn watch_shared_lane(&self, session_id: &str, node_id: &str) {
+        let watched = self
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|s| s.shared_lanes.get(node_id))
+            .map(|lease| (lease.failure_watch(), lease.worker.process.id));
+        let Some(((mut lane, mut worker), pid)) = watched else {
+            return;
+        };
+        let sessions = Arc::downgrade(&self.sessions);
+        let process_manager = Arc::downgrade(&self.process_manager);
+        let health_monitor = self.health_monitor.clone();
+        let (session_id, node_id) = (session_id.to_string(), node_id.to_string());
+        tokio::spawn(async move {
+            // A receiver whose sender is gone means the lane was detached.
+            let reason = tokio::select! {
+                r = lane.wait_for(Option::is_some) => match r { Ok(v) => v.clone(), Err(_) => return },
+                r = worker.wait_for(Option::is_some) => match r { Ok(v) => v.clone(), Err(_) => return },
+            }
+            .unwrap_or_default();
+            let (Some(sessions), Some(process_manager)) = (sessions.upgrade(), process_manager.upgrade()) else {
+                return;
+            };
+            let attached = sessions
+                .read()
+                .await
+                .get(&session_id)
+                .is_some_and(|s| s.shared_lanes.contains_key(&node_id));
+            if !attached {
+                return;
+            }
+            tracing::error!("Node {node_id} failed in its shared worker ({reason}); terminating pipeline {session_id}");
+            let _ = health_monitor
+                .handle_process_exit(pid, ExitReason::Error(-1), Some(session_id.clone()), Some(node_id.clone()))
+                .await;
+            if let Err(e) = Self::terminate_session_static(sessions, process_manager, &session_id).await {
+                tracing::error!("Failed to terminate session {}: {}", session_id, e);
+            }
+        });
+    }
+
     /// Static version of terminate_session for use in closures
     #[cfg(feature = "multiprocess")]
     async fn terminate_session_static(
@@ -1745,8 +1890,12 @@ sys.stdout.flush()
         if let Some(mut session) = sessions_guard.remove(session_id) {
             session.status = SessionStatus::Terminating;
 
-            // Terminate all processes in the session
-            for (_, process) in session.node_processes.drain() {
+            // Terminate all processes in the session; detach from shared workers
+            for (node_id, process) in session.node_processes.drain() {
+                if let Some(lease) = session.shared_lanes.remove(&node_id) {
+                    lease.detach().await;
+                    continue;
+                }
                 process_manager
                     .terminate_process(process, std::time::Duration::from_secs(5))
                     .await?;
@@ -1780,6 +1929,7 @@ sys.stdout.flush()
             status: SessionStatus::Initializing,
             created_at: std::time::Instant::now(),
             init_progress: HashMap::new(),
+            shared_lanes: HashMap::new(),
         };
 
         sessions.insert(session_id, session);
@@ -1985,14 +2135,18 @@ sys.stdout.flush()
         let node_id_clone = node_id.to_string();
         let session_id_clone = session_id.to_string();
         let control = self.get_control();
-        let process = self
-            .sessions
-            .read()
-            .await
-            .get(session_id)
-            .and_then(|session| session.node_processes.get(node_id))
-            .cloned()
-            .ok_or_else(|| Error::Execution(format!("Missing process for node {node_id}")))?;
+        let (process, shared_failure) = {
+            let sessions = self.sessions.read().await;
+            let session = sessions.get(session_id);
+            let process = session
+                .and_then(|session| session.node_processes.get(node_id))
+                .cloned()
+                .ok_or_else(|| Error::Execution(format!("Missing process for node {node_id}")))?;
+            let shared_failure = session
+                .and_then(|session| session.shared_lanes.get(node_id))
+                .map(|lease| lease.failure_watch());
+            (process, shared_failure)
+        };
 
         // Control channel was already created in initialize() before spawning Python
         // Now poll for the READY signal - need direct iceoryx2 subscriber (not RuntimeData wrapper)
@@ -2018,6 +2172,14 @@ sys.stdout.flush()
 
                 poll_count += 1;
                 if poll_count % 100 == 0 {
+                    if let Some((lane, worker)) = &shared_failure {
+                        let failure = lane.borrow().clone().or_else(|| worker.borrow().clone());
+                        if let Some(failure) = failure {
+                            return Err(Error::Execution(format!(
+                                "Node {node_id_clone} failed in its shared worker before readiness: {failure}"
+                            )));
+                        }
+                    }
                     let status = handle.block_on(async { process.status.read().await.clone() });
                     if matches!(status, super::process_manager::ProcessStatus::Error(_)
                         | super::process_manager::ProcessStatus::Stopped
@@ -2142,6 +2304,8 @@ sys.stdout.flush()
     ) -> Result<NodeIpcThread> {
         // Create channels for async <-> thread communication
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<IpcCommand>(100);
+        // The wake thread must not keep the command channel open on its own.
+        let wake_tx = cmd_tx.downgrade();
         let (resp_tx, resp_rx) = tokio::sync::mpsc::channel::<IpcResponse>(100);
 
         let registry = self.channel_registry.clone();
@@ -2218,6 +2382,42 @@ sys.stdout.flush()
                 node_id_clone
             );
 
+            // Event-driven wake. Without it this thread spins and the node
+            // polls. `input_wake` signals the node after each publish; the wake
+            // thread turns the node's signals into `IpcCommand::Wake`, so this
+            // thread can block on its command channel while idle.
+            let input_wake = rt.block_on(registry.create_wake_notifier(&input_ch)).ok();
+            let stop_wake = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // `REMOTEMEDIA_IPC_HOST_SPIN=1` keeps this thread spinning (one core
+            // per Python node) while the node still blocks on its input event.
+            // Measured on Windows, a spinning host thread makes the node's own
+            // model time faster and steadier (first audio about 126 ms against
+            // about 138 ms); why is not understood. Spinning only while a turn
+            // is in flight did not help.
+            let host_spin = std::env::var("REMOTEMEDIA_IPC_HOST_SPIN").is_ok_and(|v| v == "1");
+            let wake_thread = input_wake.as_ref().filter(|_| !host_spin).and_then(|_| {
+                spawn_wake_thread(
+                    registry.clone(),
+                    output_ch.clone(),
+                    node_id_clone.clone(),
+                    wake_tx,
+                    stop_wake.clone(),
+                )
+            });
+            let event_driven = wake_thread.is_some();
+            if !event_driven {
+                tracing::debug!("IPC thread for node {} polls (no wake events)", node_id_clone);
+            }
+            let notify_node = |what: &str| {
+                if let Some(notifier) = &input_wake {
+                    if let Err(e) = notifier.notify() {
+                        tracing::trace!("wake after {what} failed: {e:?}");
+                    }
+                }
+            };
+            // A command taken while blocked, handled on the next iteration.
+            let mut pending: Option<IpcCommand> = None;
+
             // Optional bounded callback for continuous output forwarding.
             // Uses blocking_send from this sync OS thread so a full queue
             // naturally stalls the iceoryx2 subscriber loop below.
@@ -2229,7 +2429,11 @@ sys.stdout.flush()
             // Main loop: process commands using persistent publishers/subscribers
             loop {
                 // Check for commands (non-blocking poll)
-                match cmd_rx.try_recv() {
+                let next = match pending.take() {
+                    Some(command) => Ok(command),
+                    None => cmd_rx.try_recv(),
+                };
+                match next {
                     Ok(IpcCommand::SendData { bytes, copies }) => {
                         // Per-frame hot path: keep tracing at trace!/debug! to avoid
                         // allocating a format-args record per audio frame. Use
@@ -2243,6 +2447,7 @@ sys.stdout.flush()
 
                         match publisher.send_with_copy_context(&bytes, &copies) {
                             Ok(_) => {
+                                notify_node("input");
                                 tracing::trace!(
                                     "[IPC Thread] Node '{}': Successfully published data to iceoryx2",
                                     node_id_clone
@@ -2270,14 +2475,17 @@ sys.stdout.flush()
                         // to ensure we capture all output from streaming nodes
                     }
                     Ok(IpcCommand::SendDataNoAck { bytes }) => {
-                        if let Err(e) = publisher.send(&bytes) {
-                            tracing::warn!(
+                        match publisher.send(&bytes) {
+                            Ok(_) => notify_node("out-of-band input"),
+                            Err(e) => tracing::warn!(
                                 "[IPC Thread] Node '{}': out-of-band publish failed: {}",
                                 node_id_clone,
                                 e
-                            );
+                            ),
                         }
                     }
+                    // Nothing to do here: the next iteration polls the subscribers.
+                    Ok(IpcCommand::Wake) => {}
                     Ok(IpcCommand::RegisterOutputCallback {
                         callback_tx,
                         copies,
@@ -2328,10 +2536,43 @@ sys.stdout.flush()
                             initial_copies.as_ref().unwrap_or(&callback_copies),
                         ) {
                             Ok(Some(output_data)) => {
+                                // A version 2 worker reports its copies in its
+                                // end-of-input frame: account them before the
+                                // frame completes the turn.
+                                if let Some(copies) = &initial_copies {
+                                    if output_data.as_slice().first()
+                                        == Some(&super::copy_authority::END_OF_INPUT)
+                                    {
+                                        if let Err(error) = super::copy_authority::replay_end_of_input(
+                                            copies,
+                                            output_data.as_slice(),
+                                        ) {
+                                            tracing::error!(
+                                                "Copy report from node {} rejected: {}",
+                                                node_id_clone,
+                                                error
+                                            );
+                                        }
+                                    }
+                                }
                                 deliver_ipc_output(output_data, &mut output_callback, &resp_tx);
                             }
+                            Ok(None) if event_driven => {
+                                // Idle: block until a command arrives or the
+                                // wake thread reports that the node published.
+                                match cmd_rx.blocking_recv() {
+                                    Some(command) => pending = Some(command),
+                                    None => {
+                                        tracing::debug!(
+                                            "Command channel closed for node: {}",
+                                            node_id_clone
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
                             Ok(None) => {
-                                // No data, yield to scheduler (avoids 100% CPU but minimal latency)
+                                // No wake events: yield to the scheduler and poll again.
                                 std::thread::yield_now();
                             }
                             Err(e) => {
@@ -2346,6 +2587,10 @@ sys.stdout.flush()
                 }
             }
 
+            stop_wake.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = wake_thread {
+                let _ = thread.join();
+            }
             tracing::debug!("IPC thread exited for node: {}", node_id_clone);
         });
 
@@ -2471,7 +2716,12 @@ sys.stdout.flush()
             // Then terminate processes
             #[cfg(feature = "multiprocess")]
             {
-                for (_, process) in session.node_processes.drain() {
+                for (node_id, process) in session.node_processes.drain() {
+                    // A shared worker keeps running for its other sessions.
+                    if let Some(lease) = session.shared_lanes.remove(&node_id) {
+                        lease.detach().await;
+                        continue;
+                    }
                     self.process_manager
                         .terminate_process(process, std::time::Duration::from_secs(5))
                         .await?;
@@ -2702,6 +2952,21 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                     false, // No backpressure for control
                 )
                 .await?;
+
+            // Wake events, so neither side polls: the host signals the input
+            // event after publishing an input, and the node signals the output
+            // event after publishing an output or a control message. A side
+            // that cannot open them falls back to polling.
+            // `REMOTEMEDIA_IPC_WAKE_EVENTS=0` turns them off (both sides poll).
+            let wake_events = std::env::var("REMOTEMEDIA_IPC_WAKE_EVENTS").map_or(true, |v| v != "0");
+            for channel in [&input_channel_name, &output_channel_name] {
+                if !wake_events {
+                    break;
+                }
+                if let Err(e) = self.channel_registry.create_wake_event(channel).await {
+                    tracing::warn!("No wake event for {channel}; that side will poll: {e}");
+                }
+            }
 
             tracing::debug!(
                 "Pre-created IPC channels for node {}: {}, {}, {}",
@@ -2952,7 +3217,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
 
                     // Lock out the Python user-site (e.g. ~/.local) for managed-venv
                     // subprocesses. A stale `iceoryx2` in the host user-site (e.g.
-                    // 0.9.0) would shadow the venv's pinned `iceoryx2` (0.9.3) on
+                    // 0.9.3) would shadow the venv's pinned `iceoryx2` (0.10.0) on
                     // `import iceoryx2`. Any version skew between the venv's iceoryx2
                     // and the Rust server's iceoryx2 corrupts the shared-memory
                     // service the server pre-creates, surfacing as
@@ -2983,10 +3248,53 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             }
         }
 
+        // Shared model worker (openspec: add-shared-model-workers): attach this
+        // session's lane to a worker that already holds the model, when both
+        // the host policy and the node class allow it. Otherwise (or when the
+        // class turns out not to be @shareable) spawn a process as usual.
+        #[cfg(feature = "multiprocess")]
+        let mut shared_lease = {
+            #[cfg(feature = "docker")]
+            let docker = use_docker;
+            #[cfg(not(feature = "docker"))]
+            let docker = false;
+            let policy = self.config.worker_sharing.clone().with_env_overrides();
+            if !docker && policy.applies_to(&ctx.node_type, &ctx.params) {
+                let spawn = self.process_manager.spawn_config().read().await.clone();
+                let authority = self
+                    .initial_copies
+                    .clone()
+                    .map(|copies| super::copy_authority::CopyAuthority::start(copies, &ctx.node_id, &session_id))
+                    .transpose()
+                    .map_err(|e| Error::Execution(format!("Copy authority startup failed: {e}")))?;
+                match super::shared_workers::pool()
+                    .reserve(&ctx.node_type, &ctx.params, spawn, &policy, &self.config)
+                    .await?
+                {
+                    Some(worker) => Some(
+                        worker
+                            .attach(
+                                &session_id,
+                                &ctx.node_id,
+                                &ctx.params,
+                                authority,
+                                std::time::Duration::from_secs(self.config.init_timeout_secs),
+                            )
+                            .await?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            }
+        };
+
         // NOW spawn process or container (channels already exist)
         #[cfg(feature = "multiprocess")]
         {
-            let process = {
+            let process = if let Some(lease) = &shared_lease {
+                lease.worker.process.clone()
+            } else {
                 #[cfg(feature = "docker")]
                 {
                     if use_docker {
@@ -3089,6 +3397,9 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                     .channels
                     .insert(output_channel_name.clone(), output_channel);
                 session.ipc_threads.insert(ctx.node_id.clone(), ipc_thread);
+                if let Some(lease) = shared_lease.take() {
+                    session.shared_lanes.insert(ctx.node_id.clone(), lease);
+                }
 
                 tracing::debug!(
                     "Created IPC thread and channels for node {}: {}, {}",
@@ -3134,11 +3445,12 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             tracing::debug!(
                 "✅ Received READY signal - Python subscriber is ready to receive data"
             );
+            self.watch_shared_lane(&session_id, &ctx.node_id).await;
 
-            // Small delay to ensure Python subscriber is fully registered with iceoryx2's routing tables
-            // The subscriber creation and READY signal are very close in time, but iceoryx2 needs a moment
-            // to complete the internal pub/sub connection registration
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // No settling delay is needed here. The worker creates its input
+            // subscriber when it connects, before it loads its model and long
+            // before it signals READY, and the channel keeps a history for a
+            // subscriber that joins late.
 
             tracing::debug!(
                 "✅ Node initialization complete, IPC thread ready with persistent publishers"
@@ -3526,3 +3838,7 @@ except Exception as e:
 #[cfg(all(test, feature = "multiprocess"))]
 #[path = "legacy_ipc_tests.rs"]
 mod legacy_ipc_tests;
+
+#[cfg(all(test, feature = "multiprocess"))]
+#[path = "shared_workers_tests.rs"]
+mod shared_workers_tests;

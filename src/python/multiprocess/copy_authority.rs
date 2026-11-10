@@ -1,9 +1,19 @@
-//! Bounded, acknowledged metadata-only reporting to one retained host authority.
+//! Bounded, metadata-only copy reporting to one retained host authority.
 //! The private capability is delivered over the child's stdin, never argv/logs.
-#[cfg(test)]
+//!
+//! - **Version 1** (any policy other than `allow_copies`): every copy is
+//!   authorized by an acknowledged begin request and closed by a complete or
+//!   fail request, so a strict policy rejects before the copy happens.
+//! - **Version 2** (`allow_copies`): the worker authorizes locally and keeps
+//!   per-reason totals. It reports them in the end-of-input frame it already
+//!   sends after each input ([`replay_end_of_input`]) and, for copies after
+//!   the last input, in its close request. The connection carries only the
+//!   handshake and the close, and its loss marks the worker as failed. A copy
+//!   that was unreported when the worker died is recorded as one failed
+//!   operation: its reason and size are unknown to the host.
 use crate::multiprocess::control_frames::MAX_FRAME;
 use crate::multiprocess::control_frames::{invalid, read_frame, write_frame};
-use remotemedia_types::{CopyContext, CopyOperation, CopyReason};
+use remotemedia_types::{CopyContext, CopyEvent, CopyLedger, CopyOperation, CopyPolicy, CopyReason};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::io::Write;
@@ -50,7 +60,126 @@ enum Action {
     Begin { reason: CopyReason, bytes: u64 },
     Complete { bytes: u64 },
     Fail {},
-    Close {},
+    Close {
+        /// Version 2 only: totals not yet carried by an end-of-input frame.
+        #[serde(default)]
+        totals: Option<Totals>,
+    },
+}
+
+/// Version 2 per-reason totals since the previous report, one entry per reason:
+/// `[reason, [completed, copied_bytes, failed, failed_requested_bytes]]`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Totals {
+    v: u8,
+    reasons: Vec<(CopyReason, [u64; 4])>,
+}
+
+/// Bound on operations per reason per report, so a malformed report cannot
+/// make the host replay an unbounded number of ledger events.
+const MAX_OPERATIONS: u64 = 1 << 20;
+
+/// The reasons a legacy Python worker may report.
+const WORKER_REASONS: [CopyReason; 3] = [
+    CopyReason::BorrowedInput,
+    CopyReason::PrivateIpcIngress,
+    CopyReason::PortableSerialization,
+];
+
+impl Totals {
+    fn validate(&self) -> Result<(), String> {
+        if self.v != 2 {
+            return Err("unsupported copy report version".into());
+        }
+        for (index, (reason, [completed, bytes, failed, failed_bytes])) in self.reasons.iter().enumerate() {
+            if self.reasons[..index].iter().any(|(seen, _)| seen == reason) {
+                return Err(format!("copy reason {reason:?} is reported twice"));
+            }
+            if !WORKER_REASONS.contains(reason) {
+                return Err(format!("copy reason {reason:?} is not reportable by a worker"));
+            }
+            if *completed > MAX_OPERATIONS || *failed > MAX_OPERATIONS {
+                return Err("copy report exceeds its operation bound".into());
+            }
+            if (*completed == 0 && *bytes != 0) || (*failed == 0 && *failed_bytes != 0) {
+                return Err("copy report has bytes without operations".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Replay into the ledger. Ledgers keep per-reason sums, so the bytes of
+    /// `n` operations are recorded on the first and zero on the rest.
+    fn replay(&self, copies: &CopyContext) {
+        for (reason, [completed, bytes, failed, failed_bytes]) in &self.reasons {
+            for index in 0..*completed {
+                copies.record(*reason, CopyEvent::Started);
+                copies.record(*reason, CopyEvent::Completed(if index == 0 { *bytes } else { 0 }));
+            }
+            for index in 0..*failed {
+                copies.record(*reason, CopyEvent::Started);
+                copies.record(*reason, CopyEvent::Failed(if index == 0 { *failed_bytes } else { 0 }));
+            }
+        }
+    }
+}
+
+/// `WireDataType::EndOfInput`, the first byte of a worker's end-of-input frame.
+pub(crate) const END_OF_INPUT: u8 = 8;
+
+/// Replay the copy totals a version 2 worker carries in an end-of-input frame
+/// (`type | session_len u16 | session | timestamp u64 | payload_len u32 |
+/// payload`, little-endian). An empty payload reports nothing. Call this
+/// before the frame completes its turn, so the accounting is applied with the
+/// turn it describes. Returns an error, after recording one failed operation,
+/// when the frame or its report is malformed.
+pub(crate) fn replay_end_of_input(copies: &CopyContext, frame: &[u8]) -> Result<(), String> {
+    let result = parse_end_of_input(frame).and_then(|totals| match totals {
+        Some(totals) => totals.validate().map(|()| Some(totals)),
+        None => Ok(None),
+    });
+    match result {
+        Ok(Some(totals)) => {
+            totals.replay(copies);
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(error) => {
+            record_unreported(copies);
+            Err(error)
+        }
+    }
+}
+
+fn parse_end_of_input(frame: &[u8]) -> Result<Option<Totals>, String> {
+    let truncated = || "end-of-input frame is truncated".to_string();
+    if frame.first() != Some(&END_OF_INPUT) {
+        return Err("not an end-of-input frame".into());
+    }
+    let session = u16::from_le_bytes(frame.get(1..3).ok_or_else(truncated)?.try_into().unwrap()) as usize;
+    let at = 3 + session + 8;
+    let size = u32::from_le_bytes(frame.get(at..at + 4).ok_or_else(truncated)?.try_into().unwrap()) as usize;
+    let payload = frame.get(at + 4..).ok_or_else(truncated)?;
+    if payload.len() != size {
+        return Err("end-of-input payload length mismatch".into());
+    }
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    if payload.len() > MAX_FRAME {
+        return Err("copy report exceeds its frame bound".into());
+    }
+    serde_json::from_slice(payload)
+        .map(Some)
+        .map_err(|error| format!("invalid copy report: {error}"))
+}
+
+/// A version 2 worker's copies that never reached the host: one failed
+/// operation, because their reason and size are unknown.
+fn record_unreported(copies: &CopyContext) {
+    copies.record(CopyReason::BorrowedInput, CopyEvent::Started);
+    copies.record(CopyReason::BorrowedInput, CopyEvent::Failed(0));
 }
 
 #[derive(Serialize)]
@@ -79,10 +208,21 @@ pub(crate) struct CopyAuthority {
 
 impl CopyAuthority {
     pub(crate) fn start(copies: CopyContext, node: &str, session: &str) -> io::Result<Self> {
+        // Version 2 needs no per-copy authorization, so only allow_copies uses it.
+        let version = if copies.policy() == CopyPolicy::AllowCopies { 2 } else { 1 };
+        Self::start_with_version(copies, node, session, version)
+    }
+
+    pub(crate) fn start_with_version(
+        copies: CopyContext,
+        node: &str,
+        session: &str,
+        version: u8,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let bootstrap = Bootstrap {
-            version: 1,
+            version,
             address: listener.local_addr()?.to_string(),
             token: uuid::Uuid::new_v4().to_string(),
             node: node.to_owned(),
@@ -183,7 +323,7 @@ fn accept_worker(
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         let authenticated = read_frame::<Hello>(&mut stream).is_ok_and(|hello| {
-            hello.version == 1
+            hello.version == expected.version
                 && hello.token == expected.token
                 && hello.node == expected.node
                 && hello.session == expected.session
@@ -196,9 +336,35 @@ fn accept_worker(
         drop(listener);
         stream.set_read_timeout(None)?;
         write_frame(&mut stream, &Reply { seq: 0, ok: true })?;
+        if expected.version == 2 {
+            let result = serve_v2(&mut stream, &copies);
+            if result.is_err() {
+                record_unreported(&copies);
+            }
+            return result;
+        }
         return serve(&mut stream, copies);
     }
     Err(invalid("copy reporter stopped before authenticated close"))
+}
+
+/// Version 2: the only request is the final close, carrying the totals no
+/// end-of-input frame reported. Anything else ends the lane as failed.
+fn serve_v2(stream: &mut TcpStream, copies: &CopyContext) -> io::Result<()> {
+    let request: Request = read_frame(stream)?;
+    let Action::Close { totals } = request.action else {
+        return Err(invalid("version 2 copy reporting accepts only close"));
+    };
+    if request.seq != 1 {
+        return Err(invalid("copy report sequence mismatch"));
+    }
+    if let Some(totals) = totals {
+        totals
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        totals.replay(copies);
+    }
+    write_frame(stream, &Reply { seq: 1, ok: true })
 }
 
 fn serve(stream: &mut TcpStream, copies: CopyContext) -> io::Result<()> {
@@ -245,7 +411,10 @@ fn serve(stream: &mut TcpStream, copies: CopyContext) -> io::Result<()> {
                         .ok_or_else(|| invalid("copy failure without begin"))?,
                 );
             }
-            Action::Close {} => {
+            Action::Close { totals } => {
+                if totals.is_some() {
+                    return Err(invalid("version 1 close carries no totals"));
+                }
                 if pending.is_some() {
                     return Err(invalid("copy close with unfinished operation"));
                 }

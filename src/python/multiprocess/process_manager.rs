@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
+/// How often a worker's monitor task checks for its exit.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 #[cfg(feature = "docker")]
 use bollard::Docker;
 
@@ -104,6 +107,37 @@ impl ExecutionTarget {
                     .map_err(|e| Error::Execution(format!("Failed to stop container: {}", e)))
             }
         }
+    }
+}
+
+/// Read `reader` line by line on its own OS thread until the pipe closes,
+/// calling `on_line` for each line (invalid UTF-8 is replaced, not fatal).
+///
+/// Not a tokio task: on Windows tokio reads child pipes on its blocking pool,
+/// and dropping a runtime waits for blocking tasks, so a long-lived worker (a
+/// shared model worker idling past its last session) would hold the host's
+/// runtime shutdown until the worker exits.
+fn spawn_line_reader<R>(name: String, reader: R, mut on_line: impl FnMut(String) + Send + 'static)
+where
+    R: std::io::Read + Send + 'static,
+{
+    use std::io::BufRead;
+    let result = std::thread::Builder::new().name(name).spawn(move || {
+        let mut reader = std::io::BufReader::new(reader);
+        let mut buffer = Vec::new();
+        loop {
+            buffer.clear();
+            match reader.read_until(b'\n', &mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buffer);
+                    on_line(line.trim_end_matches(['\r', '\n']).to_string());
+                }
+            }
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!("cannot start a pipe reader thread: {error}");
     }
 }
 
@@ -359,6 +393,14 @@ impl ProcessManager {
         }
     }
 
+    /// A process manager that spawns with `spawn_config` (a snapshot of
+    /// another manager's, for example after managed-environment resolution).
+    pub fn with_spawn_config(config: MultiprocessConfig, spawn_config: SpawnConfig) -> Self {
+        let mut manager = Self::new(config);
+        manager.spawn_config = Arc::new(RwLock::new(spawn_config));
+        manager
+    }
+
     /// Get access to the spawn configuration (for updating python_executable etc.)
     pub fn spawn_config(&self) -> &Arc<RwLock<SpawnConfig>> {
         &self.spawn_config
@@ -409,7 +451,52 @@ impl ProcessManager {
             node_type,
             session_id
         );
+        let mut args: Vec<String> = vec![
+            "--node-id".into(),
+            node_id.into(),
+            "--session-id".into(),
+            session_id.into(), // Pass session_id for channel naming
+            "--params-stdin".into(), // Signal that params come from stdin
+        ];
+        if authority.is_some() {
+            args.push("--copy-authority-stdin".into());
+        }
+        // Params go through stdin (avoids command-line length limits).
+        let bootstrap = match &authority {
+            Some(authority) => serde_json::json!({
+                "params": params, "copy_authority": authority.bootstrap(),
+            }),
+            None => params.clone(),
+        };
+        self.spawn_runner(node_type, node_id, session_id, args, Some(bootstrap.to_string().into_bytes()), authority)
+            .await
+    }
 
+    /// Spawn a shared model worker (`runner --shared-worker-id`) for
+    /// `node_type`. It takes no parameters: sessions attach to it later over
+    /// the worker-scoped channels `worker/{worker_id}/...`, which must exist
+    /// before this is called. Its logs are recorded under the session label
+    /// `shared-worker/{worker_id}`.
+    pub async fn spawn_shared_worker(&self, node_type: &str, worker_id: &str) -> Result<ProcessHandle> {
+        tracing::info!("Spawning shared worker {} for node type {}", worker_id, node_type);
+        let args = vec!["--shared-worker-id".to_string(), worker_id.to_string()];
+        self.spawn_runner(node_type, node_type, &format!("shared-worker/{worker_id}"), args, None, None)
+            .await
+    }
+
+    /// Start `python -m remotemedia.core.multiprocessing.runner --node-type
+    /// <node_type> <args>`, write `stdin_payload` (if any) and close stdin,
+    /// register the process and start monitoring it. `node_id` and
+    /// `session_id` label the handle and its logs.
+    async fn spawn_runner(
+        &self,
+        node_type: &str,
+        node_id: &str,
+        session_id: &str,
+        args: Vec<String>,
+        stdin_payload: Option<Vec<u8>>,
+        authority: Option<super::copy_authority::CopyAuthority>,
+    ) -> Result<ProcessHandle> {
         // Read spawn config once at the start
         let spawn_config = self.spawn_config.read().await;
 
@@ -417,21 +504,8 @@ impl ProcessManager {
         let mut command = Command::new(&spawn_config.python_executable);
 
         // Add multiprocess runner module
-        command.args([
-            "-m",
-            "remotemedia.core.multiprocessing.runner",
-            "--node-type",
-            node_type,
-            "--node-id",
-            node_id,
-            "--session-id",
-            session_id,       // Pass session_id for channel naming
-            "--params-stdin", // Signal that params come from stdin
-        ]);
-
-        if authority.is_some() {
-            command.arg("--copy-authority-stdin");
-        }
+        command.args(["-m", "remotemedia.core.multiprocessing.runner", "--node-type", node_type]);
+        command.args(&args);
 
         // Add custom node registration modules
         for module in &spawn_config.register_modules {
@@ -491,7 +565,7 @@ impl ProcessManager {
         }
 
         // Configure I/O
-        command.stdin(Stdio::piped()); // Always need stdin for params
+        command.stdin(if stdin_payload.is_some() { Stdio::piped() } else { Stdio::null() });
         let capture_output = spawn_config.capture_output;
         if capture_output {
             command.stdout(Stdio::piped());
@@ -526,40 +600,27 @@ impl ProcessManager {
         if let Some(stdout) = child.stdout.take() {
             let node_id = node_id.to_string();
             let session_id = session_id.to_string();
-            tokio::spawn(async move {
+            spawn_line_reader(format!("py-stdout-{pid}"), stdout, move |line| {
                 use crate::telemetry::node_logs::{LogLevel, LogSource, NodeLogStore};
-                use tokio::io::{AsyncBufReadExt, BufReader};
-                let Ok(stdout) = tokio::process::ChildStdout::from_std(stdout) else {
-                    return;
-                };
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::info!("[Process {}] {} stdout: {}", pid, node_id, line);
-                    NodeLogStore::global().push(
-                        &session_id,
-                        &node_id,
-                        LogLevel::Info,
-                        LogSource::Stdout,
-                        "python",
-                        &line,
-                    );
-                }
+                tracing::info!("[Process {}] {} stdout: {}", pid, node_id, line);
+                NodeLogStore::global().push(
+                    &session_id,
+                    &node_id,
+                    LogLevel::Info,
+                    LogSource::Stdout,
+                    "python",
+                    &line,
+                );
             });
         }
 
-        // Write params to stdin (avoids command-line length limits)
-        {
+        // Write the bootstrap to stdin, then close it.
+        if let Some(payload) = stdin_payload {
             use std::io::Write;
-            let bootstrap = match &authority {
-                Some(authority) => serde_json::json!({
-                    "params": params, "copy_authority": authority.bootstrap(),
-                }),
-                None => params.clone(),
-            };
             // Always close stdin, including null parameters. On failure reap the
             // newly spawned child before releasing its reporting capability.
             let result = child.stdin.take().ok_or_else(|| std::io::Error::other("missing child stdin"))
-                .and_then(|mut stdin| stdin.write_all(bootstrap.to_string().as_bytes()));
+                .and_then(|mut stdin| stdin.write_all(&payload));
             if let Err(error) = result {
                 tree.kill();
                 let _ = child.kill();
@@ -695,14 +756,10 @@ impl ProcessManager {
             let session_id = process.session_id.clone();
             let pid = process.id;
             let tail = process.stderr_tail.clone();
-            tokio::spawn(async move {
+            let mut prev = None;
+            spawn_line_reader(format!("py-stderr-{pid}"), stderr, move |line| {
                 use crate::telemetry::node_logs::{parse_python_line, LogSource, NodeLogStore};
-                use tokio::io::{AsyncBufReadExt, BufReader};
-                let stderr = tokio::process::ChildStderr::from_std(stderr).unwrap();
-                let mut lines = BufReader::new(stderr).lines();
-                let mut prev = None;
-
-                while let Ok(Some(line)) = lines.next_line().await {
+                {
                     tracing::warn!("[Process {}] {}: {}", pid, node_id, line);
                     let level = parse_python_line(&line, prev);
                     prev = Some(level);
@@ -783,8 +840,10 @@ impl ProcessManager {
                     break;
                 }
 
-                // Check periodically
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                // Check periodically. This only bounds how quickly an exit or
+                // a lost reporting authority is noticed; a 1 ms period woke
+                // this task up to a thousand times a second per worker.
+                tokio::time::sleep(EXIT_POLL_INTERVAL).await;
             }
         });
     }

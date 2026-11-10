@@ -345,7 +345,64 @@ pub fn register_default_python_nodes() {
             })),
     );
 
+    register_python_node(
+        PythonNodeConfig::new("FasterWhisperSTTNode")
+            .with_description(
+                "Whisper STT on CTranslate2 (faster-whisper): one audio utterance in, \
+                 plain-text transcript out.",
+            )
+            .with_category("stt")
+            .accepts(["audio"])
+            .produces(["text"])
+            .with_config_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string", "default": "base.en",
+                              "description": "faster-whisper model name (base.en, small, large-v3-turbo, ...), converted-weights repo or local path"},
+                    "language": {"type": ["string", "null"], "default": "en",
+                                 "description": "Language code; null lets Whisper detect it"},
+                    "device": {"type": "string", "enum": ["auto", "cuda", "cpu"], "default": "auto"},
+                    "device_index": {"type": "integer", "minimum": 0, "default": 0},
+                    "compute_type": {"type": "string", "default": "default",
+                                     "description": "CTranslate2 compute type (float16, int8_float16, int8, ...)"},
+                    "beam_size": {"type": "integer", "minimum": 1, "default": 5},
+                    "no_speech_prob": {"type": ["number", "null"], "default": 0.4,
+                                       "description": "Drop segments at or above this no-speech probability; null keeps all"},
+                    "initial_prompt": {"type": ["string", "null"]},
+                    "hotwords": {"type": ["string", "null"]},
+                    "vad_filter": {"type": "boolean", "default": false},
+                    "trailing_silence_secs": {"type": "number", "minimum": 0, "default": 0.0},
+                    "cpu_threads": {"type": "integer", "minimum": 0, "default": 0}
+                },
+                "additionalProperties": true
+            })),
+    );
+
     // TTS nodes
+    register_python_node(
+        PythonNodeConfig::new("KokoroOnnxTTSNode")
+            .with_multi_output(true)
+            .with_description(
+                "Text-to-speech using Kokoro on ONNX Runtime (kokoro-onnx); no PyTorch needed",
+            )
+            .with_category("tts")
+            .accepts(["text"])
+            .produces(["audio"])
+            .with_config_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "voice": {"type": "string", "default": "af_heart"},
+                    "lang": {"type": "string", "default": "en-us", "description": "espeak-ng language"},
+                    "speed": {"type": "number", "minimum": 0.5, "maximum": 2.0, "default": 1.0},
+                    "model_path": {"type": ["string", "null"], "description": "Kokoro ONNX model; downloaded when omitted"},
+                    "voices_path": {"type": ["string", "null"], "description": "Voices file; downloaded when omitted"},
+                    "providers": {"type": ["array", "null"], "items": {"type": "string"},
+                                  "description": "ONNX Runtime execution providers, in priority order"}
+                },
+                "additionalProperties": true
+            })),
+    );
+
     register_python_node(
         PythonNodeConfig::new("KokoroTTSNode")
             .with_multi_output(true)

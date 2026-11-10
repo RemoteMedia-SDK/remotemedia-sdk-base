@@ -29,6 +29,30 @@ static GLOBAL_REGISTRY: OnceLock<Arc<ChannelRegistry>> = OnceLock::new();
 /// Matches the global iceoryx2 config: publish_subscribe.max_slice_len = 1048576
 const MAX_SLICE_LEN: usize = 1 * 1024 * 1024;
 
+/// Initial slice size of a channel's publisher; see `create_publisher`.
+#[cfg(feature = "multiprocess")]
+const INITIAL_SLICE_LEN: usize = 16 * 1024;
+
+#[cfg(feature = "multiprocess")]
+type WakeEventFactory = iceoryx2::service::port_factory::event::PortFactory<ipc::Service>;
+
+/// Port that signals a channel's reader that a message was published.
+#[cfg(feature = "multiprocess")]
+pub type WakeNotifier = iceoryx2::port::notifier::Notifier<ipc::Service>;
+
+/// Port a channel's reader blocks on until the writer signals.
+#[cfg(feature = "multiprocess")]
+pub type WakeListener = iceoryx2::port::listener::Listener<ipc::Service>;
+
+/// Name of the event service that accompanies a channel.
+pub fn wake_event_name(channel_name: &str) -> String {
+    format!("{channel_name}_event")
+}
+
+/// Subscriber ports a channel accepts. See `ChannelRegistry::create_channel`.
+#[cfg(feature = "multiprocess")]
+const CHANNEL_MAX_SUBSCRIBERS: usize = 2;
+
 /// Channel statistics
 #[derive(Debug, Default, Clone)]
 pub struct ChannelStats {
@@ -66,6 +90,11 @@ pub struct ChannelRegistry {
     #[cfg(feature = "multiprocess")]
     /// Active services (must be kept alive or they get dropped/deleted)
     services: Arc<RwLock<HashMap<String, PortFactory<ipc::Service, [u8], ()>>>>,
+
+    #[cfg(feature = "multiprocess")]
+    /// Wake-event services, keyed by the channel they belong to. See
+    /// [`ChannelRegistry::create_wake_event`].
+    wake_events: Arc<RwLock<HashMap<String, WakeEventFactory>>>,
 }
 
 impl ChannelRegistry {
@@ -87,6 +116,7 @@ impl ChannelRegistry {
                                 node: Some(node),
                                 channels: Arc::new(RwLock::new(HashMap::new())),
                                 services: Arc::new(RwLock::new(HashMap::new())),
+                                wake_events: Arc::new(RwLock::new(HashMap::new())),
                             })
                         }
                         Err(e) => {
@@ -96,6 +126,7 @@ impl ChannelRegistry {
                                 node: None,
                                 channels: Arc::new(RwLock::new(HashMap::new())),
                                 services: Arc::new(RwLock::new(HashMap::new())),
+                                wake_events: Arc::new(RwLock::new(HashMap::new())),
                             })
                         }
                     }
@@ -118,6 +149,8 @@ impl ChannelRegistry {
             channels: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "multiprocess")]
             services: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "multiprocess")]
+            wake_events: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -157,14 +190,13 @@ impl ChannelRegistry {
         // with their ports and shared memory, so a crashed run's samples are
         // never delivered to the next run's identically named
         // `session_0_*` ports.
-        let state = iceoryx2::node::Node::<iceoryx2::service::ipc::Service>::try_cleanup_dead_nodes(
-            iceoryx2::config::Config::global_config(),
-        );
-        if state.cleanups + state.failed_cleanups > 0 {
+        let (cleanups, failed_cleanups) =
+            super::runner::cleanup_dead_nodes(iceoryx2::config::Config::global_config());
+        if cleanups + failed_cleanups > 0 {
             tracing::info!(
                 "iceoryx2: removed {} dead node(s), {} could not be removed",
-                state.cleanups,
-                state.failed_cleanups
+                cleanups,
+                failed_cleanups
             );
         }
 
@@ -295,7 +327,13 @@ impl ChannelRegistry {
             .service_builder(&service_name)
             .publish_subscribe::<[u8]>()
             .max_publishers(10)
-            .max_subscribers(10)
+            // One peer reads each channel; the second slot covers a restarted
+            // peer while its predecessor's port is still registered.
+            // iceoryx2 sizes every publisher's data segment for
+            // `max_subscribers * (buffer + 2) + history` samples, and Windows
+            // commits that shared memory up front: with 10 subscribers, a
+            // capacity of 1000 and 512 KiB slices one channel reserved 5.4 GB.
+            .max_subscribers(CHANNEL_MAX_SUBSCRIBERS)
             .history_size(capacity)
             .subscriber_max_buffer_size(capacity)
             .open_or_create()
@@ -324,6 +362,63 @@ impl ChannelRegistry {
         Ok(handle)
     }
 
+    /// Create the wake event of an existing channel.
+    ///
+    /// A channel's writer notifies it after each publish and the reader
+    /// blocks on it, so neither side polls. Notifications latch: one that
+    /// arrives before the reader starts waiting is delivered when it does.
+    #[cfg(feature = "multiprocess")]
+    pub async fn create_wake_event(&self, channel_name: &str) -> Result<()> {
+        let node = self
+            .node
+            .as_ref()
+            .ok_or_else(|| Error::IpcError("Node not initialized".to_string()))?;
+        let name = wake_event_name(channel_name);
+        let service_name = ServiceName::new(&name)
+            .map_err(|e| Error::IpcError(format!("Invalid event service name: {:?}", e)))?;
+        let service = node
+            .service_builder(&service_name)
+            .event()
+            // The writer, plus a restarted peer whose old port is still registered.
+            .max_notifiers(4)
+            .max_listeners(2)
+            .open_or_create()
+            .map_err(|e| Error::IpcError(format!("Failed to create wake event: {:?}", e)))?;
+        self.wake_events
+            .write()
+            .await
+            .insert(channel_name.to_string(), service);
+        Ok(())
+    }
+
+    /// Create the port that wakes `channel_name`'s reader. The port is not
+    /// `Send`: create it on the thread that publishes.
+    #[cfg(feature = "multiprocess")]
+    pub async fn create_wake_notifier(&self, channel_name: &str) -> Result<WakeNotifier> {
+        let events = self.wake_events.read().await;
+        let service = events.get(channel_name).ok_or_else(|| {
+            Error::IpcError(format!("Wake event not found for channel: {}", channel_name))
+        })?;
+        service
+            .notifier_builder()
+            .create()
+            .map_err(|e| Error::IpcError(format!("Failed to create wake notifier: {:?}", e)))
+    }
+
+    /// Create the port `channel_name`'s reader blocks on. The port is not
+    /// `Send`: create it on the thread that waits.
+    #[cfg(feature = "multiprocess")]
+    pub async fn create_wake_listener(&self, channel_name: &str) -> Result<WakeListener> {
+        let events = self.wake_events.read().await;
+        let service = events.get(channel_name).ok_or_else(|| {
+            Error::IpcError(format!("Wake event not found for channel: {}", channel_name))
+        })?;
+        service
+            .listener_builder()
+            .create()
+            .map_err(|e| Error::IpcError(format!("Failed to create wake listener: {:?}", e)))
+    }
+
     /// Destroy a channel and cleanup resources
     ///
     /// This method:
@@ -343,6 +438,7 @@ impl ChannelRegistry {
                 // Service is dropped here, which triggers iceoryx2 cleanup
             }
         }
+        self.wake_events.write().await.remove(&channel_name);
 
         // Then remove the channel handle
         let mut channels = self.channels.write().await;
@@ -382,11 +478,13 @@ impl ChannelRegistry {
             .get(channel_name)
             .ok_or_else(|| Error::IpcError(format!("Channel not found: {}", channel_name)))?;
 
-        // Create publisher from service with dynamic allocation support
-        // Start with 512KB to handle typical audio buffers without reallocation
+        // Start small and let the publisher grow its data segment, by powers
+        // of two, when a larger message is actually sent. The segment holds
+        // the channel's full sample count at the largest slice size, so a
+        // large initial size is paid by every channel, including text-only ones.
         let publisher = service
             .publisher_builder()
-            .initial_max_slice_len(512 * 1024) // 512KB - large enough for most audio chunks
+            .initial_max_slice_len(INITIAL_SLICE_LEN)
             .allocation_strategy(AllocationStrategy::PowerOfTwo)
             .create()
             .map_err(|e| Error::IpcError(format!("Failed to create publisher: {:?}", e)))?;
