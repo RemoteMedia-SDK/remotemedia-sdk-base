@@ -8,6 +8,12 @@
 //! downstream needs a format (a speaker's rates, a 16 kHz mono STT node), it
 //! reopens in the nearest format the device offers, keeping the device's own
 //! value per dimension where that fits.
+//!
+//! Capture is zero-copy past the device: the cpal callback copies its
+//! borrowed samples once (a counted `BorrowedInput`) straight into
+//! `chunk_size`-sample loans from the session's output allocator (heap or a
+//! mapped pool), and each full loan is emitted as a shared packet. The device
+//! opens on the first tick, with that session's allocator and copy authority.
 
 use super::source_schema as io_schema;
 use crate::audio_io::{
@@ -190,15 +196,13 @@ pub fn pick_format(
 pub struct MicInputStreamingNode {
     node_id: String,
     config: MicInputConfig,
+    /// The running capture; `None` until the first read (it needs the
+    /// session's allocator) and after a format change.
     capture: Mutex<Option<AudioCapture>>,
-    /// `(channels, sample_rate)` the device is open in.
+    /// `(channels, sample_rate)` the device opens in.
     format: std::sync::Mutex<Option<(u16, u32)>>,
     /// What the device offers, when the node picks its format.
     device: std::sync::Mutex<Option<InputDeviceFormats>>,
-    /// Captured samples not yet emitted (less than one chunk).
-    carry: std::sync::Mutex<Vec<f32>>,
-    /// Device buffers lost because ticks fell behind.
-    lost: std::sync::atomic::AtomicU64,
     /// Discovered device capabilities (populated during initialize)
     discovered_capabilities: std::sync::Mutex<Option<MediaCapabilities>>,
 }
@@ -215,8 +219,6 @@ impl MicInputStreamingNode {
             capture: Mutex::new(None),
             format: std::sync::Mutex::new(None),
             device: std::sync::Mutex::new(None),
-            carry: std::sync::Mutex::new(Vec::new()),
-            lost: std::sync::atomic::AtomicU64::new(0),
             discovered_capabilities: std::sync::Mutex::new(None),
         }
     }
@@ -244,17 +246,6 @@ impl MicInputStreamingNode {
             4000
         };
         (n / ch).max(1) * ch
-    }
-
-    /// Append `captured` to the carry and take every whole chunk out of it.
-    fn take_chunks(&self, captured: &[f32]) -> Vec<Vec<f32>> {
-        let chunk = self.chunk_samples();
-        let mut carry = lock(&self.carry);
-        carry.extend_from_slice(captured);
-        let whole = carry.len() / chunk * chunk;
-        let out = carry[..whole].chunks(chunk).map(<[f32]>::to_vec).collect();
-        carry.drain(..whole);
-        out
     }
 
     fn audio(&self, samples: Vec<f32>) -> RuntimeData {
@@ -286,42 +277,93 @@ impl MicInputStreamingNode {
             .map(|s| DeviceSelector::parse(s))
     }
 
-    /// Start capturing in `channels` x `sample_rate` (the previous stream, if
-    /// any, is closed first) and record the format.
+    fn capture_config(&self, channels: u16, sample_rate: u32) -> CaptureConfig {
+        CaptureConfig {
+            device: self.selector(),
+            host: self.config.host.clone(),
+            sample_rate,
+            channels,
+            buffer_size_ms: self.config.buffer_ms,
+        }
+    }
+
+    /// Settle on `channels` x `sample_rate`: check the device offers it (the
+    /// error names what it does offer), close any running capture, and record
+    /// the format. The device opens on the next read.
     fn open(
         &self,
         guard: &mut Option<AudioCapture>,
         channels: u16,
         sample_rate: u32,
     ) -> Result<(), Error> {
-        *guard = None;
-        let capture = AudioCapture::start(CaptureConfig {
-            device: self.selector(),
-            host: self.config.host.clone(),
-            sample_rate,
-            channels,
-            buffer_size_ms: self.config.buffer_ms,
-        })
-        .map_err(|e| Error::Execution(format!("Failed to start audio capture: {}", e)))?;
-        let (rate, ch) = (capture.config().sample_rate, capture.config().channels);
-        *lock(&self.format) = Some((ch, rate));
+        *guard = None; // stops and joins the previous stream
+        AudioCapture::validate_config(&self.capture_config(channels, sample_rate))
+            .map_err(|e| Error::Execution(format!("Failed to start audio capture: {e:#}")))?;
+        *lock(&self.format) = Some((channels, sample_rate));
         *lock(&self.discovered_capabilities) = Some(MediaCapabilities::with_output(
             MediaConstraints::Audio(AudioConstraints {
-                sample_rate: Some(ConstraintValue::Exact(rate)),
-                channels: Some(ConstraintValue::Exact(ch as u32)),
+                sample_rate: Some(ConstraintValue::Exact(sample_rate)),
+                channels: Some(ConstraintValue::Exact(channels as u32)),
                 format: Some(ConstraintValue::Exact(AudioSampleFormat::F32)),
             }),
         ));
-        lock(&self.carry).clear();
         tracing::info!(
-            "MicInput initialized: capturing from '{}' ({}Hz, {} ch)",
-            capture.device_name(),
-            rate,
-            ch
+            node = %self.node_id,
+            "MicInput initialized: capturing at {}Hz, {} ch",
+            sample_rate,
+            channels
         );
-        *guard = Some(capture);
         Ok(())
     }
+
+    /// The running capture, started on first use: into the session's
+    /// allocator with its copy authority (`ctx`), or a heap provider with
+    /// legacy authority for context-free callers.
+    fn started<'a>(
+        &self,
+        guard: &'a mut Option<AudioCapture>,
+        ctx: Option<&dyn NodeRuntimeContextRead>,
+    ) -> Result<&'a mut AudioCapture, Error> {
+        if guard.is_none() {
+            let (channels, sample_rate) = self.current_format();
+            let config = self.capture_config(channels, sample_rate);
+            let samples = self.chunk_samples();
+            let capture = match ctx {
+                Some(ctx) => AudioCapture::start_with_context(config, samples, ctx),
+                None => AudioCapture::start_with_context(
+                    config,
+                    samples,
+                    &AudioCapture::legacy_context(),
+                ),
+            }
+            .map_err(capture_error)?;
+            *guard = Some(capture);
+        }
+        Ok(guard.as_mut().expect("capture started"))
+    }
+
+    /// One ready packet, or empty audio when none is ready yet.
+    async fn read_once(
+        &self,
+        ctx: Option<&dyn NodeRuntimeContextRead>,
+    ) -> Result<RuntimeData, Error> {
+        let mut guard = self.capture.lock().await;
+        let capture = self.started(&mut guard, ctx)?;
+        Ok(capture
+            .try_recv_packet()
+            .map_err(capture_error)?
+            .unwrap_or_else(|| self.audio(Vec::new())))
+    }
+
+    /// Use `capture` as the running capture (a test fixture).
+    #[cfg(test)]
+    pub(crate) async fn set_capture(&self, capture: AudioCapture) {
+        *self.capture.lock().await = Some(capture);
+    }
+}
+
+fn capture_error(error: anyhow::Error) -> Error {
+    Error::Execution(format!("MicInput: {error:#}"))
 }
 
 #[async_trait::async_trait]
@@ -358,16 +400,7 @@ impl AsyncStreamingNode for MicInputStreamingNode {
     }
 
     async fn process(&self, _data: RuntimeData) -> Result<RuntimeData, Error> {
-        // Get audio from capture
-        let mut guard = self.capture.lock().await;
-        let capture = guard
-            .as_mut()
-            .ok_or_else(|| Error::Execution("MicInput not initialized".into()))?;
-
-        // Try to receive audio (non-blocking, return what's available);
-        // nothing yet is empty audio.
-        let samples = capture.try_recv().unwrap_or_default();
-        Ok(self.audio(samples))
+        self.read_once(None).await
     }
 
     async fn process_streaming<F>(
@@ -379,39 +412,18 @@ impl AsyncStreamingNode for MicInputStreamingNode {
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
-        // Continuous audio capture loop
         let mut guard = self.capture.lock().await;
-        let capture = guard
-            .as_mut()
-            .ok_or_else(|| Error::Execution("MicInput not initialized".into()))?;
-
-        let chunk_size = if self.config.chunk_size > 0 {
-            self.config.chunk_size
-        } else {
-            4000
-        };
-        let mut buffer = Vec::with_capacity(chunk_size);
-        let mut chunks_sent = 0;
-
-        // Receive audio and chunk it
-        while let Some(samples) = capture.recv().await {
-            buffer.extend(samples);
-
-            // Send complete chunks
-            while buffer.len() >= chunk_size {
-                let chunk: Vec<f32> = buffer.drain(..chunk_size).collect();
-                callback(self.audio(chunk))?;
-                chunks_sent += 1;
-            }
+        self.started(&mut guard, None)?;
+        // Owned locally: a cancelled future drops (stops and joins) the
+        // capture rather than leaving the microphone running.
+        let mut capture = guard.take().expect("capture started");
+        drop(guard);
+        let mut sent = 0;
+        while let Some(packet) = capture.recv_packet().await.map_err(capture_error)? {
+            callback(packet)?;
+            sent += 1;
         }
-
-        // Send remaining samples if any
-        if !buffer.is_empty() {
-            callback(self.audio(buffer))?;
-            chunks_sent += 1;
-        }
-
-        Ok(chunks_sent)
+        Ok(sent)
     }
 }
 
@@ -432,10 +444,10 @@ impl StreamingNode for MicInputStreamingNode {
 
     async fn process_async(
         &self,
-        data: RuntimeData,
-        _ctx: &dyn NodeRuntimeContextRead,
+        _data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
-        <Self as AsyncStreamingNode>::process(self, data).await
+        self.read_once(Some(ctx)).await
     }
 
     async fn process_multi_async(
@@ -472,32 +484,33 @@ impl StreamingNode for MicInputStreamingNode {
     async fn tick(
         &self,
         _tick: Tick,
-        _ctx: &dyn NodeRuntimeContextRead,
+        ctx: &dyn NodeRuntimeContextRead,
         mut cb: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
     ) -> Result<(), Error> {
-        let (captured, lost) = {
-            let mut guard = self.capture.lock().await;
-            let capture = guard
-                .as_mut()
-                .ok_or_else(|| Error::Execution("MicInput not initialized".into()))?;
-            capture.drain()
-        };
-        if lost > 0 {
-            let total = self
-                .lost
-                .fetch_add(lost, std::sync::atomic::Ordering::Relaxed)
-                + lost;
-            tracing::warn!(
-                node = %self.node_id,
-                lost,
-                total,
-                "MicInput fell behind the device; captured buffers were dropped"
-            );
-        }
-        for samples in self.take_chunks(&captured) {
-            cb(self.audio(samples))?;
+        let mut guard = self.capture.lock().await;
+        let capture = self.started(&mut guard, Some(ctx))?;
+        // Every full chunk captured since the last tick, as shared packets.
+        // Device or queue losses are terminal errors, not silent gaps.
+        while let Some(packet) = capture.try_recv_packet().map_err(capture_error)? {
+            cb(packet)?;
         }
         Ok(())
+    }
+
+    /// `{"__aux_port__": "shutdown"}` stops the device; chunks already
+    /// captured still drain on later reads.
+    async fn process_control_message(
+        &self,
+        message: RuntimeData,
+        _ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<bool, Error> {
+        if matches!(message, RuntimeData::Json(ref value) if value["__aux_port__"] == "shutdown") {
+            if let Some(capture) = self.capture.lock().await.as_ref() {
+                capture.request_stop();
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     // Capability Resolution Methods (spec 023)
@@ -661,13 +674,76 @@ mod tests {
     }
 
     #[test]
-    fn captured_audio_is_emitted_in_whole_frame_chunks_and_the_rest_carried() {
-        // 3 channels, chunk_size 10 -> 9 samples (3 whole frames) per chunk.
-        let m = mic(json!({"channels": 3, "chunk_size": 10}));
-        let first = m.take_chunks(&[0.0; 20]);
-        assert_eq!(first.iter().map(Vec::len).collect::<Vec<_>>(), vec![9, 9]);
-        assert!(m.take_chunks(&[0.0; 6]).is_empty()); // carry: 2 + 6 = 8 < 9
-        assert_eq!(m.take_chunks(&[0.0; 1]).len(), 1); // carry reaches 9
+    fn chunks_are_whole_frames() {
+        // 3 channels, chunk_size 10 -> 9 samples (3 whole frames) per packet.
+        assert_eq!(
+            mic(json!({"channels": 3, "chunk_size": 10})).chunk_samples(),
+            9
+        );
+        assert_eq!(mic(json!({"channels": 2})).chunk_samples(), 4000);
+        assert_eq!(
+            mic(json!({"channels": 3, "chunk_size": 2})).chunk_samples(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn ticks_emit_shared_capture_packets_without_staging_copies() {
+        use crate::audio_io::capture::tests::fixture;
+        use crate::nodes::NodeRuntimeContext;
+        use remotemedia_types::{CopyContext, CopyPolicy, HeapOutputAllocator};
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "mic-tick");
+        let ctx = NodeRuntimeContext::for_test("s", "mic")
+            .with_output_allocator(Arc::new(HeapOutputAllocator))
+            .with_copy_context(copies.clone());
+        let node = mic(json!({"channels": 2, "sample_rate": 48000}));
+        // The fixture captures 142 samples in odd-sized callbacks into
+        // 64-sample loans: two full packets and a 14-sample tail.
+        node.set_capture(fixture(ctx.clone(), Arc::new(AtomicBool::new(false))))
+            .await;
+        let mut lens = Vec::new();
+        for _ in 0..2000 {
+            let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = out.clone();
+            StreamingNode::tick(
+                &node,
+                Tick {
+                    clock_id: "wall:50".into(),
+                    pts_us: 0,
+                    frame_idx: 0,
+                    deadline_us: 20_000,
+                },
+                &ctx,
+                Box::new(move |packet| {
+                    sink.lock().unwrap().push(packet);
+                    Ok(())
+                }),
+            )
+            .await
+            .unwrap();
+            for packet in out.lock().unwrap().drain(..) {
+                let RuntimeData::Audio {
+                    samples, channels, ..
+                } = packet
+                else {
+                    panic!("audio packet");
+                };
+                assert_eq!(channels, 2);
+                assert!(matches!(samples, AudioSamples::Shared(_)));
+                lens.push(samples.len());
+            }
+            if lens.iter().sum::<usize>() == 142 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(lens, [64, 64, 14]);
+        drop(node);
+        let report = copies.report();
+        let staged: u64 = report.entries.iter().map(|(_, e)| e.copied_bytes).sum();
+        assert_eq!(staged, 142 * 4, "only the device callback copy is counted");
     }
 
     fn audio(rate: ConstraintValue<u32>, ch: ConstraintValue<u32>) -> AudioConstraints {

@@ -58,6 +58,9 @@ pub mod loadable;
 pub mod multiprocess;
 pub mod nodes;
 pub mod python;
+// Real-time thread <-> pipeline bridge (prepared audio loans, playback queues).
+#[cfg(feature = "rt-bridge")]
+pub mod rt_bridge;
 pub mod validation;
 /// Public entrypoint for ergonomic registration macros.
 pub mod registration_macros {

@@ -126,6 +126,11 @@ ac-ffmpeg = { version = "0.19", optional = true }
 fast_image_resize = "5"
 # Device nodes (`MicInput`, `SpeakerOutput`, `ScreenCapture`, `WebcamCapture`).
 cpal = { version = "0.15", optional = true }
+# `rt_bridge`: wait-free SPSC rings between real-time callbacks and the
+# pipeline (prepared capture loans, shared-owner playback).
+rtrb = { workspace = true, optional = true }
+thread-priority = { workspace = true, optional = true }
+core_affinity = { workspace = true, optional = true }
 # `wgc`: Windows Graphics Capture (compositor capture) instead of GDI
 # PrintWindow, which makes GPU-rendered apps redraw for every frame.
 xcap = { version = "0.9", optional = true, features = ["wgc"] }
@@ -238,6 +243,8 @@ glob = { version = "0.3", optional = true }
 
 [dev-dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "." }
+# Mapped-pool providers in the rt_bridge prepared-audio tests.
+remotemedia-shared-memory = { path = "../remotemedia-plugin-sdk/crates/shared-memory" }
 tokio-test = { version = "0.4" }
 tempfile = { version = "3.8" }
 rand = { version = "0.8" }
@@ -329,11 +336,16 @@ grpc-client = ["tonic", "prost", "prost-types"]
 docker = ["dep:bollard", "dep:chrono", "dep:bytes", "dep:hyper", "dep:http-body-util", "dep:glob", "dep:rusqlite"]
 # Video codec support (spec 012)
 video = ["dep:ac-ffmpeg"]
+# `rt_bridge`: real-time thread <-> pipeline bridge (prepared audio loans,
+# shared-owner playback queues). Also re-exported as `remotemedia-rt-bridge`.
+rt-bridge = ["dep:rtrb"]
+# RT priority + core affinity for the bridge worker thread.
+rt-bridge-realtime = ["rt-bridge", "dep:thread-priority", "dep:core_affinity"]
 # `MicInput` source node and `audio_io` (cpal). On Linux it needs ALSA dev
 # libraries.
-microphone = ["dep:cpal"]
+microphone = ["dep:cpal", "rt-bridge"]
 # `SpeakerOutput` sink node and the playback half of `audio_io` (cpal).
-speaker = ["dep:cpal"]
+speaker = ["dep:cpal", "rt-bridge"]
 # `ScreenCapture` source node: a monitor or an app window (xcap). On Linux
 # it needs the PipeWire / XCB development libraries.
 screen-capture = ["dep:xcap"]

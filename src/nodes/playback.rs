@@ -4,6 +4,11 @@
 //! unchanged. A device with another channel layout (a 7.1 card offers only
 //! 8 channels in shared mode) plays mono or stereo on its own channels; see
 //! [`crate::audio_io::map_frame`].
+//!
+//! Playback retains the incoming packet's shared storage until the device
+//! callback has copied it out (the one counted `DeviceTransfer`) and hands
+//! it back off the real-time thread; the passed-through packet shares that
+//! storage. Under a strict zero-copy policy the device copy is refused.
 
 use crate::audio_io::{AudioPlayback, DeviceSelector, PlaybackConfig};
 use crate::capabilities::{
@@ -17,6 +22,7 @@ use crate::nodes::streaming_node::{
 };
 use crate::Error;
 use async_trait::async_trait;
+use remotemedia_types::{CopyContext, CopyReason};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -156,8 +162,14 @@ impl SpeakerOutputStreamingNode {
     }
 
     /// Play `sample_rate` / `channels` audio from now on, (re)opening the
-    /// device when the format changes.
-    fn ensure_format(&self, sample_rate: u32, channels: u16) -> Result<(), Error> {
+    /// device when the format changes. `copies` is the session's copy
+    /// authority for borrowed compatibility input.
+    fn ensure_format(
+        &self,
+        sample_rate: u32,
+        channels: u16,
+        copies: &CopyContext,
+    ) -> Result<(), Error> {
         if let Some(pb) = lock(&self.playback).as_ref() {
             if pb.config().sample_rate == sample_rate && pb.config().channels == channels {
                 return Ok(());
@@ -168,14 +180,17 @@ impl SpeakerOutputStreamingNode {
                 return Err(Error::Execution(why.clone()));
             }
         }
-        let playback = AudioPlayback::start(PlaybackConfig {
-            device: self.selector(),
-            host: self.config.host.clone(),
-            sample_rate,
-            channels,
-        })
+        let playback = AudioPlayback::start_with_context(
+            PlaybackConfig {
+                device: self.selector(),
+                host: self.config.host.clone(),
+                sample_rate,
+                channels,
+            },
+            copies.clone(),
+        )
         .map_err(|e| {
-            let why = format!("Failed to start audio playback: {e}");
+            let why = format!("Failed to start audio playback: {e:#}");
             *lock(&self.refused) = Some((sample_rate, channels, why.clone()));
             Error::Execution(why)
         })?;
@@ -188,6 +203,107 @@ impl SpeakerOutputStreamingNode {
         *lock(&self.playback) = Some(playback);
         Ok(())
     }
+
+    /// Queue `data`'s audio by sharing its storage, and pass the packet on.
+    /// A full device queue is backpressure: wait for the callback to make
+    /// room, up to the queued audio's duration plus slack.
+    async fn play(
+        &self,
+        mut data: RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<RuntimeData, Error> {
+        let RuntimeData::Audio {
+            samples,
+            sample_rate,
+            channels,
+            ..
+        } = &mut data
+        else {
+            self.note_ignored(&data);
+            return Ok(data);
+        };
+        let channels = (*channels).max(1) as u16;
+        if samples.len() % usize::from(channels) != 0 {
+            return Err(Error::Execution(
+                "SpeakerOutput input has an incomplete frame".into(),
+            ));
+        }
+        if samples.is_empty() {
+            return Ok(data);
+        }
+        let bytes = u64::try_from(samples.len())
+            .ok()
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| Error::Execution("SpeakerOutput byte count overflow".into()))?;
+        copies
+            .check(CopyReason::DeviceTransfer, bytes)
+            .map_err(playback_error)?;
+        self.ensure_format(*sample_rate, channels, copies)?;
+        // Move Vec-backed samples into shared storage without copying, so
+        // playback and the passed-through packet own the same buffer.
+        let shared = std::mem::take(samples).into_shared();
+        *samples = shared.clone().into();
+        let mut deadline = None;
+        loop {
+            let queued = {
+                let guard = lock(&self.playback);
+                let pb = guard
+                    .as_ref()
+                    .ok_or_else(|| Error::Execution("SpeakerOutput has stopped".into()))?;
+                match pb.queue_shared(shared.clone(), copies) {
+                    Err(e) if is_full(&e) => Err(pb.drain_timeout()),
+                    other => Ok(other.map_err(playback_error)),
+                }
+            };
+            match queued {
+                Ok(result) => {
+                    result?;
+                    break;
+                }
+                Err(drain) => {
+                    let deadline =
+                        *deadline.get_or_insert_with(|| std::time::Instant::now() + drain);
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::Execution(
+                            "SpeakerOutput: the device queue stayed full; is the device playing?"
+                                .into(),
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+        }
+        tracing::trace!("Queued {} samples to speaker", shared.len());
+        Ok(data)
+    }
+
+    /// Play out what is queued, then close the device.
+    async fn finish(&self) -> Result<(), Error> {
+        let playback = lock(&self.playback).take();
+        if let Some(mut playback) = playback {
+            let timeout = playback.drain_timeout();
+            playback.finish(timeout).await.map_err(playback_error)?;
+        }
+        Ok(())
+    }
+
+    /// Use `playback` as the open device (a test fixture).
+    #[cfg(test)]
+    fn set_playback(&self, playback: AudioPlayback) {
+        *lock(&self.playback) = Some(playback);
+    }
+}
+
+fn playback_error(error: impl std::fmt::Display) -> Error {
+    Error::Execution(format!("SpeakerOutput: {error:#}"))
+}
+
+/// The device queue has no free slot (backpressure, not a failure).
+fn is_full(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::rt_bridge::PlaybackError>(),
+        Some(crate::rt_bridge::PlaybackError::Full)
+    )
 }
 
 /// The audio a device with `formats` (`(channels, min, max)`) accepts
@@ -254,23 +370,7 @@ impl AsyncStreamingNode for SpeakerOutputStreamingNode {
     }
 
     async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
-        if let RuntimeData::Audio {
-            samples,
-            sample_rate,
-            channels,
-            ..
-        } = &data
-        {
-            self.ensure_format(*sample_rate, (*channels).max(1) as u16)?;
-            if let Some(pb) = lock(&self.playback).as_ref() {
-                pb.queue(samples);
-            }
-            tracing::trace!("Played {} samples to speaker", samples.len());
-        } else {
-            self.note_ignored(&data);
-        }
-        // Sink node returns the input unchanged (for pipeline passthrough)
-        Ok(data)
+        self.play(data, CopyContext::legacy()).await
     }
 }
 
@@ -292,9 +392,12 @@ impl StreamingNode for SpeakerOutputStreamingNode {
     async fn process_async(
         &self,
         data: RuntimeData,
-        _ctx: &dyn NodeRuntimeContextRead,
+        ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
-        <Self as AsyncStreamingNode>::process(self, data).await
+        match ctx.copy_context() {
+            Some(copies) => self.play(data, &copies).await,
+            None => self.play(data, CopyContext::legacy()).await,
+        }
     }
 
     async fn process_multi_async(
@@ -311,6 +414,20 @@ impl StreamingNode for SpeakerOutputStreamingNode {
 
     fn is_multi_input(&self) -> bool {
         false
+    }
+
+    /// `{"__aux_port__": "shutdown"}` plays out what is queued and closes the
+    /// device.
+    async fn process_control_message(
+        &self,
+        message: RuntimeData,
+        _ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<bool, Error> {
+        if matches!(message, RuntimeData::Json(ref value) if value["__aux_port__"] == "shutdown") {
+            self.finish().await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     // Capability Resolution Methods (spec 023)
@@ -354,7 +471,7 @@ impl StreamingNode for SpeakerOutputStreamingNode {
             if let (Some(ConstraintValue::Exact(rate)), Some(ConstraintValue::Exact(ch))) =
                 (&a.sample_rate, &a.channels)
             {
-                self.ensure_format(*rate, (*ch).max(1) as u16)?;
+                self.ensure_format(*rate, (*ch).max(1) as u16, CopyContext::legacy())?;
             }
         }
         Ok(())
@@ -397,6 +514,70 @@ mod tests {
         assert!(lock(&n.playback).is_none());
         let warned: Vec<u64> = (1..=1000).filter(|i| is_power_of_ten(*i)).collect();
         assert_eq!(warned, vec![1, 10, 100, 1000]);
+    }
+
+    #[tokio::test]
+    async fn audio_is_played_from_and_passed_on_in_the_same_shared_storage() {
+        use crate::audio_io::playback::tests::test_playback;
+        use crate::data::AudioSamples;
+        use crate::nodes::NodeRuntimeContext;
+        use remotemedia_types::CopyPolicy;
+
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "speaker-node");
+        let ctx = NodeRuntimeContext::for_test("s", "spkr").with_copy_context(copies.clone());
+        let n = SpeakerOutputStreamingNode::new("spkr".into(), SpeakerOutputConfig::default());
+        // The fixture device plays 48 kHz mono, the format of this input.
+        let (playback, device) = test_playback(copies.clone());
+        n.set_playback(playback);
+        let input = RuntimeData::Audio {
+            samples: AudioSamples::Vec(vec![0.25, 0.5, 0.75]),
+            sample_rate: 48000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: None,
+        };
+        let out = StreamingNode::process_async(&n, input, &ctx).await.unwrap();
+        let RuntimeData::Audio { samples, .. } = &out else {
+            panic!("audio passes through");
+        };
+        assert!(matches!(samples, AudioSamples::Shared(_)));
+        assert_eq!(device.render(4), [0.25, 0.5, 0.75, 0.0]);
+        n.finish().await.unwrap();
+        drop(out);
+        let report = copies.report();
+        let device_bytes: u64 = report
+            .entries
+            .iter()
+            .filter(|(reason, _)| *reason == CopyReason::DeviceTransfer)
+            .map(|(_, e)| e.copied_bytes)
+            .sum();
+        let all: u64 = report.entries.iter().map(|(_, e)| e.copied_bytes).sum();
+        assert_eq!(device_bytes, 12, "the device copy is the only one");
+        assert_eq!(all, 12);
+    }
+
+    #[tokio::test]
+    async fn strict_policy_refuses_the_device_copy_before_opening() {
+        use crate::data::AudioSamples;
+        use crate::nodes::NodeRuntimeContext;
+        use remotemedia_types::CopyPolicy;
+
+        let copies = CopyContext::new(CopyPolicy::RequireZeroCopy, "speaker-strict");
+        let ctx = NodeRuntimeContext::for_test("s", "spkr").with_copy_context(copies);
+        let n = SpeakerOutputStreamingNode::new("spkr".into(), SpeakerOutputConfig::default());
+        let input = RuntimeData::Audio {
+            samples: AudioSamples::Vec(vec![0.0; 4]),
+            sample_rate: 48000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: None,
+        };
+        assert!(StreamingNode::process_async(&n, input, &ctx).await.is_err());
+        assert!(lock(&n.playback).is_none());
     }
 }
 
