@@ -133,6 +133,12 @@ pub struct PluginPythonMeta {
     #[serde(default = "default_module_root")]
     pub module_root: String,
 
+    /// How JSON inputs reach this plugin's nodes: `"json"` (the default, as
+    /// JSON data, like a regular Python node) or `"text"` (as text holding the
+    /// JSON, for plugins written before JSON delivery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_input: Option<String>,
+
     /// Explicit mapped runner contract. Requires host-authorized mapped runtime;
     /// it must never fall back to the legacy serialized runner.
     #[serde(default, skip_serializing_if = "Option::is_none")]

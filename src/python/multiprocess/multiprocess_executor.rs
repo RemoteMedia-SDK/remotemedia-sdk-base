@@ -1239,6 +1239,17 @@ impl MultiprocessExecutor {
             .await;
     }
 
+    /// Set an environment variable for this executor's worker processes.
+    /// It is part of the shared-worker key.
+    pub async fn set_spawn_env(&self, key: &str, value: &str) {
+        self.process_manager
+            .spawn_config()
+            .write()
+            .await
+            .env_vars
+            .insert(key.to_string(), value.to_string());
+    }
+
     /// Get the list of registered modules
     pub async fn get_registered_modules(&self) -> Vec<String> {
         self.process_manager.get_registered_modules().await
@@ -1472,6 +1483,16 @@ def _scan_file(path, want_node_type, want_class=None):
             return (deps or []), True, scope
     return None, False, None
 
+def _module_source(module):
+    """Source file of an importable module, found on sys.path without importing it."""
+    relative = Path(*module.split("."))
+    for entry in sys.path:
+        base = Path(entry) if entry else Path.cwd()
+        for candidate in (base / relative.with_suffix(".py"), base / relative / "__init__.py"):
+            if candidate.is_file():
+                return candidate
+    return None
+
 def _dotted_class_source(node_type):
     """(source file, class name) of a node registered by dotted path
     (`pkg.module.ClassName`), found on sys.path without importing it."""
@@ -1557,6 +1578,19 @@ try:
         if matched:
             break
     if not matched:
+        # A class registered by name in a module the worker imports first.
+        for module in os.environ.get("REMOTEMEDIA_DEPS_PROBE_MODULES", "").split(","):
+            module_path = _module_source(module) if module else None
+            if module_path is None:
+                continue
+            deps, found, scope = _scan_file(module_path, NODE_TYPE)
+            if found:
+                RESULT["deps"] = _merge_dedup(deps or [], _extract_pep723(module_path))
+                RESULT["instance_scope"] = scope
+                RESULT["source_file"] = str(module_path)
+                matched = True
+                break
+    if not matched:
         dotted_path, dotted_class = _dotted_class_source(NODE_TYPE)
         if dotted_path is not None:
             deps, found, scope = _scan_file(dotted_path, NODE_TYPE, dotted_class)
@@ -1579,6 +1613,12 @@ sys.stdout.flush()
         let mut cmd = tokio::process::Command::new(python);
         cmd.args(["-c", &script]);
         cmd.env("REMOTEMEDIA_DEPS_PROBE_NODE_TYPE", node_type);
+        // Modules the worker will import to register node classes (a source
+        // plugin's entry module): the probe looks for the node type in them.
+        cmd.env(
+            "REMOTEMEDIA_DEPS_PROBE_MODULES",
+            self.process_manager.get_registered_modules().await.join(","),
+        );
         #[cfg(windows)]
         if let Some(flags) = super::process_manager::no_window_flag() {
             cmd.creation_flags(flags);
@@ -3117,8 +3157,17 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             // Pre-discover node-declared deps (via @python_requires decorator)
             // by running a lightweight Python probe BEFORE spawning the real process.
             // This ensures the managed venv includes all required packages upfront.
-            let (node_deps, probed_scope) = self.discover_node_deps(&ctx.node_type).await;
+            let (mut node_deps, probed_scope) = self.discover_node_deps(&ctx.node_type).await;
             self.declared_instance_scope = probed_scope;
+            // A source plugin's `plugin.toml` `requires` are base dependencies,
+            // like the class's own declaration.
+            if let Some(plugin_deps) = ctx.params.get("__python_plugin_deps__").and_then(|v| v.as_array()) {
+                for dep in plugin_deps.iter().filter_map(|v| v.as_str()) {
+                    if !node_deps.iter().any(|existing| existing == dep) {
+                        node_deps.push(dep.to_string());
+                    }
+                }
+            }
 
             // Collect deps from:
             // 1. Node class __python_requires__ (discovered via probe above)

@@ -997,15 +997,45 @@ impl PipelineExecutor {
         }
         #[cfg(feature = "python-source-plugin")]
         {
+            // `[python].module_root` is relative to the plugin's root.
+            let module_root = match py.module_root.trim() {
+                "" | "." | "./" => module_root,
+                relative => module_root.join(relative),
+            };
+            let json_as_text = match py.json_input.as_deref() {
+                None | Some("json") => false,
+                Some("text") => true,
+                Some(other) => {
+                    return Err(Error::Manifest(format!(
+                        "source-python plugin '{}': json_input must be \"json\" or \"text\", got {other:?}",
+                        plugin_toml.plugin.name
+                    )))
+                }
+            };
+            // The digest covers the plugin's source files, so an edited
+            // local plugin is a different plugin.
+            let digest = format!(
+                "sha256:{}",
+                crate::loadable::source_python::content_digest(&module_root)
+            );
+            {
+                // Loading the same plugin again is a no-op.
+                let registry = self.registry.read().await;
+                if !py.node_types.is_empty()
+                    && py.node_types.iter().all(|node_type| {
+                        registry.has_node_type(node_type)
+                            && registry.implementation(node_type).digest.as_deref()
+                                == Some(digest.as_str())
+                    })
+                {
+                    return Ok(());
+                }
+            }
             let implementation = crate::telemetry::NodeImplementation {
                 kind: crate::telemetry::ImplementationKind::Python,
                 plugin_name: Some(plugin_toml.plugin.name.clone()),
                 plugin_version: Some(plugin_toml.plugin.version.clone()),
-                digest: Some(if hash.starts_with("sha256:") {
-                    hash.clone()
-                } else {
-                    format!("sha256:{hash}")
-                }),
+                digest: Some(digest.clone()),
                 loaded_at_ms: Some(
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1023,7 +1053,8 @@ impl PipelineExecutor {
                     hash: hash.clone(),
                 };
                 let factory = std::sync::Arc::new(
-                    crate::loadable::source_python::SourcePythonFactory::new(plugin),
+                    crate::loadable::source_python::SourcePythonFactory::new(plugin)
+                        .json_as_text(json_as_text),
                 );
                 registry.register_with_implementation(factory, implementation.clone());
             }

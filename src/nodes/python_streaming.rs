@@ -14,8 +14,27 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Where a Python node's class comes from when it is not on the host's default
+/// import path: a Python source plugin, for example.
+#[derive(Debug, Clone, Default)]
+pub struct PythonSpawnSettings {
+    /// Directories put first on the worker's import path.
+    pub python_path: Vec<std::path::PathBuf>,
+    /// Modules the worker imports before it looks the node type up; importing
+    /// them registers the node classes.
+    pub register_modules: Vec<String>,
+    /// Extra environment variables for the worker. They are part of the
+    /// shared-worker key, so a value that identifies the code (a plugin
+    /// digest) keeps different versions in different workers.
+    pub env: Vec<(String, String)>,
+    /// Deliver JSON inputs as text holding the JSON (`json_input = "text"`).
+    pub json_as_text: bool,
+}
+
 /// Wrapper that adapts a Python node to the AsyncStreamingNode trait
 pub struct PythonStreamingNode {
+    /// Per-node spawn settings; `None` for nodes on the default import path.
+    spawn: Option<PythonSpawnSettings>,
     node_id: String,
     node_type: String,
     params: Value,
@@ -49,6 +68,7 @@ impl PythonStreamingNode {
         }
 
         Ok(Self {
+            spawn: None,
             node_id,
             node_type: node_type.to_string(),
             params: params.clone(),
@@ -59,6 +79,13 @@ impl PythonStreamingNode {
         })
     }
 
+    /// Run this node's worker with per-node spawn settings (import path,
+    /// modules to import, environment). Must be set before first use.
+    pub fn with_spawn_settings(mut self, settings: PythonSpawnSettings) -> Self {
+        self.spawn = Some(settings);
+        self
+    }
+
     /// Create with session ID for multiprocess execution (spec 002)
     pub fn with_session(
         node_id: String,
@@ -67,6 +94,7 @@ impl PythonStreamingNode {
         session_id: String,
     ) -> Result<Self, Error> {
         Ok(Self {
+            spawn: None,
             node_id,
             node_type: node_type.to_string(),
             params: params.clone(),
@@ -89,6 +117,7 @@ impl PythonStreamingNode {
             let _ = declared_instance_scope.set(scope);
         }
         Ok(Self {
+            spawn: None,
             node_id,
             node_type: node_type.to_string(),
             params: params.clone(),
@@ -135,10 +164,26 @@ impl PythonStreamingNode {
             );
 
             // Load config from runtime.toml or use defaults
-            let config = crate::python::multiprocess::MultiprocessConfig::from_default_file()
+            let mut config = crate::python::multiprocess::MultiprocessConfig::from_default_file()
                 .unwrap_or_default();
+            if let Some(spawn) = &self.spawn {
+                // The node's own directories go first on the import path.
+                for (index, path) in spawn.python_path.iter().enumerate() {
+                    if !config.python_path.contains(path) {
+                        config.python_path.insert(index, path.clone());
+                    }
+                }
+            }
 
             let mut executor = crate::python::multiprocess::MultiprocessExecutor::new(config);
+            if let Some(spawn) = &self.spawn {
+                for module in &spawn.register_modules {
+                    executor.register_module(module).await;
+                }
+                for (key, value) in &spawn.env {
+                    executor.set_spawn_env(key, value).await;
+                }
+            }
             if let Some(copies) = copies {
                 executor.bind_initial_copy_context(copies)?;
             }
@@ -192,6 +237,15 @@ impl PythonStreamingNode {
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
         let session_id_opt = session_id.or_else(|| self.session_id.clone());
+        // `json_input = "text"`: this node asked for JSON inputs as text.
+        let data = match data {
+            RuntimeData::Json(value)
+                if self.spawn.as_ref().is_some_and(|spawn| spawn.json_as_text) =>
+            {
+                RuntimeData::Text(value.to_string())
+            }
+            other => other,
+        };
         // First-use initialization binds lifetime output authority. Later request
         // contexts remain input/decode authority without rebinding the worker.
         self.ensure_initialized_with_copies(Some(copies.clone()), session_id_opt.clone())

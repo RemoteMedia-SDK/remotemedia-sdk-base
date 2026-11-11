@@ -69,14 +69,128 @@ pub struct SourcePythonPlugin {
 /// to know anything new about plugins.
 pub struct SourcePythonFactory {
     plugin: Arc<SourcePythonPlugin>,
+    /// SHA-256 over the plugin's source files. Identifies the code a worker
+    /// runs, so two versions of a plugin never share a worker.
+    digest: String,
+    /// `json_input = "text"` in `plugin.toml`.
+    json_as_text: bool,
+}
+
+/// Environment switch that keeps the previous plugin-SDK runner for source
+/// plugins (`REMOTEMEDIA_SOURCE_PLUGIN_RUNTIME=legacy`). Rollback only.
+const RUNTIME_SWITCH: &str = "REMOTEMEDIA_SOURCE_PLUGIN_RUNTIME";
+
+/// SHA-256 (hex) over the Python sources and `plugin.toml` under `root`:
+/// each file's path relative to `root`, then its bytes, in path order.
+/// Hidden directories and `__pycache__` are skipped.
+pub fn content_digest(root: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn collect(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if !name.starts_with('.') && name != "__pycache__" {
+                    collect(&path, files);
+                }
+            } else if name.ends_with(".py") || name == "plugin.toml" {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(root, &mut files);
+    files.sort();
+    let mut hasher = Sha256::new();
+    for file in files {
+        let relative = file.strip_prefix(root).unwrap_or(&file);
+        hasher.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
+        hasher.update([0u8]);
+        hasher.update(std::fs::read(&file).unwrap_or_default());
+        hasher.update([0u8]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl SourcePythonFactory {
     /// Wrap a resolved plugin spec into a factory.
     pub fn new(plugin: SourcePythonPlugin) -> Self {
+        let digest = content_digest(&plugin.module_root);
         Self {
             plugin: Arc::new(plugin),
+            digest,
+            json_as_text: false,
         }
+    }
+
+    /// Deliver JSON inputs to this plugin's nodes as text holding the JSON
+    /// (`json_input = "text"`).
+    pub fn json_as_text(mut self, on: bool) -> Self {
+        self.json_as_text = on;
+        self
+    }
+
+    /// SHA-256 (hex) of the plugin's source files.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// A node on the in-tree multiprocess executor, the runtime regular
+    /// Python nodes use: the plugin's module root on the worker's import
+    /// path, its entry module imported first, its `requires` as base
+    /// dependencies. (openspec: unify-python-source-plugin-runtime)
+    fn create_on_executor(
+        &self,
+        node_id: String,
+        params: &serde_json::Value,
+        session_id: Option<String>,
+    ) -> Result<Box<dyn StreamingNode>, Error> {
+        use crate::nodes::python_streaming::{PythonSpawnSettings, PythonStreamingNode};
+
+        let plugin = &self.plugin;
+        let mut params = params.clone();
+        if !params.is_object() {
+            params = serde_json::json!({});
+        }
+        if let Some(object) = params.as_object_mut() {
+            object.insert(
+                "__python_plugin_deps__".into(),
+                serde_json::json!(plugin.requires),
+            );
+            // Environments are scoped per plugin as well as by the session's
+            // scope setting, as with the previous runner.
+            if let Some(scope) = object
+                .get("__python_env_scope_context__")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!("{value};plugin:{}", plugin.hash))
+            {
+                object.insert("__python_env_scope_context__".into(), scope.into());
+            }
+        }
+        let settings = PythonSpawnSettings {
+            python_path: vec![plugin.module_root.clone()],
+            register_modules: vec![plugin.entry_module.clone()],
+            env: vec![("REMOTEMEDIA_PLUGIN_DIGEST".into(), self.digest.clone())],
+            json_as_text: self.json_as_text,
+        };
+        let node = match session_id {
+            Some(session) if !session.is_empty() => {
+                PythonStreamingNode::with_session(node_id, &plugin.node_type, &params, session)?
+            }
+            _ => PythonStreamingNode::new(node_id, &plugin.node_type, &params)?,
+        }
+        .with_spawn_settings(settings);
+        Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(node))))
     }
 
     /// Access the resolved plugin metadata.
@@ -90,12 +204,23 @@ impl StreamingNodeFactory for SourcePythonFactory {
         &self.plugin.node_type
     }
 
+    fn is_python_node(&self) -> bool {
+        true
+    }
+
+    fn is_multi_output_streaming(&self) -> bool {
+        true
+    }
+
     fn create(
         &self,
         node_id: String,
         params: &serde_json::Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
+        if std::env::var(RUNTIME_SWITCH).as_deref() != Ok("legacy") {
+            return self.create_on_executor(node_id, params, session_id);
+        }
         let plugin = self.plugin.clone();
         let params_json = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
 
