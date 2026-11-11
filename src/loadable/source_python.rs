@@ -166,16 +166,18 @@ impl SourcePythonFactory {
                 "__python_plugin_deps__".into(),
                 serde_json::json!(plugin.requires),
             );
-            // Environments are scoped per plugin as well as by the session's
-            // scope setting, as with the previous runner.
-            if let Some(scope) = object
+            // An environment belongs to one plugin: two plugins with the same
+            // dependency list do not share one. The session's own scope
+            // setting, when present, still applies on top.
+            let scope = match object
                 .get("__python_env_scope_context__")
                 .and_then(|value| value.as_str())
                 .filter(|value| !value.trim().is_empty())
-                .map(|value| format!("{value};plugin:{}", plugin.hash))
             {
-                object.insert("__python_env_scope_context__".into(), scope.into());
-            }
+                Some(session_scope) => format!("{session_scope};plugin:{}", plugin.hash),
+                None => format!("plugin:{}", plugin.hash),
+            };
+            object.insert("__python_env_scope_context__".into(), scope.into());
         }
         let settings = PythonSpawnSettings {
             python_path: vec![plugin.module_root.clone()],
