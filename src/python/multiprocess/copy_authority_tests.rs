@@ -22,6 +22,16 @@ fn request(stream: &mut TcpStream, seq: u64, action: Value) -> Value {
     read_frame(stream).unwrap()
 }
 
+/// The Python for the real-worker tests, which also need the sibling
+/// `remotemedia-sdk` checkout's `clients/python`. Unset: the test is skipped.
+fn legacy_wire_python() -> Option<String> {
+    let python = std::env::var("LEGACY_WIRE_PYTHON").ok();
+    if python.is_none() {
+        eprintln!("skipping: set LEGACY_WIRE_PYTHON to run real Python copy-reporting tests");
+    }
+    python
+}
+
 fn counts(copies: &CopyContext, reason: CopyReason) -> remotemedia_types::CopyCounts {
     copies
         .report()
@@ -154,8 +164,9 @@ fn legacy_copy_protocol_authentication_and_frame_bounds_precede_ledger_access() 
 #[test]
 fn legacy_copy_python_hooks_report_to_real_host_context() {
     use std::process::{Command, Stdio};
-    let python = std::env::var("LEGACY_WIRE_PYTHON")
-        .expect("set LEGACY_WIRE_PYTHON for real Python reporting tests");
+    let Some(python) = legacy_wire_python() else {
+        return;
+    };
     let source =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../remotemedia-sdk/clients/python");
     for mode in ["success", "abandon", "strict"] {
@@ -237,12 +248,13 @@ async fn run_native_launcher(abort_reporting: bool) {
     };
     use futures::FutureExt;
     use std::panic::AssertUnwindSafe;
+    let Some(python) = legacy_wire_python() else {
+        return;
+    };
     let source =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../remotemedia-sdk/clients/python");
     let config = MultiprocessConfig {
-        python_executable: std::env::var("LEGACY_WIRE_PYTHON")
-            .expect("set LEGACY_WIRE_PYTHON")
-            .into(),
+        python_executable: python.into(),
         python_path: vec![source.clone(), source.join("tests/support")],
         ..Default::default()
     };
