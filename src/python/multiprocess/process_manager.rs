@@ -293,6 +293,32 @@ impl ProcessHandle {
     }
 }
 
+/// `PYTHONPATH` for a node worker: the configured `paths` first, then the
+/// host's own `PYTHONPATH` entries (`inherited`) that are not already listed.
+///
+/// A worker must be able to import the node classes the host registered by
+/// dotted path (`my_nodes.MyNode`). Those live wherever the host's
+/// `PYTHONPATH` says, so a configured path (the managed environment's client
+/// source, for example) is added in front of it and does not replace it.
+pub(crate) fn python_path_with_inherited(
+    paths: &[std::path::PathBuf],
+    inherited: Option<&str>,
+) -> String {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let mut entries: Vec<String> = Vec::new();
+    let configured = paths.iter().map(|p| p.to_string_lossy().to_string());
+    let inherited = inherited
+        .unwrap_or_default()
+        .split(separator)
+        .map(str::to_string);
+    for entry in configured.chain(inherited) {
+        if !entry.trim().is_empty() && !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    entries.join(&separator.to_string())
+}
+
 /// Process spawn configuration
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -519,14 +545,13 @@ impl ProcessManager {
 
         // Set Python path
         if !spawn_config.python_path.is_empty() {
-            let python_path = spawn_config
-                .python_path
-                .iter()
-                .map(|p| p.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(if cfg!(windows) { ";" } else { ":" });
-
-            command.env("PYTHONPATH", python_path);
+            command.env(
+                "PYTHONPATH",
+                python_path_with_inherited(
+                    &spawn_config.python_path,
+                    std::env::var("PYTHONPATH").ok().as_deref(),
+                ),
+            );
         }
 
         // Set working directory
@@ -949,6 +974,18 @@ use nix;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn worker_python_path_keeps_the_hosts_entries_after_the_configured_ones() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let configured = [std::path::PathBuf::from("client-src")];
+        let inherited = ["my-nodes", "client-src", "", "more"].join(sep);
+        assert_eq!(
+            super::python_path_with_inherited(&configured, Some(&inherited)),
+            ["client-src", "my-nodes", "more"].join(sep)
+        );
+        assert_eq!(super::python_path_with_inherited(&configured, None), "client-src");
+    }
+
     use super::*;
 
     fn alive(pid: u32) -> bool {

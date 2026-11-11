@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use remotemedia_plugin_sdk::python_ipc::{IpcCommand, WireDataType, WireRuntimeData};
-use remotemedia_plugin_sdk::python_subprocess::{spawn_python_subprocess, PluginProvisioning};
+use remotemedia_plugin_sdk::python_subprocess::{
+    spawn_python_subprocess_with_handshake, PluginProvisioning,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use std::collections::HashMap;
@@ -161,7 +163,7 @@ impl StreamingNodeFactory for SourcePythonFactory {
             ),
         };
 
-        let (cmd_tx, child) = spawn_python_subprocess(
+        let (cmd_tx, child, handshake) = spawn_python_subprocess_with_handshake(
             &provisioning,
             &plugin.entry_module,
             &plugin.node_type,
@@ -180,6 +182,7 @@ impl StreamingNodeFactory for SourcePythonFactory {
             node_type: plugin.node_type.clone(),
             session_id,
             cmd_tx,
+            declared_instance_scope: handshake.instance_scope,
             _child: child,
             _env_lease: provisioning.venv.clone(),
         }))
@@ -216,6 +219,9 @@ struct SourcePythonNode {
     node_type: String,
     session_id: String,
     cmd_tx: mpsc::Sender<IpcCommand>,
+    /// The node class's `@instance_scope(...)`, as the worker reported it
+    /// before READY.
+    declared_instance_scope: Option<crate::nodes::InstanceScope>,
     /// Held so the subprocess is killed on drop.
     _child: Arc<std::sync::Mutex<std::process::Child>>,
     /// Environment cache lease. Fields drop after `Drop::drop`, so this is
@@ -259,6 +265,10 @@ fn wire_copies(
 impl StreamingNode for SourcePythonNode {
     fn node_type(&self) -> &str {
         &self.node_type
+    }
+
+    fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
+        self.declared_instance_scope
     }
 
     fn is_multi_input(&self) -> bool {

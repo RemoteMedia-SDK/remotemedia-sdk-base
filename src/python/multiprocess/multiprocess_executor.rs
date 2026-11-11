@@ -1276,22 +1276,21 @@ impl MultiprocessExecutor {
         let mut python_path_env = {
             let spawn_config = self.process_manager.spawn_config().read().await;
 
+            // Configured paths first, then the host's PYTHONPATH: a node
+            // class registered by dotted path is found through the latter.
+            let inherited = std::env::var("PYTHONPATH").ok();
             if !self.config.python_path.is_empty() {
-                self.config
-                    .python_path
-                    .iter()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .collect::<Vec<_>>()
-                    .join(if cfg!(windows) { ";" } else { ":" })
+                super::process_manager::python_path_with_inherited(
+                    &self.config.python_path,
+                    inherited.as_deref(),
+                )
             } else if !spawn_config.python_path.is_empty() {
-                spawn_config
-                    .python_path
-                    .iter()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .collect::<Vec<_>>()
-                    .join(if cfg!(windows) { ";" } else { ":" })
+                super::process_manager::python_path_with_inherited(
+                    &spawn_config.python_path,
+                    inherited.as_deref(),
+                )
             } else {
-                String::new()
+                super::process_manager::python_path_with_inherited(&[], inherited.as_deref())
             }
         };
 
@@ -1415,7 +1414,7 @@ def _dec_name(dec):
         return func.attr
     return None
 
-def _scan_file(path, want_node_type):
+def _scan_file(path, want_node_type, want_class=None):
     """Return (deps_list, found, instance_scope) where `deps_list` is the
     @python_requires([...]) literal on the class registered as
     `<want_node_type>`. Class registration is recognised via either
@@ -1424,7 +1423,9 @@ def _scan_file(path, want_node_type):
     `@streaming_node(node_type=<target>)` (the older registration
     decorator, still used by e.g. `tts.py::KokoroTTSNode`). Returns
     `(None, False, None)` if no matching class is found.
-    `instance_scope` is the `@instance_scope("...")` literal, if any."""
+    `instance_scope` is the `@instance_scope("...")` literal, if any.
+    With `want_class`, the class is matched by its name instead (a node
+    registered by dotted path, `module.ClassName`)."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -1436,7 +1437,7 @@ def _scan_file(path, want_node_type):
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
             continue
-        matches = False
+        matches = want_class is not None and node.name == want_class
         deps = None
         scope = None
         for dec in node.decorator_list:
@@ -1470,6 +1471,20 @@ def _scan_file(path, want_node_type):
         if matches:
             return (deps or []), True, scope
     return None, False, None
+
+def _dotted_class_source(node_type):
+    """(source file, class name) of a node registered by dotted path
+    (`pkg.module.ClassName`), found on sys.path without importing it."""
+    module, _, cls = node_type.rpartition(".")
+    if not module or not cls:
+        return None, None
+    relative = Path(*module.split("."))
+    for entry in sys.path:
+        base = Path(entry) if entry else Path.cwd()
+        for candidate in (base / relative.with_suffix(".py"), base / relative / "__init__.py"):
+            if candidate.is_file():
+                return candidate, cls
+    return None, None
 
 def _extract_pep723(path):
     try:
@@ -1541,6 +1556,15 @@ try:
                 break
         if matched:
             break
+    if not matched:
+        dotted_path, dotted_class = _dotted_class_source(NODE_TYPE)
+        if dotted_path is not None:
+            deps, found, scope = _scan_file(dotted_path, NODE_TYPE, dotted_class)
+            if found:
+                RESULT["deps"] = _merge_dedup(deps or [], _extract_pep723(dotted_path))
+                RESULT["instance_scope"] = scope
+                RESULT["source_file"] = str(dotted_path)
+                matched = True
     if not matched:
         RESULT["error"] = f"no class found with @register_node({{NODE_TYPE!r}}) under any candidate root"
 except BaseException as exc:
