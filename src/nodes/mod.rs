@@ -20,6 +20,8 @@ pub mod builder;
 pub mod calculator;
 pub mod core_provider;
 pub mod debug_log;
+pub mod emitter;
+pub use emitter::{EmitOrigin, Emitter, TryEmitError};
 pub mod envelope_first_notifier;
 pub mod motion;
 pub mod passthrough;

@@ -236,6 +236,7 @@ pub(crate) fn build_snapshot(
                 status,
                 inputs: cell.inputs.load(Relaxed),
                 outputs: cell.outputs.load(Relaxed),
+                emitted: cell.emitted.load(Relaxed),
                 errors: cell.errors.load(Relaxed),
                 bypassed: cell.bypassed.load(Relaxed),
                 discarded: cell.discarded.load(Relaxed),

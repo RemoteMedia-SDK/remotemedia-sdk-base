@@ -1784,6 +1784,7 @@ mod tests {
 
     mod output_drain;
     mod provenance;
+    mod emit;
     mod participants;
 
     fn create_test_manifest() -> Manifest {

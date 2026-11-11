@@ -22,7 +22,8 @@
 //! taps, intercepts) and its telemetry slot.
 
 use super::{NODE_INPUT_CAPACITY, StreamingNode};
-use crate::transport::origin::Routed;
+use crate::nodes::Emitter;
+use crate::transport::origin::{Origin, Routed};
 use crate::transport::session_control::{aux_port_of, SessionControl};
 use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -49,10 +50,18 @@ pub(crate) enum ParticipantEvent {
     Left(String),
 }
 
-/// Starts the tasks of one node instance on the given input queue. `primary`
-/// is the instance that owns the node's liveness telemetry and RPC handlers.
+/// Starts the tasks of one node instance on the given input queue, with the
+/// instance's emitter and the participant it serves (its default attribution
+/// for emitted output). `primary` is the instance that owns the node's
+/// liveness telemetry and RPC handlers.
 pub(super) type SpawnInstance = Arc<
-    dyn Fn(Box<dyn StreamingNode>, mpsc::Receiver<Routed>, bool) -> (JoinHandle<Result<()>>, JoinHandle<Result<()>>)
+    dyn Fn(
+            Box<dyn StreamingNode>,
+            mpsc::Receiver<Routed>,
+            Emitter,
+            Option<Arc<Origin>>,
+            bool,
+        ) -> (JoinHandle<Result<()>>, JoinHandle<Result<()>>)
         + Send
         + Sync,
 >;
@@ -74,7 +83,7 @@ pub(super) struct InstanceFactory {
 impl InstanceFactory {
     /// Create and initialize an instance under `instance_id` (which names its
     /// worker channels, so it must differ from every other instance's).
-    async fn create(&self, instance_id: &str) -> Result<Box<dyn StreamingNode>> {
+    async fn create(&self, instance_id: &str) -> Result<(Box<dyn StreamingNode>, Emitter)> {
         let mut node = self.registry.create_node(
             &self.node_type,
             instance_id.to_string(),
@@ -95,14 +104,15 @@ impl InstanceFactory {
             };
             node = Box::new(checked);
         }
+        let emitter = Emitter::pending(instance_id);
         let ctx = crate::nodes::InitializeContext {
             session_id: self.session_id.clone(),
             node_id: instance_id.to_string(),
             control: self.control.clone(),
         }
-        .with_copy_context(self.copies.clone());
+        .for_instance(self.copies.clone(), emitter.clone());
         node.initialize(&ctx).await?;
-        Ok(node)
+        Ok((node, emitter))
     }
 }
 
@@ -113,8 +123,9 @@ pub(super) struct Dispatcher {
     pub(super) node_id: String,
     pub(super) session_id: String,
     pub(super) input_rx: mpsc::Receiver<Routed>,
-    /// The instance created at session start; serves the first participant.
-    pub(super) primary: Option<Box<dyn StreamingNode>>,
+    /// The instance created at session start, with its emitter; serves the
+    /// first participant.
+    pub(super) primary: Option<(Box<dyn StreamingNode>, Emitter)>,
     pub(super) factory: Arc<InstanceFactory>,
     pub(super) spawn: SpawnInstance,
     pub(super) max_instances: usize,
@@ -210,7 +221,7 @@ impl Dispatcher {
                 }
                 return;
             }
-            let instance = self.open(&key, tasks, created);
+            let instance = self.open(&key, frame.origin.clone(), tasks, created);
             instances.insert(key.clone(), instance);
             self.telemetry.set_instances(self.node_index, instances.len());
         }
@@ -225,19 +236,20 @@ impl Dispatcher {
     fn open(
         &mut self,
         key: &str,
+        participant: Option<Arc<Origin>>,
         tasks: &mut Vec<(String, JoinHandle<Result<()>>)>,
         created: &mut usize,
     ) -> Instance {
         let (tx, rx) = mpsc::channel(NODE_INPUT_CAPACITY);
         let who = if key == DEFAULT_KEY { "unattributed input" } else { key };
-        if let Some(node) = self.primary.take() {
+        if let Some((node, emitter)) = self.primary.take() {
             tracing::info!(
                 session_id = %self.session_id,
                 node_id = %self.node_id,
                 participant = %who,
                 "per-participant node: startup instance serves this participant"
             );
-            let (main, fan) = (self.spawn)(node, rx, true);
+            let (main, fan) = (self.spawn)(node, rx, emitter, participant, true);
             tasks.push((format!("{} ({who}) main", self.node_id), main));
             tasks.push((format!("{} ({who}) fan-out", self.node_id), fan));
             return Instance { tx };
@@ -260,8 +272,8 @@ impl Dispatcher {
         let label = format!("{} ({who})", self.node_id);
         let who = who.to_string();
         let task = tokio::spawn(async move {
-            let node = match factory.create(&instance_id).await {
-                Ok(node) => node,
+            let (node, emitter) = match factory.create(&instance_id).await {
+                Ok(created) => created,
                 Err(error) => {
                     let message = format!("instance for participant '{who}' failed to start: {error}");
                     tracing::error!(node_id = %node_id, instance = %instance_id, "{message}");
@@ -276,7 +288,7 @@ impl Dispatcher {
                     return Err(Error::Execution(message));
                 }
             };
-            let (main, fan) = spawn(node, rx, false);
+            let (main, fan) = spawn(node, rx, emitter, participant, false);
             let main = main.await.map_err(|e| Error::Execution(e.to_string()))?;
             let fan = fan.await.map_err(|e| Error::Execution(e.to_string()))?;
             main.and(fan)

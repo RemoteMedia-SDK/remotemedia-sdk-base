@@ -125,6 +125,9 @@ pub struct NodeTelemetry {
     pub status: NodeStatus,
     pub inputs: u64,
     pub outputs: u64,
+    /// Outputs the node emitted on its own, without an input (openspec:
+    /// add-node-initiated-output). Included in `outputs`.
+    pub emitted: u64,
     pub errors: u64,
     pub bypassed: u64,
     pub discarded: u64,
@@ -157,6 +160,7 @@ impl Default for NodeTelemetry {
             status: NodeStatus::Idle,
             inputs: 0,
             outputs: 0,
+            emitted: 0,
             errors: 0,
             bypassed: 0,
             discarded: 0,

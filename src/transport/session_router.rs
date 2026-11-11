@@ -370,6 +370,11 @@ pub struct SessionRouter {
 
     /// Cached node instances (created once per session)
     cached_nodes: HashMap<String, Box<dyn StreamingNode>>,
+    /// The emitter each cached node was initialized with (openspec:
+    /// add-node-initiated-output); connected when the node's tasks start.
+    emitters: HashMap<String, crate::nodes::Emitter>,
+    /// Participants currently in the session.
+    roster: Arc<crate::transport::origin::Roster>,
     snapshot_bindings: Option<SnapshotBindings>,
 
     /// Kind-split sink output. See [`ClientOutputRouter`] for why we don't
@@ -665,6 +670,8 @@ impl SessionRouter {
             graph,
             registry,
             cached_nodes: HashMap::new(),
+            emitters: HashMap::new(),
+            roster: Default::default(),
             snapshot_bindings: None,
             output_router,
             input_rx: std::sync::Mutex::new(Some(input_rx)),
@@ -1072,8 +1079,14 @@ impl SessionRouter {
         let session_id = self.session_id.clone();
         let control = self.control.clone();
         let node_materialization = self.node_materialization.clone();
+        self.emitters = created
+            .iter()
+            .map(|(id, _, _)| (id.clone(), crate::nodes::Emitter::pending(id.clone())))
+            .collect();
+        let emitters = self.emitters.clone();
         let init_futures = created.into_iter().map(|(id, ty, node)| {
             let copies = node_materialization.context(&id);
+            let emitter = emitters[&id].clone();
             let init_ctx = InitializeContext {
                 session_id: session_id.clone(),
                 node_id: id.clone(),
@@ -1083,7 +1096,7 @@ impl SessionRouter {
             let span = node_span(&session_id, &id);
             async move {
                 let copies = copies.map_err(|error| (id.clone(), ty.clone(), error))?;
-                let init_ctx = init_ctx.with_copy_context(copies);
+                let init_ctx = init_ctx.for_instance(copies, emitter);
                 use futures::FutureExt;
                 let result = std::panic::AssertUnwindSafe(node.initialize(&init_ctx))
                     .catch_unwind()
@@ -1614,6 +1627,7 @@ impl SessionRouter {
 
         // Drain node instances out of the cache. Each task owns its node.
         let nodes = std::mem::take(&mut self.cached_nodes);
+        let mut emitters = std::mem::take(&mut self.emitters);
 
         let mut handles = Vec::with_capacity(nodes.len() * 2);
         let mut source_completions =
@@ -1665,6 +1679,11 @@ impl SessionRouter {
                 None
             };
 
+            // A node that was cached without going through `initialize_nodes`
+            // still gets an emitter for its per-call context.
+            let emitter = emitters
+                .remove(&node_id)
+                .unwrap_or_else(|| crate::nodes::Emitter::pending(node_id.clone()));
             let spec = self.manifest.nodes.iter().find(|n| n.id == node_id);
             let scope = self.instance_scope(spec, node.as_ref());
             if scope == crate::nodes::InstanceScope::PerParticipant {
@@ -1692,7 +1711,12 @@ impl SessionRouter {
                     let shutdown = shutdown.subscribe();
                     let output_allocator = output_allocator.clone();
                     let materialization = materialization.clone();
-                    Arc::new(move |node: Box<dyn StreamingNode>, input_rx: mpsc::Receiver<Routed>, primary: bool| {
+                    let roster = self.roster.clone();
+                    Arc::new(move |node: Box<dyn StreamingNode>,
+                                   input_rx: mpsc::Receiver<Routed>,
+                                   emitter: crate::nodes::Emitter,
+                                   participant: Option<Arc<crate::transport::origin::Origin>>,
+                                   primary: bool| {
                         Self::spawn_node_pipeline(
                             output_allocator.clone(),
                             materialization.clone(),
@@ -1716,6 +1740,9 @@ impl SessionRouter {
                             shutdown.clone(),
                             None,
                             primary,
+                            emitter,
+                            participant,
+                            roster.clone(),
                         )
                     })
                 };
@@ -1739,7 +1766,7 @@ impl SessionRouter {
                     node_id: node_id.clone(),
                     session_id: self.session_id.clone(),
                     input_rx,
-                    primary: Some(node),
+                    primary: Some((node, emitter)),
                     factory,
                     spawn,
                     max_instances: spec.max_instances.unwrap_or_else(partition::default_max_instances),
@@ -1780,6 +1807,9 @@ impl SessionRouter {
                 shutdown.subscribe(),
                 completion,
                 true,
+                emitter,
+                None,
+                self.roster.clone(),
             );
 
             handles.push((format!("{node_id} main"), main_handle));
@@ -1837,8 +1867,25 @@ impl SessionRouter {
         // The node's only instance, or the startup instance of a
         // per-participant node: owns liveness telemetry and RPC handlers.
         primary: bool,
+        // The instance's handle onto its own output edge, and the participant
+        // a per-participant instance serves (its default attribution).
+        emitter: crate::nodes::Emitter,
+        participant: Option<Arc<crate::transport::origin::Origin>>,
+        roster: Arc<crate::transport::origin::Roster>,
     ) -> (JoinHandle<Result<()>>, JoinHandle<Result<()>>) {
         let (fan_tx, mut fan_rx) = mpsc::channel::<Routed>(NODE_FANOUT_CAPACITY);
+        // Emitted frames enter the same queue as the outputs of a call, so
+        // taps, intercepts, successors and telemetry treat them alike and a
+        // node's outputs keep the order it produced them in. The emitter holds
+        // its sender only while open; it is closed when the main task ends,
+        // also when that task is aborted.
+        emitter.bind(
+            fan_tx.clone(),
+            participant,
+            roster,
+            Some((nt.tel.clone(), nt.idx)),
+        );
+        let emitter_closer = emitter.close_on_drop();
         // Device tensors leaving the session or entering a host-only node are
         // transferred under this node's copy policy (device_delivery).
         let egress_copies = materialization.clone();
@@ -2168,6 +2215,7 @@ impl SessionRouter {
         let main_tel = tel.clone();
         let supervised_children = children.clone();
         let main_body = async move {
+            let emitter_closer = emitter_closer;
             let tel = main_tel;
             let cell = tel.node(node_idx);
             if primary {
@@ -2216,7 +2264,8 @@ impl SessionRouter {
             // barge path.
             .with_cancel_gate(Arc::clone(&cancel))
             .with_output_allocator(output_allocator)
-            .with_copy_context(materialization);
+            .with_copy_context(materialization)
+            .with_emitter(emitter);
 
             if let Some((rx, call_replies)) = rpc_rx {
                 let (rpc_shutdown, rpc_stop) = tokio::sync::watch::channel(false);
@@ -2540,7 +2589,9 @@ impl SessionRouter {
                 // Every field is `Arc`-backed; this keeps the per-dispatch
                 // session state stable while still letting closures own
                 // their own clone for spawning.
-                let ctx = bound_ctx.clone();
+                let mut ctx = bound_ctx.clone();
+                // The node can keep this to attribute a later emit.
+                ctx.origin = origin.clone();
 
                 // Build the dispatch future (not yet awaited). Once
                 // we await it inside the select!, dropping it on
@@ -2701,6 +2752,9 @@ impl SessionRouter {
                 cell.in_flight_since_us.store(0, RELAXED);
                 probes.node_out.record_since(node_dispatch_start);
             };
+            // The instance is stopping: emitting ends here, before the
+            // node's shutdown runs.
+            drop(emitter_closer);
             // input_rx closed: drop fan_tx so the drain task exits once
             // it finishes forwarding any already-queued outputs.
             drop(fan_tx);
@@ -2762,6 +2816,7 @@ impl SessionRouter {
             == Some(crate::transport::origin::LEAVE)
         {
             if let Some(id) = packet.metadata.get(crate::transport::data::participant::ID) {
+                self.roster.leave(id);
                 let _ = lifecycle.send(ParticipantEvent::Left(id.clone()));
             }
             return;
@@ -2773,6 +2828,9 @@ impl SessionRouter {
 
         // Who sent this frame; carried next to the payload through the graph.
         let origin = crate::transport::origin::Origin::from_metadata(&packet.metadata).map(Arc::new);
+        if let Some(origin) = &origin {
+            self.roster.note(origin);
+        }
         let mut input_data = crate::transport::data::apply_transport_metadata_to_runtime(
             packet.data.into_shared(),
             &packet.metadata,

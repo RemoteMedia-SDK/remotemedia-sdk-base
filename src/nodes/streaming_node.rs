@@ -71,6 +71,22 @@ impl InitializeContext {
         InitializeContextWithCopies {
             context: self,
             copies,
+            emitter: None,
+        }
+    }
+
+    /// [`Self::with_copy_context`], plus the emitter of the node instance
+    /// being initialized (openspec: add-node-initiated-output). The node
+    /// reads it with `Emitter::of(ctx)`.
+    pub fn for_instance(
+        self,
+        copies: remotemedia_types::CopyContext,
+        emitter: crate::nodes::Emitter,
+    ) -> impl InitializeContextRead {
+        InitializeContextWithCopies {
+            context: self,
+            copies,
+            emitter: Some(emitter),
         }
     }
 
@@ -127,9 +143,15 @@ impl remotemedia_traits::runtime_context::InitializeContextRead for InitializeCo
 struct InitializeContextWithCopies {
     context: InitializeContext,
     copies: remotemedia_types::CopyContext,
+    emitter: Option<crate::nodes::Emitter>,
 }
 
 impl InitializeContextRead for InitializeContextWithCopies {
+    fn emitter_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.emitter
+            .as_ref()
+            .map(|emitter| emitter as &(dyn std::any::Any + Send + Sync))
+    }
     fn copy_context(&self) -> Option<remotemedia_types::CopyContext> {
         Some(self.copies.clone())
     }
@@ -455,6 +477,8 @@ mod runtime_context_default_tests {
     fn ctx_for(node_id: &str, session_id: &str) -> NodeRuntimeContext {
         NodeRuntimeContext {
             source_completion: None,
+            emitter: crate::nodes::Emitter::detached(String::new()),
+            origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from(session_id),
             node_id: Arc::from(node_id),

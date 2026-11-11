@@ -168,6 +168,8 @@ fn state_from_u8(v: u8) -> NodeState {
 pub struct NodeCell {
     pub(crate) inputs: AtomicU64,
     pub(crate) outputs: AtomicU64,
+    /// Outputs the node emitted on its own (also counted in `outputs`).
+    pub(crate) emitted: AtomicU64,
     pub(crate) errors: AtomicU64,
     pub(crate) bypassed: AtomicU64,
     pub(crate) discarded: AtomicU64,
@@ -212,6 +214,7 @@ impl NodeCell {
         Self {
             inputs: AtomicU64::new(0),
             outputs: AtomicU64::new(0),
+            emitted: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             bypassed: AtomicU64::new(0),
             discarded: AtomicU64::new(0),

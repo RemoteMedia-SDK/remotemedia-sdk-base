@@ -53,6 +53,39 @@ impl Origin {
     }
 }
 
+/// The participants currently in a session, as the router has seen them: a
+/// participant is known from its first input until it leaves. Lets a node
+/// attribute emitted output to a participant by id without inventing identity
+/// fields (openspec: add-node-initiated-output).
+#[derive(Debug, Default)]
+pub struct Roster {
+    current: parking_lot::RwLock<HashMap<String, Arc<Origin>>>,
+}
+
+impl Roster {
+    /// Record the sender of an input. The latest fields win.
+    pub fn note(&self, origin: &Arc<Origin>) {
+        if let Some(known) = self.current.read().get(origin.id()) {
+            if Arc::ptr_eq(known, origin) || **known == **origin {
+                return;
+            }
+        }
+        self.current
+            .write()
+            .insert(origin.id().to_string(), Arc::clone(origin));
+    }
+
+    /// The participant left the session.
+    pub fn leave(&self, id: &str) {
+        self.current.write().remove(id);
+    }
+
+    /// The identity of a current participant.
+    pub fn get(&self, id: &str) -> Option<Arc<Origin>> {
+        self.current.read().get(id).cloned()
+    }
+}
+
 /// A payload on its way between nodes, with the identity of the participant
 /// whose input produced it (`None` for unattributed frames, e.g. paced output
 /// or input sent without a participant).
