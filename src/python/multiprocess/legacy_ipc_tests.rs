@@ -277,7 +277,7 @@ fn legacy_ipc_fanout_retains_one_owner_until_last_slice() {
     let bytes = SharedBytes::from_owner(owner);
     let (callback_tx, mut callback_rx) = tokio::sync::mpsc::channel(1);
     let (response_tx, mut response_rx) = tokio::sync::mpsc::channel(1);
-    deliver_ipc_output(bytes, &mut Some(callback_tx), &response_tx);
+    deliver_ipc_output(bytes, None, &mut Some(callback_tx), &response_tx);
     let callback = callback_rx.blocking_recv().unwrap();
     let IpcResponse::OutputData(response) = response_rx.blocking_recv().unwrap() else {
         panic!("missing output")
@@ -304,7 +304,7 @@ fn legacy_ipc_callback_pressure_then_close_preserves_response() {
     let worker = std::thread::spawn(move || {
         let mut callback = Some(callback_tx);
         started_tx.send(()).unwrap();
-        deliver_ipc_output(bytes.into(), &mut callback, &response_tx);
+        deliver_ipc_output(bytes.into(), None, &mut callback, &response_tx);
         done_tx.send(callback.is_none()).unwrap();
     });
     started_rx
@@ -336,7 +336,7 @@ fn legacy_ipc_closed_response_does_not_discard_callback_output() {
     drop(response_rx);
     let bytes = vec![3; 256];
     let pointer = bytes.as_ptr();
-    deliver_ipc_output(bytes.into(), &mut Some(callback_tx), &response_tx);
+    deliver_ipc_output(bytes.into(), None, &mut Some(callback_tx), &response_tx);
     let callback = callback_rx.blocking_recv().unwrap();
     assert_eq!(callback.as_slice().as_ptr(), pointer);
     assert_eq!(callback.as_slice(), &[3; 256]);

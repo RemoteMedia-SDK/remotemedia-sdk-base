@@ -41,7 +41,7 @@ mod native_copy_reporting;
 mod native_wire;
 #[cfg(feature = "multiprocess")]
 pub use native_wire::publish_runtime_data_with_limit;
-mod python_wire;
+pub(crate) mod python_wire;
 
 /// Typed mapped runner for existing node traits and direct output allocation.
 /// The legacy `runner::Plugin` remains a copying compatibility protocol.

@@ -62,6 +62,159 @@ pub fn to_python_wire_with_copy_context(
     Ok(wire)
 }
 
+// ── Turn tags (openspec: add-node-initiated-output) ───────────────────
+//
+// A frame may carry a tag after its payload. The payload length in the header
+// is unchanged, so the tag is whatever follows the payload:
+//
+//   input  (host → worker): seq u64 | origin_len u16 | origin (JSON object of
+//                           the sender's `participant.*` fields, or empty)
+//   output (worker → host): seq u64 | origin_mode u8 | id_len u16 | id
+//
+// `seq` numbers the input a frame belongs to. An output with `seq` 0 answers
+// no input: the node emitted it. A worker tags its outputs when its host set
+// `REMOTEMEDIA_PY_WIRE_TURNS=1` in its environment; a host tags its inputs
+// once the worker announced `TURNS:1`. Either side accepts untagged frames.
+
+/// Environment variable a host sets to `1` on the workers it starts when it
+/// reads turn tags. A host started with it set to `0` does not.
+pub const TURN_TAG_ENV: &str = "REMOTEMEDIA_PY_WIRE_TURNS";
+
+/// Whether this host reads turn tags (`REMOTEMEDIA_PY_WIRE_TURNS=0` opts out).
+pub fn turn_tags_enabled() -> bool {
+    std::env::var(TURN_TAG_ENV).map_or(true, |value| value != "0")
+}
+
+/// Who an emitted output frame is attributed to, as the worker asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmitTag {
+    /// The instance's default attribution.
+    Default,
+    /// Nobody.
+    Unattributed,
+    /// The participant with this id.
+    Participant(String),
+}
+
+/// The tag of an output frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputTurn {
+    /// The input this frame answers; 0 for an emitted frame.
+    pub seq: u64,
+    /// Attribution requested for an emitted frame.
+    pub origin: EmitTag,
+}
+
+/// Offset one past the payload, when the header is well formed.
+fn payload_end(frame: &[u8]) -> Option<usize> {
+    let session = u16::from_le_bytes(frame.get(1..3)?.try_into().ok()?) as usize;
+    let length_at = 3usize.checked_add(session)?.checked_add(8)?;
+    let payload = u32::from_le_bytes(frame.get(length_at..length_at + 4)?.try_into().ok()?);
+    let end = (length_at + 4).checked_add(payload as usize)?;
+    (end <= frame.len()).then_some(end)
+}
+
+/// Tag an input frame with its sequence number and its sender's fields.
+pub fn append_input_turn(
+    wire: &mut Vec<u8>,
+    seq: u64,
+    origin: Option<&std::collections::HashMap<String, String>>,
+) -> Result<(), String> {
+    let origin = match origin {
+        Some(fields) => serde_json::to_vec(fields).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+    let length = u16::try_from(origin.len()).map_err(|_| "participant fields exceed u16")?;
+    wire.extend_from_slice(&seq.to_le_bytes());
+    wire.extend_from_slice(&length.to_le_bytes());
+    wire.extend_from_slice(&origin);
+    Ok(())
+}
+
+/// Split an output frame into the frame proper and its tag. `None` for a
+/// frame without a tag.
+pub fn split_output_turn(frame: &SharedBytes) -> Result<Option<(SharedBytes, OutputTurn)>, String> {
+    let bytes: &[u8] = frame;
+    let Some(end) = payload_end(bytes) else {
+        return Ok(None);
+    };
+    if end == bytes.len() {
+        return Ok(None);
+    }
+    let mut tag = Reader {
+        bytes: &bytes[end..],
+        position: 0,
+    };
+    let seq = tag.u64()?;
+    let mode = tag.u8()?;
+    let id = tag.string16()?;
+    if !tag.rest().is_empty() {
+        return Err("trailing bytes after the turn tag".into());
+    }
+    let origin = match mode {
+        0 => EmitTag::Default,
+        1 => EmitTag::Unattributed,
+        2 => EmitTag::Participant(id),
+        other => return Err(format!("unknown emit origin mode {other}")),
+    };
+    let frame = frame.slice(0..end).map_err(|e| e.to_string())?;
+    Ok(Some((frame, OutputTurn { seq, origin })))
+}
+
+#[cfg(test)]
+mod turn_tag_tests {
+    use super::*;
+
+    fn text_frame(body: &str) -> Vec<u8> {
+        to_python_wire(&RuntimeData::Text(body.into()), "session").unwrap()
+    }
+
+    #[test]
+    fn an_untagged_frame_has_no_turn() {
+        let frame = SharedBytes::from(text_frame("hello"));
+        assert_eq!(split_output_turn(&frame).unwrap(), None);
+    }
+
+    #[test]
+    fn an_output_tag_is_split_off_and_the_frame_still_decodes() {
+        for (mode, id, expected) in [
+            (0u8, "", EmitTag::Default),
+            (1, "", EmitTag::Unattributed),
+            (2, "alice", EmitTag::Participant("alice".into())),
+        ] {
+            let mut wire = text_frame("hello");
+            wire.extend_from_slice(&7u64.to_le_bytes());
+            wire.push(mode);
+            wire.extend_from_slice(&(id.len() as u16).to_le_bytes());
+            wire.extend_from_slice(id.as_bytes());
+            let (frame, turn) = split_output_turn(&SharedBytes::from(wire)).unwrap().unwrap();
+            assert_eq!(turn, OutputTurn { seq: 7, origin: expected });
+            assert!(matches!(from_python_wire(&frame).unwrap(), RuntimeData::Text(t) if t == "hello"));
+        }
+    }
+
+    #[test]
+    fn a_malformed_tag_is_an_error() {
+        let mut wire = text_frame("hello");
+        wire.extend_from_slice(&[1, 2, 3]);
+        assert!(split_output_turn(&SharedBytes::from(wire)).is_err());
+    }
+
+    #[test]
+    fn an_input_tag_follows_the_payload() {
+        let untagged = text_frame("hello");
+        let mut wire = untagged.clone();
+        let fields = std::collections::HashMap::from([("participant.id".to_string(), "bob".to_string())]);
+        append_input_turn(&mut wire, 3, Some(&fields)).unwrap();
+        assert_eq!(payload_end(&wire), Some(untagged.len()));
+        let tag = &wire[untagged.len()..];
+        assert_eq!(u64::from_le_bytes(tag[..8].try_into().unwrap()), 3);
+        let length = u16::from_le_bytes(tag[8..10].try_into().unwrap()) as usize;
+        let origin: serde_json::Value = serde_json::from_slice(&tag[10..10 + length]).unwrap();
+        assert_eq!(origin["participant.id"], "bob");
+    }
+}
+
 fn string16(out: &mut Vec<u8>, value: &str) -> Result<(), String> {
     let length = u16::try_from(value.len()).map_err(|_| "Python wire string exceeds u16")?;
     out.extend_from_slice(&length.to_le_bytes());

@@ -47,6 +47,9 @@ pub struct PythonStreamingNode {
     /// Control bus handle for progress reporting during initialization.
     /// Set by `initialize()` from the `InitializeContext`.
     control: Mutex<Option<Arc<SessionControl>>>,
+    /// The node instance's emitter, handed to the executor so the Python
+    /// node can emit output on its own (openspec: add-node-initiated-output).
+    emitter: std::sync::Mutex<Option<crate::nodes::Emitter>>,
 }
 
 impl PythonStreamingNode {
@@ -76,6 +79,7 @@ impl PythonStreamingNode {
             declared_instance_scope: std::sync::OnceLock::new(),
             session_id,
             control: Mutex::new(None),
+            emitter: std::sync::Mutex::new(None),
         })
     }
 
@@ -102,6 +106,7 @@ impl PythonStreamingNode {
             declared_instance_scope: std::sync::OnceLock::new(),
             session_id: Some(session_id),
             control: Mutex::new(None),
+            emitter: std::sync::Mutex::new(None),
         })
     }
 
@@ -125,6 +130,7 @@ impl PythonStreamingNode {
             declared_instance_scope,
             session_id: None,
             control: Mutex::new(None),
+            emitter: std::sync::Mutex::new(None),
         })
     }
 
@@ -187,6 +193,9 @@ impl PythonStreamingNode {
             if let Some(copies) = copies {
                 executor.bind_initial_copy_context(copies)?;
             }
+            if let Some(emitter) = self.emitter.lock().unwrap().clone() {
+                executor.set_emitter(emitter);
+            }
             let mut py_executor: Box<dyn NodeExecutor> = Box::new(executor);
 
             // Pass the control bus handle so progress events from Python
@@ -232,6 +241,7 @@ impl PythonStreamingNode {
         session_id: Option<String>,
         callback: F,
         copies: remotemedia_types::CopyContext,
+        origin: Option<Arc<crate::transport::origin::Origin>>,
     ) -> Result<usize, Error>
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
@@ -303,12 +313,7 @@ impl PythonStreamingNode {
         };
 
         let result = executor
-            .process_runtime_data_streaming_with_copy_context(
-                data,
-                session_id_opt,
-                callback,
-                &copies,
-            )
+            .process_turn(data, session_id_opt, callback, &copies, origin.as_deref())
             .await;
 
         tracing::info!("[PythonStreamingNode] Node {}: mp_executor.process_runtime_data_streaming returned {:?}", self.node_id, result);
@@ -437,6 +442,9 @@ impl AsyncStreamingNode for PythonStreamingNode {
                 *self.control.lock().await = Some(Arc::clone(ctrl));
             }
         }
+        if ctx.emitter_any().is_some() {
+            *self.emitter.lock().unwrap() = Some(crate::nodes::Emitter::of(ctx));
+        }
         let copies = ctx.copy_context();
         self.ensure_initialized_with_copies(copies.clone(), Some(ctx.session_id().to_owned()))
             .await?;
@@ -507,6 +515,7 @@ impl AsyncStreamingNode for PythonStreamingNode {
             session_id,
             callback,
             remotemedia_types::CopyContext::legacy().clone(),
+            None,
         )
         .await
     }
@@ -522,7 +531,14 @@ impl AsyncStreamingNode for PythonStreamingNode {
     {
         let copies = Self::legacy_copies(ctx)?;
         let session = (!ctx.session_id().is_empty()).then(|| ctx.session_id().to_owned());
-        self.stream_with_copies(data, session, callback, copies)
+        // A node that starts its worker on its first input still gets the
+        // instance's emitter; the input's sender travels with the input.
+        let host = crate::nodes::NodeRuntimeContext::of(ctx);
+        if let Some(host) = host {
+            self.emitter.lock().unwrap().get_or_insert_with(|| host.emitter());
+        }
+        let origin = host.and_then(|host| host.origin());
+        self.stream_with_copies(data, session, callback, copies, origin)
             .await
     }
 

@@ -620,6 +620,13 @@ impl ProcessManager {
             command.args(["--register-module", module]);
         }
 
+        // This host reads turn tags on the output wire (openspec:
+        // add-node-initiated-output); the worker then tags its frames.
+        command.env(
+            crate::multiprocess::python_wire::TURN_TAG_ENV,
+            if crate::multiprocess::python_wire::turn_tags_enabled() { "1" } else { "0" },
+        );
+
         // Set environment variables
         for (key, value) in &spawn_config.env_vars {
             command.env(key, value);

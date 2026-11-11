@@ -661,6 +661,15 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
     /// Plugins that do all work eagerly inside the factory's `create()`
     /// see a no-op (FFI default impl returns `Ok(())`).
     async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
+        // The plugin gets the instance's emitter before it initializes, so
+        // it can start producing on its own from `initialize`.
+        if ctx.emitter_any().is_some() {
+            self.inner
+                .bind_emitter(loadable_node_abi::buffer::NodeEmitter_TO::from_value(
+                    HostEmitter(crate::nodes::Emitter::of(ctx)),
+                    abi_stable::sabi_trait::TD_Opaque,
+                ));
+        }
         match self
             .inner
             .initialize(
@@ -948,6 +957,73 @@ fn context_session(ctx: &dyn NodeRuntimeContextRead) -> Option<String> {
     }
 }
 
+/// The host emitter behind the plugin ABI's `NodeEmitter`.
+struct HostEmitter(crate::nodes::Emitter);
+
+impl HostEmitter {
+    fn frame(
+        message: FfiMessage,
+        origin: u8,
+        participant: RString,
+    ) -> Result<(RuntimeData, crate::nodes::EmitOrigin), RString> {
+        use loadable_node_abi::buffer::{EMIT_AS_DEFAULT, EMIT_AS_PARTICIPANT, EMIT_UNATTRIBUTED};
+        let origin = match origin {
+            EMIT_AS_DEFAULT => crate::nodes::EmitOrigin::Default,
+            EMIT_UNATTRIBUTED => crate::nodes::EmitOrigin::Unattributed,
+            EMIT_AS_PARTICIPANT => crate::nodes::EmitOrigin::Participant(participant.into_string()),
+            other => return Err(format!("unknown emit origin {other}").into()),
+        };
+        Ok((runtime_buffer::decode(message)?, origin))
+    }
+}
+
+impl loadable_node_abi::buffer::NodeEmitter for HostEmitter {
+    fn emit(
+        &self,
+        message: FfiMessage,
+        origin: u8,
+        participant: RString,
+    ) -> async_ffi::FfiFuture<RResult<(), RString>> {
+        let emitter = self.0.clone();
+        async move {
+            let (data, origin) = match Self::frame(message, origin, participant) {
+                Ok(frame) => frame,
+                Err(error) => return RErr(error),
+            };
+            match emitter.emit_as(data, origin).await {
+                Ok(()) => ROk(()),
+                Err(error) => RErr(error.to_string().into()),
+            }
+        }
+        .into_ffi()
+    }
+
+    fn try_emit(&self, message: FfiMessage, origin: u8, participant: RString) -> RResult<bool, RString> {
+        let (data, origin) = match Self::frame(message, origin, participant) {
+            Ok(frame) => frame,
+            Err(error) => return RErr(error),
+        };
+        match self.0.try_emit_as(data, origin) {
+            Ok(()) => ROk(true),
+            Err(crate::nodes::TryEmitError::Full(_)) => ROk(false),
+            Err(error) => RErr(error.to_string().into()),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+
+    fn closed(&self) -> async_ffi::FfiFuture<()> {
+        let emitter = self.0.clone();
+        async move { emitter.closed().await }.into_ffi()
+    }
+
+    fn finish(&self) {
+        self.0.finish();
+    }
+}
+
 fn encode_shared(data: RuntimeData) -> Result<FfiMessage, Error> {
     runtime_buffer::encode(data).map_err(|error| Error::Execution(error.into_string()))
 }
@@ -1077,5 +1153,133 @@ impl FfiRpcReplySink for RpcChannelSink {
             }
         }
         .into_ffi()
+    }
+}
+
+/// A plugin built on the SDK emits through the host's emitter (openspec:
+/// add-node-initiated-output).
+#[cfg(all(test, feature = "loadable-export"))]
+mod emitter_contract_tests {
+    use super::*;
+    use remotemedia_plugin_sdk::adapter::StreamingNodeFfiAdapter;
+    use remotemedia_plugin_sdk::Emitter as PluginEmitter;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Emits three frames from a task it starts in `initialize`, then one as
+    /// a participant who is not in the session, and records how that went.
+    struct Ticker {
+        rejected: Arc<AtomicBool>,
+        saw_close: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl AsyncStreamingNode for Ticker {
+        fn node_type(&self) -> &str {
+            "Ticker"
+        }
+        async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
+            let emitter = PluginEmitter::of(ctx);
+            let (rejected, saw_close) = (self.rejected.clone(), self.saw_close.clone());
+            tokio::spawn(async move {
+                for n in 0..3 {
+                    if emitter.emit(RuntimeData::Text(format!("tick-{n}"))).await.is_err() {
+                        rejected.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                if emitter.emit_as(RuntimeData::Text("boo".into()), "ghost").await.is_err() {
+                    rejected.store(true, Ordering::SeqCst);
+                }
+                emitter.closed().await;
+                saw_close.store(true, Ordering::SeqCst);
+            });
+            Ok(())
+        }
+        async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
+            Ok(data)
+        }
+    }
+
+    struct TickerFactory(Arc<AtomicBool>, Arc<AtomicBool>);
+    impl FfiNodeFactory for TickerFactory {
+        fn node_type(&self) -> RString {
+            "Ticker".into()
+        }
+        fn create(&self, _: RString) -> RResult<FfiNodeBox, RString> {
+            ROk(loadable_node_abi::FfiNode_TO::from_value(
+                StreamingNodeFfiAdapter::new(Ticker {
+                    rejected: self.0.clone(),
+                    saw_close: self.1.clone(),
+                }),
+                TD_Opaque,
+            ))
+        }
+    }
+
+    fn node(rejected: &Arc<AtomicBool>, saw_close: &Arc<AtomicBool>) -> Box<dyn crate::nodes::StreamingNode> {
+        wrap_ffi_factory(TickerFactory(rejected.clone(), saw_close.clone()))
+            .create("ticker".into(), &serde_json::json!({}), Some("session".into()))
+            .unwrap()
+    }
+
+    fn init_ctx() -> crate::nodes::InitializeContext {
+        crate::nodes::InitializeContext {
+            session_id: "session".into(),
+            node_id: "ticker".into(),
+            control: None,
+        }
+    }
+
+    async fn wait_for(flag: &AtomicBool) {
+        for _ in 0..200 {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("flag was not set in time");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plugin_emits_from_a_task_through_the_hosts_emitter() {
+        let (rejected, saw_close) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let node = node(&rejected, &saw_close);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let emitter = crate::nodes::Emitter::pending("ticker");
+        emitter.bind(tx, None, Default::default(), None);
+        let ctx = init_ctx().for_instance(CopyContext::legacy().clone(), emitter.clone());
+        node.initialize(&ctx).await.unwrap();
+
+        for n in 0..3 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("emitted frame")
+                .unwrap();
+            assert!(matches!(frame.data, RuntimeData::Text(body) if body == format!("tick-{n}")));
+            assert!(frame.origin.is_none());
+        }
+        // A participant who is not in the session: the plugin gets an error
+        // and nothing is queued.
+        wait_for(&rejected).await;
+        assert!(rx.try_recv().is_err());
+        // The instance stops: the plugin's task sees the emitter close.
+        emitter.finish();
+        wait_for(&saw_close).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plugin_on_a_host_without_an_emitter_gets_an_error_and_keeps_running() {
+        let (rejected, saw_close) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let node = node(&rejected, &saw_close);
+        // What a host that predates the emitter does: it binds nothing.
+        node.initialize(&init_ctx()).await.unwrap();
+        wait_for(&rejected).await;
+        let ctx = crate::nodes::NodeRuntimeContext::for_test("session", "ticker");
+        let out = node
+            .process_async(RuntimeData::Text("still here".into()), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(out, RuntimeData::Text(body) if body == "still here"));
     }
 }
