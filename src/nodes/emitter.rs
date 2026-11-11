@@ -36,69 +36,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Who an emitted frame is attributed to.
-#[derive(Debug, Clone, Default)]
-pub enum EmitOrigin {
-    /// The instance's default: its participant for a per-participant
-    /// instance, nobody for a shared one.
-    #[default]
-    Default,
-    /// Nobody, also on a per-participant instance.
-    Unattributed,
-    /// An origin the node read from an input (`ctx.origin()`).
-    Origin(Arc<Origin>),
-    /// A participant currently in the session, by `participant.id`.
-    Participant(String),
-}
-
-impl From<Arc<Origin>> for EmitOrigin {
-    fn from(origin: Arc<Origin>) -> Self {
-        Self::Origin(origin)
-    }
-}
-
-/// What `ctx.origin()` returns: `None` is an unattributed input.
-impl From<Option<Arc<Origin>>> for EmitOrigin {
-    fn from(origin: Option<Arc<Origin>>) -> Self {
-        origin.map_or(Self::Unattributed, Self::Origin)
-    }
-}
-
-impl From<&str> for EmitOrigin {
-    fn from(participant_id: &str) -> Self {
-        Self::Participant(participant_id.to_string())
-    }
-}
-
-impl From<String> for EmitOrigin {
-    fn from(participant_id: String) -> Self {
-        Self::Participant(participant_id)
-    }
-}
-
-/// Why a non-waiting emit did not queue its frame. The frame is handed back.
-#[derive(Debug)]
-pub enum TryEmitError {
-    /// The emit queue is full; [`Emitter::emit`] would wait.
-    Full(RuntimeData),
-    /// The instance has not started its tasks yet.
-    NotStarted(RuntimeData),
-    /// The frame cannot be emitted: the instance stopped, or the origin
-    /// names an unknown participant.
-    Rejected(RuntimeData, Error),
-}
-
-impl std::fmt::Display for TryEmitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Full(_) => f.write_str("emit queue is full"),
-            Self::NotStarted(_) => f.write_str("node instance has not started"),
-            Self::Rejected(_, error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for TryEmitError {}
+pub use remotemedia_traits::emit::{Emit, EmitOrigin, TryEmitError};
 
 /// What an open emitter is connected to.
 struct Binding {
@@ -112,6 +50,10 @@ struct Binding {
 enum State {
     /// Created, the instance's tasks have not started.
     Pending,
+    /// Connected to the instance's fan-out queue; the instance has not been
+    /// started (its session is still loading, or parked in the warm pool).
+    Bound(Binding),
+    /// The instance runs.
     Open(Binding),
     Closed,
 }
@@ -137,7 +79,8 @@ impl std::fmt::Debug for Emitter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let state = match &*self.shared.state.lock() {
             State::Pending => "pending",
-            State::Open(_) => "open",
+            State::Bound(_) => "loaded",
+            State::Open(_) => "running",
             State::Closed => "closed",
         };
         f.debug_struct("Emitter")
@@ -184,13 +127,14 @@ impl Emitter {
     /// The emitter of the instance a per-call method runs on, or a detached
     /// one when the call does not come from a streaming session.
     pub fn for_call(ctx: &dyn remotemedia_traits::runtime_context::NodeRuntimeContextRead) -> Self {
-        match crate::nodes::NodeRuntimeContext::of(ctx) {
-            Some(ctx) => ctx.emitter(),
-            None => Self::detached(ctx.node_id()),
-        }
+        ctx.emitter_any()
+            .and_then(|emitter| emitter.downcast_ref::<Emitter>())
+            .cloned()
+            .unwrap_or_else(|| Self::detached(ctx.node_id()))
     }
 
-    /// Connect to the instance's fan-out queue. No effect once closed.
+    /// Connect to the instance's fan-out queue. The instance is loaded, not
+    /// running: emits wait for [`Self::start`]. No effect once closed.
     pub(crate) fn bind(
         &self,
         tx: mpsc::Sender<Routed>,
@@ -203,7 +147,7 @@ impl Emitter {
             if !matches!(*state, State::Pending) {
                 return;
             }
-            *state = State::Open(Binding {
+            *state = State::Bound(Binding {
                 tx,
                 default_origin,
                 roster,
@@ -211,6 +155,26 @@ impl Emitter {
             });
         }
         self.shared.changed.notify_waiters();
+    }
+
+    /// Open the instance's start gate (`loaded -> running`, openspec:
+    /// add-source-node-lifecycle): emits go through, [`Self::started`]
+    /// resolves, the node's body and pacer begin. No effect unless bound.
+    pub(crate) fn start(&self) {
+        {
+            let mut state = self.shared.state.lock();
+            let State::Bound(_) = &*state else { return };
+            let State::Bound(binding) = std::mem::replace(&mut *state, State::Closed) else {
+                unreachable!()
+            };
+            *state = State::Open(binding);
+        }
+        self.shared.changed.notify_waiters();
+    }
+
+    /// Whether the instance runs: started and not stopped.
+    pub fn is_running(&self) -> bool {
+        matches!(*self.shared.state.lock(), State::Open(_))
     }
 
     /// Close the emitter for every clone. Frames already queued are still
@@ -246,14 +210,15 @@ impl Emitter {
         matches!(*self.shared.state.lock(), State::Closed)
     }
 
-    /// Resolves when the instance's tasks have started and emits no longer
-    /// wait for them (or the emitter is closed). A node's `initialize` runs
-    /// while other nodes are still loading; a task that keeps time waits for
-    /// this before it starts its clock.
+    /// Resolves when the instance has started (or the emitter is closed):
+    /// every node of the session is initialized and, for a session from the
+    /// warm pool, a client has acquired it. Emits wait for the same moment.
+    /// A node's `initialize` runs while other nodes are still loading; a
+    /// task that keeps time waits for this before it starts its clock.
     pub async fn started(&self) {
         loop {
             let changed = self.shared.changed.notified();
-            if !matches!(*self.shared.state.lock(), State::Pending) {
+            if matches!(*self.shared.state.lock(), State::Open(_) | State::Closed) {
                 return;
             }
             changed.await;
@@ -330,7 +295,7 @@ impl Emitter {
     fn target(&self, origin: &EmitOrigin) -> Target {
         let state = self.shared.state.lock();
         let binding = match &*state {
-            State::Pending => return Target::Pending,
+            State::Pending | State::Bound(_) => return Target::Pending,
             State::Closed => return Target::Ready(Err(self.stopped())),
             State::Open(binding) => binding,
         };
@@ -376,6 +341,32 @@ fn count(telemetry: &Option<(Arc<SessionTelemetry>, usize)>) {
     }
 }
 
+#[async_trait::async_trait]
+impl Emit for Emitter {
+    async fn emit_as(&self, data: RuntimeData, origin: EmitOrigin) -> Result<()> {
+        Emitter::emit_as(self, data, origin).await
+    }
+    fn try_emit_as(
+        &self,
+        data: RuntimeData,
+        origin: EmitOrigin,
+    ) -> std::result::Result<(), TryEmitError> {
+        Emitter::try_emit_as(self, data, origin)
+    }
+    async fn started(&self) {
+        Emitter::started(self).await
+    }
+    async fn closed(&self) {
+        Emitter::closed(self).await
+    }
+    fn is_closed(&self) -> bool {
+        Emitter::is_closed(self)
+    }
+    fn finish(&self) {
+        Emitter::finish(self)
+    }
+}
+
 /// See [`Emitter::close_on_drop`].
 pub(crate) struct CloseOnDrop(Emitter);
 
@@ -406,6 +397,7 @@ mod tests {
         let roster = Arc::new(Roster::default());
         let emitter = Emitter::pending("node");
         emitter.bind(tx, default, roster.clone(), None);
+        emitter.start();
         (emitter, rx, roster)
     }
 
@@ -422,6 +414,13 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(4);
         emitter.bind(tx, None, Arc::new(Roster::default()), None);
+        // Loaded, not running: the emit and `started()` still wait.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!early.is_finished());
+        assert!(!emitter.is_running());
+        assert!(tokio::time::timeout(Duration::from_millis(20), emitter.started()).await.is_err());
+        emitter.start();
+        emitter.started().await;
         early.await.unwrap().unwrap();
         assert!(matches!(rx.recv().await.unwrap().data, RuntimeData::Text(t) if t == "early"));
     }

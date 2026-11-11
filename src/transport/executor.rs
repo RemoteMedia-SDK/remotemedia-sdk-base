@@ -204,6 +204,9 @@ pub struct SessionHandle {
     shutdown_tx: mpsc::Sender<()>,
     /// Handle to the session router task
     task_handle: JoinHandle<Result<()>>,
+    /// Starts the session's node instances; already started unless the
+    /// session was built for the warm pool.
+    start: super::session_router::SessionStart,
     /// Whether the session is still active
     is_active: bool,
     /// Active trace recorder, if `REMOTEMEDIA_RECORD_DIR` was set when
@@ -219,6 +222,19 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Start the session's node instances: bodies run, clocks tick, emits
+    /// go through (openspec: add-source-node-lifecycle). A session is
+    /// started when it is created; one parked in the warm pool is started
+    /// when it is acquired. Idempotent.
+    pub fn start(&self) {
+        self.start.start();
+    }
+
+    /// Whether the session's node instances have been started.
+    pub fn is_started(&self) -> bool {
+        self.start.is_started()
+    }
+
     /// Static declaration report captured during cold build and retained when
     /// prewarmed/reused. An empty issue list is not zero-copy certification.
     pub fn buffer_preflight(&self) -> Option<&super::buffer_preflight::BufferPreflightReport> {
@@ -1548,6 +1564,20 @@ impl PipelineExecutor {
         &self,
         manifest: Arc<Manifest>,
     ) -> Result<SessionHandle> {
+        self.build_session(manifest, false).await
+    }
+
+    /// [`Self::cold_build_session`] for the warm pool: the session's nodes
+    /// are loaded but not started. No body runs and no clock ticks until
+    /// [`SessionHandle::start`] (openspec: add-source-node-lifecycle).
+    pub(crate) async fn cold_build_parked_session(
+        &self,
+        manifest: Arc<Manifest>,
+    ) -> Result<SessionHandle> {
+        self.build_session(manifest, true).await
+    }
+
+    async fn build_session(&self, manifest: Arc<Manifest>, parked: bool) -> Result<SessionHandle> {
         // Resolve + load any plugin dependencies the manifest declares
         // BEFORE validation runs — otherwise unknown-node-type errors
         // would fire even though the plugin would have contributed
@@ -1690,6 +1720,10 @@ impl PipelineExecutor {
 
         // Get input sender before moving router
         let input_tx = router.get_input_sender();
+        let start = router.session_start();
+        if parked {
+            start.hold();
+        }
         // Snapshot the perf aggregator handle before the router is
         // moved into the spawned task — performance tooling reads
         // merged HDR-histogram percentiles off this at end-of-run.
@@ -1766,6 +1800,7 @@ impl PipelineExecutor {
             output_data_rx: Some(data_rx),
             shutdown_tx,
             task_handle,
+            start,
             is_active: true,
             _recorder: recorder,
             perf_aggregator,
@@ -1835,6 +1870,7 @@ mod tests {
 
     mod output_drain;
     mod provenance;
+    mod body;
     mod emit;
     mod participants;
 

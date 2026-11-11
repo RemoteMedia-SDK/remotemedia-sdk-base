@@ -627,6 +627,13 @@ impl ProcessManager {
             if crate::multiprocess::python_wire::turn_tags_enabled() { "1" } else { "0" },
         );
 
+        // This host tells a worker when its session starts (openspec:
+        // add-source-node-lifecycle); a node's `background()` waits for it.
+        command.env(
+            crate::multiprocess::python_wire::START_ENV,
+            if crate::multiprocess::python_wire::start_signal_enabled() { "1" } else { "0" },
+        );
+
         // Set environment variables
         for (key, value) in &spawn_config.env_vars {
             command.env(key, value);

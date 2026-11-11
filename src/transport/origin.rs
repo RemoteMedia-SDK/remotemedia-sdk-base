@@ -11,7 +11,7 @@
 //!
 //! [`DataPacket`]: super::session_router::DataPacket
 
-use super::data::{participant, TransportData};
+use super::data::TransportData;
 use crate::data::RuntimeData;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,36 +25,7 @@ pub const LEAVE: &str = "leave";
 /// participant's first input announces it as well.
 pub const JOIN: &str = "join";
 
-/// Who produced a frame: the sender's canonical `participant.*` fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Origin {
-    id: String,
-    fields: HashMap<String, String>,
-}
-
-impl Origin {
-    /// The identity in `metadata`, or `None` without a `participant.id`.
-    /// Only `participant.*` keys are kept.
-    pub fn from_metadata(metadata: &HashMap<String, String>) -> Option<Self> {
-        let id = metadata.get(participant::ID)?.clone();
-        let fields = metadata
-            .iter()
-            .filter(|(key, _)| key.starts_with("participant.") && key.as_str() != LIFECYCLE)
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        Some(Self { id, fields })
-    }
-
-    /// `participant.id`.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// All carried `participant.*` fields.
-    pub fn fields(&self) -> &HashMap<String, String> {
-        &self.fields
-    }
-}
+pub use remotemedia_traits::emit::Origin;
 
 /// The participants currently in a session, as the router has seen them: a
 /// participant is known from its first input until it leaves. Lets a node
@@ -135,6 +106,7 @@ impl From<RuntimeData> for Routed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::data::participant;
 
     fn alice() -> Arc<Origin> {
         let metadata = HashMap::from([

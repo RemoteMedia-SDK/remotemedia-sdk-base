@@ -22,7 +22,7 @@ pub mod core_provider;
 pub mod debug_log;
 pub mod emitter;
 pub mod interval_source;
-pub use emitter::{EmitOrigin, Emitter, TryEmitError};
+pub use emitter::{Emit, EmitOrigin, Emitter, TryEmitError};
 pub mod envelope_first_notifier;
 pub mod motion;
 pub mod passthrough;

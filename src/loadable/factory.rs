@@ -166,6 +166,7 @@ impl LoadableNodeBundle {
                     inner: f,
                     node_type,
                     schema: None,
+                    declared: Default::default(),
                 }) as Arc<dyn StreamingNodeFactory>
             })
             .collect();
@@ -273,6 +274,7 @@ where
         inner: boxed,
         node_type,
         schema,
+        declared: Default::default(),
     })
 }
 
@@ -280,6 +282,34 @@ struct LoadableFactoryAdapter {
     inner: FfiNodeFactoryBox,
     node_type: String,
     schema: Option<crate::nodes::schema::NodeSchema>,
+    /// What the plugin declares for a node with no parameters.
+    declared: std::sync::OnceLock<remotemedia_traits::NodeDescription>,
+}
+
+impl LoadableFactoryAdapter {
+    /// What the plugin declares about a node with these parameters, without
+    /// creating it (`FfiNodeFactory::describe`).
+    fn describe(&self, params: &Value) -> remotemedia_traits::NodeDescription {
+        let params = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
+        let declared = self
+            .inner
+            .describe(RString::from(params))
+            .into_result()
+            .map_err(|error| Error::Execution(error.into_string()))
+            .and_then(|json| remotemedia_traits::NodeDescription::from_json(json.as_str()));
+        match declared {
+            Ok(description) => description,
+            Err(error) => {
+                tracing::warn!(node_type = %self.node_type, %error, "plugin declaration ignored");
+                Default::default()
+            }
+        }
+    }
+
+    fn declared(&self) -> &remotemedia_traits::NodeDescription {
+        self.declared
+            .get_or_init(|| self.describe(&Value::Object(Default::default())))
+    }
 }
 
 impl StreamingNodeFactory for LoadableFactoryAdapter {
@@ -342,6 +372,27 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
         self.schema.clone()
     }
 
+    fn self_driven(&self) -> Option<bool> {
+        self.declared().self_driven
+    }
+
+    fn instance_scope(&self) -> Option<remotemedia_traits::streaming::InstanceScope> {
+        self.declared()
+            .instance_scope
+            .as_deref()
+            .and_then(remotemedia_traits::streaming::InstanceScope::parse)
+    }
+
+    fn capability_behavior(&self) -> crate::capabilities::CapabilityBehavior {
+        self.declared()
+            .capability_behavior
+            .unwrap_or(crate::capabilities::CapabilityBehavior::Passthrough)
+    }
+
+    fn media_capabilities(&self, params: &Value) -> Option<crate::capabilities::MediaCapabilities> {
+        self.describe(params).media_capabilities
+    }
+
     fn node_type(&self) -> &str {
         &self.node_type
     }
@@ -394,6 +445,9 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
                     .ok_or_else(|| Error::Execution(format!("invalid plugin instance scope: {value}")))?,
             ),
         };
+        // Instance declarations (openspec: add-source-node-lifecycle).
+        let self_driven = pacing.get("self_driven").and_then(Value::as_bool);
+        let background = pacing.get("background").and_then(Value::as_bool).unwrap_or(false);
         let rpc_methods: Vec<RpcMethod> = serde_json::from_str(ffi_node.rpc_methods().as_str())
             .map_err(|e| Error::Execution(format!("invalid plugin RPC descriptors: {e}")))?;
         let snapshots = loadable_node_abi::snapshot::runtime::import_ports(
@@ -410,6 +464,8 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
             rate,
             clocked_media_addr,
             instance_scope,
+            self_driven,
+            background,
             node_type: self.node_type.clone(),
             node_id,
         }))))
@@ -426,12 +482,37 @@ struct LoadableNodeAdapter {
     rate: u32,
     clocked_media_addr: Option<(String, String)>,
     instance_scope: Option<remotemedia_traits::streaming::InstanceScope>,
+    self_driven: Option<bool>,
+    /// The plugin node has a background body.
+    background: bool,
     node_type: String,
     node_id: String,
 }
 
 #[async_trait]
 impl AsyncStreamingNode for LoadableNodeAdapter {
+    fn self_driven(&self) -> Option<bool> {
+        self.self_driven
+    }
+
+    fn has_background(&self) -> bool {
+        self.background
+    }
+
+    /// The plugin's body. Dropping this future drops the plugin's, which
+    /// cancels the body on the plugin's side.
+    async fn background(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<(), Error> {
+        self.inner
+            .background(FfiCallContext {
+                session_id: context_session(ctx).map(RString::from).into(),
+                node_id: self.node_id.clone().into(),
+                origin: abi_stable::std_types::RNone,
+            })
+            .await
+            .into_result()
+            .map_err(|e| Error::from_plugin(e.into_string(), &self.node_id, &self.node_type))
+    }
+
     fn validate_snapshot_input(
         &self,
         port: &str,
@@ -559,6 +640,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
                     }
                     .into(),
                     node_id: ctx.node_id().into(),
+                    origin: ffi_origin(ctx),
                 },
                 sink,
             )
@@ -741,8 +823,14 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
                 .shared_stream(data, self.execution_context(session_id, None), callback)
                 .await;
         }
-        self.legacy_stream(data, session_id, CopyContext::legacy(), callback)
-            .await
+        self.legacy_stream(
+            data,
+            session_id,
+            abi_stable::std_types::RNone,
+            CopyContext::legacy(),
+            callback,
+        )
+        .await
     }
 
     /// Ctx-aware streaming entry point — same per-frame FFI path,
@@ -765,6 +853,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         self.legacy_stream(
             data,
             context_session(ctx),
+            ffi_origin(ctx),
             &self.legacy_copies(ctx)?,
             callback,
         )
@@ -794,6 +883,7 @@ impl LoadableNodeAdapter {
             identity: FfiCallContext {
                 session_id: session_id.map(RString::from).into(),
                 node_id: self.node_id.clone().into(),
+                origin: abi_stable::std_types::RNone,
             },
             allocator: allocator.map(runtime_buffer::export_allocator).into(),
             snapshots: RVec::new(),
@@ -802,6 +892,7 @@ impl LoadableNodeAdapter {
 
     fn context_from(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<FfiExecutionContext, Error> {
         let mut context = self.execution_context(context_session(ctx), ctx.output_allocator());
+        context.identity.origin = ffi_origin(ctx);
         context.materialization = ctx
             .copy_context()
             .map(loadable_node_abi::copy_ledger::runtime::export)
@@ -957,6 +1048,12 @@ fn context_session(ctx: &dyn NodeRuntimeContextRead) -> Option<String> {
     }
 }
 
+/// The participant of the input a call processes, as the plugin ABI
+/// carries it.
+fn ffi_origin(ctx: &dyn NodeRuntimeContextRead) -> abi_stable::std_types::ROption<RString> {
+    ctx.origin().map(|origin| RString::from(origin.to_json())).into()
+}
+
 /// The host emitter behind the plugin ABI's `NodeEmitter`.
 struct HostEmitter(crate::nodes::Emitter);
 
@@ -966,11 +1063,18 @@ impl HostEmitter {
         origin: u8,
         participant: RString,
     ) -> Result<(RuntimeData, crate::nodes::EmitOrigin), RString> {
-        use loadable_node_abi::buffer::{EMIT_AS_DEFAULT, EMIT_AS_PARTICIPANT, EMIT_UNATTRIBUTED};
+        use loadable_node_abi::buffer::{
+            EMIT_AS_DEFAULT, EMIT_AS_ORIGIN, EMIT_AS_PARTICIPANT, EMIT_UNATTRIBUTED,
+        };
         let origin = match origin {
             EMIT_AS_DEFAULT => crate::nodes::EmitOrigin::Default,
             EMIT_UNATTRIBUTED => crate::nodes::EmitOrigin::Unattributed,
             EMIT_AS_PARTICIPANT => crate::nodes::EmitOrigin::Participant(participant.into_string()),
+            // An origin the plugin read from an input and kept.
+            EMIT_AS_ORIGIN => match crate::transport::origin::Origin::from_json(participant.as_str()) {
+                Some(origin) => crate::nodes::EmitOrigin::Origin(Arc::new(origin)),
+                None => return Err("emit origin names no participant".into()),
+            },
             other => return Err(format!("unknown emit origin {other}").into()),
         };
         Ok((runtime_buffer::decode(message)?, origin))
@@ -998,16 +1102,38 @@ impl loadable_node_abi::buffer::NodeEmitter for HostEmitter {
         .into_ffi()
     }
 
-    fn try_emit(&self, message: FfiMessage, origin: u8, participant: RString) -> RResult<bool, RString> {
+    fn try_emit(
+        &self,
+        message: FfiMessage,
+        origin: u8,
+        participant: RString,
+    ) -> loadable_node_abi::buffer::FfiTryEmit {
+        use crate::nodes::TryEmitError;
+        use loadable_node_abi::buffer::{
+            FfiTryEmit, TRY_EMIT_FULL, TRY_EMIT_NOT_STARTED, TRY_EMIT_QUEUED, TRY_EMIT_REJECTED,
+        };
+        // The plugin keeps the frame it tried to emit; nothing is handed
+        // back across the boundary.
+        let outcome = |status, error: String| FfiTryEmit {
+            status,
+            message: abi_stable::std_types::RNone,
+            error: error.into(),
+        };
         let (data, origin) = match Self::frame(message, origin, participant) {
             Ok(frame) => frame,
-            Err(error) => return RErr(error),
+            Err(error) => return outcome(TRY_EMIT_REJECTED, error.into_string()),
         };
         match self.0.try_emit_as(data, origin) {
-            Ok(()) => ROk(true),
-            Err(crate::nodes::TryEmitError::Full(_)) => ROk(false),
-            Err(error) => RErr(error.to_string().into()),
+            Ok(()) => outcome(TRY_EMIT_QUEUED, String::new()),
+            Err(TryEmitError::Full(_)) => outcome(TRY_EMIT_FULL, String::new()),
+            Err(TryEmitError::NotStarted(_)) => outcome(TRY_EMIT_NOT_STARTED, String::new()),
+            Err(TryEmitError::Rejected(_, error)) => outcome(TRY_EMIT_REJECTED, error.to_string()),
         }
+    }
+
+    fn started(&self) -> async_ffi::FfiFuture<()> {
+        let emitter = self.0.clone();
+        async move { emitter.started().await }.into_ffi()
     }
 
     fn is_closed(&self) -> bool {
@@ -1156,6 +1282,9 @@ impl FfiRpcReplySink for RpcChannelSink {
     }
 }
 
+#[cfg(all(test, feature = "loadable-export"))]
+mod body_tests;
+
 /// A plugin built on the SDK emits through the host's emitter (openspec:
 /// add-node-initiated-output).
 #[cfg(all(test, feature = "loadable-export"))]
@@ -1248,6 +1377,7 @@ mod emitter_contract_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let emitter = crate::nodes::Emitter::pending("ticker");
         emitter.bind(tx, None, Default::default(), None);
+        emitter.start();
         let ctx = init_ctx().for_instance(CopyContext::legacy().clone(), emitter.clone());
         node.initialize(&ctx).await.unwrap();
 

@@ -1,9 +1,9 @@
 //! `IntervalSource`: a self-driven node that emits a JSON tick on an interval.
 //!
 //! The smallest node that produces without client input (openspec:
-//! add-node-initiated-output): it declares itself self-driven, starts a task
-//! in `initialize`, and puts frames on its own output edge through its
-//! emitter. A session whose only source is an `IntervalSource` produces
+//! add-node-initiated-output): it declares itself self-driven and has a
+//! background body, which puts frames on the node's own output edge through
+//! its emitter (openspec: add-source-node-lifecycle). A session whose only source is an `IntervalSource` produces
 //! output with nothing sent to it, and ends when the source has emitted
 //! `count` ticks.
 //!
@@ -23,9 +23,9 @@
 
 use crate::data::RuntimeData;
 use crate::nodes::{
-    AsyncNodeWrapper, AsyncStreamingNode, Emitter, InitializeContextRead, StreamingNode,
-    StreamingNodeFactory,
+    AsyncNodeWrapper, AsyncStreamingNode, Emitter, StreamingNode, StreamingNodeFactory,
 };
+use remotemedia_traits::runtime_context::NodeRuntimeContextRead;
 use crate::Error;
 use serde_json::Value;
 use std::sync::Arc;
@@ -78,34 +78,28 @@ impl AsyncStreamingNode for IntervalSourceNode {
         Some(true)
     }
 
-    async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
-        let emitter = Emitter::of(ctx);
-        let (interval, count, payload) = (self.interval, self.count, self.payload.clone());
-        tokio::spawn(async move {
-            // Other nodes may still be loading. Start counting when the
-            // session's node tasks run, not while it is being set up.
-            emitter.started().await;
-            let started = Instant::now();
-            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut tick = 0u64;
-            while count.map_or(true, |count| tick < count) {
-                tokio::select! {
-                    // The instance stopped: so does the task.
-                    _ = emitter.closed() => return,
-                    _ = ticker.tick() => {}
-                }
-                let mut frame = payload.clone();
-                frame.insert("tick".into(), tick.into());
-                frame.insert("elapsed_ms".into(), (started.elapsed().as_millis() as u64).into());
-                if emitter.emit(RuntimeData::Json(Value::Object(frame))).await.is_err() {
-                    return;
-                }
-                tick += 1;
-            }
-            // Every tick has been emitted: the node has finished producing.
-            emitter.finish();
-        });
+    fn has_background(&self) -> bool {
+        true
+    }
+
+    /// The node's body. The runtime starts it when the session starts,
+    /// cancels it when the instance stops, and treats its return as the
+    /// node having finished producing.
+    async fn background(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<(), Error> {
+        let emitter = Emitter::for_call(ctx);
+        let started = Instant::now();
+        let mut ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + self.interval, self.interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick = 0u64;
+        while self.count.map_or(true, |count| tick < count) {
+            ticker.tick().await;
+            let mut frame = self.payload.clone();
+            frame.insert("tick".into(), tick.into());
+            frame.insert("elapsed_ms".into(), (started.elapsed().as_millis() as u64).into());
+            emitter.emit(RuntimeData::Json(Value::Object(frame))).await?;
+            tick += 1;
+        }
         Ok(())
     }
 

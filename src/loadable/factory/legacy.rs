@@ -77,6 +77,7 @@ impl LoadableNodeAdapter {
         &self,
         data: RuntimeData,
         session: Option<String>,
+        origin: abi_stable::std_types::ROption<RString>,
         copies: &CopyContext,
         callback: F,
     ) -> Result<usize, Error>
@@ -91,6 +92,7 @@ impl LoadableNodeAdapter {
             FfiCallContext {
                 session_id: session.map(RString::from).into(),
                 node_id: self.node_id.clone().into(),
+                origin,
             },
             sink,
         );

@@ -85,6 +85,34 @@ pub fn turn_tags_enabled() -> bool {
     std::env::var(TURN_TAG_ENV).map_or(true, |value| value != "0")
 }
 
+/// Environment variable a host sets to `1` on the workers it starts when it
+/// sends them a start signal (openspec: add-source-node-lifecycle). A worker
+/// whose node has a `background()` then announces `START:1` before `READY`
+/// and starts the body when the signal arrives: a [`start_frame`] on its
+/// input lane. Without the variable the worker starts the body after READY.
+pub const START_ENV: &str = "REMOTEMEDIA_PY_WIRE_START";
+
+/// Whether this host sends the start signal (`REMOTEMEDIA_PY_WIRE_START=0`
+/// opts out: workers then start `background()` once their node is ready).
+pub fn start_signal_enabled() -> bool {
+    std::env::var(START_ENV).map_or(true, |value| value != "0")
+}
+
+/// Wire type of the start signal: a frame with no payload.
+pub const START_FRAME_TYPE: u8 = 9;
+
+/// The start signal for a worker of `session_id`.
+pub fn start_frame(session_id: &str) -> Vec<u8> {
+    let session = session_id.as_bytes();
+    let mut frame = Vec::with_capacity(15 + session.len());
+    frame.push(START_FRAME_TYPE);
+    frame.extend_from_slice(&(session.len() as u16).to_le_bytes());
+    frame.extend_from_slice(session);
+    frame.extend_from_slice(&0u64.to_le_bytes());
+    frame.extend_from_slice(&0u32.to_le_bytes());
+    frame
+}
+
 /// Who an emitted output frame is attributed to, as the worker asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmitTag {

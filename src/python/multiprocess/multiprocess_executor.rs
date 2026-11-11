@@ -2316,7 +2316,7 @@ sys.stdout.flush()
         session_id: &str,
         node_id: &str,
         timeout: std::time::Duration,
-    ) -> Result<(bool, Option<crate::nodes::InstanceScope>, bool, bool)> {
+    ) -> Result<(bool, Option<crate::nodes::InstanceScope>, bool, bool, bool)> {
         let start = std::time::Instant::now();
         let control_channel_name = format!("control/{}_{}", session_id, node_id);
 
@@ -2343,7 +2343,7 @@ sys.stdout.flush()
 
         // Control channel was already created in initialize() before spawning Python
         // Now poll for the READY signal - need direct iceoryx2 subscriber (not RuntimeData wrapper)
-        type Readiness = (bool, Option<crate::nodes::InstanceScope>, bool, bool);
+        type Readiness = (bool, Option<crate::nodes::InstanceScope>, bool, bool, bool);
         let ready = tokio::task::spawn_blocking(move || -> Result<Readiness> {
             let handle = tokio::runtime::Handle::current();
             // `@instance_scope` as the worker reports it before READY.
@@ -2352,6 +2352,8 @@ sys.stdout.flush()
             let mut turns = false;
             // Whether the node class is `@self_driven`.
             let mut self_driven = false;
+            // The worker's node has a body that waits for the start signal.
+            let mut awaits_start = false;
 
             // Create raw subscriber for control channel (bypasses RuntimeData deserialization)
             let subscriber = handle.block_on(registry.create_raw_subscriber(&channel_name))?;
@@ -2367,7 +2369,7 @@ sys.stdout.flush()
                         node_id_clone,
                         poll_count
                     );
-                    return Ok((false, scope, turns, self_driven));
+                    return Ok((false, scope, turns, self_driven, awaits_start));
                 }
 
                 poll_count += 1;
@@ -2421,7 +2423,9 @@ sys.stdout.flush()
                         // Check if it's the READY signal
                         if bytes == b"READY" {
                             tracing::debug!("Node {} signaled READY via iceoryx2", node_id_clone);
-                            return Ok((true, scope, turns, self_driven));
+                            return Ok((true, scope, turns, self_driven, awaits_start));
+                        } else if bytes == b"START:1" {
+                            awaits_start = true;
                         } else if bytes == b"TURNS:1" {
                             turns = true;
                         } else if bytes == b"SELF:1" {
@@ -3661,7 +3665,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             // Python creates its input subscriber BEFORE sending READY, so when we receive
             // READY signal, Python is fully prepared to receive data
             // Wait for READY signal with configured timeout (allows time for heavy model loading)
-            let (ready, reported_scope, worker_tags_turns, worker_self_driven) = self
+            let (ready, reported_scope, worker_tags_turns, worker_self_driven, worker_awaits_start) = self
                 .wait_for_ready_signal_ipc(
                     &session_id,
                     &ctx.node_id,
@@ -3703,6 +3707,40 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
 
             if worker_self_driven {
                 self.declared_self_driven = Some(true);
+            }
+
+            // The node's `background()` waits for the session to start: tell
+            // the worker when this instance's start gate opens. Without an
+            // emitter (no streaming session) there is no gate to wait for.
+            if worker_awaits_start {
+                let command_tx = global_sessions()
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .and_then(|session| session.get(&ctx.node_id))
+                    .cloned();
+                let emitter = self.emitter.lock().unwrap().clone();
+                let bytes = crate::multiprocess::python_wire::start_frame(&session_id);
+                let node_id = ctx.node_id.clone();
+                match command_tx {
+                    Some(command_tx) => {
+                        tokio::spawn(async move {
+                            if let Some(emitter) = emitter {
+                                emitter.started().await;
+                                if emitter.is_closed() {
+                                    return;
+                                }
+                            }
+                            if command_tx.send(IpcCommand::SendDataNoAck { bytes }).await.is_err() {
+                                tracing::debug!(node = %node_id, "worker stopped before its session started");
+                            }
+                        });
+                    }
+                    None => tracing::warn!(
+                        node = %node_id,
+                        "no IPC thread to send the start signal to; the node's background() will not run"
+                    ),
+                }
             }
 
             // A worker that tags its frames can emit output between inputs:

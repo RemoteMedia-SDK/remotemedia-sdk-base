@@ -422,6 +422,12 @@ impl NodeRuntimeContext {
 // — no edits needed at the call site for the common case.
 
 impl NodeRuntimeContextRead for NodeRuntimeContext {
+    fn origin(&self) -> Option<Arc<crate::transport::origin::Origin>> {
+        self.origin.clone()
+    }
+    fn emitter_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(&self.emitter)
+    }
     fn finish_source(&self) -> crate::Result<()> {
         NodeRuntimeContext::finish_source(self)
     }

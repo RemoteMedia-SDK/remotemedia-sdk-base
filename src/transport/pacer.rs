@@ -102,6 +102,10 @@ pub trait TickSource: Send + 'static {
     /// disconnected on a wire-bound source); the Pacer treats `None`
     /// as a clean shutdown signal.
     async fn next(&mut self) -> Option<Tick>;
+
+    /// The node instance has started: a source that keeps its own time
+    /// begins counting here, not when it was built.
+    fn restart(&mut self) {}
 }
 
 /// Build the `<medium>:<stream_id>` address used on the media_clock
@@ -225,6 +229,11 @@ impl WallTickSource {
 
 #[async_trait]
 impl TickSource for WallTickSource {
+    fn restart(&mut self) {
+        self.interval.reset_immediately();
+        self.started = Instant::now();
+    }
+
     async fn next(&mut self) -> Option<Tick> {
         self.interval.tick().await;
         let pts_us = self.started.elapsed().as_micros() as u64;
@@ -344,6 +353,23 @@ impl Pacer {
             count: 0,
             last_log: Instant::now() - TRANSIENT_ERROR_LOG_INTERVAL,
         };
+
+        // Clock-driven ticks start with the instance, like a body: not while
+        // sibling nodes load, and not while the session is parked.
+        let emitter = self.ctx.emitter();
+        if !emitter.is_running() && !emitter.is_closed() {
+            tokio::select! {
+                biased;
+                _ = async {
+                    match &mut stopping {
+                        Some(stop) => { let _ = stop.wait_for(|requested| *requested).await; }
+                        None => std::future::pending().await,
+                    }
+                } => return Ok(()),
+                _ = emitter.started() => {}
+            }
+            self.source.restart();
+        }
 
         loop {
             let next = tokio::select! {

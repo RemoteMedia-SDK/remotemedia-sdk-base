@@ -223,6 +223,7 @@ fn sink() -> (EmitSink, mpsc::Receiver<crate::transport::origin::Routed>) {
     let (tx, rx) = mpsc::channel(16);
     let emitter = Emitter::pending("fixture");
     emitter.bind(tx, None, Default::default(), None);
+    emitter.start();
     let sink = EmitSink {
         emitter,
         copies: remotemedia_types::CopyContext::legacy().clone(),
