@@ -413,6 +413,9 @@ impl StreamingNode for BufferCheckedNode {
     fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
         self.inner.instance_scope()
     }
+    fn self_driven(&self) -> Option<bool> {
+        self.inner.self_driven()
+    }
     fn capability_subscriptions(&self) -> Vec<String> {
         self.inner.capability_subscriptions()
     }

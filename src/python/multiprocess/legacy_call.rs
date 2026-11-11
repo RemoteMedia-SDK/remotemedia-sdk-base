@@ -38,10 +38,11 @@ impl EmitSink {
     /// reported and dropped.
     pub(super) async fn deliver(&self, frame: remotemedia_types::SharedBytes, origin: EmitTag) {
         // An end frame that answers no input: the node's background body
-        // returned. It has finished producing; frames it emitted before are
-        // already delivered, since this one arrived after them.
+        // returned. A self-driven node has then finished producing; frames it
+        // emitted before are already delivered, since this one arrived after
+        // them.
         if is_end_of_input(&frame) {
-            self.emitter.finish();
+            self.emitter.body_finished();
             return;
         }
         let data = match crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(

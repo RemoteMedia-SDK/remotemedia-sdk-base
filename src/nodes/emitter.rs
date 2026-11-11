@@ -121,6 +121,9 @@ struct Shared {
     state: parking_lot::Mutex<State>,
     /// Woken on every state change.
     changed: tokio::sync::Notify,
+    /// The instance belongs to a self-driven node: when its body returns,
+    /// the node has finished producing.
+    self_driven: std::sync::atomic::AtomicBool,
 }
 
 /// A node instance's handle onto its own output edge. Cheap to clone; every
@@ -164,6 +167,7 @@ impl Emitter {
                 node_id: node_id.into(),
                 state: parking_lot::Mutex::new(state),
                 changed: tokio::sync::Notify::new(),
+                self_driven: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -215,6 +219,20 @@ impl Emitter {
     pub fn finish(&self) {
         *self.shared.state.lock() = State::Closed;
         self.shared.changed.notify_waiters();
+    }
+
+    /// The instance belongs to a self-driven node.
+    pub(crate) fn mark_self_driven(&self) {
+        self.shared.self_driven.store(true, Relaxed);
+    }
+
+    /// The node's background body returned. On a self-driven instance the
+    /// node has finished producing, so the emitter closes. An ordinary node
+    /// keeps its emitter: it still replies to inputs and may emit from them.
+    pub(crate) fn body_finished(&self) {
+        if self.shared.self_driven.load(Relaxed) {
+            self.finish();
+        }
     }
 
     /// Closes the emitter when dropped, so an instance whose task is aborted
@@ -482,6 +500,19 @@ mod tests {
         // emitter holds no sender once closed.
         assert!(rx.recv().await.is_some());
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_returning_body_finishes_only_a_self_driven_instance() {
+        let (ordinary, _rx, _roster) = open(4, None);
+        ordinary.body_finished();
+        assert!(!ordinary.is_closed());
+        ordinary.emit(text("still emitting")).await.unwrap();
+
+        let (source, _rx, _roster) = open(4, None);
+        source.mark_self_driven();
+        source.body_finished();
+        assert!(source.is_closed());
     }
 
     #[tokio::test]

@@ -310,6 +310,7 @@ impl StreamingNodeFactory for SourcePythonFactory {
             session_id,
             cmd_tx,
             declared_instance_scope: handshake.instance_scope,
+            declared_self_driven: handshake.self_driven,
             _child: child,
             _env_lease: provisioning.venv.clone(),
         }))
@@ -349,6 +350,8 @@ struct SourcePythonNode {
     /// The node class's `@instance_scope(...)`, as the worker reported it
     /// before READY.
     declared_instance_scope: Option<crate::nodes::InstanceScope>,
+    /// Whether the node class is self-driven, as the worker reported it.
+    declared_self_driven: bool,
     /// Held so the subprocess is killed on drop.
     _child: Arc<std::sync::Mutex<std::process::Child>>,
     /// Environment cache lease. Fields drop after `Drop::drop`, so this is
@@ -398,6 +401,10 @@ impl StreamingNode for SourcePythonNode {
         self.declared_instance_scope
     }
 
+    fn self_driven(&self) -> Option<bool> {
+        self.declared_self_driven.then_some(true)
+    }
+
     fn is_multi_input(&self) -> bool {
         false
     }
@@ -420,7 +427,7 @@ impl StreamingNode for SourcePythonNode {
         tokio::spawn(async move {
             while let Some(frame) = emitted.recv().await {
                 if frame.finished {
-                    emitter.finish();
+                    emitter.body_finished();
                     continue;
                 }
                 let origin = match frame.origin_mode {

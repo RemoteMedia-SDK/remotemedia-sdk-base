@@ -605,6 +605,17 @@ async fn unary_execution_rejects_a_pipeline_without_an_input_taking_node() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("self-driven"), "{error}");
+
+    // Declared by the node instance only: neither the manifest nor the
+    // factory says so.
+    let error = executor
+        .execute_unary(
+            manifest(&[("source", "EmitNode", serde_json::json!({"self_driven": true}))], &[]),
+            TransportData::new(text("anyone?")),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("self-driven"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

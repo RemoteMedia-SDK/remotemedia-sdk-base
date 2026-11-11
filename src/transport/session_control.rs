@@ -619,6 +619,9 @@ struct ControlIngress {
 /// handed to the router via `attach_control`.
 pub struct SessionControl {
     session_id: String,
+    /// How many nodes take the session's client input, once the router has
+    /// initialized its nodes (openspec: add-node-initiated-output).
+    entry_points: std::sync::OnceLock<usize>,
     transport_copies: remotemedia_types::CopyContext,
     /// Latest office observation, read at the start of an LLM turn. This is
     /// replaceable state, not a queued input that could stall the media router.
@@ -826,6 +829,7 @@ impl SessionControl {
 
         Arc::new(Self {
             session_id: session_id.clone(),
+            entry_points: std::sync::OnceLock::new(),
             transport_copies,
             office_observation: parking_lot::RwLock::new(None),
             taps: DashMap::new(),
@@ -882,6 +886,17 @@ impl SessionControl {
     }
 
     /// Hot-path telemetry handle, when available.
+    /// Record how many nodes take the session's client input.
+    pub(crate) fn set_entry_points(&self, count: usize) {
+        let _ = self.entry_points.set(count);
+    }
+
+    /// Whether some node takes the session's client input. `None` until the
+    /// session's nodes are initialized.
+    pub fn takes_session_input(&self) -> Option<bool> {
+        self.entry_points.get().map(|count| *count > 0)
+    }
+
     pub fn telemetry(&self) -> Option<Arc<crate::telemetry::SessionTelemetry>> {
         self.telemetry.get().cloned()
     }

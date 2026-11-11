@@ -512,6 +512,7 @@ impl SelfDrivenLive {
     /// Count an instance until its emitter closes.
     fn track(self: &Arc<Self>, emitter: crate::nodes::Emitter) {
         use std::sync::atomic::Ordering::SeqCst;
+        emitter.mark_self_driven();
         self.running.fetch_add(1, SeqCst);
         self.started.store(true, SeqCst);
         let live = Arc::clone(self);
@@ -903,6 +904,21 @@ impl SessionRouter {
             }
         }
         Ok(())
+    }
+
+    /// The self-driven nodes among `nodes`.
+    fn self_driven_ids(
+        &self,
+        nodes: &HashMap<String, Box<dyn StreamingNode>>,
+    ) -> std::collections::HashSet<String> {
+        nodes
+            .iter()
+            .filter(|(id, node)| {
+                let spec = self.manifest.nodes.iter().find(|n| &n.id == *id);
+                self.self_driven(spec, node.as_ref())
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Whether the node is self-driven: the manifest node's `session_input`,
@@ -1299,6 +1315,19 @@ impl SessionRouter {
 
         self.validate_instance_scopes()?;
         self.snapshot_bindings = Some(self.bind_snapshot_inputs()?);
+
+        // Now that instances exist, their own declarations count: record how
+        // many nodes take client input, for callers that need one (unary).
+        if let Some(control) = &self.control {
+            let self_driven = self.self_driven_ids(&self.cached_nodes);
+            let entry_points = self
+                .graph
+                .sources
+                .iter()
+                .filter(|id| !self_driven.contains(*id))
+                .count();
+            control.set_entry_points(entry_points);
+        }
 
         // Refine the descriptor now that node instances exist: pacing is a
         // property of the instance, not the factory.
@@ -1726,14 +1755,7 @@ impl SessionRouter {
 
         // Self-driven nodes do not take client input: a source among them is
         // not an entry point. The session stays open while one runs.
-        let self_driven: std::collections::HashSet<String> = nodes
-            .iter()
-            .filter(|(id, node)| {
-                let spec = self.manifest.nodes.iter().find(|n| &n.id == *id);
-                self.self_driven(spec, node.as_ref())
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        let self_driven = self.self_driven_ids(&nodes);
         self.entry_points = self
             .graph
             .sources

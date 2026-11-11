@@ -560,6 +560,15 @@ impl SessionInputSender {
     }
 }
 
+/// A unary execution answers one input: some node has to take it.
+fn no_input_taking_node() -> crate::Error {
+    crate::Error::ConfigError(
+        "no node of this pipeline takes the session's input: every source is self-driven. \
+         Run it as a streaming session"
+            .to_string(),
+    )
+}
+
 /// Participant-scoped ingress handle for a shared pipeline session.
 #[derive(Clone)]
 pub struct ParticipantSessionHandle {
@@ -1369,15 +1378,18 @@ impl PipelineExecutor {
                 is_source && !self_driven
             });
             if !takes_input {
-                return Err(crate::Error::ConfigError(
-                    "no node of this pipeline takes the session's input: every source is                      self-driven. Run it as a streaming session"
-                        .to_string(),
-                ));
+                return Err(no_input_taking_node());
             }
         }
 
         // Create a temporary session
         let mut session = self.create_session(manifest).await?;
+        // Node instances can declare themselves self-driven too (a Python
+        // `SourceNode` does, once its worker is ready).
+        if session.input_control.takes_session_input() == Some(false) {
+            session.close().await?;
+            return Err(no_input_taking_node());
+        }
 
         // Send input
         session.send_input(input).await?;
