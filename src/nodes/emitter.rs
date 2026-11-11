@@ -228,6 +228,20 @@ impl Emitter {
         matches!(*self.shared.state.lock(), State::Closed)
     }
 
+    /// Resolves when the instance's tasks have started and emits no longer
+    /// wait for them (or the emitter is closed). A node's `initialize` runs
+    /// while other nodes are still loading; a task that keeps time waits for
+    /// this before it starts its clock.
+    pub async fn started(&self) {
+        loop {
+            let changed = self.shared.changed.notified();
+            if !matches!(*self.shared.state.lock(), State::Pending) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// Resolves when the emitter is closed: the stop signal for a task that
     /// holds a clone.
     pub async fn closed(&self) {

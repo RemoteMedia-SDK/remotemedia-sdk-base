@@ -51,6 +51,8 @@ impl NodeProvider for CoreNodesProvider {
         // Basic utility nodes
         registry.register(Arc::new(CalculatorNodeFactory));
         registry.register(Arc::new(PassThroughNodeFactory));
+        // A self-driven source: emits on an interval with no client input.
+        registry.register(Arc::new(super::interval_source::IntervalSourceNodeFactory));
 
         // Video processing nodes
         registry.register(Arc::new(VideoFlipNodeFactory));

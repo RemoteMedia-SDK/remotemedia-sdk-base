@@ -402,6 +402,47 @@ impl StreamingNode for SourcePythonNode {
         false
     }
 
+    /// Frames the Python node emits on its own go to the node instance's
+    /// emitter, in the order the node sent them (openspec:
+    /// add-node-initiated-output).
+    async fn initialize(&self, ctx: &dyn crate::nodes::InitializeContextRead) -> Result<(), Error> {
+        if ctx.emitter_any().is_none() {
+            return Ok(());
+        }
+        let emitter = crate::nodes::Emitter::of(ctx);
+        let (frames, mut emitted) =
+            mpsc::channel::<remotemedia_plugin_sdk::python_ipc::EmittedFrame>(64);
+        self.cmd_tx
+            .send(IpcCommand::EmitSink { frames })
+            .await
+            .map_err(|e| Error::Execution(format!("ipc cmd send: {e}")))?;
+        let node_type = self.node_type.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = emitted.recv().await {
+                if frame.finished {
+                    emitter.finish();
+                    continue;
+                }
+                let origin = match frame.origin_mode {
+                    0 => crate::nodes::EmitOrigin::Default,
+                    1 => crate::nodes::EmitOrigin::Unattributed,
+                    _ => crate::nodes::EmitOrigin::Participant(frame.participant),
+                };
+                let result = match WireRuntimeData::from_bytes(&frame.frame)
+                    .map_err(Error::Execution)
+                    .and_then(decode_wire)
+                {
+                    Ok(data) => emitter.emit_as(data, origin).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    tracing::error!(node_type = %node_type, "emitted frame was not delivered: {error}");
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Only the runtime-delivered `__call_reply__` uses the native lane
     /// (call-reply-only lane); other `@rpc` methods keep reaching the
     /// runner's dispatcher through the input path.
