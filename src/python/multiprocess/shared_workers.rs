@@ -39,6 +39,8 @@ const CONTROL_CAPACITY: usize = 64;
 const CONTROL_TICK: Duration = Duration::from_millis(5);
 /// How long a detach may take before the lane is given up on.
 const DETACH_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a dropped lease waits for its lane's final copy report.
+const DROPPED_LANE_REPORT: Duration = Duration::from_secs(5);
 /// How long a worker may take to exit after `shutdown` before it is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
@@ -773,10 +775,24 @@ impl Drop for Lease {
         }
         let lane_id = (self.session_id.clone(), self.node_id.clone());
         self.worker.lanes.lock().unwrap().remove(&lane_id);
-        if self.worker.alive() {
-            let _ = self
+        let detaching = self.worker.alive()
+            && self
                 .worker
-                .send(serde_json::json!({"op": "detach", "session": self.session_id, "node": self.node_id}));
+                .send(serde_json::json!({"op": "detach", "session": self.session_id, "node": self.node_id}))
+                .is_ok();
+        if let (true, Some(authority)) = (detaching, self.copy_authority.take()) {
+            // The lane reports its copies once its node has stopped. Keep the
+            // reporter until then; dropping it here would cut the report off
+            // and the lane would log a failed stop.
+            let node = self.node_id.clone();
+            let report = move || {
+                if authority.finish_within(DROPPED_LANE_REPORT).is_err() {
+                    tracing::error!("copy accounting for shared lane {node} did not close cleanly");
+                }
+            };
+            let _ = std::thread::Builder::new()
+                .name("lane-copy-report".into())
+                .spawn(report);
         }
         // `release` schedules the idle timer on the runtime.
         if tokio::runtime::Handle::try_current().is_ok() {
