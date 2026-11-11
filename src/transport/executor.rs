@@ -589,6 +589,23 @@ impl ParticipantSessionHandle {
             .await
     }
 
+    /// Tell the session this participant joined, without sending input.
+    /// Per-participant self-driven nodes start their instance for it
+    /// (openspec: add-node-initiated-output). A participant's first input
+    /// announces it as well.
+    pub async fn join(&self) -> Result<()> {
+        self.input
+            .send(
+                TransportData::new(RuntimeData::Json(serde_json::json!({})))
+                    .with_participant_descriptor(&self.participant)
+                    .with_metadata(
+                        crate::transport::origin::LIFECYCLE.to_string(),
+                        crate::transport::origin::JOIN.to_string(),
+                    ),
+            )
+            .await
+    }
+
     /// Tell the session this participant left: its per-participant node
     /// instances drain their queued frames and shut down (openspec:
     /// add-multi-participant-sessions). Frames sent before this are still
@@ -1336,6 +1353,28 @@ impl PipelineExecutor {
         // spliced in by negotiation when `metadata.auto_negotiate` is set.
         self.validate_manifest(&manifest).await?;
         let manifest = self.negotiate_capabilities(manifest).await?;
+
+        // A unary execution answers one input: some node has to take it.
+        {
+            let registry = self.registry.read().await;
+            let takes_input = manifest.nodes.iter().any(|node| {
+                let is_source = !manifest.connections.iter().any(|c| c.to == node.id);
+                let self_driven = match node.session_input {
+                    Some(takes) => !takes,
+                    None => registry
+                        .get_factory(&node.node_type)
+                        .and_then(|factory| factory.self_driven())
+                        .unwrap_or(false),
+                };
+                is_source && !self_driven
+            });
+            if !takes_input {
+                return Err(crate::Error::ConfigError(
+                    "no node of this pipeline takes the session's input: every source is                      self-driven. Run it as a streaming session"
+                        .to_string(),
+                ));
+            }
+        }
 
         // Create a temporary session
         let mut session = self.create_session(manifest).await?;

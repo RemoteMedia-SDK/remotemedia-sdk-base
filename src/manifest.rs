@@ -316,6 +316,13 @@ pub struct NodeManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_scope: Option<crate::nodes::InstanceScope>,
 
+    /// `false`: the node is self-driven. It does not take the session's
+    /// client input, also when nothing is connected to its input, and
+    /// produces through its emitter. Overrides the node's own declaration
+    /// (openspec: add-node-initiated-output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_input: Option<bool>,
+
     /// For a per-participant node: the most instances it may run in one
     /// session (default: `ExecutorConfig::max_participant_instances`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

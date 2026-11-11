@@ -375,6 +375,12 @@ pub struct SessionRouter {
     emitters: HashMap<String, crate::nodes::Emitter>,
     /// Participants currently in the session.
     roster: Arc<crate::transport::origin::Roster>,
+    /// The nodes client input goes to: the graph's sources that are not
+    /// self-driven. Set when the node tasks start.
+    entry_points: Vec<String>,
+    /// Self-driven nodes, and their running instances (`None` without any).
+    self_driven_ids: std::collections::HashSet<String>,
+    self_driven_live: Option<Arc<SelfDrivenLive>>,
     snapshot_bindings: Option<SnapshotBindings>,
 
     /// Kind-split sink output. See [`ClientOutputRouter`] for why we don't
@@ -490,6 +496,47 @@ struct PipelineTasks {
     lifecycle: tokio::sync::broadcast::Sender<ParticipantEvent>,
     /// All spawned tasks (main + fan-out per node). Awaited on shutdown.
     tasks: TaskGroup,
+}
+
+/// The self-driven node instances of a session that are still running
+/// (openspec: add-node-initiated-output). An instance runs until its emitter
+/// closes: the node finished, its participant left, or the session stopped.
+#[derive(Default)]
+struct SelfDrivenLive {
+    running: std::sync::atomic::AtomicUsize,
+    started: std::sync::atomic::AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl SelfDrivenLive {
+    /// Count an instance until its emitter closes.
+    fn track(self: &Arc<Self>, emitter: crate::nodes::Emitter) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.running.fetch_add(1, SeqCst);
+        self.started.store(true, SeqCst);
+        let live = Arc::clone(self);
+        tokio::spawn(async move {
+            emitter.closed().await;
+            live.running.fetch_sub(1, SeqCst);
+            live.changed.notify_waiters();
+        });
+    }
+
+    fn any_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// Resolves once an instance has run and none is running any more.
+    async fn finished(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        loop {
+            let changed = self.changed.notified();
+            if self.started.load(SeqCst) && self.running.load(SeqCst) == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 /// One stream successor of a node: its input channel plus the telemetry edge
@@ -672,6 +719,9 @@ impl SessionRouter {
             cached_nodes: HashMap::new(),
             emitters: HashMap::new(),
             roster: Default::default(),
+            entry_points: Vec::new(),
+            self_driven_ids: Default::default(),
+            self_driven_live: None,
             snapshot_bindings: None,
             output_router,
             input_rx: std::sync::Mutex::new(Some(input_rx)),
@@ -853,6 +903,24 @@ impl SessionRouter {
             }
         }
         Ok(())
+    }
+
+    /// Whether the node is self-driven: the manifest node's `session_input`,
+    /// else the instance's declaration, else its factory's, else not
+    /// (openspec: add-node-initiated-output).
+    fn self_driven(
+        &self,
+        spec: Option<&crate::manifest::NodeManifest>,
+        node: &dyn StreamingNode,
+    ) -> bool {
+        spec.and_then(|spec| spec.session_input)
+            .map(|takes_input| !takes_input)
+            .or_else(|| node.self_driven())
+            .or_else(|| {
+                spec.and_then(|spec| self.registry.get_factory(&spec.node_type))
+                    .and_then(|factory| factory.self_driven())
+            })
+            .unwrap_or(false)
     }
 
     /// The node's effective instance scope: the manifest node's
@@ -1492,12 +1560,27 @@ impl SessionRouter {
         // input channel. Each node's bounded input mpsc provides natural
         // backpressure back through `input_rx`.
         let mut sources_finished = false;
+        // With self-driven nodes the end of client input does not end the
+        // session: it ends when it is closed, or when client input has ended
+        // (or no node takes any) and every self-driven instance has finished.
+        let live = self.self_driven_live.clone();
+        let mut input_ended = false;
         let explicit_close = loop {
             let ingress_start = std::time::Instant::now();
             tokio::select! {
                 biased;
 
                 _ = pipeline.tasks.wait_for_failure() => break true,
+
+                _ = async { live.as_ref().expect("guarded").finished().await },
+                    if live.is_some() && (input_ended || self.entry_points.is_empty()) =>
+                {
+                    tracing::info!(
+                        "Session {}: every self-driven node has finished, draining the pipeline",
+                        self.session_id
+                    );
+                    break false;
+                },
 
                 _ = pipeline.source_completions.wait(), if !sources_finished => {
                     sources_finished = true;
@@ -1506,7 +1589,7 @@ impl SessionRouter {
                     input_rx.close();
                 },
 
-                result = input_rx.recv() => {
+                result = input_rx.recv(), if !input_ended => {
                     match result {
                         Some(packet) => {
                             self.probes.ingress.record_since(ingress_start);
@@ -1516,6 +1599,18 @@ impl SessionRouter {
                                 _ = shutdown_rx.recv() => break true,
                                 _ = self.route_input(packet, &pipeline.input_txs, &pipeline.ingress_edges, &pipeline.lifecycle) => {}
                             }
+                        }
+                        None if live.as_ref().is_some_and(|live| live.any_running()) => {
+                            // Client input ended while a self-driven node
+                            // runs: the input-driven nodes drain, the rest of
+                            // the session stays up.
+                            tracing::info!(
+                                "Session {}: client input ended; self-driven nodes keep the session open",
+                                self.session_id
+                            );
+                            input_ended = true;
+                            let keep = &self.self_driven_ids;
+                            pipeline.input_txs.retain(|id, _| keep.contains(id));
                         }
                         None => {
                             tracing::warn!(
@@ -1629,6 +1724,35 @@ impl SessionRouter {
         let nodes = std::mem::take(&mut self.cached_nodes);
         let mut emitters = std::mem::take(&mut self.emitters);
 
+        // Self-driven nodes do not take client input: a source among them is
+        // not an entry point. The session stays open while one runs.
+        let self_driven: std::collections::HashSet<String> = nodes
+            .iter()
+            .filter(|(id, node)| {
+                let spec = self.manifest.nodes.iter().find(|n| &n.id == *id);
+                self.self_driven(spec, node.as_ref())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.entry_points = self
+            .graph
+            .sources
+            .iter()
+            .filter(|id| !self_driven.contains(*id))
+            .cloned()
+            .collect();
+        let live = (!self_driven.is_empty()).then(|| Arc::new(SelfDrivenLive::default()));
+        if !self_driven.is_empty() {
+            tracing::info!(
+                session_id = %self.session_id,
+                nodes = ?self_driven,
+                entry_points = ?self.entry_points,
+                "self-driven nodes do not take client input"
+            );
+        }
+        self.self_driven_live = live.clone();
+        self.self_driven_ids = self_driven.clone();
+
         let mut handles = Vec::with_capacity(nodes.len() * 2);
         let mut source_completions =
             source_completion::SourceCompletions::for_graph(&self.graph, &nodes);
@@ -1684,6 +1808,7 @@ impl SessionRouter {
             let emitter = emitters
                 .remove(&node_id)
                 .unwrap_or_else(|| crate::nodes::Emitter::pending(node_id.clone()));
+            let node_live = live.clone().filter(|_| self_driven.contains(&node_id));
             let spec = self.manifest.nodes.iter().find(|n| n.id == node_id);
             let scope = self.instance_scope(spec, node.as_ref());
             if scope == crate::nodes::InstanceScope::PerParticipant {
@@ -1712,6 +1837,7 @@ impl SessionRouter {
                     let output_allocator = output_allocator.clone();
                     let materialization = materialization.clone();
                     let roster = self.roster.clone();
+                    let node_live = node_live.clone();
                     Arc::new(move |node: Box<dyn StreamingNode>,
                                    input_rx: mpsc::Receiver<Routed>,
                                    emitter: crate::nodes::Emitter,
@@ -1743,6 +1869,7 @@ impl SessionRouter {
                             emitter,
                             participant,
                             roster.clone(),
+                            node_live.clone(),
                         )
                     })
                 };
@@ -1775,6 +1902,7 @@ impl SessionRouter {
                     node_index: node_idx,
                     lifecycle: lifecycle.subscribe(),
                     shutdown: shutdown.subscribe(),
+                    self_driven: node_live.is_some(),
                 };
                 handles.push((
                     format!("{node_id} participants"),
@@ -1810,6 +1938,7 @@ impl SessionRouter {
                 emitter,
                 None,
                 self.roster.clone(),
+                node_live,
             );
 
             handles.push((format!("{node_id} main"), main_handle));
@@ -1872,6 +2001,9 @@ impl SessionRouter {
         emitter: crate::nodes::Emitter,
         participant: Option<Arc<crate::transport::origin::Origin>>,
         roster: Arc<crate::transport::origin::Roster>,
+        // Set for an instance of a self-driven node: the session counts it as
+        // running until its emitter closes.
+        live: Option<Arc<SelfDrivenLive>>,
     ) -> (JoinHandle<Result<()>>, JoinHandle<Result<()>>) {
         let (fan_tx, mut fan_rx) = mpsc::channel::<Routed>(NODE_FANOUT_CAPACITY);
         // Emitted frames enter the same queue as the outputs of a call, so
@@ -1886,6 +2018,9 @@ impl SessionRouter {
             Some((nt.tel.clone(), nt.idx)),
         );
         let emitter_closer = emitter.close_on_drop();
+        if let Some(live) = live {
+            live.track(emitter.clone());
+        }
         // Device tensors leaving the session or entering a host-only node are
         // transferred under this node's copy policy (device_delivery).
         let egress_copies = materialization.clone();
@@ -2821,6 +2956,19 @@ impl SessionRouter {
             }
             return;
         }
+        // An explicit join carries no data either.
+        if packet.metadata.get(crate::transport::origin::LIFECYCLE).map(String::as_str)
+            == Some(crate::transport::origin::JOIN)
+        {
+            if let Some(origin) =
+                crate::transport::origin::Origin::from_metadata(&packet.metadata).map(Arc::new)
+            {
+                if self.roster.note(&origin) {
+                    let _ = lifecycle.send(ParticipantEvent::Joined(origin));
+                }
+            }
+            return;
+        }
         let arrival_ts_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2829,7 +2977,10 @@ impl SessionRouter {
         // Who sent this frame; carried next to the payload through the graph.
         let origin = crate::transport::origin::Origin::from_metadata(&packet.metadata).map(Arc::new);
         if let Some(origin) = &origin {
-            self.roster.note(origin);
+            // A participant's first input is also how it joins.
+            if self.roster.note(origin) {
+                let _ = lifecycle.send(ParticipantEvent::Joined(origin.clone()));
+            }
         }
         let mut input_data = crate::transport::data::apply_transport_metadata_to_runtime(
             packet.data.into_shared(),
@@ -2844,7 +2995,8 @@ impl SessionRouter {
         let targets: Vec<&str> = if let Some(ref target) = packet.to_node {
             vec![target.as_str()]
         } else {
-            self.graph.sources.iter().map(|s| s.as_str()).collect()
+            // Client input goes to the sources that take it.
+            self.entry_points.iter().map(|s| s.as_str()).collect()
         };
 
         for target in targets {

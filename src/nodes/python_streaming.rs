@@ -50,6 +50,8 @@ pub struct PythonStreamingNode {
     /// The node instance's emitter, handed to the executor so the Python
     /// node can emit output on its own (openspec: add-node-initiated-output).
     emitter: std::sync::Mutex<Option<crate::nodes::Emitter>>,
+    /// `@self_driven` of the Python class, learned at initialization.
+    declared_self_driven: std::sync::OnceLock<bool>,
 }
 
 impl PythonStreamingNode {
@@ -80,6 +82,7 @@ impl PythonStreamingNode {
             session_id,
             control: Mutex::new(None),
             emitter: std::sync::Mutex::new(None),
+            declared_self_driven: std::sync::OnceLock::new(),
         })
     }
 
@@ -107,6 +110,7 @@ impl PythonStreamingNode {
             session_id: Some(session_id),
             control: Mutex::new(None),
             emitter: std::sync::Mutex::new(None),
+            declared_self_driven: std::sync::OnceLock::new(),
         })
     }
 
@@ -131,6 +135,7 @@ impl PythonStreamingNode {
             session_id: None,
             control: Mutex::new(None),
             emitter: std::sync::Mutex::new(None),
+            declared_self_driven: std::sync::OnceLock::new(),
         })
     }
 
@@ -220,6 +225,13 @@ impl PythonStreamingNode {
             py_executor.initialize(&context).await?;
             if let Some(scope) = Self::scope_of(py_executor.as_mut()) {
                 let _ = self.declared_instance_scope.set(scope);
+            }
+            if let Some(self_driven) = py_executor
+                .as_any_mut()
+                .downcast_mut::<crate::python::multiprocess::MultiprocessExecutor>()
+                .and_then(|mp| mp.declared_self_driven())
+            {
+                let _ = self.declared_self_driven.set(self_driven);
             }
 
             *executor_guard = Some(py_executor);
@@ -354,6 +366,11 @@ impl AsyncStreamingNode for PythonStreamingNode {
     /// The Python class's `@instance_scope(...)`, once initialized.
     fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
         self.declared_instance_scope.get().copied()
+    }
+
+    /// The Python class's `@self_driven`, once initialized.
+    fn self_driven(&self) -> Option<bool> {
+        self.declared_self_driven.get().copied()
     }
 
     fn rpc_methods(&self) -> Vec<remotemedia_traits::rpc::RpcMethod> {

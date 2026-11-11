@@ -21,6 +21,9 @@ use std::sync::Arc;
 pub const LIFECYCLE: &str = "participant.lifecycle";
 /// [`LIFECYCLE`] value: the participant in `participant.id` left the session.
 pub const LEAVE: &str = "leave";
+/// [`LIFECYCLE`] value: the participant in the packet joined the session. A
+/// participant's first input announces it as well.
+pub const JOIN: &str = "join";
 
 /// Who produced a frame: the sender's canonical `participant.*` fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,16 +66,18 @@ pub struct Roster {
 }
 
 impl Roster {
-    /// Record the sender of an input. The latest fields win.
-    pub fn note(&self, origin: &Arc<Origin>) {
+    /// Record the sender of an input. The latest fields win. `true` when the
+    /// participant was not known: it has just joined.
+    pub fn note(&self, origin: &Arc<Origin>) -> bool {
         if let Some(known) = self.current.read().get(origin.id()) {
             if Arc::ptr_eq(known, origin) || **known == **origin {
-                return;
+                return false;
             }
         }
         self.current
             .write()
-            .insert(origin.id().to_string(), Arc::clone(origin));
+            .insert(origin.id().to_string(), Arc::clone(origin))
+            .is_none()
     }
 
     /// The participant left the session.

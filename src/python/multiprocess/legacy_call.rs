@@ -37,6 +37,13 @@ impl EmitSink {
     /// holds back the node's later output. A frame that cannot be emitted is
     /// reported and dropped.
     pub(super) async fn deliver(&self, frame: remotemedia_types::SharedBytes, origin: EmitTag) {
+        // An end frame that answers no input: the node's background body
+        // returned. It has finished producing; frames it emitted before are
+        // already delivered, since this one arrived after them.
+        if is_end_of_input(&frame) {
+            self.emitter.finish();
+            return;
+        }
         let data = match crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(
             frame,
             &self.copies,

@@ -46,6 +46,8 @@ pub(super) fn default_max_instances() -> usize {
 /// Session-level participant lifecycle, broadcast to every dispatcher.
 #[derive(Debug, Clone)]
 pub(crate) enum ParticipantEvent {
+    /// The participant joined: its first input, or an explicit join.
+    Joined(Arc<Origin>),
     /// The participant with this id left the session.
     Left(String),
 }
@@ -134,6 +136,9 @@ pub(super) struct Dispatcher {
     pub(super) node_index: usize,
     pub(super) lifecycle: broadcast::Receiver<ParticipantEvent>,
     pub(super) shutdown: watch::Receiver<bool>,
+    /// A self-driven node gets no client input to learn its participants
+    /// from: its instances start when a participant joins.
+    pub(super) self_driven: bool,
 }
 
 struct Instance {
@@ -151,6 +156,17 @@ impl Dispatcher {
                 biased;
                 _ = self.shutdown.changed() => break,
                 event = self.lifecycle.recv() => match event {
+                    Ok(ParticipantEvent::Joined(origin)) => {
+                        let key = origin.id().to_string();
+                        if self.self_driven
+                            && !instances.contains_key(&key)
+                            && instances.len() < self.max_instances
+                        {
+                            let instance = self.open(&key, Some(origin), &mut tasks, &mut created);
+                            instances.insert(key, instance);
+                            self.telemetry.set_instances(self.node_index, instances.len());
+                        }
+                    }
                     Ok(ParticipantEvent::Left(id)) => {
                         if instances.remove(&id).is_some() {
                             self.telemetry.set_instances(self.node_index, instances.len());

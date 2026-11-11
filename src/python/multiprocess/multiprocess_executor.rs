@@ -734,6 +734,9 @@ pub struct MultiprocessExecutor {
     /// `SCOPE:` control message, else the source probe.
     declared_instance_scope: Option<crate::nodes::InstanceScope>,
 
+    /// `@self_driven` as the worker reported it before READY.
+    declared_self_driven: Option<bool>,
+
     /// The node instance's emitter (openspec: add-node-initiated-output):
     /// where frames the Python node emits on its own are delivered.
     emitter: Arc<std::sync::Mutex<Option<crate::nodes::Emitter>>>,
@@ -1236,6 +1239,7 @@ impl MultiprocessExecutor {
             config,
             current_context: None,
             declared_instance_scope: None,
+            declared_self_driven: None,
             emitter: Default::default(),
             wire_turns: Default::default(),
             turn_seq: Default::default(),
@@ -1350,6 +1354,11 @@ impl MultiprocessExecutor {
     /// known once [`NodeExecutor::initialize`] returned.
     pub fn declared_instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
         self.declared_instance_scope
+    }
+
+    /// Whether the Python class is `@self_driven`, once the worker is ready.
+    pub fn declared_self_driven(&self) -> Option<bool> {
+        self.declared_self_driven
     }
 
     /// Get the channel registry for IPC communication
@@ -2307,7 +2316,7 @@ sys.stdout.flush()
         session_id: &str,
         node_id: &str,
         timeout: std::time::Duration,
-    ) -> Result<(bool, Option<crate::nodes::InstanceScope>, bool)> {
+    ) -> Result<(bool, Option<crate::nodes::InstanceScope>, bool, bool)> {
         let start = std::time::Instant::now();
         let control_channel_name = format!("control/{}_{}", session_id, node_id);
 
@@ -2334,13 +2343,15 @@ sys.stdout.flush()
 
         // Control channel was already created in initialize() before spawning Python
         // Now poll for the READY signal - need direct iceoryx2 subscriber (not RuntimeData wrapper)
-        type Readiness = (bool, Option<crate::nodes::InstanceScope>, bool);
+        type Readiness = (bool, Option<crate::nodes::InstanceScope>, bool, bool);
         let ready = tokio::task::spawn_blocking(move || -> Result<Readiness> {
             let handle = tokio::runtime::Handle::current();
             // `@instance_scope` as the worker reports it before READY.
             let mut scope = None;
             // Whether the worker tags its frames with the input they answer.
             let mut turns = false;
+            // Whether the node class is `@self_driven`.
+            let mut self_driven = false;
 
             // Create raw subscriber for control channel (bypasses RuntimeData deserialization)
             let subscriber = handle.block_on(registry.create_raw_subscriber(&channel_name))?;
@@ -2356,7 +2367,7 @@ sys.stdout.flush()
                         node_id_clone,
                         poll_count
                     );
-                    return Ok((false, scope, turns));
+                    return Ok((false, scope, turns, self_driven));
                 }
 
                 poll_count += 1;
@@ -2410,9 +2421,11 @@ sys.stdout.flush()
                         // Check if it's the READY signal
                         if bytes == b"READY" {
                             tracing::debug!("Node {} signaled READY via iceoryx2", node_id_clone);
-                            return Ok((true, scope, turns));
+                            return Ok((true, scope, turns, self_driven));
                         } else if bytes == b"TURNS:1" {
                             turns = true;
+                        } else if bytes == b"SELF:1" {
+                            self_driven = true;
                         } else if let Some(declared) = bytes.strip_prefix(b"SCOPE:") {
                             let declared = std::str::from_utf8(declared).unwrap_or("");
                             scope = crate::nodes::InstanceScope::parse(declared);
@@ -3648,7 +3661,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             // Python creates its input subscriber BEFORE sending READY, so when we receive
             // READY signal, Python is fully prepared to receive data
             // Wait for READY signal with configured timeout (allows time for heavy model loading)
-            let (ready, reported_scope, worker_tags_turns) = self
+            let (ready, reported_scope, worker_tags_turns, worker_self_driven) = self
                 .wait_for_ready_signal_ipc(
                     &session_id,
                     &ctx.node_id,
@@ -3687,6 +3700,10 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 "✅ Received READY signal - Python subscriber is ready to receive data"
             );
             self.watch_shared_lane(&session_id, &ctx.node_id).await;
+
+            if worker_self_driven {
+                self.declared_self_driven = Some(true);
+            }
 
             // A worker that tags its frames can emit output between inputs:
             // read its response lane while no turn runs.
