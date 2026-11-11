@@ -711,6 +711,11 @@ pub struct MultiprocessExecutor {
     /// Current node context
     current_context: Option<ExecutorNodeContext>,
 
+    /// Instance scope the node class declares with `@instance_scope(...)`
+    /// (openspec: add-multi-participant-sessions): from the worker's
+    /// `SCOPE:` control message, else the source probe.
+    declared_instance_scope: Option<crate::nodes::InstanceScope>,
+
     /// Fixed before initialization; owns startup and background-output accounting.
     initial_copies: Option<remotemedia_types::CopyContext>,
     /// Canonical identity survives cleanup so the bound ledger cannot migrate.
@@ -1142,6 +1147,7 @@ impl MultiprocessExecutor {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
             current_context: None,
+            declared_instance_scope: None,
             initial_copies: None,
             initial_scope: None,
             env_lease: None,
@@ -1238,6 +1244,12 @@ impl MultiprocessExecutor {
         self.process_manager.get_registered_modules().await
     }
 
+    /// The instance scope the node class declared with `@instance_scope`,
+    /// known once [`NodeExecutor::initialize`] returned.
+    pub fn declared_instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
+        self.declared_instance_scope
+    }
+
     /// Get the channel registry for IPC communication
     pub fn channel_registry(&self) -> &Arc<ChannelRegistry> {
         &self.channel_registry
@@ -1251,7 +1263,10 @@ impl MultiprocessExecutor {
     /// avoiding a failed first spawn.
     ///
     /// Returns an empty Vec if discovery fails (e.g., node not found, Python not available).
-    async fn discover_node_deps(&self, node_type: &str) -> Vec<String> {
+    async fn discover_node_deps(
+        &self,
+        node_type: &str,
+    ) -> (Vec<String>, Option<crate::nodes::InstanceScope>) {
         let python = self.config.python_executable.clone();
 
         // The probe no longer imports `remotemedia` (see comment below
@@ -1350,7 +1365,7 @@ from pathlib import Path
 # Passed out-of-band: interpolating the node type into this source would let
 # a crafted node_type execute arbitrary code in the probe interpreter.
 NODE_TYPE = os.environ["REMOTEMEDIA_DEPS_PROBE_NODE_TYPE"]
-RESULT = {{"deps": [], "error": None, "source_file": None, "roots_searched": []}}
+RESULT = {{"deps": [], "instance_scope": None, "error": None, "source_file": None, "roots_searched": []}}
 
 def _candidate_roots():
     roots = []
@@ -1401,27 +1416,29 @@ def _dec_name(dec):
     return None
 
 def _scan_file(path, want_node_type):
-    """Return (deps_list, found) where `deps_list` is the
+    """Return (deps_list, found, instance_scope) where `deps_list` is the
     @python_requires([...]) literal on the class registered as
     `<want_node_type>`. Class registration is recognised via either
     `@register_node(<target>)` (MultiprocessNode pattern, used by
     `lfm2_text.py`, `tool_classifier.py`, etc.) OR
     `@streaming_node(node_type=<target>)` (the older registration
     decorator, still used by e.g. `tts.py::KokoroTTSNode`). Returns
-    `(None, False)` if no matching class is found."""
+    `(None, False, None)` if no matching class is found.
+    `instance_scope` is the `@instance_scope("...")` literal, if any."""
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
-        return None, False
+        return None, False, None
     try:
         tree = ast.parse(text)
     except SyntaxError:
-        return None, False
+        return None, False, None
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
             continue
         matches = False
         deps = None
+        scope = None
         for dec in node.decorator_list:
             if not isinstance(dec, ast.Call):
                 continue
@@ -1444,9 +1461,15 @@ def _scan_file(path, want_node_type):
                         arg = _list_of_strs(kw.value) or arg
                 if arg is not None:
                     deps = arg
+            elif name == "instance_scope":
+                if dec.args:
+                    scope = _str_value(dec.args[0])
+                for kw in dec.keywords:
+                    if kw.arg == "scope":
+                        scope = _str_value(kw.value) or scope
         if matches:
-            return (deps or []), True
-    return None, False
+            return (deps or []), True, scope
+    return None, False, None
 
 def _extract_pep723(path):
     try:
@@ -1508,10 +1531,11 @@ try:
             # Skip giant test trees if any
             if "tests" in py_path.parts or "__pycache__" in py_path.parts:
                 continue
-            deps, found = _scan_file(py_path, NODE_TYPE)
+            deps, found, scope = _scan_file(py_path, NODE_TYPE)
             if found:
                 pep723 = _extract_pep723(py_path)
                 RESULT["deps"] = _merge_dedup(deps or [], pep723)
+                RESULT["instance_scope"] = scope
                 RESULT["source_file"] = str(py_path)
                 matched = True
                 break
@@ -1559,7 +1583,8 @@ sys.stdout.flush()
             }
         };
 
-        let parse_marker = |stdout_bytes: &[u8]| -> Option<(Vec<String>, Option<String>)> {
+        type Probed = (Vec<String>, Option<String>, Option<crate::nodes::InstanceScope>);
+        let parse_marker = |stdout_bytes: &[u8]| -> Option<Probed> {
             let text = String::from_utf8_lossy(stdout_bytes);
             for line in text.lines() {
                 let trimmed = line.trim();
@@ -1578,7 +1603,11 @@ sys.stdout.flush()
                             .get("error")
                             .and_then(|e| e.as_str())
                             .map(|s| s.to_string());
-                        return Some((deps, err));
+                        let scope = val
+                            .get("instance_scope")
+                            .and_then(|s| s.as_str())
+                            .and_then(crate::nodes::InstanceScope::parse);
+                        return Some((deps, err, scope));
                     }
                 }
             }
@@ -1589,7 +1618,7 @@ sys.stdout.flush()
             Ok(Ok(output)) if output.status.success() => {
                 emit_stderr(node_type, &output.stderr);
                 match parse_marker(&output.stdout) {
-                    Some((deps, err)) => {
+                    Some((deps, err, scope)) => {
                         if let Some(err) = err {
                             tracing::warn!(
                                 node_type = %node_type,
@@ -1609,7 +1638,7 @@ sys.stdout.flush()
                                 "Node deps discovery probe returned empty deps"
                             );
                         }
-                        deps
+                        (deps, scope)
                     }
                     None => {
                         let stdout_text = String::from_utf8_lossy(&output.stdout);
@@ -1618,7 +1647,7 @@ sys.stdout.flush()
                             stdout = %stdout_text.trim(),
                             "Node deps discovery probe did not emit RMDEPS marker"
                         );
-                        Vec::new()
+                        (Vec::new(), None)
                     }
                 }
             }
@@ -1629,7 +1658,7 @@ sys.stdout.flush()
                     exit_status = ?output.status,
                     "Node deps discovery probe exited with non-zero status"
                 );
-                Vec::new()
+                (Vec::new(), None)
             }
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -1637,14 +1666,14 @@ sys.stdout.flush()
                     error = %e,
                     "Failed to run node deps discovery probe"
                 );
-                Vec::new()
+                (Vec::new(), None)
             }
             Err(_) => {
                 tracing::warn!(
                     node_type = %node_type,
                     "Node deps discovery probe timed out after 15s"
                 );
-                Vec::new()
+                (Vec::new(), None)
             }
         }
     }
@@ -2123,7 +2152,7 @@ sys.stdout.flush()
         session_id: &str,
         node_id: &str,
         timeout: std::time::Duration,
-    ) -> Result<bool> {
+    ) -> Result<(bool, Option<crate::nodes::InstanceScope>)> {
         let start = std::time::Instant::now();
         let control_channel_name = format!("control/{}_{}", session_id, node_id);
 
@@ -2150,8 +2179,11 @@ sys.stdout.flush()
 
         // Control channel was already created in initialize() before spawning Python
         // Now poll for the READY signal - need direct iceoryx2 subscriber (not RuntimeData wrapper)
-        let ready = tokio::task::spawn_blocking(move || -> Result<bool> {
+        type Readiness = (bool, Option<crate::nodes::InstanceScope>);
+        let ready = tokio::task::spawn_blocking(move || -> Result<Readiness> {
             let handle = tokio::runtime::Handle::current();
+            // `@instance_scope` as the worker reports it before READY.
+            let mut scope = None;
 
             // Create raw subscriber for control channel (bypasses RuntimeData deserialization)
             let subscriber = handle.block_on(registry.create_raw_subscriber(&channel_name))?;
@@ -2167,7 +2199,7 @@ sys.stdout.flush()
                         node_id_clone,
                         poll_count
                     );
-                    return Ok(false);
+                    return Ok((false, scope));
                 }
 
                 poll_count += 1;
@@ -2221,7 +2253,17 @@ sys.stdout.flush()
                         // Check if it's the READY signal
                         if bytes == b"READY" {
                             tracing::debug!("Node {} signaled READY via iceoryx2", node_id_clone);
-                            return Ok(true);
+                            return Ok((true, scope));
+                        } else if let Some(declared) = bytes.strip_prefix(b"SCOPE:") {
+                            let declared = std::str::from_utf8(declared).unwrap_or("");
+                            scope = crate::nodes::InstanceScope::parse(declared);
+                            if scope.is_none() {
+                                tracing::warn!(
+                                    "Node {} declared an unknown instance scope {:?}",
+                                    node_id_clone,
+                                    declared
+                                );
+                            }
                         } else if bytes.starts_with(b"DEPS:") {
                             // Node is reporting its Python package requirements.
                             // In managed mode these were already pre-discovered and
@@ -3051,7 +3093,8 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             // Pre-discover node-declared deps (via @python_requires decorator)
             // by running a lightweight Python probe BEFORE spawning the real process.
             // This ensures the managed venv includes all required packages upfront.
-            let node_deps = self.discover_node_deps(&ctx.node_type).await;
+            let (node_deps, probed_scope) = self.discover_node_deps(&ctx.node_type).await;
+            self.declared_instance_scope = probed_scope;
 
             // Collect deps from:
             // 1. Node class __python_requires__ (discovered via probe above)
@@ -3419,13 +3462,25 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             // Python creates its input subscriber BEFORE sending READY, so when we receive
             // READY signal, Python is fully prepared to receive data
             // Wait for READY signal with configured timeout (allows time for heavy model loading)
-            let ready = self
+            let (ready, reported_scope) = self
                 .wait_for_ready_signal_ipc(
                     &session_id,
                     &ctx.node_id,
                     std::time::Duration::from_secs(self.config.init_timeout_secs),
                 )
                 .await?;
+            if let Some(reported) = reported_scope {
+                if let Some(probed) = self.declared_instance_scope.filter(|p| *p != reported) {
+                    tracing::warn!(
+                        node_id = %ctx.node_id,
+                        "node source declares instance scope {} but the running class reports {}; using {}",
+                        probed.as_str(),
+                        reported.as_str(),
+                        reported.as_str()
+                    );
+                }
+                self.declared_instance_scope = Some(reported);
+            }
             if !ready {
                 let last = self
                     .sessions

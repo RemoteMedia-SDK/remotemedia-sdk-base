@@ -74,7 +74,8 @@ async fn exercise_source_drain(cancel: bool) {
     let first = tokio::time::timeout(Duration::from_secs(2), outputs.data_rx.recv())
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .data;
     drop(input);
     // The final tick is held by the test, so completion here would mean it was
     // aborted. Always release/join before reporting a failed assertion.
@@ -104,7 +105,7 @@ async fn exercise_source_drain(cancel: bool) {
     assert_eq!(first.as_ptr(), bytes.as_ptr());
     assert_eq!(first.as_ref(), &[3, 1, 4, 1]);
     if !cancel {
-        let RuntimeData::Binary(last) = outputs.data_rx.recv().await.unwrap() else {
+        let RuntimeData::Binary(last) = outputs.data_rx.recv().await.unwrap().data else {
             panic!("binary tail required")
         };
         assert_eq!(last.as_ptr(), bytes.as_ptr());

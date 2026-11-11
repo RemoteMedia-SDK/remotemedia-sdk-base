@@ -249,14 +249,16 @@ impl SharedPipelineSession {
     }
 
     fn spawn_output_drainer(
-        mut rx: mpsc::Receiver<RuntimeData>,
+        mut rx: mpsc::Receiver<TransportData>,
         tx: broadcast::Sender<TransportData>,
     ) {
         tokio::spawn(async move {
-            while let Some(data) = rx.recv().await {
+            while let Some(mut output) = rx.recv().await {
                 // Every subscriber clones on receive; promote once so those
-                // clones share one sample allocation.
-                let _ = tx.send(TransportData::new(data.into_shared()));
+                // clones share one sample allocation. Metadata carries the
+                // output's participant attribution.
+                output.data = output.data.into_shared();
+                let _ = tx.send(output);
             }
         });
     }

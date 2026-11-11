@@ -664,6 +664,7 @@ async fn host(via: Via, env: &Env, spec: EndpointSpec, takeover: bool) -> Result
                 op: Some(PbOp::Hello(Hello {
                     session_id: env.session.session_id.clone(),
                     attach_id: "host".into(),
+                    participant: None,
                 })),
             })
             .await

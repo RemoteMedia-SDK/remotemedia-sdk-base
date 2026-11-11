@@ -164,3 +164,39 @@ fn wire_output_file_references_and_control_keep_metadata_semantics() {
         assert_eq!(counts(&strict), CopyCounts::default());
     }
 }
+
+#[test]
+fn transport_metadata_rides_in_data_buffer_metadata_for_every_payload() {
+    use crate::generated::data_buffer::DataType;
+    let copies = CopyContext::new(CopyPolicy::AllowCopies, "wire-metadata");
+    let metadata: std::collections::HashMap<String, String> = [
+        ("participant.id".to_string(), "alice".to_string()),
+        ("participant.role".to_string(), "client".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    for data in [RuntimeData::Text("hello".into()), audio(vec![0.25, -0.5, 1.0, 0.0])] {
+        let transport = remotemedia_core::transport::TransportData {
+            data: data.clone(),
+            sequence: None,
+            metadata: metadata.clone(),
+        };
+        let wire = encode_transport_data_with_context(&transport, &copies).unwrap();
+        let decoded = DataBuffer::decode(wire.clone()).unwrap();
+        assert_eq!(decoded.metadata, metadata);
+        // The payload is the same as without metadata.
+        let bare = DataBuffer::decode(encode_runtime_data_with_context(&data, &copies).unwrap()).unwrap();
+        assert_eq!(decoded.data_type, bare.data_type);
+        assert!(matches!(decoded.data_type, Some(DataType::Text(_)) | Some(DataType::Audio(_))));
+        // No metadata: identical to the plain encoder.
+        let plain = remotemedia_core::transport::TransportData {
+            data: data.clone(),
+            sequence: None,
+            metadata: Default::default(),
+        };
+        assert_eq!(
+            encode_transport_data_with_context(&plain, &copies).unwrap(),
+            encode_runtime_data_with_context(&data, &copies).unwrap()
+        );
+    }
+}

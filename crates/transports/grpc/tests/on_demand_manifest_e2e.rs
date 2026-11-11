@@ -62,6 +62,8 @@ async fn run_manifest(endpoint: &str, name: &str, node_id: &str, text: &str) -> 
                 output_taps: Vec::new(),
                 embedded_plugins: Vec::new(),
                 embedded_python_env: None,
+                shared_session_key: String::new(),
+                participant: None,
             })),
         })
         .await

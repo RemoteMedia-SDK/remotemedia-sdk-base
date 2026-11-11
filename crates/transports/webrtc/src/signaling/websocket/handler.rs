@@ -33,6 +33,10 @@ use tracing::{debug, error, info, warn};
 #[path = "control_live_tests.rs"]
 mod control_live_tests;
 
+#[cfg(test)]
+#[path = "room_tests.rs"]
+mod room_tests;
+
 /// Peer connection info for WebSocket clients
 pub struct WsPeerConnection {
     pub peer_id: String,
@@ -52,6 +56,10 @@ pub struct SharedState {
     /// Optional event sender for FFI integration
     /// When set, peer connect/disconnect and pipeline events are forwarded
     pub event_tx: Option<mpsc::Sender<WebRtcEventBridge>>,
+    /// Shared sessions by room key (`config.shared_session_key`): every
+    /// peer of a room joins one session as its own participant (openspec:
+    /// add-multi-participant-sessions).
+    pub rooms: Arc<tokio::sync::Mutex<HashMap<String, Arc<crate::peer::SharedPipelineSession>>>>,
 }
 
 impl SharedState {
@@ -78,7 +86,38 @@ impl SharedState {
             runner,
             manifest,
             event_tx,
+            rooms: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The room key when peers share one session, else `None` (one session
+    /// per peer).
+    pub fn room_key(&self) -> Option<&str> {
+        self.config.shared_session_key.as_deref().filter(|key| !key.is_empty())
+    }
+
+    /// The live shared session of room `key`, created on first use and again
+    /// after the previous one ended (it closes when its last peer leaves).
+    pub async fn room(
+        &self,
+        key: &str,
+    ) -> crate::Result<Arc<crate::peer::SharedPipelineSession>> {
+        let mut rooms = self.rooms.lock().await;
+        if let Some(room) = rooms.get(key) {
+            if room.is_active().await {
+                return Ok(Arc::clone(room));
+            }
+        }
+        let core = self
+            .runner
+            .get_or_create_shared_session(format!("webrtc-room:{key}"), Arc::clone(&self.manifest))
+            .await
+            .map_err(|e| crate::Error::InternalError(format!("Failed to create room session: {e}")))?;
+        let control = self.runner.control_bus().get(core.session_id());
+        let room = crate::peer::SharedPipelineSession::new(core, control, true).await?;
+        info!("Room '{}' runs on shared session {}", key, room.session_id());
+        rooms.insert(key.to_string(), Arc::clone(&room));
+        Ok(room)
     }
 
     /// Emit an event if event_tx is configured
@@ -482,8 +521,15 @@ async fn handle_offer(
             }
         };
 
-        // Handle offer and get SDP answer
-        let answer_sdp: String = match server_peer.handle_offer(params.sdp).await {
+        // Handle offer and get SDP answer: in a room, join its shared session.
+        let answered = match state.room_key() {
+            Some(key) => match state.room(key).await {
+                Ok(room) => server_peer.handle_offer_with_shared_session(params.sdp, room).await,
+                Err(e) => Err(e),
+            },
+            None => server_peer.handle_offer(params.sdp).await,
+        };
+        let answer_sdp: String = match answered {
             Ok(sdp) => sdp,
             Err(e) => {
                 error!("ServerPeer failed to handle offer: {}", e);

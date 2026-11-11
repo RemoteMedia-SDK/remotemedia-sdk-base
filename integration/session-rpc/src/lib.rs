@@ -44,7 +44,7 @@ mod tests {
     ) -> (
         Arc<SessionControl>,
         broadcast::Receiver<RuntimeData>,
-        mpsc::Receiver<RuntimeData>,
+        mpsc::Receiver<remotemedia_sdk_base::transport::TransportData>,
         mpsc::Sender<()>,
         tokio::task::JoinHandle<remotemedia_sdk_base::Result<()>>,
     ) {
@@ -87,7 +87,7 @@ mod tests {
             .await
             .unwrap();
         let mut received = receivers.data_rx;
-        let first = deadline(received.recv()).await.unwrap();
+        let first = deadline(received.recv()).await.unwrap().data;
         assert_eq!(
             first,
             RuntimeData::Json(serde_json::json!({"session":session,"node":"manager"}))

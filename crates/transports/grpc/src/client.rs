@@ -359,6 +359,8 @@ impl PipelineClient for GrpcPipelineClient {
             output_taps: Vec::new(),
             embedded_plugins: embedded,
             embedded_python_env: proto_python_env,
+            shared_session_key: String::new(),
+            participant: None,
         };
 
         let channel = self.get_channel().await?;

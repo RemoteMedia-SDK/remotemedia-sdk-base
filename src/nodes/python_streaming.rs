@@ -20,6 +20,9 @@ pub struct PythonStreamingNode {
     node_type: String,
     params: Value,
     executor: Mutex<Option<Box<dyn NodeExecutor>>>,
+    /// `@instance_scope` of the Python class, learned at initialization
+    /// (openspec: add-multi-participant-sessions).
+    declared_instance_scope: std::sync::OnceLock<crate::nodes::InstanceScope>,
     /// Session ID for multiprocess execution (spec 002)
     session_id: Option<String>,
     /// Control bus handle for progress reporting during initialization.
@@ -50,6 +53,7 @@ impl PythonStreamingNode {
             node_type: node_type.to_string(),
             params: params.clone(),
             executor: Mutex::new(None),
+            declared_instance_scope: std::sync::OnceLock::new(),
             session_id,
             control: Mutex::new(None),
         })
@@ -67,6 +71,7 @@ impl PythonStreamingNode {
             node_type: node_type.to_string(),
             params: params.clone(),
             executor: Mutex::new(None),
+            declared_instance_scope: std::sync::OnceLock::new(),
             session_id: Some(session_id),
             control: Mutex::new(None),
         })
@@ -77,16 +82,29 @@ impl PythonStreamingNode {
         node_id: String,
         node_type: &str,
         params: &Value,
-        executor: Box<dyn NodeExecutor>,
+        mut executor: Box<dyn NodeExecutor>,
     ) -> Result<Self, Error> {
+        let declared_instance_scope = std::sync::OnceLock::new();
+        if let Some(scope) = Self::scope_of(executor.as_mut()) {
+            let _ = declared_instance_scope.set(scope);
+        }
         Ok(Self {
             node_id,
             node_type: node_type.to_string(),
             params: params.clone(),
             executor: Mutex::new(Some(executor)),
+            declared_instance_scope,
             session_id: None,
             control: Mutex::new(None),
         })
+    }
+
+    /// The `@instance_scope` an initialized multiprocess executor learned.
+    fn scope_of(executor: &mut dyn NodeExecutor) -> Option<crate::nodes::InstanceScope> {
+        executor
+            .as_any_mut()
+            .downcast_mut::<crate::python::multiprocess::MultiprocessExecutor>()
+            .and_then(|mp| mp.declared_instance_scope())
     }
 
     pub async fn ensure_initialized(&self) -> Result<(), Error> {
@@ -146,6 +164,9 @@ impl PythonStreamingNode {
 
             // Initialize
             py_executor.initialize(&context).await?;
+            if let Some(scope) = Self::scope_of(py_executor.as_mut()) {
+                let _ = self.declared_instance_scope.set(scope);
+            }
 
             *executor_guard = Some(py_executor);
         }
@@ -271,6 +292,11 @@ impl AsyncStreamingNode for PythonStreamingNode {
     /// Only the runtime-delivered `__call_reply__` uses the native lane;
     /// every other typed-RPC method keeps reaching the Python dispatcher
     /// through the input path (call-reply-only lane).
+    /// The Python class's `@instance_scope(...)`, once initialized.
+    fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
+        self.declared_instance_scope.get().copied()
+    }
+
     fn rpc_methods(&self) -> Vec<remotemedia_traits::rpc::RpcMethod> {
         vec![remotemedia_traits::call::call_reply_method()]
     }

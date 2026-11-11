@@ -384,6 +384,16 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
         };
         let clocked_media_addr = serde_json::from_value(pacing["clocked_media_addr"].clone())
             .map_err(|e| Error::Execution(format!("invalid plugin clock address: {e}")))?;
+        // Optional (older plugins omit it): openspec add-multi-participant-sessions.
+        let instance_scope = match pacing.get("instance_scope") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .and_then(remotemedia_traits::streaming::InstanceScope::parse)
+                    .ok_or_else(|| Error::Execution(format!("invalid plugin instance scope: {value}")))?,
+            ),
+        };
         let rpc_methods: Vec<RpcMethod> = serde_json::from_str(ffi_node.rpc_methods().as_str())
             .map_err(|e| Error::Execution(format!("invalid plugin RPC descriptors: {e}")))?;
         let snapshots = loadable_node_abi::snapshot::runtime::import_ports(
@@ -399,6 +409,7 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
             nature,
             rate,
             clocked_media_addr,
+            instance_scope,
             node_type: self.node_type.clone(),
             node_id,
         }))))
@@ -414,6 +425,7 @@ struct LoadableNodeAdapter {
     nature: PacingNature,
     rate: u32,
     clocked_media_addr: Option<(String, String)>,
+    instance_scope: Option<remotemedia_traits::streaming::InstanceScope>,
     node_type: String,
     node_id: String,
 }
@@ -601,6 +613,9 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
     }
     fn clocked_media_addr(&self) -> Option<(String, String)> {
         self.clocked_media_addr.clone()
+    }
+    fn instance_scope(&self) -> Option<remotemedia_traits::streaming::InstanceScope> {
+        self.instance_scope
     }
 
     async fn tick(

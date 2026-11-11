@@ -65,6 +65,10 @@
 // Shared configuration is independent of any network transport feature.
 pub mod buffer_config;
 
+// Process-wide executors and membership counts for shared streaming sessions.
+#[cfg(any(feature = "python", feature = "napi"))]
+pub(crate) mod shared_sessions;
+
 // Python-specific modules (only compiled with `python` feature)
 #[cfg(feature = "python")]
 mod api;

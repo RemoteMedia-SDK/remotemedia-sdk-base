@@ -246,6 +246,30 @@ pub fn runtime_data_to_data_buffer_with_context(
 /// copy. Audio arrives as little-endian bytes and must be converted to f32
 /// samples; that conversion is a counted `PortableDeserialization`, rejected
 /// under strict policy before it runs.
+/// `participant.*` metadata for a [`crate::generated::ParticipantInfo`]
+/// (empty fields are left out; an empty id yields no entries).
+pub fn participant_metadata(
+    info: &crate::generated::ParticipantInfo,
+) -> std::collections::HashMap<String, String> {
+    use remotemedia_core::transport::data::participant;
+    let mut metadata = std::collections::HashMap::new();
+    if info.id.is_empty() {
+        return metadata;
+    }
+    for (key, value) in [
+        (participant::ID, &info.id),
+        (participant::ROLE, &info.role),
+        (participant::TRACK_ID, &info.track_id),
+        (participant::MODALITY, &info.modality),
+        (participant::DISPLAY_NAME, &info.display_name),
+    ] {
+        if !value.is_empty() {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+    metadata
+}
+
 pub fn data_buffer_into_runtime_data_with_context(
     mut buffer: DataBuffer,
     arrival_ts_us: Option<u64>,
@@ -276,6 +300,13 @@ pub fn data_buffer_into_runtime_data_with_context(
             RuntimeData::Binary(data) => *data = shared,
             _ => {}
         }
+    }
+    // `DataBuffer.metadata` (e.g. `participant.*` on audio) reaches nodes
+    // through the payload's own metadata where the payload has one.
+    if !buffer.metadata.is_empty() {
+        decoded = decoded.map(|data| {
+            remotemedia_core::transport::data::apply_transport_metadata_to_runtime(data, &buffer.metadata)
+        });
     }
     Ok(decoded)
 }

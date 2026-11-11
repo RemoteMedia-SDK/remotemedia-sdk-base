@@ -40,11 +40,14 @@ mod input_copies;
 use input_copies::InputCopies;
 
 type InputSlot = Arc<Mutex<Option<InputSender>>>;
-type RxSlot = Arc<Mutex<Option<mpsc::Receiver<RuntimeData>>>>;
+/// Session outputs; metadata carries the producing participant.
+type RxSlot = Arc<Mutex<Option<mpsc::Receiver<TransportData>>>>;
 type HandleSlot = Arc<Mutex<Option<SessionHandle>>>;
 
 #[cfg(test)]
 mod input_policy_tests;
+#[cfg(test)]
+mod shared_session_tests;
 
 enum InputSender {
     Raw(SessionInputSender),
@@ -61,9 +64,11 @@ impl InputSender {
 }
 
 enum Outcome {
-    Got(&'static str, RuntimeData),
+    Got(&'static str, TransportData),
     Closed(&'static str),
 }
+
+type MembershipSlot = Arc<Mutex<Option<crate::shared_sessions::SharedMembership>>>;
 
 /// Long-lived streaming session handle, callable from Python.
 ///
@@ -79,6 +84,9 @@ pub struct PyStreamingSession {
     video_rx: RxSlot,
     data_rx: RxSlot,
     handle: HandleSlot,
+    /// This handle's membership of a shared session (`None` for a private
+    /// session); closing the last handle closes the shared session.
+    membership: MembershipSlot,
     /// Keep the executor alive for the session's lifetime. The scheduler
     /// task spawned at session creation holds `Arc` clones internally, but
     /// holding the executor here is a defensive cheap guarantee.
@@ -193,6 +201,101 @@ impl PyStreamingSession {
     /// `None` once every kind channel is closed. `kind` is one of
     /// `"audio" | "video" | "data"`.
     fn recv_output<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.next_output(py, false)
+    }
+
+    /// Await the next output across all kinds, with its attribution.
+    /// Resolves to `{"kind": "audio" | "video" | "data", "data": <as
+    /// recv_output>, "participant": {"id", "role", ...} | None}`, or `None`
+    /// once every kind channel is closed. In a shared session `participant`
+    /// names the participant whose input produced the output (openspec:
+    /// add-multi-participant-sessions).
+    fn recv_event<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.next_output(py, true)
+    }
+
+    /// Try to take the next output without waiting; see `recv_event`.
+    fn try_recv_event(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        for (kind, rx) in [("audio", &self.audio_rx), ("video", &self.video_rx), ("data", &self.data_rx)] {
+            let Ok(mut guard) = rx.try_lock() else { continue };
+            if let Some(Ok(out)) = guard.as_mut().map(|rx| rx.try_recv()) {
+                return pack_event(py, kind, out, &self.input_copies.session);
+            }
+        }
+        Ok(py.None())
+    }
+
+    /// Non-blocking peek on audio. Returns the next frame, or `None` if
+    /// the channel is empty / closed / locked.
+    fn try_recv_audio(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        try_recv_kind_sync(py, &self.audio_rx, &self.input_copies.session)
+    }
+
+    fn try_recv_data(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        try_recv_kind_sync(py, &self.data_rx, &self.input_copies.session)
+    }
+
+    fn try_recv_video(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        try_recv_kind_sync(py, &self.video_rx, &self.input_copies.session)
+    }
+
+    /// Signal end-of-input. After this, `send_input` raises. Outputs continue
+    /// to drain until each kind channel closes naturally.
+    fn signal_input_complete<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let input_sender = Arc::clone(&self.input_sender);
+        future_into_py(py, async move {
+            *input_sender.lock().await = None;
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+
+    /// Gracefully tear down the session. Idempotent.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let handle = Arc::clone(&self.handle);
+        let input_sender = Arc::clone(&self.input_sender);
+        let audio = Arc::clone(&self.audio_rx);
+        let video = Arc::clone(&self.video_rx);
+        let data = Arc::clone(&self.data_rx);
+        let membership = Arc::clone(&self.membership);
+        future_into_py(py, async move {
+            // A participant leaves its shared session: its per-participant
+            // node instances drain and stop.
+            if let Some(InputSender::Participant(participant)) = input_sender.lock().await.take() {
+                let _ = participant.leave().await;
+            }
+            *audio.lock().await = None;
+            *video.lock().await = None;
+            *data.lock().await = None;
+            if let Some(mut h) = handle.lock().await.take() {
+                let _ = h.close().await;
+            }
+            if let Some(membership) = membership.lock().await.take() {
+                membership.leave().await;
+            }
+            Python::attach(|py| Ok(py.None()))
+        })
+    }
+
+    /// Open an in-proc control attach against this session.
+    ///
+    /// Returns a `PyAttachedSession` resolved through the process-global
+    /// `SessionControlBus`. Raises `SessionNotFoundError` if the session is
+    /// not yet registered (e.g. called before `create_streaming_session`
+    /// completes, or after `close`).
+    fn control(&self, py: Python<'_>) -> PyResult<Py<crate::control_session::PyAttachedSession>> {
+        let session = crate::control_session::open(&self.session_id)?;
+        Py::new(py, session)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PyStreamingSession(session_id='{}')", self.session_id)
+    }
+}
+
+impl PyStreamingSession {
+    /// Await the next output across all kinds: `(kind, data)` or, with
+    /// `attributed`, the `recv_event` dict.
+    fn next_output<'py>(&self, py: Python<'py>, attributed: bool) -> PyResult<Bound<'py, PyAny>> {
         let audio = Arc::clone(&self.audio_rx);
         let video = Arc::clone(&self.video_rx);
         let data = Arc::clone(&self.data_rx);
@@ -254,11 +357,17 @@ impl PyStreamingSession {
 
                 // Restore receivers. Drop any that closed.
                 match outcome {
-                    Outcome::Got(kind, rd) => {
+                    Outcome::Got(kind, out) => {
                         *a_guard = a_taken;
                         *v_guard = v_taken;
                         *d_guard = d_taken;
-                        return Python::attach(|py| pack_kind(py, kind, rd, &copies));
+                        return Python::attach(|py| {
+                            if attributed {
+                                pack_event(py, kind, out, &copies)
+                            } else {
+                                pack_kind(py, kind, out.data, &copies)
+                            }
+                        });
                     }
                     Outcome::Closed("audio") => {
                         *a_guard = None;
@@ -280,64 +389,6 @@ impl PyStreamingSession {
             }
         })
     }
-
-    /// Non-blocking peek on audio. Returns the next frame, or `None` if
-    /// the channel is empty / closed / locked.
-    fn try_recv_audio(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        try_recv_kind_sync(py, &self.audio_rx, &self.input_copies.session)
-    }
-
-    fn try_recv_data(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        try_recv_kind_sync(py, &self.data_rx, &self.input_copies.session)
-    }
-
-    fn try_recv_video(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        try_recv_kind_sync(py, &self.video_rx, &self.input_copies.session)
-    }
-
-    /// Signal end-of-input. After this, `send_input` raises. Outputs continue
-    /// to drain until each kind channel closes naturally.
-    fn signal_input_complete<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let input_sender = Arc::clone(&self.input_sender);
-        future_into_py(py, async move {
-            *input_sender.lock().await = None;
-            Python::attach(|py| Ok(py.None()))
-        })
-    }
-
-    /// Gracefully tear down the session. Idempotent.
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let handle = Arc::clone(&self.handle);
-        let input_sender = Arc::clone(&self.input_sender);
-        let audio = Arc::clone(&self.audio_rx);
-        let video = Arc::clone(&self.video_rx);
-        let data = Arc::clone(&self.data_rx);
-        future_into_py(py, async move {
-            *input_sender.lock().await = None;
-            *audio.lock().await = None;
-            *video.lock().await = None;
-            *data.lock().await = None;
-            if let Some(mut h) = handle.lock().await.take() {
-                let _ = h.close().await;
-            }
-            Python::attach(|py| Ok(py.None()))
-        })
-    }
-
-    /// Open an in-proc control attach against this session.
-    ///
-    /// Returns a `PyAttachedSession` resolved through the process-global
-    /// `SessionControlBus`. Raises `SessionNotFoundError` if the session is
-    /// not yet registered (e.g. called before `create_streaming_session`
-    /// completes, or after `close`).
-    fn control(&self, py: Python<'_>) -> PyResult<Py<crate::control_session::PyAttachedSession>> {
-        let session = crate::control_session::open(&self.session_id)?;
-        Py::new(py, session)
-    }
-
-    fn __repr__(&self) -> String {
-        format!("PyStreamingSession(session_id='{}')", self.session_id)
-    }
 }
 
 fn recv_kind_async(
@@ -348,7 +399,7 @@ fn recv_kind_async(
     future_into_py(py, async move {
         let mut guard = rx_arc.lock().await;
         let result = match guard.as_mut() {
-            Some(rx) => rx.recv().await,
+            Some(rx) => rx.recv().await.map(|out| out.data),
             None => None,
         };
         if result.is_none() {
@@ -373,7 +424,7 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot, copies: &CopyContext) -> PyRe
     };
     use tokio::sync::mpsc::error::TryRecvError;
     let outcome = match guard.as_mut() {
-        Some(rx) => rx.try_recv(),
+        Some(rx) => rx.try_recv().map(|out| out.data),
         None => return Ok(py.None()),
     };
     match outcome {
@@ -388,6 +439,27 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot, copies: &CopyContext) -> PyRe
             Ok(py.None())
         }
     }
+}
+
+/// `{"kind", "data", "participant"}` for one output.
+fn pack_event(py: Python<'_>, kind: &str, out: TransportData, copies: &CopyContext) -> PyResult<Py<PyAny>> {
+    let event = pyo3::types::PyDict::new(py);
+    event.set_item("kind", kind)?;
+    event.set_item(
+        "data",
+        runtime_data_to_python_with_context(py, &out.data.into_shared(), copies)?,
+    )?;
+    match crate::shared_sessions::participant_fields(&out.metadata) {
+        Some(fields) => {
+            let who = pyo3::types::PyDict::new(py);
+            for (field, value) in fields {
+                who.set_item(field, value)?;
+            }
+            event.set_item("participant", who)?;
+        }
+        None => event.set_item("participant", py.None())?,
+    }
+    Ok(event.into_any().unbind())
 }
 
 fn pack_kind(
@@ -459,11 +531,11 @@ pub fn create_streaming_session(
 
 /// Create or join a shared streaming session for a participant.
 ///
-/// `shared_session_key` is the logical room/conversation key. Calls with the
-/// same key and executor share one core pipeline session; this FFI constructor
-/// creates an executor scoped to the returned Python object, so share the
-/// returned session object in-process when multiple Python tasks should attach
-/// to the same runtime instance.
+/// `shared_session_key` is the logical room/conversation key. Calls in one
+/// process with the same key (and the same `pipeline_buffers`) join one
+/// pipeline session, each as its own participant; `recv_event()` reports which
+/// participant produced each output. `close()` leaves the session; the last
+/// handle to close shuts it down.
 #[pyfunction]
 #[pyo3(signature = (
     manifest_json,
@@ -495,12 +567,13 @@ pub fn create_shared_streaming_session(
         .transpose()?
         .unwrap_or_default();
     future_into_py(py, async move {
-        let executor = PipelineExecutor::with_config(config)
+        // One executor per configuration for the whole process, so the same
+        // key really is the same session.
+        let executor = crate::shared_sessions::shared_executor(config)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create executor: {}", e)))?;
         for factory in crate::plugins::collect_registered_factories() {
             executor.register_factory(factory).await;
         }
-        let executor = Arc::new(executor);
         let sess = build_shared_session(
             executor,
             manifest_json,
@@ -547,6 +620,7 @@ pub(crate) async fn build_session(
         video_rx: Arc::new(Mutex::new(Some(receivers.video_rx))),
         data_rx: Arc::new(Mutex::new(Some(receivers.data_rx))),
         handle: Arc::new(Mutex::new(Some(handle))),
+        membership: Arc::new(Mutex::new(None)),
         _executor: executor,
     })
 }
@@ -583,6 +657,7 @@ pub(crate) async fn build_shared_session(
     }
     let participant = shared.participant_handle(participant);
     let receivers = bridge_shared_outputs(shared.subscribe_outputs());
+    let membership = crate::shared_sessions::SharedMembership::join(Arc::clone(&shared));
 
     Ok(PyStreamingSession {
         output_allocator: shared.output_allocator().await,
@@ -594,6 +669,7 @@ pub(crate) async fn build_shared_session(
         video_rx: Arc::new(Mutex::new(Some(receivers.1))),
         data_rx: Arc::new(Mutex::new(Some(receivers.2))),
         handle: Arc::new(Mutex::new(None)),
+        membership: Arc::new(Mutex::new(Some(membership))),
         _executor: executor,
     })
 }
@@ -601,9 +677,9 @@ pub(crate) async fn build_shared_session(
 fn bridge_shared_outputs(
     mut outputs: SharedPipelineOutputReceivers,
 ) -> (
-    mpsc::Receiver<RuntimeData>,
-    mpsc::Receiver<RuntimeData>,
-    mpsc::Receiver<RuntimeData>,
+    mpsc::Receiver<TransportData>,
+    mpsc::Receiver<TransportData>,
+    mpsc::Receiver<TransportData>,
 ) {
     let (audio_tx, audio_rx) = mpsc::channel(128);
     let (video_tx, video_rx) = mpsc::channel(128);
@@ -614,11 +690,11 @@ fn bridge_shared_outputs(
             let Ok(Some(output)) = outputs.recv_output().await else {
                 break;
             };
-            let runtime = output.data;
-            let result = match &runtime {
-                RuntimeData::Audio { .. } => audio_tx.send(runtime).await,
-                RuntimeData::Video { .. } => video_tx.send(runtime).await,
-                _ => data_tx.send(runtime).await,
+            // Keep the whole output: its metadata attributes it to a participant.
+            let result = match &output.data {
+                RuntimeData::Audio { .. } => audio_tx.send(output).await,
+                RuntimeData::Video { .. } => video_tx.send(output).await,
+                _ => data_tx.send(output).await,
             };
             if matches!(result, Err(mpsc::error::SendError(_))) {
                 break;

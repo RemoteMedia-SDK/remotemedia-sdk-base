@@ -592,6 +592,12 @@ impl SyncStreamingNode for AudioBufferAccumulatorNode {
         "AudioBufferAccumulatorNode"
     }
 
+    /// Keeps per-speaker state: one instance per participant (openspec:
+    /// add-multi-participant-sessions).
+    fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
+        Some(crate::nodes::InstanceScope::PerParticipant)
+    }
+
     fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
         Err(Error::Execution(
             "AudioBufferAccumulatorNode requires streaming mode - \
