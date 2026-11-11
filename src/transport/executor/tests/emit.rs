@@ -194,6 +194,12 @@ impl StreamingNodeFactory for EmitFactory {
     fn node_type(&self) -> &str {
         self.node_type
     }
+    // A manifest may make this node a source, so it declares its output.
+    fn media_capabilities(&self, _params: &serde_json::Value) -> Option<crate::capabilities::MediaCapabilities> {
+        Some(crate::capabilities::MediaCapabilities::with_output(
+            crate::capabilities::MediaConstraints::Text(Default::default()),
+        ))
+    }
 }
 
 /// Sleeps before passing each input on: a slow consumer.

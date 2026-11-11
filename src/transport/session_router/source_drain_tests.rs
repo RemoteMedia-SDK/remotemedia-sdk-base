@@ -21,12 +21,14 @@ impl crate::nodes::AsyncStreamingNode for HeldTick {
     fn pacing_nature(&self) -> crate::nodes::PacingNature {
         crate::nodes::PacingNature::SourceWall(100)
     }
-    async fn tick(
+    async fn tick_with_ctx(
         &self,
         _tick: crate::nodes::Tick,
-        _session: Option<String>,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
         mut output: Box<dyn FnMut(RuntimeData) -> Result<()> + Send>,
     ) -> Result<()> {
+        // This is the source's last tick: the session ends once it is done.
+        ctx.finish_source()?;
         self.calls.fetch_add(1, Ordering::SeqCst);
         output(RuntimeData::Binary(self.bytes.clone()))?;
         self.release.notified().await;
@@ -77,8 +79,9 @@ async fn exercise_source_drain(cancel: bool) {
         .unwrap()
         .data;
     drop(input);
-    // The final tick is held by the test, so completion here would mean it was
-    // aborted. Always release/join before reporting a failed assertion.
+    // Client input ended. The source has not finished, so the session stays
+    // open; its final tick is held by the test, so completion here would mean
+    // it was aborted. Always release/join before reporting a failed assertion.
     let premature = tokio::time::timeout(Duration::from_millis(50), &mut running).await;
     if premature.is_ok() {
         release.notify_one();

@@ -1311,6 +1311,9 @@ impl PipelineExecutor {
         manifest: Arc<Manifest>,
     ) -> Result<Arc<Manifest>> {
         let registry = self.registry.read().await;
+        // A self-driven source declares what it puts out: nothing upstream
+        // and nothing the client sends would otherwise say.
+        crate::capabilities::sources::check_self_driven_sources(&manifest, &registry)?;
         let outcome = negotiate_manifest(manifest.clone(), &registry);
         drop(registry);
 

@@ -86,10 +86,73 @@ enum NativeFrame {
 
 struct ChannelSink {
     tx: tokio::sync::mpsc::Sender<NativeFrame>,
+    /// Counts frames pushed here until the host has forwarded them.
+    outputs: Arc<SinkOutputs>,
+}
+
+/// Outputs a plugin pushed into a call's sink that the host has not
+/// forwarded yet. The plugin's emitter waits for this to reach zero, so a
+/// frame emitted after a reply is delivered after it: a call's sink and the
+/// instance's emitter are two paths onto the same output edge.
+#[derive(Default)]
+struct SinkOutputs {
+    pending: std::sync::atomic::AtomicUsize,
+    forwarded: tokio::sync::Notify,
+}
+
+impl SinkOutputs {
+    fn pushed(&self) {
+        self.pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn forwarded(&self) {
+        self.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.forwarded.notify_waiters();
+    }
+
+    fn any(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// Resolves when every pushed output has been forwarded.
+    async fn settled(&self) {
+        loop {
+            let forwarded = self.forwarded.notified();
+            if !self.any() {
+                return;
+            }
+            forwarded.await;
+        }
+    }
+}
+
+/// The receiving end of a call's sink. Frames still queued when the call
+/// ends (an error, a cancelled call) are counted as forwarded, so an emit
+/// never waits for a frame nobody will deliver.
+struct SinkReceiver {
+    rx: tokio::sync::mpsc::Receiver<NativeFrame>,
+    outputs: Arc<SinkOutputs>,
+}
+
+impl Drop for SinkReceiver {
+    fn drop(&mut self) {
+        self.rx.close();
+        while self.rx.try_recv().is_ok() {
+            self.outputs.forwarded();
+        }
+    }
 }
 
 impl ChannelSink {
     fn send(&self, bytes: NativeFrame) -> RResult<(), RString> {
+        let sent = self.send_frame(bytes);
+        if matches!(sent, ROk(())) {
+            self.outputs.pushed();
+        }
+        sent
+    }
+
+    fn send_frame(&self, bytes: NativeFrame) -> RResult<(), RString> {
         match self.tx.try_send(bytes) {
             Ok(()) => ROk(()),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -466,6 +529,7 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
             instance_scope,
             self_driven,
             background,
+            outputs: Default::default(),
             node_type: self.node_type.clone(),
             node_id,
         }))))
@@ -485,6 +549,8 @@ struct LoadableNodeAdapter {
     self_driven: Option<bool>,
     /// The plugin node has a background body.
     background: bool,
+    /// Outputs of in-flight calls that are not forwarded yet.
+    outputs: Arc<SinkOutputs>,
     node_type: String,
     node_id: String,
 }
@@ -748,7 +814,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         if ctx.emitter_any().is_some() {
             self.inner
                 .bind_emitter(loadable_node_abi::buffer::NodeEmitter_TO::from_value(
-                    HostEmitter(crate::nodes::Emitter::of(ctx)),
+                    HostEmitter(crate::nodes::Emitter::of(ctx), self.outputs.clone()),
                     abi_stable::sabi_trait::TD_Opaque,
                 ));
         }
@@ -862,6 +928,14 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
 }
 
 impl LoadableNodeAdapter {
+    /// The sink of one call.
+    fn sink(&self, tx: tokio::sync::mpsc::Sender<NativeFrame>) -> ChannelSink {
+        ChannelSink {
+            tx,
+            outputs: self.outputs.clone(),
+        }
+    }
+
     fn uses_shared(&self) -> Result<bool, Error> {
         match self.inner.shared_buffer_protocol() {
             0 => Ok(false),
@@ -945,7 +1019,7 @@ impl LoadableNodeAdapter {
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let sink = SharedOutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
+        let sink = SharedOutputSink_TO::from_value(self.sink(tx), TD_Opaque);
         let future = self
             .inner
             .process_streaming_shared(encode_shared(data)?, context, sink);
@@ -959,7 +1033,7 @@ impl LoadableNodeAdapter {
         callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
     ) -> Result<(), Error> {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let sink = SharedOutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
+        let sink = SharedOutputSink_TO::from_value(self.sink(tx), TD_Opaque);
         let tick = loadable_node_abi::FfiTick {
             clock_id: tick.clock_id.into(),
             pts_us: tick.pts_us,
@@ -979,7 +1053,7 @@ impl LoadableNodeAdapter {
     async fn drain_outputs<F>(
         &self,
         ffi_fut: async_ffi::FfiFuture<RResult<usize, RString>>,
-        mut frame_rx: tokio::sync::mpsc::Receiver<NativeFrame>,
+        frame_rx: tokio::sync::mpsc::Receiver<NativeFrame>,
         legacy_copies: Option<&CopyContext>,
         mut callback: F,
     ) -> Result<usize, Error>
@@ -987,22 +1061,32 @@ impl LoadableNodeAdapter {
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
         tokio::pin!(ffi_fut);
+        let mut frames = SinkReceiver {
+            rx: frame_rx,
+            outputs: self.outputs.clone(),
+        };
 
         let mut count = 0usize;
         let mut ffi_result: Option<RResult<usize, RString>> = None;
         loop {
             tokio::select! {
                 biased;
-                maybe_frame = frame_rx.recv() => {
+                maybe_frame = frames.rx.recv() => {
                     match maybe_frame {
                         Some(frame) => {
-                            let out_data = match frame {
-                                NativeFrame::Shared(message) => runtime_buffer::decode(message)
-                                    .map_err(|error| Error::Execution(error.into_string()))?,
-                                NativeFrame::Legacy(bytes) => self.legacy_decode(bytes.as_slice(), legacy_copies.ok_or_else(||
-                                    Error::Execution("unexpected legacy frame on shared plugin path".into()))?)?,
-                            };
-                            callback(out_data)?;
+                            let forwarded = (|| {
+                                let out_data = match frame {
+                                    NativeFrame::Shared(message) => runtime_buffer::decode(message)
+                                        .map_err(|error| Error::Execution(error.into_string()))?,
+                                    NativeFrame::Legacy(bytes) => self.legacy_decode(bytes.as_slice(), legacy_copies.ok_or_else(||
+                                        Error::Execution("unexpected legacy frame on shared plugin path".into()))?)?,
+                                };
+                                callback(out_data)
+                            })();
+                            // On the node's output edge (or failed): an emit
+                            // made after this frame may go now.
+                            self.outputs.forwarded();
+                            forwarded?;
                             count += 1;
                         }
                         None => {
@@ -1055,7 +1139,7 @@ fn ffi_origin(ctx: &dyn NodeRuntimeContextRead) -> abi_stable::std_types::ROptio
 }
 
 /// The host emitter behind the plugin ABI's `NodeEmitter`.
-struct HostEmitter(crate::nodes::Emitter);
+struct HostEmitter(crate::nodes::Emitter, Arc<SinkOutputs>);
 
 impl HostEmitter {
     fn frame(
@@ -1089,11 +1173,14 @@ impl loadable_node_abi::buffer::NodeEmitter for HostEmitter {
         participant: RString,
     ) -> async_ffi::FfiFuture<RResult<(), RString>> {
         let emitter = self.0.clone();
+        let outputs = self.1.clone();
         async move {
             let (data, origin) = match Self::frame(message, origin, participant) {
                 Ok(frame) => frame,
                 Err(error) => return RErr(error),
             };
+            // Replies the plugin pushed before this emit go out first.
+            outputs.settled().await;
             match emitter.emit_as(data, origin).await {
                 Ok(()) => ROk(()),
                 Err(error) => RErr(error.to_string().into()),
@@ -1123,6 +1210,11 @@ impl loadable_node_abi::buffer::NodeEmitter for HostEmitter {
             Ok(frame) => frame,
             Err(error) => return outcome(TRY_EMIT_REJECTED, error.into_string()),
         };
+        // Replies pushed before this emit are still on their way out: it
+        // cannot go ahead of them without waiting.
+        if self.1.any() {
+            return outcome(TRY_EMIT_FULL, String::new());
+        }
         match self.0.try_emit_as(data, origin) {
             Ok(()) => outcome(TRY_EMIT_QUEUED, String::new()),
             Err(TryEmitError::Full(_)) => outcome(TRY_EMIT_FULL, String::new()),

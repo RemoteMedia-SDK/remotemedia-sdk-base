@@ -556,6 +556,23 @@ impl<'a> CapabilityResolver<'a> {
             ctx.add_connection(from, to);
         }
 
+        // A self-driven source has no upstream to inherit from: it declares
+        // its output (openspec: add-source-node-lifecycle).
+        for (node_id, node_type) in nodes {
+            if connections.iter().any(|(_, to)| to == node_id) {
+                continue;
+            }
+            let Some(factory) = self.registry.get_factory(node_type) else {
+                continue;
+            };
+            let node_params = params.get(node_id).cloned().unwrap_or(Value::Null);
+            if factory.self_driven() == Some(true)
+                && !super::sources::declares_output(factory.as_ref(), &node_params)
+            {
+                return Err(super::sources::undeclared_source(node_id, node_type));
+            }
+        }
+
         Ok(())
     }
 

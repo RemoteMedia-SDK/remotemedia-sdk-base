@@ -127,6 +127,17 @@ impl StreamingNodeFactory for IntervalSourceNodeFactory {
     fn self_driven(&self) -> Option<bool> {
         Some(true)
     }
+
+    /// A source declares its output: JSON ticks.
+    fn media_capabilities(&self, _params: &Value) -> Option<crate::capabilities::MediaCapabilities> {
+        Some(crate::capabilities::MediaCapabilities::with_output(
+            crate::capabilities::MediaConstraints::Json(Default::default()),
+        ))
+    }
+
+    fn capability_behavior(&self) -> crate::capabilities::CapabilityBehavior {
+        crate::capabilities::CapabilityBehavior::Static
+    }
 }
 
 #[cfg(test)]

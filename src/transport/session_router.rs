@@ -50,7 +50,6 @@ use input_queue::InputQueue;
 mod children_tests;
 #[cfg(test)]
 mod routing_identity_tests;
-mod source_completion;
 #[cfg(test)]
 mod source_completion_tests;
 #[cfg(test)]
@@ -490,7 +489,6 @@ const RELAXED: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxe
 /// lifetime of the session. Built in [`SessionRouter::spawn_pipeline_tasks`]
 /// and torn down in [`SessionRouter::teardown_pipeline_tasks`].
 struct PipelineTasks {
-    source_completions: source_completion::SourceCompletions,
     /// Input sender for each node (keyed by node id). The router pushes
     /// source-bound and `to_node`-addressed packets through these.
     input_txs: HashMap<String, InputQueue>,
@@ -500,6 +498,13 @@ struct PipelineTasks {
     lifecycle: tokio::sync::broadcast::Sender<ParticipantEvent>,
     /// All spawned tasks (main + fan-out per node). Awaited on shutdown.
     tasks: TaskGroup,
+}
+
+/// Whether the runtime drives a node with this nature from a clock.
+fn is_paced(nature: crate::nodes::PacingNature) -> bool {
+    use crate::nodes::PacingNature;
+    matches!(nature, PacingNature::SourceWall(hz) if hz > 0)
+        || matches!(nature, PacingNature::ClockedToOutboundMedia)
 }
 
 /// Opens the start gate of every node instance of a session (openspec:
@@ -976,9 +981,26 @@ impl SessionRouter {
             .filter(|(id, node)| {
                 let spec = self.manifest.nodes.iter().find(|n| &n.id == *id);
                 self.self_driven(spec, node.as_ref())
+                    || self.paced_source(id.as_str(), spec, node.as_ref())
             })
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// A clock-paced node with no upstream is a source like any other
+    /// (openspec: add-source-node-lifecycle): client input is not delivered
+    /// to it, and the session counts it as running until it finishes
+    /// (`finish_source()`) or stops. A manifest node with
+    /// `"session_input": true` keeps taking client input.
+    fn paced_source(
+        &self,
+        node_id: &str,
+        spec: Option<&crate::manifest::NodeManifest>,
+        node: &dyn StreamingNode,
+    ) -> bool {
+        is_paced(node.pacing_nature())
+            && self.graph.sources.iter().any(|source| source == node_id)
+            && spec.and_then(|spec| spec.session_input) != Some(true)
     }
 
     /// Whether the node is self-driven: the manifest node's `session_input`,
@@ -1661,20 +1683,25 @@ impl SessionRouter {
 
                 _ = pipeline.tasks.wait_for_failure() => break true,
 
+                // One rule for every kind of source (emitter-based and
+                // paced): the session ends when client input has ended, or
+                // no node takes any, and every source has finished.
                 _ = async { live.as_ref().expect("guarded").finished().await },
-                    if live.is_some() && (input_ended || self.entry_points.is_empty()) =>
+                    if live.is_some()
+                        && !sources_finished
+                        && (input_ended || self.entry_points.is_empty()) =>
                 {
                     tracing::info!(
                         "Session {}: every self-driven node has finished, draining the pipeline",
                         self.session_id
                     );
-                    break false;
-                },
-
-                _ = pipeline.source_completions.wait(), if !sources_finished => {
                     sources_finished = true;
-                    // Refuse new ingress, but deliver packets already accepted
-                    // before the final source committed completion.
+                    if input_ended {
+                        break false;
+                    }
+                    // No node takes client input. Refuse new ingress, but
+                    // deliver packets already accepted (addressed to a node)
+                    // before the last source finished.
                     input_rx.close();
                 },
 
@@ -1836,8 +1863,6 @@ impl SessionRouter {
         self.self_driven_ids = self_driven.clone();
 
         let mut handles = Vec::with_capacity(nodes.len() * 2);
-        let mut source_completions =
-            source_completion::SourceCompletions::for_graph(&self.graph, &nodes);
 
         for (node_id, node) in nodes {
             let input_rx = match input_rxs.remove(&node_id) {
@@ -1947,7 +1972,6 @@ impl SessionRouter {
                                 input_weak: input_weak.clone(),
                             },
                             shutdown.clone(),
-                            None,
                             primary,
                             emitter,
                             participant,
@@ -1995,7 +2019,6 @@ impl SessionRouter {
                 continue;
             }
 
-            let completion = source_completions.register(node.pacing_nature());
             let (main_handle, fan_handle) = Self::spawn_node_pipeline(
                 output_allocator,
                 materialization,
@@ -2017,7 +2040,6 @@ impl SessionRouter {
                     input_weak,
                 },
                 shutdown.subscribe(),
-                completion,
                 true,
                 emitter,
                 None,
@@ -2038,7 +2060,6 @@ impl SessionRouter {
             .collect();
 
         Ok(PipelineTasks {
-            source_completions,
             input_txs,
             ingress_edges,
             lifecycle,
@@ -2077,7 +2098,6 @@ impl SessionRouter {
         perf: Arc<PerfAggregator>,
         nt: NodeTelemetryHandle,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
-        completion: Option<tokio::sync::oneshot::Sender<()>>,
         // The node's only instance, or the startup instance of a
         // per-participant node: owns liveness telemetry and RPC handlers.
         primary: bool,
@@ -2643,8 +2663,7 @@ impl SessionRouter {
                         src,
                         OnMiss::default(),
                     )
-                    .with_perf(perf.clone())
-                    .with_completion(completion);
+                    .with_perf(perf.clone());
                     pacer.spawn_draining(shutdown.clone())
                 })
             };
@@ -3160,7 +3179,6 @@ impl SessionRouter {
     /// Await every spawned task after dropping the router's own input_txs.
     async fn teardown_pipeline_tasks(pipeline: PipelineTasks, explicit_close: bool) -> Result<()> {
         let PipelineTasks {
-            source_completions: _,
             input_txs,
             ingress_edges: _,
             lifecycle: _,
@@ -3468,7 +3486,6 @@ mod tests {
         let cancelled = tokio::spawn(std::future::pending::<Result<()>>());
         cancelled.abort();
         let pipeline = PipelineTasks {
-            source_completions: source_completion::SourceCompletions::new(false),
             input_txs: HashMap::new(),
             ingress_edges: HashMap::new(),
             lifecycle: tokio::sync::broadcast::channel(1).0,

@@ -23,7 +23,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use remotemedia_plugin_sdk::python_ipc::{IpcCommand, WireDataType, WireRuntimeData};
+use remotemedia_plugin_sdk::python_ipc::{
+    BodyState, EmittedFrame, IpcCommand, TurnFrame, WireDataType, WireRuntimeData,
+};
 use remotemedia_plugin_sdk::python_subprocess::{
     spawn_python_subprocess_with_handshake, PluginProvisioning,
 };
@@ -308,9 +310,12 @@ impl StreamingNodeFactory for SourcePythonFactory {
         Ok(Box::new(SourcePythonNode {
             node_type: plugin.node_type.clone(),
             session_id,
+            node_id,
             cmd_tx,
             declared_instance_scope: handshake.instance_scope,
             declared_self_driven: handshake.self_driven,
+            declared_background: handshake.background,
+            body: Default::default(),
             _child: child,
             _env_lease: provisioning.venv.clone(),
         }))
@@ -352,6 +357,13 @@ struct SourcePythonNode {
     declared_instance_scope: Option<crate::nodes::InstanceScope>,
     /// Whether the node class is self-driven, as the worker reported it.
     declared_self_driven: bool,
+    /// The worker's node has a `background()` that waits for the start
+    /// signal: this node's body starts it and reports how it ended.
+    declared_background: bool,
+    /// How the worker's `background()` stands.
+    body: tokio::sync::watch::Sender<BodyState>,
+    /// The id the runner was started with (it names the runner's stop event).
+    node_id: String,
     /// Held so the subprocess is killed on drop.
     _child: Arc<std::sync::Mutex<std::process::Child>>,
     /// Environment cache lease. Fields drop after `Drop::drop`, so this is
@@ -362,6 +374,48 @@ struct SourcePythonNode {
 impl Drop for SourcePythonNode {
     fn drop(&mut self) {
         remotemedia_plugin_sdk::python_ipc::terminate_runner(&self._child);
+    }
+}
+
+/// Deliver one frame the Python node emitted on its own. `runtime_owns_body`:
+/// the node's body is run by the router, which finishes the emitter when the
+/// body returns.
+async fn deliver_emitted(
+    mut frame: EmittedFrame,
+    emitter: &crate::nodes::Emitter,
+    body: &tokio::sync::watch::Sender<BodyState>,
+    runtime_owns_body: bool,
+    node_type: &str,
+) {
+    if let Some(error) = frame.failed.take() {
+        if !runtime_owns_body {
+            tracing::error!(node_type = %node_type, "the Python runner exited: {error}");
+        }
+        body.send_replace(BodyState::Failed(error));
+        return;
+    }
+    if frame.finished {
+        if runtime_owns_body {
+            body.send_replace(BodyState::Finished);
+        } else {
+            emitter.body_finished();
+        }
+        return;
+    }
+    let origin = match frame.origin_mode {
+        0 => crate::nodes::EmitOrigin::Default,
+        1 => crate::nodes::EmitOrigin::Unattributed,
+        _ => crate::nodes::EmitOrigin::Participant(frame.participant),
+    };
+    let result = match WireRuntimeData::from_bytes(&frame.frame)
+        .map_err(Error::Execution)
+        .and_then(decode_wire)
+    {
+        Ok(data) => emitter.emit_as(data, origin).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        tracing::error!(node_type = %node_type, "emitted frame was not delivered: {error}");
     }
 }
 
@@ -424,30 +478,51 @@ impl StreamingNode for SourcePythonNode {
             .await
             .map_err(|e| Error::Execution(format!("ipc cmd send: {e}")))?;
         let node_type = self.node_type.clone();
+        let (body, runtime_owns_body) = (self.body.clone(), self.declared_background);
         tokio::spawn(async move {
             while let Some(frame) = emitted.recv().await {
-                if frame.finished {
-                    emitter.body_finished();
-                    continue;
-                }
-                let origin = match frame.origin_mode {
-                    0 => crate::nodes::EmitOrigin::Default,
-                    1 => crate::nodes::EmitOrigin::Unattributed,
-                    _ => crate::nodes::EmitOrigin::Participant(frame.participant),
-                };
-                let result = match WireRuntimeData::from_bytes(&frame.frame)
-                    .map_err(Error::Execution)
-                    .and_then(decode_wire)
-                {
-                    Ok(data) => emitter.emit_as(data, origin).await,
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = result {
-                    tracing::error!(node_type = %node_type, "emitted frame was not delivered: {error}");
-                }
+                deliver_emitted(frame, &emitter, &body, runtime_owns_body, &node_type).await;
             }
         });
         Ok(())
+    }
+
+    fn has_background(&self) -> bool {
+        self.declared_background
+    }
+
+    /// The Python node's `background()`: the router calls this when the
+    /// instance starts. It tells the worker to start the body and resolves
+    /// when the body returned, or fails when the worker exited (a failing
+    /// `background()` ends the worker).
+    async fn background(&self, _ctx: &dyn NodeRuntimeContextRead) -> Result<(), Error> {
+        remotemedia_plugin_sdk::python_ipc::run_body(&self.cmd_tx, &self.session_id, &self.body)
+            .await
+            .map_err(|error| Error::Execution(format!("node type '{}': {error}", self.node_type)))
+    }
+
+    /// The runtime's `shutdown` notice: ask the worker to stop, so it
+    /// cancels `background()` and runs `cleanup()`, before this node is
+    /// dropped and whatever is left of the runner is ended.
+    async fn process_control_message(
+        &self,
+        message: RuntimeData,
+        _ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<bool, Error> {
+        if crate::transport::session_control::aux_port_of(&message).as_deref() == Some("shutdown") {
+            let (child, session_id, node_id) =
+                (self._child.clone(), self.session_id.clone(), self.node_id.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                remotemedia_plugin_sdk::python_ipc::stop_runner(
+                    &child,
+                    &session_id,
+                    &node_id,
+                    remotemedia_plugin_sdk::python_ipc::STOP_GRACE,
+                )
+            })
+            .await;
+        }
+        Ok(false)
     }
 
     /// Only the runtime-delivered `__call_reply__` uses the native lane
@@ -532,22 +607,41 @@ impl StreamingNode for SourcePythonNode {
         // real generator — the consumer (router) drains in the same
         // event loop tick and `blocking_send` on the IPC thread will
         // park if the consumer ever falls behind.
-        let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(32);
+        //
+        // One turn: the input carries the participant it came from, and the
+        // input's replies and the frames the node emits meanwhile arrive on
+        // one channel, in the order the node produced them.
+        let (frame_tx, mut frame_rx) = mpsc::channel::<TurnFrame>(32);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .send(IpcCommand::RoundStreaming {
+            .send(IpcCommand::Turn {
                 req_bytes,
-                frame_tx,
+                origin: ctx.origin().map(|origin| origin.to_json()),
+                frames: frame_tx,
                 reply: reply_tx,
             })
             .await
             .map_err(|e| Error::Execution(format!("ipc cmd send: {e}")))?;
 
+        let emitter = crate::nodes::Emitter::for_call(ctx);
         let mut count = 0usize;
         while let Some(frame) = frame_rx.recv().await {
-            let runtime_data = decode_output(&frame, &copies)?;
-            callback(runtime_data)?;
-            count += 1;
+            match frame {
+                TurnFrame::Reply(frame) => {
+                    callback(decode_output(&frame, &copies)?)?;
+                    count += 1;
+                }
+                TurnFrame::Emitted(frame) => {
+                    deliver_emitted(
+                        frame,
+                        &emitter,
+                        &self.body,
+                        self.declared_background,
+                        &self.node_type,
+                    )
+                    .await
+                }
+            }
         }
         // `frame_rx` returns `None` only after the IPC thread drops its
         // sender, which happens immediately before it sends on `reply`.

@@ -418,3 +418,340 @@ async fn a_task_a_node_spawned_itself_waits_for_the_start_of_a_parked_session() 
     assert!(tick["elapsed_ms"].as_u64().unwrap() < 150, "{tick}");
     assert!(acquired.elapsed() < Duration::from_secs(2));
 }
+
+// ── Rust source nodes (trait and attribute) ─────────────────────────────
+
+struct Counter {
+    count: u64,
+}
+
+#[async_trait::async_trait]
+impl remotemedia_traits::SourceNode for Counter {
+    fn node_type(&self) -> &str {
+        "Counter"
+    }
+    async fn background(&self, ctx: &dyn NodeRuntimeContextRead) -> crate::Result<()> {
+        let emitter = Emitter::for_call(ctx);
+        for n in 0..self.count {
+            emitter.emit(text(format!("count-{n}"))).await?;
+        }
+        Ok(())
+    }
+}
+
+/// The same source, declared with the attribute. In its own module: the
+/// macro's output names `Result` with two parameters.
+mod attribute {
+    use crate::data::RuntimeData;
+    use crate::nodes::{Emitter, NodeRuntimeContextRead};
+
+    #[crate::node(source, node_type = "MacroCounter", output_caps = "text")]
+    pub struct MacroCounterNode {
+        #[config(default = 3)]
+        pub count: u64,
+    }
+
+    impl MacroCounterNode {
+        async fn background_impl(
+            &self,
+            ctx: &dyn NodeRuntimeContextRead,
+        ) -> Result<(), crate::Error> {
+            let emitter = Emitter::for_call(ctx);
+            for n in 0..self.config.count {
+                emitter.emit(RuntimeData::Text(format!("count-{n}"))).await?;
+            }
+            Ok(())
+        }
+    }
+}
+use attribute::MacroCounterNode;
+
+/// Declares itself self-driven and says nothing about its output.
+struct SilentFactory;
+
+impl StreamingNodeFactory for SilentFactory {
+    fn create(
+        &self,
+        _node_id: String,
+        _params: &serde_json::Value,
+        _session_id: Option<String>,
+    ) -> crate::Result<Box<dyn StreamingNode>> {
+        Ok(remotemedia_traits::SourceNodeWrapper::boxed(Counter { count: 1 }))
+    }
+    fn node_type(&self) -> &str {
+        "Silent"
+    }
+    fn self_driven(&self) -> Option<bool> {
+        Some(true)
+    }
+}
+
+async fn source_executor() -> Arc<PipelineExecutor> {
+    let (executor, _probe) = executor().await;
+    executor
+        .register_factory(Arc::new(remotemedia_traits::source_factory(
+            "Counter",
+            crate::capabilities::MediaConstraints::Text(Default::default()),
+            |params: &serde_json::Value| {
+                Ok(Counter {
+                    count: params.get("count").and_then(|v| v.as_u64()).unwrap_or(3),
+                })
+            },
+        )))
+        .await;
+    executor.register_factory(MacroCounterNode::source_factory()).await;
+    executor.register_factory(Arc::new(SilentFactory)).await;
+    executor
+}
+
+async fn runs_as_a_source(node_type: &str) {
+    let executor = source_executor().await;
+    let mut session = executor
+        .create_session(manifest(&[("source", node_type, serde_json::json!({"count": 3}))]))
+        .await
+        .unwrap();
+    // Nothing is sent. Three frames, then the session ends with its source.
+    for n in 0..3 {
+        assert_eq!(next(&mut session).await, (format!("count-{n}"), None));
+    }
+    let end = tokio::time::timeout(Duration::from_secs(5), session.recv_output()).await;
+    assert!(matches!(end, Ok(Ok(None))), "{node_type}: the session did not end: {end:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_type_that_implements_source_node_is_a_source() {
+    runs_as_a_source("Counter").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_struct_with_the_source_attribute_is_a_source() {
+    runs_as_a_source("MacroCounter").await;
+    let factory = MacroCounterNode::source_factory();
+    assert_eq!(factory.self_driven(), Some(true));
+    assert!(factory
+        .media_capabilities(&serde_json::Value::Null)
+        .is_some_and(|capabilities| capabilities.default_output().is_some()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_self_driven_source_that_declares_no_output_fails_validation_and_is_named() {
+    let executor = source_executor().await;
+    // The factory says the node is self-driven.
+    let error = executor
+        .create_session(manifest(&[("mute", "Silent", serde_json::json!({}))]))
+        .await
+        .err()
+        .expect("validation fails")
+        .to_string();
+    assert!(error.contains("'mute'") && error.contains("output capabilities"), "{error}");
+    assert!(error.contains("output_caps") && error.contains("media_capabilities"), "{error}");
+
+    // The manifest says so, of a node whose factory declares nothing.
+    let mut by_manifest = (*manifest(&[("quiet", "BodyNode", serde_json::json!({"mode": "return"}))])).clone();
+    by_manifest.nodes[0].session_input = Some(false);
+    let error = executor
+        .create_session(Arc::new(by_manifest.clone()))
+        .await
+        .err()
+        .expect("validation fails")
+        .to_string();
+    assert!(error.contains("'quiet'"), "{error}");
+
+    // Declared on the manifest node: accepted.
+    by_manifest.nodes[0].media_capabilities = Some(crate::capabilities::MediaCapabilities::with_output(
+        crate::capabilities::MediaConstraints::Text(Default::default()),
+    ));
+    let mut session = executor.create_session(Arc::new(by_manifest)).await.unwrap();
+    session.close().await.unwrap();
+
+    // With an upstream node it is not a source: nothing to declare.
+    let mut fed = (*manifest(&[
+        ("in", "BodyNode", serde_json::json!({})),
+        ("mute", "Silent", serde_json::json!({})),
+    ]))
+    .clone();
+    fed.connections.push(Connection {
+        from: "in".into(),
+        to: "mute".into(),
+        ..Default::default()
+    });
+    let mut session = executor.create_session(Arc::new(fed)).await.unwrap();
+    session.close().await.unwrap();
+}
+
+#[test]
+fn the_resolver_rejects_an_undeclared_self_driven_source() {
+    let mut registry = crate::nodes::StreamingNodeRegistry::new();
+    registry.register(Arc::new(SilentFactory));
+    registry.register(MacroCounterNode::source_factory());
+    let resolver = crate::capabilities::resolver::CapabilityResolver::new(&registry);
+    let error = resolver
+        .resolve(&[("mute".into(), "Silent".into())], &[], &Default::default())
+        .err()
+        .expect("resolution fails")
+        .to_string();
+    assert!(error.contains("'mute'") && error.contains("Silent"), "{error}");
+    assert!(resolver
+        .resolve(&[("clock".into(), "MacroCounter".into())], &[], &Default::default())
+        .is_ok());
+}
+
+// ── Paced sources follow the source rules ───────────────────────────────
+
+/// Ticks `ticks` times, then finishes. Answers input it receives.
+struct PacedNode {
+    ticks: u64,
+    done: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl AsyncStreamingNode for PacedNode {
+    fn node_type(&self) -> &str {
+        "Paced"
+    }
+    fn pacing_nature(&self) -> crate::nodes::PacingNature {
+        crate::nodes::PacingNature::SourceWall(100)
+    }
+    async fn process(&self, data: RuntimeData) -> crate::Result<RuntimeData> {
+        match data {
+            RuntimeData::Text(body) => Ok(text(format!("paced-heard:{body}"))),
+            other => Ok(other),
+        }
+    }
+    async fn tick_with_ctx(
+        &self,
+        _tick: crate::nodes::Tick,
+        ctx: &dyn NodeRuntimeContextRead,
+        mut output: Box<dyn FnMut(RuntimeData) -> crate::Result<()> + Send>,
+    ) -> crate::Result<()> {
+        let n = self.done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n >= self.ticks {
+            return Ok(());
+        }
+        output(text(format!("tick-{n}")))?;
+        if n + 1 == self.ticks {
+            ctx.finish_source()?;
+        }
+        Ok(())
+    }
+}
+
+struct PacedFactory;
+
+impl StreamingNodeFactory for PacedFactory {
+    fn create(
+        &self,
+        _node_id: String,
+        params: &serde_json::Value,
+        _session_id: Option<String>,
+    ) -> crate::Result<Box<dyn StreamingNode>> {
+        Ok(Box::new(AsyncNodeWrapper(Arc::new(PacedNode {
+            ticks: params.get("ticks").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
+            done: Default::default(),
+        }))))
+    }
+    fn node_type(&self) -> &str {
+        "Paced"
+    }
+}
+
+async fn paced_executor() -> Arc<PipelineExecutor> {
+    let executor = source_executor().await;
+    executor.register_factory(Arc::new(PacedFactory)).await;
+    executor
+}
+
+/// Outputs until `quiet` passes with none, sorted.
+async fn drain(session: &mut SessionHandle, quiet: Duration) -> Vec<String> {
+    let mut seen = Vec::new();
+    while let Ok(Ok(Some(output))) = tokio::time::timeout(quiet, session.recv_output()).await {
+        if let RuntimeData::Text(body) = &output.data {
+            seen.push(body.clone());
+        }
+    }
+    seen.sort();
+    seen
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_input_is_not_delivered_to_a_paced_source() {
+    let executor = paced_executor().await;
+    let mut session = executor
+        .create_session(manifest(&[
+            ("paced", "Paced", serde_json::json!({"ticks": 2})),
+            ("echo", "BodyNode", serde_json::json!({})),
+        ]))
+        .await
+        .unwrap();
+    session.send_input(TransportData::new(text("hello"))).await.unwrap();
+    // The ordinary source answers once; the paced source only ticks.
+    let seen = drain(&mut session, Duration::from_millis(400)).await;
+    assert_eq!(seen, ["emitted-hello", "hello", "tick-0", "tick-1"]);
+    session.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manifest_can_keep_a_paced_source_taking_client_input() {
+    let executor = paced_executor().await;
+    let mut manifest = (*manifest(&[("paced", "Paced", serde_json::json!({"ticks": 1}))])).clone();
+    manifest.nodes[0].session_input = Some(true);
+    let mut session = executor.create_session(Arc::new(manifest)).await.unwrap();
+    session.send_input(TransportData::new(text("hello"))).await.unwrap();
+    let seen = drain(&mut session, Duration::from_millis(400)).await;
+    assert_eq!(seen, ["paced-heard:hello", "tick-0"]);
+    session.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_of_paced_and_emitter_based_sources_ends_when_both_have_finished() {
+    let executor = paced_executor().await;
+    let mut session = executor
+        .create_session(manifest(&[
+            ("paced", "Paced", serde_json::json!({"ticks": 2})),
+            ("counter", "Counter", serde_json::json!({"count": 2})),
+        ]))
+        .await
+        .unwrap();
+    // No node takes client input, and nothing is sent.
+    let mut seen = Vec::new();
+    let ended = loop {
+        match tokio::time::timeout(Duration::from_secs(5), session.recv_output()).await {
+            Ok(Ok(Some(output))) => {
+                if let RuntimeData::Text(body) = &output.data {
+                    seen.push(body.clone());
+                }
+            }
+            Ok(Ok(None)) => break true,
+            other => panic!("the session did not end by itself: {other:?}"),
+        }
+    };
+    assert!(ended);
+    seen.sort();
+    assert_eq!(seen, ["count-0", "count-1", "tick-0", "tick-1"]);
+    assert!(session.wait().await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paced_source_that_has_not_finished_keeps_its_session_open() {
+    let executor = paced_executor().await;
+    let mut session = executor
+        .create_session(manifest(&[
+            ("paced", "Paced", serde_json::json!({})),
+            ("counter", "Counter", serde_json::json!({"count": 1})),
+        ]))
+        .await
+        .unwrap();
+    // The emitter-based source finished long ago; the paced one still ticks.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut ticks = 0;
+    while let Ok(Ok(Some(_))) =
+        tokio::time::timeout(Duration::from_millis(100), session.recv_output()).await
+    {
+        ticks += 1;
+        if ticks > 5 {
+            break;
+        }
+    }
+    assert!(ticks > 5, "the session ended while a paced source was running");
+    session.close().await.unwrap();
+}

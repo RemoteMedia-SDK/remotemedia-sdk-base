@@ -260,7 +260,6 @@ impl TickSource for WallTickSource {
 /// stored alongside the node's main + fan-out tasks and aborted on
 /// session shutdown.
 pub struct Pacer {
-    completion: Option<tokio::sync::oneshot::Sender<()>>,
     node_id: String,
     node: Arc<dyn StreamingNode>,
     ctx: NodeRuntimeContext,
@@ -294,7 +293,6 @@ impl Pacer {
     ) -> Self {
         Self {
             node_id: node_id.into(),
-            completion: None,
             node,
             ctx,
             fan_tx,
@@ -309,14 +307,6 @@ impl Pacer {
     /// don't care about telemetry stay terse.
     pub fn with_perf(mut self, perf: Arc<PerfAggregator>) -> Self {
         self.perf = Some(perf);
-        self
-    }
-
-    pub(crate) fn with_completion(
-        mut self,
-        completion: Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Self {
-        self.completion = completion;
         self
     }
 
@@ -503,9 +493,10 @@ impl Pacer {
         if !requested {
             return Ok(false);
         }
-        if let Some(completion) = self.completion.take() {
-            let _ = completion.send(());
-        }
+        // The source has finished producing. Its emitter closes, which is
+        // how the session stops counting a self-driven instance as running:
+        // the same signal an emitter-based source gives.
+        self.ctx.emitter().finish();
         Ok(true)
     }
 }
