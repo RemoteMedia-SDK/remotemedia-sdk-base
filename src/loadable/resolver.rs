@@ -328,6 +328,33 @@ pub fn current_platform() -> String {
     format!("{arch}-{os}")
 }
 
+/// The file a Rust plugin's `asset_pattern` names for this host, e.g.
+/// `lib{name}-{arch}-{os}.{ext}` → `libwhisper-aarch64-android.so`.
+pub fn platform_asset_name(name: &str, pattern: &str) -> String {
+    let ext = match std::env::consts::OS {
+        "windows" => "dll",
+        "macos" | "ios" => "dylib",
+        _ => "so",
+    };
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    pattern
+        .replace("{name}", name)
+        .replace("{arch}", std::env::consts::ARCH)
+        .replace("{os}", os)
+        .replace("{ext}", ext)
+}
+
+/// In a local Rust plugin directory, the build for this host named by its
+/// `asset_pattern`, when present.
+fn local_platform_asset(dir: &Path, plugin_toml: &PluginToml) -> Option<PathBuf> {
+    let pattern = plugin_toml.rust.as_ref()?.asset_pattern.as_deref()?;
+    let path = dir.join(platform_asset_name(&plugin_toml.plugin.name, pattern));
+    path.is_file().then_some(path)
+}
+
 /// Resolves [`PluginSpec`] entries to concrete local file paths.
 ///
 /// Stateless apart from the base directory; clone freely.
@@ -857,6 +884,12 @@ impl PluginResolver {
                             package_root: canonical,
                         });
                     }
+                    // A directory of per-platform builds named by the
+                    // release `asset_pattern`: one manifest entry serves
+                    // every runner's OS and architecture.
+                    if let Some(binary) = local_platform_asset(&canonical, &plugin_toml) {
+                        return Ok(ResolvedPlugin::Cdylib { path: binary });
+                    }
                     return Err(ResolverError::BadPluginToml {
                         url: plugin_toml_path.display().to_string(),
                         source: crate::loadable::plugin_toml::PluginTomlError::RustPluginWrongPath,
@@ -1373,6 +1406,60 @@ mod tests {
         let resolver = PluginResolver::new(tmp.path());
         let resolved = resolver.resolve(&sh("./plugins/libfoo.so")).unwrap();
         assert_eq!(resolved, plugin_file);
+    }
+
+    #[test]
+    fn local_rust_plugin_directory_picks_this_platforms_build() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("whisper-litert");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.toml"),
+            "[plugin]\nname = \"whisper-litert\"\nversion = \"0.1.0\"\nlanguage = \"rust\"\n\n\
+             [rust]\nnode_types = [\"WhisperLiteRtNode\"]\nasset_pattern = \"lib{name}-{arch}-{os}.{ext}\"\n",
+        )
+        .unwrap();
+        let resolver = PluginResolver::new(tmp.path());
+        let spec = sh("./whisper-litert");
+
+        // No build for this platform: still the "Rust plugins load from a
+        // file" error.
+        let none = futures::executor::block_on(resolver.resolve_async(&spec)).unwrap_err();
+        assert!(
+            matches!(none, ResolverError::BadPluginToml { .. }),
+            "{none:?}"
+        );
+
+        let mine = dir.join(platform_asset_name(
+            "whisper-litert",
+            "lib{name}-{arch}-{os}.{ext}",
+        ));
+        std::fs::write(&mine, b"x").unwrap();
+        std::fs::write(dir.join("libwhisper-litert-riscv64-plan9.so"), b"x").unwrap();
+        match futures::executor::block_on(resolver.resolve_async(&spec)).unwrap() {
+            ResolvedPlugin::Cdylib { path } => assert_eq!(path, mine.canonicalize().unwrap()),
+            other => panic!("expected a cdylib, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn platform_asset_names_follow_the_release_convention() {
+        let name = platform_asset_name("x", "lib{name}-{arch}-{os}.{ext}");
+        let expected_ext = if cfg!(windows) {
+            "dll"
+        } else if cfg!(target_os = "macos") {
+            "dylib"
+        } else {
+            "so"
+        };
+        assert!(
+            name.starts_with(&format!("libx-{}-", std::env::consts::ARCH)),
+            "{name}"
+        );
+        assert!(name.ends_with(&format!(".{expected_ext}")), "{name}");
+        if cfg!(target_os = "macos") {
+            assert!(name.contains("-darwin."), "{name}");
+        }
     }
 
     #[test]
