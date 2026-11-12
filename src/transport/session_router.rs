@@ -2517,6 +2517,8 @@ impl SessionRouter {
             if node_ref.has_background() {
                 let body_node = Arc::clone(&node);
                 let body_ctx = bound_ctx.clone();
+                let (body_tel, body_control, body_node_id) =
+                    (tel.clone(), control.clone(), main_node_id.clone());
                 children.add_fallible(
                     "background",
                     tokio::spawn(
@@ -2526,7 +2528,18 @@ impl SessionRouter {
                             if emitter.is_closed() {
                                 return Ok(());
                             }
-                            body_node.background(&body_ctx).await?;
+                            if let Err(error) = body_node.background(&body_ctx).await {
+                                // Observers learn which node failed, as for
+                                // a failed call, before the session ends.
+                                crate::telemetry::publisher::record_node_error(
+                                    &body_tel,
+                                    Some(node_idx),
+                                    body_control.as_deref(),
+                                    &body_node_id,
+                                    &format!("background body failed: {error}"),
+                                );
+                                return Err(error);
+                            }
                             // A self-driven node has finished producing.
                             emitter.body_finished();
                             Ok(())

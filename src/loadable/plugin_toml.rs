@@ -157,6 +157,11 @@ pub struct PluginPythonMapped {
     /// Optional output-copy negotiation; a capability request, not permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_copy_protocol: Option<u16>,
+    /// Background calls (openspec: add-source-node-lifecycle): the worker
+    /// runs a node's `background()` in one long-lived call and delivers
+    /// `emit` on it. Requires client and buffer wheels that support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_protocol: Option<u16>,
     #[serde(default)]
     pub snapshot_inputs: Vec<String>,
     #[serde(default)]
@@ -211,6 +216,11 @@ pub struct PluginNativeWorker {
     pub snapshot_inputs: Vec<String>,
     #[serde(default)]
     pub snapshot_outputs: Vec<String>,
+    /// Background calls (openspec: add-source-node-lifecycle): the worker
+    /// runs its node's body in one long-lived call. Declare it only for a
+    /// worker built against a plugin SDK that has the protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_protocol: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -428,6 +428,9 @@ impl NodeRuntimeContextRead for NodeRuntimeContext {
     fn emitter_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
         Some(&self.emitter)
     }
+    fn emit_handle(&self) -> Option<Arc<dyn remotemedia_traits::emit::Emit>> {
+        Some(Arc::new(self.emitter.clone()))
+    }
     fn finish_source(&self) -> crate::Result<()> {
         NodeRuntimeContext::finish_source(self)
     }

@@ -107,6 +107,15 @@ fn configure_factory(
     let factory = factory
         .with_snapshot_inputs(worker.snapshot_inputs.clone())?
         .with_snapshot_outputs(worker.snapshot_outputs.clone())?;
+    let factory = match worker.background_protocol {
+        None => factory,
+        Some(1) => factory.with_background(),
+        Some(version) => {
+            return Err(Error::ConfigError(format!(
+                "mapped native background protocol {version} is unsupported; expected 1"
+            )))
+        }
+    };
     let factory = if let Some(declaration) = worker.buffer_contract.clone() {
         factory.with_buffer_contract(move |_, protocol| Ok(Some(declaration.bind(protocol))))
     } else {
