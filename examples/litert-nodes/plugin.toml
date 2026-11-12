@@ -1,0 +1,26 @@
+# LiteRT nodes as a Rust cdylib plugin.
+#
+# A directory holding this file and one build per platform, named by
+# `asset_pattern`, works as a local plugin on every host:
+#
+#   litert-nodes/
+#     plugin.toml
+#     liblitert-nodes-aarch64-android.so    (cargo build --target aarch64-linux-android)
+#     liblitert-nodes-x86_64-windows.dll
+#     liblitert-nodes-x86_64-linux.so
+#
+#   "plugins": [{ "path": "./plugins/litert-nodes", "node_types": ["WhisperLiteRtNode"] }]
+#
+# The LiteRT runtime is not bundled: the node loads it when it starts
+# (`runtime_lib` param or REMOTEMEDIA_LITERT_LIB; LiteRT-LM's litert-lm.dll on
+# Windows, the liblitert_lm.so an Android app ships).
+
+[plugin]
+name        = "litert-nodes"
+version     = "0.1.0"
+language    = "rust"
+description = "Whisper speech-to-text on LiteRT (TFLite), the same model on Android and desktop"
+
+[rust]
+node_types    = ["WhisperLiteRtNode"]
+asset_pattern = "lib{name}-{arch}-{os}.{ext}"

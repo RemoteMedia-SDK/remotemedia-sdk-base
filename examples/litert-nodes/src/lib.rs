@@ -1,28 +1,26 @@
-//! LiteRT/TFLite-backed RemoteMedia nodes for Android and mobile targets.
+//! LiteRT (TFLite) nodes for RemoteMedia.
 //!
-//! This crate provides reusable Rust implementations of LiteRT/TFLite model nodes,
-//! including shared model loading, signature runner invocation, tensor marshaling,
-//! audio preprocessing, and a Whisper ASR implementation.
+//! `WhisperLiteRtNode` runs a Whisper model exported to TFLite with `encode`
+//! and `decode` signatures (e.g. `whisper_tiny_30s_f32.tflite`). By default it
+//! compiles the model for the GPU with LiteRT's CompiledModel API (`npu` and
+//! `npu,gpu` ask for the NPU; `cpu` uses the TFLite interpreter on XNNPACK).
+//! The runtime library is loaded when the node starts, not linked: on Android
+//! LiteRT's `libLiteRt.so` with its GPU accelerator and NPU dispatch
+//! libraries beside it, on Windows LiteRT-LM's `litert-lm.dll`. The same
+//! model and node run on a phone and on a PC, so a unit holding it can move
+//! between them.
+//!
+//! Built as a loadable plugin (`plugin_export!`), and as a library for the
+//! `whisper-litert` command that transcribes a WAV file.
 
-#[cfg(feature = "whisper")]
+pub mod backend;
+pub mod compiled;
+pub mod litert;
+pub mod mel;
+pub mod node;
+pub mod tokenizer;
 pub mod whisper;
 
-mod audio_preprocessing;
-mod error;
-mod litert_ffi;
-mod litert_model;
-mod litert_session;
-mod tensor_marshaling;
-mod tokenizer;
+pub use whisper::{Transcript, Whisper, WhisperConfig};
 
-pub use error::{LiteRtError, Result};
-pub use litert_model::{LiteRtModel, LiteRtModelConfig};
-pub use litert_session::{LiteRtSession, SessionConfig, SignatureRunner};
-pub use tensor_marshaling::{TensorSpec, TensorValidator, TensorMarshaler};
-pub use audio_preprocessing::{AudioPreprocessor, ResampleConfig, LogMelConfig};
-
-#[cfg(feature = "loadable-export")]
-mod loadable_export;
-
-#[cfg(test)]
-mod tests;
+remotemedia_plugin_sdk::plugin_export!(node::WhisperLiteRtFactory);
