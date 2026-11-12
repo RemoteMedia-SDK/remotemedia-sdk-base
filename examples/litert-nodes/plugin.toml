@@ -9,18 +9,20 @@
 #     liblitert-nodes-x86_64-windows.dll
 #     liblitert-nodes-x86_64-linux.so
 #
-#   "plugins": [{ "path": "./plugins/litert-nodes", "node_types": ["WhisperLiteRtNode"] }]
+#   "plugins": [{ "path": "./plugins/litert-nodes",
+#                 "node_types": ["WhisperLiteRtNode", "GemmaAssistantNode", "KokoroTtsNode"] }]
 #
-# The LiteRT runtime is not bundled: the node loads it when it starts
-# (`runtime_lib` param or REMOTEMEDIA_LITERT_LIB; LiteRT-LM's litert-lm.dll on
-# Windows, the liblitert_lm.so an Android app ships).
+# The runtimes are not bundled: each node loads its library when it starts
+# (`runtime_lib`, or REMOTEMEDIA_LITERT_LIB / REMOTEMEDIA_LITERT_LM_LIB):
+# LiteRT's libLiteRt.so on Android, LiteRT-LM's liblitert-lm.so (Android) or
+# litert-lm.dll (Windows). See README.md.
 
 [plugin]
 name        = "litert-nodes"
 version     = "0.1.0"
 language    = "rust"
-description = "Whisper speech-to-text on LiteRT (TFLite), the same model on Android and desktop"
+description = "Whisper speech-to-text, a Gemma voice assistant (LiteRT-LM) and Kokoro text-to-speech on LiteRT, the same models on Android and desktop"
 
 [rust]
-node_types    = ["WhisperLiteRtNode"]
+node_types    = ["WhisperLiteRtNode", "GemmaAssistantNode", "KokoroTtsNode"]
 asset_pattern = "lib{name}-{arch}-{os}.{ext}"

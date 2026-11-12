@@ -9,6 +9,7 @@ use std::sync::Arc;
 use libloading::Library;
 
 use crate::backend::Backend;
+use crate::compiled::ModelSource;
 
 type Ptr = *mut c_void;
 
@@ -25,6 +26,8 @@ pub struct Api {
     _lib: Library,
     pub source: String,
     model_create_from_file: unsafe extern "C" fn(*const c_char) -> Ptr,
+    model_create: unsafe extern "C" fn(*const c_void, usize) -> Ptr,
+    tensor_type: unsafe extern "C" fn(Ptr) -> i32,
     model_delete: unsafe extern "C" fn(Ptr),
     options_create: unsafe extern "C" fn() -> Ptr,
     options_delete: unsafe extern "C" fn(Ptr),
@@ -34,6 +37,7 @@ pub struct Api {
     interpreter_delete: unsafe extern "C" fn(Ptr),
     signature_runner: unsafe extern "C" fn(Ptr, *const c_char) -> Ptr,
     runner_allocate: unsafe extern "C" fn(Ptr) -> i32,
+    runner_resize: unsafe extern "C" fn(Ptr, *const c_char, *const i32, i32) -> i32,
     runner_input: unsafe extern "C" fn(Ptr, *const c_char) -> Ptr,
     runner_output: unsafe extern "C" fn(Ptr, *const c_char) -> Ptr,
     runner_invoke: unsafe extern "C" fn(Ptr) -> i32,
@@ -43,6 +47,63 @@ pub struct Api {
     xnnpack_options_default: unsafe extern "C" fn() -> XnnPackOptions,
     xnnpack_create: unsafe extern "C" fn(*const XnnPackOptions) -> Ptr,
     xnnpack_delete: unsafe extern "C" fn(Ptr),
+    ops: Option<OperatorFns>,
+}
+
+/// The TFLite operator API, for registering the BiLSTM custom op.
+#[derive(Clone, Copy)]
+struct OperatorFns {
+    create: unsafe extern "C" fn(i32, *const c_char, i32, Ptr) -> Ptr,
+    delete: unsafe extern "C" fn(Ptr),
+    set_invoke: unsafe extern "C" fn(Ptr, unsafe extern "C" fn(Ptr, Ptr) -> i32),
+    add: unsafe extern "C" fn(Ptr, Ptr),
+    num_inputs: unsafe extern "C" fn(Ptr) -> i32,
+    input: unsafe extern "C" fn(Ptr, Ptr, i32) -> Ptr,
+    output: unsafe extern "C" fn(Ptr, Ptr, i32) -> Ptr,
+    data: unsafe extern "C" fn(Ptr) -> Ptr,
+    byte_size: unsafe extern "C" fn(Ptr) -> usize,
+    num_dims: unsafe extern "C" fn(Ptr) -> i32,
+    dim: unsafe extern "C" fn(Ptr, i32) -> i32,
+}
+
+static OPERATOR_FNS: std::sync::OnceLock<OperatorFns> = std::sync::OnceLock::new();
+const BUILTIN_CUSTOM: i32 = 32;
+
+unsafe extern "C" fn bilstm_invoke(context: Ptr, node: Ptr) -> i32 {
+    let Some(f) = OPERATOR_FNS.get().copied() else {
+        return 1;
+    };
+    if (f.num_inputs)(node) != crate::bilstm::INPUTS as i32 {
+        return 1;
+    }
+    let dims = |t: Ptr| -> Vec<usize> {
+        (0..(f.num_dims)(t)).map(|i| (f.dim)(t, i) as usize).collect()
+    };
+    let tensors: Vec<Ptr> = (0..crate::bilstm::INPUTS as i32)
+        .map(|i| (f.input)(context, node, i))
+        .collect();
+    if tensors.iter().any(|t| t.is_null() || (f.data)(*t).is_null()) {
+        return 1;
+    }
+    let (x, w_hh) = (dims(tensors[0]), dims(tensors[4]));
+    if x.len() != 3 || w_hh.len() != 2 {
+        return 1;
+    }
+    let ins: [&[u8]; crate::bilstm::INPUTS] = std::array::from_fn(|i| {
+        std::slice::from_raw_parts((f.data)(tensors[i]) as *const u8, (f.byte_size)(tensors[i]))
+    });
+    let out = (f.output)(context, node, 0);
+    if out.is_null() || (f.data)(out).is_null() {
+        return 1;
+    }
+    let out = std::slice::from_raw_parts_mut((f.data)(out) as *mut u8, (f.byte_size)(out));
+    match crate::bilstm::run(ins, out, [x[0], x[1], x[2]], w_hh[1]) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("[litert] {e}");
+            1
+        }
+    }
 }
 
 /// Library names tried when none is given.
@@ -98,6 +159,8 @@ impl Api {
     unsafe fn resolve(lib: Library, source: &str) -> Result<Self, String> {
         Ok(Self {
             model_create_from_file: sym!(lib, "TfLiteModelCreateFromFile"),
+            model_create: sym!(lib, "TfLiteModelCreate"),
+            tensor_type: sym!(lib, "TfLiteTensorType"),
             model_delete: sym!(lib, "TfLiteModelDelete"),
             options_create: sym!(lib, "TfLiteInterpreterOptionsCreate"),
             options_delete: sym!(lib, "TfLiteInterpreterOptionsDelete"),
@@ -107,6 +170,7 @@ impl Api {
             interpreter_delete: sym!(lib, "TfLiteInterpreterDelete"),
             signature_runner: sym!(lib, "TfLiteInterpreterGetSignatureRunner"),
             runner_allocate: sym!(lib, "TfLiteSignatureRunnerAllocateTensors"),
+            runner_resize: sym!(lib, "TfLiteSignatureRunnerResizeInputTensor"),
             runner_input: sym!(lib, "TfLiteSignatureRunnerGetInputTensor"),
             runner_output: sym!(lib, "TfLiteSignatureRunnerGetOutputTensor"),
             runner_invoke: sym!(lib, "TfLiteSignatureRunnerInvoke"),
@@ -116,6 +180,22 @@ impl Api {
             xnnpack_options_default: sym!(lib, "TfLiteXNNPackDelegateOptionsDefault"),
             xnnpack_create: sym!(lib, "TfLiteXNNPackDelegateCreate"),
             xnnpack_delete: sym!(lib, "TfLiteXNNPackDelegateDelete"),
+            ops: (|| -> Result<OperatorFns, String> {
+                Ok(OperatorFns {
+                    create: sym!(lib, "TfLiteOperatorCreate"),
+                    delete: sym!(lib, "TfLiteOperatorDelete"),
+                    set_invoke: sym!(lib, "TfLiteOperatorSetInvoke"),
+                    add: sym!(lib, "TfLiteInterpreterOptionsAddOperator"),
+                    num_inputs: sym!(lib, "TfLiteOpaqueNodeNumberOfInputs"),
+                    input: sym!(lib, "TfLiteOpaqueNodeGetInput"),
+                    output: sym!(lib, "TfLiteOpaqueNodeGetOutput"),
+                    data: sym!(lib, "TfLiteOpaqueTensorData"),
+                    byte_size: sym!(lib, "TfLiteOpaqueTensorByteSize"),
+                    num_dims: sym!(lib, "TfLiteOpaqueTensorNumDims"),
+                    dim: sym!(lib, "TfLiteOpaqueTensorDim"),
+                })
+            })()
+            .ok(),
             source: source.to_string(),
             _lib: lib,
         })
@@ -128,13 +208,28 @@ pub struct Interpreter {
     model: Ptr,
     delegate: Ptr,
     interpreter: Ptr,
+    operator: Ptr,
+    _owner: Option<Arc<dyn Send + Sync>>,
 }
 
 impl Interpreter {
     pub fn load(api: Arc<Api>, model_path: &str, threads: i32) -> Result<Self, String> {
-        let path = CString::new(model_path).map_err(|e| e.to_string())?;
+        Self::load_source(api, ModelSource::File(model_path.to_string()), threads)
+    }
+
+    pub fn load_source(api: Arc<Api>, source: ModelSource, threads: i32) -> Result<Self, String> {
+        let (model, owner, model_path) = match source {
+            ModelSource::File(path) => {
+                let c = CString::new(path.as_str()).map_err(|e| e.to_string())?;
+                (unsafe { (api.model_create_from_file)(c.as_ptr()) }, None, path)
+            }
+            ModelSource::Buffer { owner, ptr, len } => (
+                unsafe { (api.model_create)(ptr as *const c_void, len) },
+                Some(owner),
+                format!("<{len}-byte buffer>"),
+            ),
+        };
         unsafe {
-            let model = (api.model_create_from_file)(path.as_ptr());
             if model.is_null() {
                 return Err(format!("cannot load model {model_path}"));
             }
@@ -143,6 +238,22 @@ impl Interpreter {
             let delegate = (api.xnnpack_create)(&xnn);
             let options = (api.options_create)();
             (api.options_set_num_threads)(options, threads);
+            // Kokoro's acoustic model needs the BiLSTM custom op; models
+            // without it ignore the registration.
+            let mut operator: Ptr = std::ptr::null_mut();
+            if let Some(ops) = api.ops {
+                let _ = OPERATOR_FNS.set(ops);
+                operator = (ops.create)(
+                    BUILTIN_CUSTOM,
+                    c"litert_custom_op.bidirectional_lstm".as_ptr(),
+                    1,
+                    std::ptr::null_mut(),
+                );
+                if !operator.is_null() {
+                    (ops.set_invoke)(operator, bilstm_invoke);
+                    (ops.add)(options, operator);
+                }
+            }
             if !delegate.is_null() {
                 (api.options_add_delegate)(options, delegate);
             }
@@ -160,6 +271,8 @@ impl Interpreter {
                 model,
                 delegate,
                 interpreter,
+                operator,
+                _owner: owner,
             })
         }
     }
@@ -192,6 +305,9 @@ impl Drop for Interpreter {
             (self.api.interpreter_delete)(self.interpreter);
             if !self.delegate.is_null() {
                 (self.api.xnnpack_delete)(self.delegate);
+            }
+            if let (Some(ops), false) = (self.api.ops, self.operator.is_null()) {
+                (ops.delete)(self.operator);
             }
             (self.api.model_delete)(self.model);
         }
@@ -230,6 +346,35 @@ impl Signature {
         Ok(self.tensor(name, true)?.1)
     }
 
+    /// Bytes and `TfLiteType` of an input or output.
+    pub fn info(&self, name: &str, input: bool) -> Result<(usize, u32), String> {
+        let cname = CString::new(name).map_err(|e| e.to_string())?;
+        unsafe {
+            let tensor = if input {
+                (self.api.runner_input)(self.runner, cname.as_ptr())
+            } else {
+                (self.api.runner_output)(self.runner, cname.as_ptr())
+            };
+            if tensor.is_null() {
+                return Err(format!("'{}' has no tensor '{name}'", self.key));
+            }
+            Ok((
+                (self.api.tensor_byte_size)(tensor),
+                (self.api.tensor_type)(tensor) as u32,
+            ))
+        }
+    }
+
+    pub fn bytes_mut(&mut self, name: &str) -> Result<&mut [u8], String> {
+        let (data, bytes) = self.tensor(name, true)?;
+        Ok(unsafe { std::slice::from_raw_parts_mut(data, bytes) })
+    }
+
+    pub fn output_bytes(&self, name: &str) -> Result<&[u8], String> {
+        let (data, bytes) = self.tensor(name, false)?;
+        Ok(unsafe { std::slice::from_raw_parts(data as *const u8, bytes) })
+    }
+
     /// An input tensor's buffer as `T` (f32 or i32), checked against `len`.
     pub fn input_mut<T: Copy>(&mut self, name: &str, len: usize) -> Result<&mut [T], String> {
         let (data, bytes) = self.tensor(name, true)?;
@@ -246,6 +391,24 @@ impl Signature {
     pub fn output_f32(&self, name: &str) -> Result<&[f32], String> {
         let (data, bytes) = self.tensor(name, false)?;
         Ok(unsafe { std::slice::from_raw_parts(data as *const f32, bytes / 4) })
+    }
+
+    /// New shapes for inputs, then reallocation.
+    pub fn resize(&mut self, shapes: &[(&str, &[i32])]) -> Result<(), String> {
+        unsafe {
+            for (name, dims) in shapes {
+                let cname = CString::new(*name).map_err(|e| e.to_string())?;
+                let status =
+                    (self.api.runner_resize)(self.runner, cname.as_ptr(), dims.as_ptr(), dims.len() as i32);
+                if status != 0 {
+                    return Err(format!("'{}' cannot resize '{name}' to {dims:?}", self.key));
+                }
+            }
+            if (self.api.runner_allocate)(self.runner) != 0 {
+                return Err(format!("'{}' cannot reallocate after resizing", self.key));
+            }
+        }
+        Ok(())
     }
 
     pub fn invoke(&mut self) -> Result<(), String> {
@@ -278,9 +441,18 @@ impl TfLiteBackend {
         threads: i32,
         signatures: &[&str],
     ) -> Result<Self, String> {
+        Self::load_source(lib, ModelSource::File(model_path.to_string()), threads, signatures)
+    }
+
+    pub fn load_source(
+        lib: Option<&str>,
+        model: ModelSource,
+        threads: i32,
+        signatures: &[&str],
+    ) -> Result<Self, String> {
         let api = Api::load(lib)?;
         let source = api.source.clone();
-        let interpreter = Interpreter::load(api, model_path, threads)?;
+        let interpreter = Interpreter::load_source(api, model, threads)?;
         let mut map = HashMap::new();
         for key in signatures {
             map.insert(key.to_string(), interpreter.signature(key)?);
@@ -299,6 +471,9 @@ impl TfLiteBackend {
             .ok_or_else(|| format!("no signature '{key}'"))
     }
 }
+
+// The interpreter is used by one thread at a time (the model's own thread).
+unsafe impl Send for TfLiteBackend {}
 
 impl Backend for TfLiteBackend {
     fn input_len(&self, signature: &str, input: &str) -> Result<usize, String> {
@@ -354,5 +529,37 @@ impl Backend for TfLiteBackend {
             "{} (TFLite interpreter, XNNPACK CPU, {} threads)",
             self.source, self.threads
         )
+    }
+
+    fn tensor_info(&self, signature: &str, name: &str, output: bool) -> Result<(usize, u32), String> {
+        self.signatures
+            .get(signature)
+            .ok_or_else(|| format!("no signature '{signature}'"))?
+            .info(name, !output)
+    }
+
+    fn write_bytes(&mut self, signature: &str, input: &str, data: &[u8]) -> Result<(), String> {
+        let dst = self.signature(signature)?.bytes_mut(input)?;
+        if data.len() > dst.len() {
+            return Err(format!(
+                "'{signature}' input '{input}' is {} bytes, got {}",
+                dst.len(),
+                data.len()
+            ));
+        }
+        dst[..data.len()].copy_from_slice(data);
+        dst[data.len()..].fill(0);
+        Ok(())
+    }
+
+    fn resize_inputs(&mut self, signature: &str, shapes: &[(&str, &[i32])]) -> Result<(), String> {
+        self.signature(signature)?.resize(shapes)
+    }
+
+    fn read_bytes(&mut self, signature: &str, output: &str, out: &mut Vec<u8>) -> Result<(), String> {
+        let src = self.signature(signature)?.output_bytes(output)?;
+        out.clear();
+        out.extend_from_slice(src);
+        Ok(())
     }
 }

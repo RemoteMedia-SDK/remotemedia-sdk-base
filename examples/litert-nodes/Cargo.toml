@@ -3,7 +3,7 @@ name = "remotemedia-litert-nodes"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "LiteRT (TFLite) nodes for RemoteMedia: Whisper speech-to-text that runs the same model on Android and desktop"
+description = "LiteRT nodes for RemoteMedia: Whisper speech-to-text, Gemma (LiteRT-LM) chat and Kokoro text-to-speech, the same models on Android and desktop"
 repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk-base"
 publish = false
 
@@ -18,6 +18,21 @@ crate-type = ["cdylib", "rlib"]
 name = "whisper-litert"
 path = "src/bin/whisper_litert.rs"
 
+[[bin]]
+name = "kokoro-litert"
+path = "src/bin/kokoro_litert.rs"
+required-features = ["kokoro"]
+
+[[bin]]
+name = "gemma-litert"
+path = "src/bin/gemma_litert.rs"
+
+[features]
+default = ["kokoro"]
+# Kokoro text-to-speech: compiles LiteRT-LM's English phonemizer (C++) with
+# Abseil, so the build needs CMake, Ninja and a C++ compiler.
+kokoro = []
+
 [dependencies]
 # Same plugin SDK checkout as the host runner, so the plugin ABI matches.
 remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk" }
@@ -29,7 +44,15 @@ serde_json = "1"
 libloading = "0.8"
 rustfft = "6"
 futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
 hound = "3.5"
+memmap2 = "0.9"
+regex = "1"
+matrixmultiply = { version = "0.3", features = ["threading"] }
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"
 
 [profile.release]
 debug = false

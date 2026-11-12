@@ -1,26 +1,44 @@
-//! LiteRT (TFLite) nodes for RemoteMedia.
+//! LiteRT nodes for RemoteMedia: the same models on an Android phone's GPU
+//! and on a desktop CPU, so a unit holding them can move between the two.
 //!
-//! `WhisperLiteRtNode` runs a Whisper model exported to TFLite with `encode`
-//! and `decode` signatures (e.g. `whisper_tiny_30s_f32.tflite`). By default it
-//! compiles the model for the GPU with LiteRT's CompiledModel API (`npu` and
-//! `npu,gpu` ask for the NPU; `cpu` uses the TFLite interpreter on XNNPACK).
-//! The runtime library is loaded when the node starts, not linked: on Android
-//! LiteRT's `libLiteRt.so` with its GPU accelerator and NPU dispatch
-//! libraries beside it, on Windows LiteRT-LM's `litert-lm.dll`. The same
-//! model and node run on a phone and on a PC, so a unit holding it can move
-//! between them.
+//! * `WhisperLiteRtNode`: Whisper (TFLite) speech-to-text, on LiteRT's
+//!   CompiledModel API (GPU / NPU) or the TFLite interpreter (`cpu`).
+//! * `GemmaAssistantNode`: a voice assistant for a room, on LiteRT-LM's C API
+//!   (`lm`), e.g. Gemma 4 E2B.
+//! * `KokoroTtsNode` (feature `kokoro`): Kokoro-82M text-to-speech from its
+//!   `.litertlm` bundle (`container`, `kokoro`), with the bundle's
+//!   BiLSTM custom op (`bilstm`) and LiteRT-LM's English phonemizer (C++).
+//!
+//! Runtime libraries are loaded when a node starts, not linked: on Android
+//! LiteRT's `libLiteRt.so` (with its GPU accelerator beside it) and
+//! LiteRT-LM's `liblitert-lm.so`, on Windows LiteRT-LM's `litert-lm.dll`.
 //!
 //! Built as a loadable plugin (`plugin_export!`), and as a library for the
-//! `whisper-litert` command that transcribes a WAV file.
+//! `whisper-litert`, `gemma-litert` and `kokoro-litert` commands.
 
+pub mod assistant;
 pub mod backend;
+pub mod bilstm;
 pub mod compiled;
+pub mod container;
+#[cfg(feature = "kokoro")]
+pub mod kokoro;
 pub mod litert;
+pub mod lm;
 pub mod mel;
 pub mod node;
 pub mod tokenizer;
+#[cfg(feature = "kokoro")]
+pub mod tts_node;
 pub mod whisper;
 
 pub use whisper::{Transcript, Whisper, WhisperConfig};
 
-remotemedia_plugin_sdk::plugin_export!(node::WhisperLiteRtFactory);
+#[cfg(feature = "kokoro")]
+remotemedia_plugin_sdk::plugin_export!(
+    node::WhisperLiteRtFactory,
+    assistant::GemmaAssistantFactory,
+    tts_node::KokoroTtsFactory,
+);
+#[cfg(not(feature = "kokoro"))]
+remotemedia_plugin_sdk::plugin_export!(node::WhisperLiteRtFactory, assistant::GemmaAssistantFactory);

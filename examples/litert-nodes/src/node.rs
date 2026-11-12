@@ -50,7 +50,7 @@ pub struct WhisperLiteRtNode {
 }
 
 /// `${NAME}` → the variable's value.
-fn expand(value: &str) -> String {
+pub(crate) fn expand(value: &str) -> String {
     let mut out = String::new();
     let mut rest = value;
     while let Some(start) = rest.find("${") {

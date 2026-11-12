@@ -23,4 +23,16 @@ pub trait Backend {
     ) -> Result<(), String>;
     /// What runs the model, for logs: library and accelerator.
     fn describe(&self) -> String;
+    /// Bytes of an input (`output` false) or output, and its element type
+    /// (TFLite numbering: 1 f32, 2 i32, 4 i64).
+    fn tensor_info(&self, signature: &str, name: &str, output: bool) -> Result<(usize, u32), String>;
+    /// Writes `data` at the start of an input and zeroes the rest.
+    fn write_bytes(&mut self, signature: &str, input: &str, data: &[u8]) -> Result<(), String>;
+    /// A whole output's bytes, after `invoke`.
+    fn read_bytes(&mut self, signature: &str, output: &str, out: &mut Vec<u8>) -> Result<(), String>;
+    /// Gives inputs new shapes and reallocates (outputs follow). Not every
+    /// backend or model can.
+    fn resize_inputs(&mut self, _signature: &str, _shapes: &[(&str, &[i32])]) -> Result<(), String> {
+        Err("this backend cannot resize inputs".into())
+    }
 }

@@ -59,6 +59,7 @@ struct Api {
     get_accelerator: unsafe extern "C" fn(H, usize, *mut H) -> Status,
     accelerator_name: unsafe extern "C" fn(H, *mut *const c_char) -> Status,
     create_model_from_file: unsafe extern "C" fn(H, *const c_char, *mut H) -> Status,
+    create_model_from_buffer: unsafe extern "C" fn(H, *const c_void, usize, *mut H) -> Status,
     destroy_model: unsafe extern "C" fn(H),
     num_signatures: unsafe extern "C" fn(H, *mut usize) -> Status,
     model_signature: unsafe extern "C" fn(H, usize, *mut H) -> Status,
@@ -85,7 +86,152 @@ struct Api {
     run: unsafe extern "C" fn(H, usize, usize, *mut H, usize, *mut H) -> Status,
     fully_accelerated: unsafe extern "C" fn(H, *mut bool) -> Status,
     non_cpu_fully_accelerated: unsafe extern "C" fn(H, *mut bool) -> Status,
+    add_custom_op: Option<
+        unsafe extern "C" fn(H, *const c_char, i32, *const CustomOpKernel, *mut c_void) -> Status,
+    >,
+    buffer_tensor_type: unsafe extern "C" fn(H, *mut RankedTensorType) -> Status,
+    create_opaque_options:
+        Option<unsafe extern "C" fn(*const c_char, *mut c_void, unsafe extern "C" fn(*mut c_void), *mut H) -> Status>,
+    add_opaque_options: Option<unsafe extern "C" fn(H, H) -> Status>,
 }
+
+unsafe extern "C" fn free_c_string(payload: *mut c_void) {
+    drop(CString::from_raw(payload as *mut c_char));
+}
+
+/// `LiteRtLayout`: rank and has_strides bit-fields, dimensions, strides.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Layout {
+    bits: u32,
+    dims: [i32; 8],
+    strides: [u32; 8],
+}
+
+/// `LiteRtCustomOpKernel`.
+#[repr(C)]
+pub struct CustomOpKernel {
+    init: unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> Status,
+    output_layouts: unsafe extern "C" fn(*mut c_void, usize, *const Layout, usize, *mut Layout) -> Status,
+    run: unsafe extern "C" fn(*mut c_void, usize, *const H, usize, *mut H) -> Status,
+    destroy: unsafe extern "C" fn(*mut c_void) -> Status,
+}
+
+/// What the BiLSTM kernel's callbacks need from the library.
+#[derive(Clone, Copy)]
+struct KernelFns {
+    tensor_type: unsafe extern "C" fn(H, *mut RankedTensorType) -> Status,
+    packed_size: unsafe extern "C" fn(H, *mut usize) -> Status,
+    lock: unsafe extern "C" fn(H, *mut *mut c_void, i32) -> Status,
+    unlock: unsafe extern "C" fn(H) -> Status,
+}
+
+static KERNEL_FNS: std::sync::OnceLock<KernelFns> = std::sync::OnceLock::new();
+const STATUS_ERROR: Status = 1;
+
+unsafe extern "C" fn bilstm_init(_: *mut c_void, _: *const c_void, _: usize) -> Status {
+    0
+}
+
+unsafe extern "C" fn bilstm_destroy(_: *mut c_void) -> Status {
+    0
+}
+
+unsafe extern "C" fn bilstm_output_layouts(
+    _: *mut c_void,
+    num_inputs: usize,
+    inputs: *const Layout,
+    num_outputs: usize,
+    outputs: *mut Layout,
+) -> Status {
+    if num_inputs != crate::bilstm::INPUTS || num_outputs != 1 {
+        return STATUS_ERROR;
+    }
+    let inputs = std::slice::from_raw_parts(inputs, num_inputs);
+    let (x, w_hh) = (inputs[0], inputs[4]);
+    if x.bits & 0x7f != 3 || w_hh.bits & 0x7f != 2 {
+        return STATUS_ERROR;
+    }
+    let mut out = Layout {
+        bits: 3,
+        dims: [0; 8],
+        strides: [0; 8],
+    };
+    out.dims[0] = x.dims[0];
+    out.dims[1] = x.dims[1];
+    out.dims[2] = 2 * w_hh.dims[1];
+    *outputs = out;
+    0
+}
+
+unsafe extern "C" fn bilstm_run(
+    _: *mut c_void,
+    num_inputs: usize,
+    inputs: *const H,
+    num_outputs: usize,
+    outputs: *mut H,
+) -> Status {
+    let Some(fns) = KERNEL_FNS.get().copied() else {
+        return STATUS_ERROR;
+    };
+    if num_inputs != crate::bilstm::INPUTS || num_outputs != 1 {
+        return STATUS_ERROR;
+    }
+    let inputs = std::slice::from_raw_parts(inputs, num_inputs);
+    let output = *outputs;
+    let dims = |buffer: H| -> Option<Vec<usize>> {
+        let mut ty = RankedTensorType([0; 18]);
+        if (fns.tensor_type)(buffer, &mut ty) != 0 {
+            return None;
+        }
+        let rank = (ty.0[1] & 0x7f) as usize;
+        Some((0..rank).map(|i| ty.0[2 + i] as usize).collect())
+    };
+    let (Some(x), Some(w_hh)) = (dims(inputs[0]), dims(inputs[4])) else {
+        return STATUS_ERROR;
+    };
+    if x.len() != 3 || w_hh.len() != 2 {
+        return STATUS_ERROR;
+    }
+    let mut locked: Vec<H> = Vec::new();
+    let mut slices: Vec<&[u8]> = Vec::new();
+    let mut failed = false;
+    for &buffer in inputs {
+        let mut size = 0usize;
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        if (fns.packed_size)(buffer, &mut size) != 0 || (fns.lock)(buffer, &mut ptr, LOCK_READ) != 0 {
+            failed = true;
+            break;
+        }
+        locked.push(buffer);
+        slices.push(std::slice::from_raw_parts(ptr as *const u8, size));
+    }
+    let mut status = STATUS_ERROR;
+    if !failed {
+        let mut size = 0usize;
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        if (fns.packed_size)(output, &mut size) == 0 && (fns.lock)(output, &mut ptr, LOCK_WRITE) == 0 {
+            let out = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+            let ins: [&[u8]; crate::bilstm::INPUTS] = std::array::from_fn(|i| slices[i]);
+            match crate::bilstm::run(ins, out, [x[0], x[1], x[2]], w_hh[1]) {
+                Ok(()) => status = 0,
+                Err(e) => eprintln!("[litert] {e}"),
+            }
+            (fns.unlock)(output);
+        }
+    }
+    for buffer in locked {
+        (fns.unlock)(buffer);
+    }
+    status
+}
+
+static BILSTM_KERNEL: CustomOpKernel = CustomOpKernel {
+    init: bilstm_init,
+    output_layouts: bilstm_output_layouts,
+    run: bilstm_run,
+    destroy: bilstm_destroy,
+};
 
 macro_rules! sym {
     ($lib:expr, $name:literal) => {
@@ -133,6 +279,7 @@ impl Api {
             get_accelerator: sym!(lib, "LiteRtGetAccelerator"),
             accelerator_name: sym!(lib, "LiteRtGetAcceleratorName"),
             create_model_from_file: sym!(lib, "LiteRtCreateModelFromFile"),
+            create_model_from_buffer: sym!(lib, "LiteRtCreateModelFromBuffer"),
             destroy_model: sym!(lib, "LiteRtDestroyModel"),
             num_signatures: sym!(lib, "LiteRtGetNumModelSignatures"),
             model_signature: sym!(lib, "LiteRtGetModelSignature"),
@@ -159,6 +306,13 @@ impl Api {
             run: sym!(lib, "LiteRtRunCompiledModel"),
             fully_accelerated: sym!(lib, "LiteRtCompiledModelIsFullyAccelerated"),
             non_cpu_fully_accelerated: sym!(lib, "LiteRtCompiledModelIsNonCpuFullyAccelerated"),
+            add_custom_op: lib
+                .get(b"LiteRtAddCustomOpKernelOption\0")
+                .ok()
+                .map(|s| *s),
+            buffer_tensor_type: sym!(lib, "LiteRtGetTensorBufferTensorType"),
+            create_opaque_options: lib.get(b"LiteRtCreateOpaqueOptions\0").ok().map(|s| *s),
+            add_opaque_options: lib.get(b"LiteRtAddOpaqueOptions\0").ok().map(|s| *s),
             source: source.to_string(),
             _lib: lib,
         })
@@ -192,6 +346,19 @@ struct Tensor {
     name: String,
     buffer: H,
     bytes: usize,
+    /// `LiteRtElementType` (1 f32, 2 i32, 4 i64, ...).
+    element: u32,
+}
+
+/// Where a model's bytes come from. A buffer must outlive the model, so the
+/// backend keeps its owner.
+pub enum ModelSource {
+    File(String),
+    Buffer {
+        owner: Arc<dyn Send + Sync>,
+        ptr: *const u8,
+        len: usize,
+    },
 }
 
 struct SignatureBuffers {
@@ -208,7 +375,11 @@ pub struct CompiledBackend {
     compiled: H,
     signatures: HashMap<String, SignatureBuffers>,
     description: String,
+    _owner: Option<Arc<dyn Send + Sync>>,
 }
+
+// The handles are used by one thread at a time (the model's own thread).
+unsafe impl Send for CompiledBackend {}
 
 /// Which accelerators a name asks for (`gpu`, `npu`, `cpu`, or a
 /// comma-separated list such as `npu,gpu`; the CPU is always the fallback).
@@ -237,6 +408,19 @@ impl CompiledBackend {
         model_path: &str,
         hw: i32,
         accelerator_dir: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::load_source(lib, ModelSource::File(model_path.to_string()), hw, accelerator_dir, None)
+    }
+
+    /// `gpu_options`: the GPU accelerator's options as TOML (the payload of
+    /// LiteRT's `gpu_options` opaque options), e.g. `precision = 2` (FP32)
+    /// or `buffer_storage_type = 1` (buffers instead of textures).
+    pub fn load_source(
+        lib: Option<&str>,
+        source: ModelSource,
+        hw: i32,
+        accelerator_dir: Option<&str>,
+        gpu_options: Option<&str>,
     ) -> Result<Self, String> {
         let api = Arc::new(Api::load(lib)?);
         unsafe {
@@ -267,6 +451,7 @@ impl CompiledBackend {
                 compiled: std::ptr::null_mut(),
                 signatures: HashMap::new(),
                 description: String::new(),
+                _owner: None,
             };
 
             let mut registered = Vec::new();
@@ -283,11 +468,27 @@ impl CompiledBackend {
                 }
             }
 
-            let path = CString::new(model_path).map_err(|e| e.to_string())?;
-            api.check(
-                (api.create_model_from_file)(env, path.as_ptr(), &mut this.model),
-                "LiteRtCreateModelFromFile",
-            )?;
+            match source {
+                ModelSource::File(model_path) => {
+                    let path = CString::new(model_path).map_err(|e| e.to_string())?;
+                    api.check(
+                        (api.create_model_from_file)(env, path.as_ptr(), &mut this.model),
+                        "LiteRtCreateModelFromFile",
+                    )?;
+                }
+                ModelSource::Buffer { owner, ptr, len } => {
+                    api.check(
+                        (api.create_model_from_buffer)(
+                            env,
+                            ptr as *const c_void,
+                            len,
+                            &mut this.model,
+                        ),
+                        "LiteRtCreateModelFromBuffer",
+                    )?;
+                    this._owner = Some(owner);
+                }
+            }
             api.check(
                 (api.create_options)(&mut this.options),
                 "LiteRtCreateOptions",
@@ -296,6 +497,38 @@ impl CompiledBackend {
                 (api.set_accelerators)(this.options, hw),
                 "LiteRtSetOptionsHardwareAccelerators",
             )?;
+            if let (Some(toml), true) = (gpu_options.filter(|t| !t.trim().is_empty()), hw & HW_GPU != 0) {
+                let (Some(create), Some(add)) = (api.create_opaque_options, api.add_opaque_options) else {
+                    return Err("this LiteRT library cannot take GPU options".into());
+                };
+                let payload = CString::new(toml.replace("\\n", "\n")).map_err(|e| e.to_string())?.into_raw();
+                let mut opaque: H = std::ptr::null_mut();
+                api.check(
+                    create(c"gpu_options".as_ptr(), payload as *mut c_void, free_c_string, &mut opaque),
+                    "LiteRtCreateOpaqueOptions",
+                )?;
+                api.check(add(this.options, opaque), "LiteRtAddOpaqueOptions")?;
+            }
+            // Kokoro's acoustic model needs the BiLSTM custom op; models
+            // without it ignore the registration.
+            if let Some(add) = api.add_custom_op {
+                let _ = KERNEL_FNS.set(KernelFns {
+                    tensor_type: api.buffer_tensor_type,
+                    packed_size: api.buffer_packed_size,
+                    lock: api.lock_buffer,
+                    unlock: api.unlock_buffer,
+                });
+                api.check(
+                    add(
+                        this.options,
+                        c"litert_custom_op.bidirectional_lstm".as_ptr(),
+                        1,
+                        &BILSTM_KERNEL,
+                        std::ptr::null_mut(),
+                    ),
+                    "LiteRtAddCustomOpKernelOption",
+                )?;
+            }
             api.check(
                 (api.create_compiled_model)(env, this.model, this.options, &mut this.compiled),
                 "LiteRtCreateCompiledModel",
@@ -371,6 +604,7 @@ impl CompiledBackend {
                             name: c_str(name),
                             buffer,
                             bytes,
+                            element: ty.0[0],
                         };
                         if output {
                             buffers.outputs.push(t);
@@ -438,6 +672,86 @@ impl CompiledBackend {
             std::ptr::copy_nonoverlapping(src, dst as *mut u8, bytes);
             self.api
                 .check((self.api.unlock_buffer)(t.buffer), "unlock input")
+        }
+    }
+
+    /// Bytes of an input (`output` false) or output, and its element type.
+    pub fn tensor_info(
+        &self,
+        signature: &str,
+        name: &str,
+        output: bool,
+    ) -> Result<(usize, u32), String> {
+        let t = self.tensor(signature, name, output)?;
+        Ok((t.bytes, t.element))
+    }
+
+    /// Signatures and their tensors: `(signature, inputs, outputs)`, each
+    /// tensor as `(name, bytes, element type)`.
+    pub fn layout(&self) -> Vec<(String, Vec<(String, usize, u32)>, Vec<(String, usize, u32)>)> {
+        let list = |ts: &Vec<Tensor>| {
+            ts.iter()
+                .map(|t| (t.name.clone(), t.bytes, t.element))
+                .collect::<Vec<_>>()
+        };
+        let mut out: Vec<_> = self
+            .signatures
+            .iter()
+            .map(|(key, sig)| (key.clone(), list(&sig.inputs), list(&sig.outputs)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The only signature's key (a model exported without one gets a default).
+    pub fn sole_signature(&self) -> Result<String, String> {
+        let mut keys = self.signatures.keys();
+        match (keys.next(), keys.next()) {
+            (Some(k), None) => Ok(k.clone()),
+            _ => Err(format!(
+                "expected one signature, found {}",
+                self.signatures.len()
+            )),
+        }
+    }
+
+    /// Writes `data` at the start of an input and zeroes the rest.
+    pub fn write_bytes(&self, signature: &str, input: &str, data: &[u8]) -> Result<(), String> {
+        let t = self.tensor(signature, input, false)?;
+        if data.len() > t.bytes {
+            return Err(format!(
+                "'{signature}' input '{input}' is {} bytes, got {}",
+                t.bytes,
+                data.len()
+            ));
+        }
+        unsafe {
+            let mut dst: *mut c_void = std::ptr::null_mut();
+            self.api.check(
+                (self.api.lock_buffer)(t.buffer, &mut dst, LOCK_WRITE),
+                "lock input",
+            )?;
+            let all = std::slice::from_raw_parts_mut(dst as *mut u8, t.bytes);
+            all[..data.len()].copy_from_slice(data);
+            all[data.len()..].fill(0);
+            self.api
+                .check((self.api.unlock_buffer)(t.buffer), "unlock input")
+        }
+    }
+
+    /// A whole output's bytes, after `invoke`.
+    pub fn read_bytes(&self, signature: &str, output: &str, out: &mut Vec<u8>) -> Result<(), String> {
+        let t = self.tensor(signature, output, true)?;
+        unsafe {
+            let mut src: *mut c_void = std::ptr::null_mut();
+            self.api.check(
+                (self.api.lock_buffer)(t.buffer, &mut src, LOCK_READ),
+                "lock output",
+            )?;
+            out.clear();
+            out.extend_from_slice(std::slice::from_raw_parts(src as *const u8, t.bytes));
+            self.api
+                .check((self.api.unlock_buffer)(t.buffer), "unlock output")
         }
     }
 }
@@ -508,6 +822,18 @@ impl Backend for CompiledBackend {
 
     fn describe(&self) -> String {
         self.description.clone()
+    }
+
+    fn tensor_info(&self, signature: &str, name: &str, output: bool) -> Result<(usize, u32), String> {
+        CompiledBackend::tensor_info(self, signature, name, output)
+    }
+
+    fn write_bytes(&mut self, signature: &str, input: &str, data: &[u8]) -> Result<(), String> {
+        CompiledBackend::write_bytes(self, signature, input, data)
+    }
+
+    fn read_bytes(&mut self, signature: &str, output: &str, out: &mut Vec<u8>) -> Result<(), String> {
+        CompiledBackend::read_bytes(self, signature, output, out)
     }
 }
 
