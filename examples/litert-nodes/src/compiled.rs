@@ -50,7 +50,8 @@ pub const HW_GPU: i32 = 2;
 pub const HW_NPU: i32 = 4;
 
 struct Api {
-    _lib: Library,
+    /// Never unloaded: see [`crate::litert::keep_loaded`].
+    _lib: std::mem::ManuallyDrop<Library>,
     source: String,
     status_string: unsafe extern "C" fn(Status) -> *const c_char,
     create_environment: unsafe extern "C" fn(i32, *const EnvOption, *mut H) -> Status,
@@ -314,7 +315,7 @@ impl Api {
             create_opaque_options: lib.get(b"LiteRtCreateOpaqueOptions\0").ok().map(|s| *s),
             add_opaque_options: lib.get(b"LiteRtAddOpaqueOptions\0").ok().map(|s| *s),
             source: source.to_string(),
-            _lib: lib,
+            _lib: crate::litert::keep_loaded(lib),
         })
     }
 

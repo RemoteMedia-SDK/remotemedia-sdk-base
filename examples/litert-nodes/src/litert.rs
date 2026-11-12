@@ -23,7 +23,8 @@ pub struct XnnPackOptions {
 }
 
 pub struct Api {
-    _lib: Library,
+    /// Never unloaded: see [`crate::litert::keep_loaded`].
+    _lib: std::mem::ManuallyDrop<Library>,
     pub source: String,
     model_create_from_file: unsafe extern "C" fn(*const c_char) -> Ptr,
     model_create: unsafe extern "C" fn(*const c_void, usize) -> Ptr,
@@ -104,6 +105,17 @@ unsafe extern "C" fn bilstm_invoke(context: Ptr, node: Ptr) -> i32 {
             1
         }
     }
+}
+
+/// Keeps a runtime library mapped for the rest of the process. The LiteRT
+/// runtimes register thread-local destructors on the threads that call them
+/// (the model thread, GPU worker threads); unloading the library when a
+/// session ends leaves those pointing at unmapped code, and the thread's exit
+/// then crashes the process (seen on Android: SIGSEGV in
+/// `pthread_key_clean_all` on the `litert-lm` thread). A later session's
+/// `dlopen` of the same path reuses the mapping.
+pub(crate) fn keep_loaded(lib: Library) -> std::mem::ManuallyDrop<Library> {
+    std::mem::ManuallyDrop::new(lib)
 }
 
 /// Library names tried when none is given.
@@ -197,7 +209,7 @@ impl Api {
             })()
             .ok(),
             source: source.to_string(),
-            _lib: lib,
+            _lib: crate::litert::keep_loaded(lib),
         })
     }
 }

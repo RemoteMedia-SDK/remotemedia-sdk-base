@@ -21,7 +21,8 @@ type StreamCallback = unsafe extern "C" fn(*mut c_void, *const c_void);
 const LOG_ERROR: c_int = 4;
 
 struct Api {
-    _lib: Library,
+    /// Never unloaded: see [`crate::litert::keep_loaded`].
+    _lib: std::mem::ManuallyDrop<Library>,
     source: String,
     last_error: unsafe extern "C" fn() -> *const c_char,
     set_min_log_level: unsafe extern "C" fn(c_int) -> Status,
@@ -116,7 +117,7 @@ impl Api {
             chunk_final: sym!(lib, "litert_lm_stream_chunk_is_final"),
             chunk_error: sym!(lib, "litert_lm_stream_chunk_get_error"),
             source: source.to_string(),
-            _lib: lib,
+            _lib: crate::litert::keep_loaded(lib),
         })
     }
 
