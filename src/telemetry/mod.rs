@@ -270,6 +270,23 @@ impl NodeCell {
         self.busy_us.fetch_add(elapsed_us, Relaxed);
         self.in_flight_since_us.store(0, Relaxed);
     }
+
+    /// Whether a dispatch is in flight on this node right now. Per-participant
+    /// instances share the node's cell, so this reflects the latest dispatch
+    /// to start or end among them.
+    #[inline]
+    pub fn is_busy(&self) -> bool {
+        self.in_flight_since_us.load(Relaxed) != 0
+    }
+
+    /// Frames waiting in this node's input, filter and fan-out queues (closed
+    /// queues count as empty).
+    pub fn queued(&self) -> usize {
+        [&self.q_input, &self.q_filter, &self.q_fanout]
+            .into_iter()
+            .filter_map(|probe| probe.get().and_then(|probe| probe.depth()))
+            .sum()
+    }
 }
 
 /// Per-edge counters.
@@ -457,6 +474,17 @@ impl SessionTelemetry {
     #[inline]
     pub fn edge(&self, idx: usize) -> Option<&EdgeCell> {
         self.edges.get(idx)
+    }
+
+    /// Whether the session has nothing to do: no node has a dispatch in
+    /// flight and every node queue is empty. A point-in-time reading; callers
+    /// that act on it (e.g. acknowledging that input has been fully processed)
+    /// should require it to hold for a while.
+    pub fn is_quiescent(&self) -> bool {
+        (0..self.node_ids().len()).all(|idx| {
+            let cell = self.node(idx);
+            !cell.is_busy() && cell.queued() == 0
+        })
     }
 
     pub fn edge_count(&self) -> usize {

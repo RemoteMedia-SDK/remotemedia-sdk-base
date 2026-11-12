@@ -53,7 +53,12 @@ struct Client {
 /// Announce, offer a data channel to the server, apply the answer and wait
 /// for the channel to open.
 async fn join(addr: std::net::SocketAddr, peer_id: &str) -> Client {
-    let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+    join_url(&format!("ws://{addr}"), peer_id).await
+}
+
+/// [`join`] through a signaling URL (e.g. one carrying `?room=`).
+async fn join_url(url: &str, peer_id: &str) -> Client {
+    let (mut ws, _) = connect_async(url).await.unwrap();
     let announced = request(
         &mut ws,
         "peer.announce",
@@ -243,4 +248,94 @@ async fn two_peers_in_a_room_share_one_session_with_attributed_outputs() {
     assert_eq!(bob.next().await, (Some("bob".into()), "still here".into()));
     assert!(room.is_active().await);
     bob.rtc.close().await.unwrap();
+}
+
+/// A host registers a room whose session it created itself (openspec:
+/// add-resilient-distributed-rooms, runner-hosted room): joins through
+/// `?room=` attach to that session, not one built from the server's
+/// manifest; the room outlives its last peer; ending it refuses joins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_room_is_used_for_joins_and_outlives_its_last_peer() {
+    let executor = Arc::new(
+        PipelineExecutor::with_config(ExecutorConfig {
+            transport_materialization_policy: CopyPolicy::AllowCopies,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    // The host's pipeline: an echo. The server's own manifest is empty, so a
+    // join that built a room from it would produce no output.
+    let host_manifest = Arc::new(Manifest {
+        nodes: vec![NodeManifest {
+            id: "echo".into(),
+            node_type: "PassThrough".into(),
+            params: json!({}),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let core = executor
+        .get_or_create_shared_session("host:standup".to_string(), host_manifest)
+        .await
+        .unwrap();
+    let control = executor.control_bus().get(core.session_id());
+    let room = crate::peer::SharedPipelineSession::new(core, control, false)
+        .await
+        .unwrap();
+    let hosted_session = room.session_id().to_string();
+
+    let config = Arc::new(WebRtcTransportConfig {
+        stun_servers: Vec::new(),
+        turn_servers: Vec::new(),
+        ..Default::default()
+    });
+    let state = Arc::new(SharedState::new(config, executor.clone(), Arc::new(Manifest::default())));
+    state.host_room("standup", Arc::clone(&room)).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { break };
+            let state = Arc::clone(&server_state);
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, state).await;
+            });
+        }
+    });
+    let url = format!("ws://{addr}/ws?room=standup");
+
+    let mut alice = join_url(&url, "alice").await;
+    let server_alice = state.server_peers.read().await.get("alice").cloned().unwrap();
+    assert_eq!(server_alice.session_id().await.as_deref(), Some(hosted_session.as_str()));
+    alice.say("hi").await;
+    assert_eq!(alice.next().await, (Some("alice".into()), "hi".into()));
+
+    // The last peer leaves: the hosted room stays up for the next one.
+    alice.rtc.close().await.unwrap();
+    server_alice.shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(room.is_active().await, "a hosted room outlives its last peer");
+
+    let mut bob = join_url(&url, "bob").await;
+    let server_bob = state.server_peers.read().await.get("bob").cloned().unwrap();
+    assert_eq!(server_bob.session_id().await.as_deref(), Some(hosted_session.as_str()));
+    bob.say("still here").await;
+    assert_eq!(bob.next().await, (Some("bob".into()), "still here".into()));
+
+    // Ending the room refuses later joins and leaves the session to the host.
+    assert!(state.end_room("standup").await.is_some());
+    assert!(state.room("standup").await.is_err(), "an ended room refuses joins");
+    bob.rtc.close().await.unwrap();
+    server_bob.shutdown().await.unwrap();
+    room.close().await.unwrap();
+}
+
+#[test]
+fn room_query_parameter_is_read_from_the_handshake() {
+    assert_eq!(room_from_query("room=standup"), Some("standup".into()));
+    assert_eq!(room_from_query("a=1&room=x"), Some("x".into()));
+    assert_eq!(room_from_query("room="), None);
+    assert_eq!(room_from_query("other=1"), None);
 }

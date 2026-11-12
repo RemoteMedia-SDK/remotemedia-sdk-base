@@ -24,8 +24,11 @@ use std::time::SystemTime;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{
-    accept_async,
-    tungstenite::{Message, Result as WsResult},
+    accept_hdr_async,
+    tungstenite::{
+        handshake::server::{Request as HandshakeRequest, Response as HandshakeResponse},
+        Message, Result as WsResult,
+    },
 };
 use tracing::{debug, error, info, warn};
 
@@ -44,6 +47,9 @@ pub struct WsPeerConnection {
     pub metadata: HashMap<String, Value>,
     pub connected_at: u64,
     pub tx: mpsc::Sender<String>,
+    /// The room this peer joined: the connection's `?room=` query, else the
+    /// server's configured room (`None` when peers do not share sessions).
+    pub room: Option<String>,
 }
 
 /// Shared state across all WebSocket connections
@@ -60,6 +66,10 @@ pub struct SharedState {
     /// peer of a room joins one session as its own participant (openspec:
     /// add-multi-participant-sessions).
     pub rooms: Arc<tokio::sync::Mutex<HashMap<String, Arc<crate::peer::SharedPipelineSession>>>>,
+    /// Rooms whose session the host created and registered with
+    /// [`SharedState::host_room`]. The server never creates or replaces their
+    /// session; a peer joining one that has ended is refused.
+    pub hosted_rooms: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SharedState {
@@ -87,6 +97,7 @@ impl SharedState {
             manifest,
             event_tx,
             rooms: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            hosted_rooms: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -96,13 +107,57 @@ impl SharedState {
         self.config.shared_session_key.as_deref().filter(|key| !key.is_empty())
     }
 
-    /// The live shared session of room `key`, created on first use and again
-    /// after the previous one ended (it closes when its last peer leaves).
+    /// The room a connection joins: the `?room=` it asked for, else the
+    /// server's configured room.
+    pub fn room_for_connection(&self, requested: Option<&str>) -> Option<String> {
+        requested
+            .filter(|key| !key.is_empty())
+            .or(self.room_key())
+            .map(str::to_string)
+    }
+
+    /// Serve `room` as room `key`. The host owns the session: it was created
+    /// (and usually wired up) before any peer joins, peers attach to it as
+    /// participants, and it is not closed when its last peer leaves; build it
+    /// with `close_when_empty = false`. Replaces a previous room of that key.
+    pub async fn host_room(&self, key: &str, room: Arc<crate::peer::SharedPipelineSession>) {
+        self.hosted_rooms
+            .lock()
+            .expect("hosted rooms lock")
+            .insert(key.to_string());
+        self.rooms.lock().await.insert(key.to_string(), room);
+        info!("Hosting room '{}'", key);
+    }
+
+    /// Stop serving hosted room `key`. The key stays reserved, so later joins
+    /// are refused rather than given a new session; the session itself is the
+    /// host's to close. Returns the room's session.
+    pub async fn end_room(&self, key: &str) -> Option<Arc<crate::peer::SharedPipelineSession>> {
+        self.rooms.lock().await.remove(key)
+    }
+
+    fn is_hosted(&self, key: &str) -> bool {
+        self.hosted_rooms
+            .lock()
+            .expect("hosted rooms lock")
+            .contains(key)
+    }
+
+    /// The live shared session of room `key`. A hosted room's session is the
+    /// host's ([`Self::host_room`]). Any other room's session is created on
+    /// first use and again after the previous one ended (it closes when its
+    /// last peer leaves).
     pub async fn room(
         &self,
         key: &str,
     ) -> crate::Result<Arc<crate::peer::SharedPipelineSession>> {
         let mut rooms = self.rooms.lock().await;
+        if self.is_hosted(key) {
+            return match rooms.get(key) {
+                Some(room) if room.is_active().await => Ok(Arc::clone(room)),
+                _ => Err(crate::Error::InternalError(format!("Room '{key}' has ended"))),
+            };
+        }
         if let Some(room) = rooms.get(key) {
             if room.is_active().await {
                 return Ok(Arc::clone(room));
@@ -135,7 +190,17 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
     let addr = stream.peer_addr()?;
     info!("New WebSocket connection from: {}", addr);
 
-    let ws_stream = accept_async(stream).await?;
+    // The handshake's `?room=<key>` picks the room this connection joins.
+    let mut requested_room: Option<String> = None;
+    let ws_stream = accept_hdr_async(
+        stream,
+        |request: &HandshakeRequest, response: HandshakeResponse| {
+            requested_room = request.uri().query().and_then(room_from_query);
+            Ok(response)
+        },
+    )
+    .await?;
+    let connection_room = state.room_for_connection(requested_room.as_deref());
 
     let (ws_tx, ws_rx) = ws_stream.split();
 
@@ -177,6 +242,7 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
                     &peer_id_clone,
                     &tx_clone,
                     &control_state,
+                    connection_room.as_deref(),
                 )
                 .await
                 {
@@ -234,10 +300,15 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
         }
 
         // Remove from peers
-        state.peers.write().await.remove(&peer_id);
+        let room = state
+            .peers
+            .write()
+            .await
+            .remove(&peer_id)
+            .and_then(|peer| peer.room);
 
-        // Broadcast peer left
-        broadcast_peer_left(&state, &peer_id).await;
+        // Broadcast peer left to the rest of its room
+        broadcast_peer_left(&state, &peer_id, room.as_deref()).await;
     }
 
     forward_task.abort();
@@ -262,6 +333,7 @@ async fn handle_message(
     peer_id: &Arc<RwLock<Option<String>>>,
     tx: &mpsc::Sender<String>,
     control_state: &Arc<ControlSessionState>,
+    connection_room: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Parse JSON-RPC request
     let request: Request<'_> = match serde_json::from_str(text) {
@@ -318,7 +390,7 @@ async fn handle_message(
     };
     match request.method.as_str() {
         "peer.announce" => {
-            handle_announce(request, state, peer_id, tx).await?;
+            handle_announce(request, state, peer_id, tx, connection_room).await?;
         }
         "peer.offer" => {
             handle_offer(request, state, peer_id, tx).await?;
@@ -333,7 +405,7 @@ async fn handle_message(
             handle_disconnect(request, state, tx).await?;
         }
         "peer.list" | "list_peers" => {
-            handle_list_peers(request, state, tx).await?;
+            handle_list_peers(request, state, tx, connection_room).await?;
         }
         "server.info" => {
             handle_server_info(request, tx).await?;
@@ -357,6 +429,7 @@ async fn handle_announce(
     state: &Arc<SharedState>,
     peer_id_ref: &Arc<RwLock<Option<String>>>,
     tx: &mpsc::Sender<String>,
+    connection_room: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let request_id = request.id.clone().unwrap_or(json!(null));
 
@@ -375,8 +448,12 @@ async fn handle_announce(
         return Ok(());
     }
 
-    // Get list of existing peers
-    let other_peers: Vec<String> = peers.keys().cloned().collect();
+    // Get list of existing peers in the same room
+    let other_peers: Vec<String> = peers
+        .values()
+        .filter(|peer| peer.room.as_deref() == connection_room)
+        .map(|peer| peer.peer_id.clone())
+        .collect();
 
     // Register peer
     let peer_conn = WsPeerConnection {
@@ -385,6 +462,7 @@ async fn handle_announce(
         metadata: params.user_data.clone().unwrap_or_default(),
         connected_at: current_timestamp(),
         tx: tx.clone(),
+        room: connection_room.map(str::to_string),
     };
 
     peers.insert(params.peer_id.clone(), peer_conn);
@@ -398,12 +476,17 @@ async fn handle_announce(
 
     drop(peers);
 
-    // Emit peer connected event for FFI integration
+    // Emit peer connected event for FFI integration. The peer's room rides
+    // along as `__room__` so hosts serving several rooms can tell them apart.
+    let mut event_metadata = params.user_data.clone().unwrap_or_default();
+    if let Some(room) = connection_room {
+        event_metadata.insert("__room__".to_string(), json!(room));
+    }
     state
         .emit_event(WebRtcEventBridge::peer_connected(
             params.peer_id.clone(),
             params.capabilities.clone(),
-            params.user_data.clone().unwrap_or_default(),
+            event_metadata,
         ))
         .await;
 
@@ -425,6 +508,7 @@ async fn handle_announce(
         &params.peer_id,
         &params.capabilities,
         &params.user_data,
+        connection_room,
     )
     .await;
 
@@ -522,7 +606,14 @@ async fn handle_offer(
         };
 
         // Handle offer and get SDP answer: in a room, join its shared session.
-        let answered = match state.room_key() {
+        let peer_room = state
+            .peers
+            .read()
+            .await
+            .get(&from_peer_id)
+            .map(|peer| peer.room.clone())
+            .unwrap_or_else(|| state.room_key().map(str::to_string));
+        let answered = match peer_room.as_deref() {
             Some(key) => match state.room(key).await {
                 Ok(room) => server_peer.handle_offer_with_shared_session(params.sdp, room).await,
                 Err(e) => Err(e),
@@ -948,6 +1039,7 @@ async fn handle_list_peers(
     request: JsonRpcRequest,
     state: &Arc<SharedState>,
     tx: &mpsc::Sender<String>,
+    connection_room: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let request_id = request.id.clone().unwrap_or(json!(null));
 
@@ -955,6 +1047,7 @@ async fn handle_list_peers(
 
     let peer_list: Vec<Value> = peers
         .values()
+        .filter(|peer| peer.room.as_deref() == connection_room)
         .map(|peer| {
             json!({
                 "peer_id": peer.peer_id,
@@ -1021,6 +1114,7 @@ async fn broadcast_peer_joined(
     peer_id: &str,
     capabilities: &[String],
     metadata: &Option<HashMap<String, Value>>,
+    room: Option<&str>,
 ) {
     let notification = json!({
         "jsonrpc": "2.0",
@@ -1039,14 +1133,14 @@ async fn broadcast_peer_joined(
 
     let peers = state.peers.read().await;
     for (id, peer) in peers.iter() {
-        if id != peer_id {
+        if id != peer_id && peer.room.as_deref() == room {
             let _ = peer.tx.send(msg.clone()).await;
         }
     }
 }
 
 /// Broadcast peer left notification
-async fn broadcast_peer_left(state: &Arc<SharedState>, peer_id: &str) {
+async fn broadcast_peer_left(state: &Arc<SharedState>, peer_id: &str, room: Option<&str>) {
     let notification = json!({
         "jsonrpc": "2.0",
         "method": "peer.left",
@@ -1061,9 +1155,17 @@ async fn broadcast_peer_left(state: &Arc<SharedState>, peer_id: &str) {
     };
 
     let peers = state.peers.read().await;
-    for peer in peers.values() {
+    for peer in peers.values().filter(|peer| peer.room.as_deref() == room) {
         let _ = peer.tx.send(msg.clone()).await;
     }
+}
+
+/// The `room` parameter of a handshake query string (`a=1&room=standup`).
+fn room_from_query(query: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "room" && !value.is_empty()).then(|| value.to_string())
+    })
 }
 
 /// Get current Unix timestamp
