@@ -13,6 +13,11 @@
 //!
 //! Output, as the reply streams (JSON):
 //!
+//! * `{"kind": "assistant", "state": "listening", "to", "for_ms"}`: a bare
+//!   "Hey Pixel"; it waits `for_ms` for the question;
+//! * `{"kind": "assistant", "state": "thinking", "reply", "to"}`: a reply has
+//!   started generating (the page shows the assistant thinking until the
+//!   first sentence);
 //! * `{"kind": "assistant", "say": "<sentence>", "reply": "<id>", "to": "<name>"}`:
 //!   one complete sentence, for text-to-speech and for the page;
 //! * `{"kind": "assistant", "text": "<reply>", "reply": "<id>", "done": true,
@@ -304,12 +309,15 @@ impl GemmaAssistantNode {
             .unwrap()
             .send(Job { prompt, pieces: tx })
             .map_err(|_| Error::Execution("the model thread is gone".into()))?;
+        callback(RuntimeData::Json(json!({
+            "kind": "assistant", "state": "thinking", "reply": reply, "to": speaker,
+        })))?;
 
         let start = Instant::now();
         let mut first_ms = None;
         let mut sentences = Sentences::first_clause();
         let mut full = String::new();
-        let mut outputs = 0;
+        let mut outputs = 1;
         let mut say = |sentence: String, outputs: &mut usize, callback: &mut F| -> Result<(), Error> {
             eprintln!(
                 "[{NODE_TYPE}] reply {reply} +{:.0} ms: {sentence}",
@@ -398,7 +406,9 @@ impl AsyncStreamingNode for GemmaAssistantNode {
         let Some(text) = line_text(&data) else {
             return Ok(0);
         };
+        let mut callback = callback;
         let speaker = speaker_name(ctx);
+        let addressed = self.addressed(&text);
         let said = {
             let mut room = self.room.lock().unwrap();
             room.pending.push_back(format!("{speaker}: {text}"));
@@ -410,7 +420,7 @@ impl AsyncStreamingNode for GemmaAssistantNode {
                 .remove(&speaker)
                 .filter(|(at, _)| at.elapsed() <= self.config.follow_up)
                 .map(|(_, name)| format!("{name} {text}"));
-            match self.addressed(&text) {
+            match addressed {
                 Addressed::Yes => Some(text.clone()),
                 Addressed::NameOnly => {
                     room.waiting.insert(speaker.clone(), (Instant::now(), text.clone()));
@@ -420,6 +430,14 @@ impl AsyncStreamingNode for GemmaAssistantNode {
             }
         };
         let Some(said) = said else {
+            if matches!(addressed, Addressed::NameOnly) {
+                // Shown on the page while it waits for the question.
+                callback(RuntimeData::Json(json!({
+                    "kind": "assistant", "state": "listening", "to": speaker,
+                    "for_ms": self.config.follow_up.as_millis() as u64,
+                })))?;
+                return Ok(1);
+            }
             return Ok(0);
         };
         self.reply(&speaker, &said, callback).await

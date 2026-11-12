@@ -47,9 +47,14 @@ turn detection often ends a turn there, so the same speaker's next line within
 `follow_up_secs` counts as addressed.
 
 The reply streams as it is generated, one complete sentence at a time (the
-first may end at a comma, so speech can start sooner):
+first may end at a comma, so speech can start sooner). Before it, activity
+events let a page show what the assistant is doing: `listening` when a line
+was only its name (it waits `for_ms` for the question), `thinking` when a
+reply starts generating.
 
 ```json
+{"kind": "assistant", "state": "listening", "to": "alice", "for_ms": 8000}
+{"kind": "assistant", "state": "thinking", "reply": "9183-7", "to": "alice"}
 {"kind": "assistant", "say": "The Pacific is the largest ocean.", "reply": "9183-7", "to": "alice"}
 {"kind": "assistant", "text": "<the whole reply>", "reply": "9183-7", "to": "alice", "done": true, "first_ms": 669, "total_ms": 3340}
 ```
