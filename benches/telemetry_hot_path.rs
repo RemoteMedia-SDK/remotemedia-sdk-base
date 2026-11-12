@@ -40,6 +40,7 @@ fn telemetry() -> SessionTelemetry {
             to: "b".into(),
             from_port: None,
             to_port: None,
+            edge_transport: None,
         }],
         ..Default::default()
     };

@@ -443,6 +443,13 @@ pub struct Connection {
     /// the connection is a streaming mpsc or a snapshot read handle.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub to_port: Option<String>,
+
+    /// How this connection crosses between processes when a distributed
+    /// deployment splits the pipeline there: `"media"` (an RTP media track)
+    /// or `"data"` (a data channel carrying each frame with its metadata).
+    /// `None` leaves the choice to the deployment. Ignored in one process.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub edge_transport: Option<String>,
 }
 
 fn default_required() -> bool {
