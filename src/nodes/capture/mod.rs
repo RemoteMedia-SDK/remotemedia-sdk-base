@@ -11,6 +11,12 @@
 //! ticks it from the moment it starts; each tick emits the newest frame if
 //! one arrived since the last tick. A consumer that falls behind therefore
 //! gets fewer, current frames instead of a growing backlog.
+//!
+//! With `"delivery": "body"` the node has a background body instead of a
+//! clock (openspec: add-source-node-lifecycle): the body wakes when the
+//! capture thread publishes a frame and emits it at once. A frame then waits
+//! for no tick, and the newest-frame behaviour is the same: while an emit
+//! waits on a slow consumer, the slot keeps only the latest frame.
 
 use crate::capabilities::{
     CapabilityBehavior, ConstraintValue, MediaCapabilities, MediaConstraints,
@@ -71,6 +77,17 @@ impl PixelOut {
     }
 }
 
+/// How a [`CaptureSourceNode`] hands frames to the pipeline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    /// The session's clock polls the slot `fps` times a second.
+    #[default]
+    Tick,
+    /// A background body emits each frame when it arrives.
+    Body,
+}
+
 /// One captured frame, already in the node's output layout.
 pub struct Frame {
     pub pixels: Vec<u8>,
@@ -85,6 +102,8 @@ pub struct FrameSlot {
     stop: AtomicBool,
     /// Frames the capture thread produced.
     captured: AtomicU64,
+    /// Wakes the node's body when a frame is published.
+    arrived: tokio::sync::Notify,
 }
 
 impl FrameSlot {
@@ -92,6 +111,8 @@ impl FrameSlot {
     pub fn put(&self, frame: Frame, captured_us: u64) {
         self.captured.fetch_add(1, Ordering::Relaxed);
         *self.latest.lock().unwrap_or_else(|p| p.into_inner()) = Some((frame, captured_us));
+        // Keeps a permit when the body is not waiting: no frame is missed.
+        self.arrived.notify_one();
     }
 
     fn take(&self) -> Option<(Frame, u64)> {
@@ -200,6 +221,7 @@ pub struct CaptureSourceNode {
     slot: Arc<FrameSlot>,
     frame_number: AtomicU64,
     started: Instant,
+    delivery: Delivery,
 }
 
 impl CaptureSourceNode {
@@ -219,6 +241,28 @@ impl CaptureSourceNode {
             slot: Arc::new(FrameSlot::default()),
             frame_number: AtomicU64::new(0),
             started: Instant::now(),
+            delivery: Delivery::Tick,
+        }
+    }
+
+    /// Deliver frames from a background body instead of the session clock.
+    pub fn with_delivery(mut self, delivery: Delivery) -> Self {
+        self.delivery = delivery;
+        self
+    }
+
+    fn video(&self, frame: Frame, captured_us: u64) -> RuntimeData {
+        RuntimeData::Video {
+            pixel_data: frame.pixels.into(),
+            width: frame.width,
+            height: frame.height,
+            format: self.out.wire(),
+            codec: None,
+            frame_number: self.frame_number.fetch_add(1, Ordering::Relaxed),
+            timestamp_us: captured_us,
+            is_keyframe: true,
+            stream_id: self.stream_id.clone(),
+            arrival_ts_us: None,
         }
     }
 
@@ -309,7 +353,33 @@ impl StreamingNode for CaptureSourceNode {
     }
 
     fn pacing_nature(&self) -> PacingNature {
-        PacingNature::SourceWall(self.fps)
+        match self.delivery {
+            Delivery::Tick => PacingNature::SourceWall(self.fps),
+            Delivery::Body => PacingNature::Reactive,
+        }
+    }
+
+    /// With a body the node is a source by declaration; on the clock it is
+    /// one because it is paced and has no upstream.
+    fn self_driven(&self) -> Option<bool> {
+        (self.delivery == Delivery::Body).then_some(true)
+    }
+
+    fn has_background(&self) -> bool {
+        self.delivery == Delivery::Body
+    }
+
+    /// Emits each frame when the capture thread publishes it. While an emit
+    /// waits on a slow consumer the slot keeps only the newest frame.
+    async fn background(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<(), Error> {
+        let emitter = crate::nodes::Emitter::for_call(ctx);
+        loop {
+            let arrived = self.slot.arrived.notified();
+            match self.slot.take() {
+                Some((frame, captured_us)) => emitter.emit(self.video(frame, captured_us)).await?,
+                None => arrived.await,
+            }
+        }
     }
 
     async fn tick(
@@ -321,19 +391,7 @@ impl StreamingNode for CaptureSourceNode {
         let Some((frame, captured_us)) = self.slot.take() else {
             return Ok(());
         };
-        let frame_number = self.frame_number.fetch_add(1, Ordering::Relaxed);
-        cb(RuntimeData::Video {
-            pixel_data: frame.pixels.into(),
-            width: frame.width,
-            height: frame.height,
-            format: self.out.wire(),
-            codec: None,
-            frame_number,
-            timestamp_us: captured_us,
-            is_keyframe: true,
-            stream_id: self.stream_id.clone(),
-            arrival_ts_us: None,
-        })
+        cb(self.video(frame, captured_us))
     }
 
     fn media_capabilities(&self) -> Option<MediaCapabilities> {
@@ -398,6 +456,173 @@ pub(crate) fn source_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{Manifest, ManifestMetadata, NodeManifest};
+    use crate::nodes::StreamingNodeFactory;
+    use crate::transport::PipelineExecutor;
+    use serde_json::Value;
+
+    /// A device that produces a small frame `fps` times a second, stamped
+    /// with its capture time. It records the node's time base.
+    struct Synthetic {
+        base: Arc<Mutex<Option<Instant>>>,
+    }
+
+    impl CaptureBackend for Synthetic {
+        fn node_type(&self) -> &'static str {
+            "SyntheticCapture"
+        }
+        fn spawn(
+            &self,
+            slot: Arc<FrameSlot>,
+            _out: PixelOut,
+            fps: u32,
+            started: Instant,
+            opened: std::sync::mpsc::Sender<OpenResult>,
+        ) {
+            *self.base.lock().unwrap() = Some(started);
+            spawn_capture_thread("synthetic-capture", move || {
+                let period = Duration::from_secs_f64(1.0 / fps as f64);
+                let mut opened = Some(opened);
+                loop {
+                    let frame_started = Instant::now();
+                    slot.put(
+                        Frame {
+                            pixels: vec![7; 64],
+                            width: 8,
+                            height: 2,
+                        },
+                        started.elapsed().as_micros() as u64,
+                    );
+                    if let Some(opened) = opened.take() {
+                        let _ = opened.send(Ok("synthetic".into()));
+                    }
+                    if !pace(&slot, period, frame_started) {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    struct SyntheticFactory {
+        base: Arc<Mutex<Option<Instant>>>,
+    }
+
+    impl StreamingNodeFactory for SyntheticFactory {
+        fn create(
+            &self,
+            node_id: String,
+            params: &Value,
+            _session_id: Option<String>,
+        ) -> Result<Box<dyn StreamingNode>, Error> {
+            let delivery: Delivery =
+                serde_json::from_value(params["delivery"].clone()).unwrap_or_default();
+            Ok(Box::new(
+                CaptureSourceNode::new(
+                    node_id,
+                    params["fps"].as_u64().unwrap_or(30) as u32,
+                    PixelOut::Rgba32,
+                    None,
+                    Box::new(Synthetic {
+                        base: self.base.clone(),
+                    }),
+                )
+                .with_delivery(delivery),
+            ))
+        }
+        fn node_type(&self) -> &str {
+            "SyntheticCapture"
+        }
+    }
+
+    fn manifest(delivery: &str, fps: u32) -> Arc<Manifest> {
+        Arc::new(Manifest {
+            version: "v1".into(),
+            metadata: ManifestMetadata {
+                name: "capture".into(),
+                ..Default::default()
+            },
+            nodes: vec![NodeManifest {
+                id: "camera".into(),
+                node_type: "SyntheticCapture".into(),
+                params: serde_json::json!({"delivery": delivery, "fps": fps}),
+                ..Default::default()
+            }],
+            connections: Vec::new(),
+            python_env: None,
+            plugins: Vec::new(),
+        })
+    }
+
+    /// Capture-to-client latency of every frame received in `run`, in
+    /// microseconds, sorted.
+    async fn latencies(delivery: &str, fps: u32, run: Duration) -> Vec<u64> {
+        let base = Arc::new(Mutex::new(None));
+        let executor = PipelineExecutor::new().unwrap();
+        executor
+            .register_factory(Arc::new(SyntheticFactory { base: base.clone() }))
+            .await;
+        let mut session = executor.create_session(manifest(delivery, fps)).await.unwrap();
+        let base = base.lock().unwrap().expect("the device started");
+        let deadline = tokio::time::Instant::now() + run;
+        let mut seen = Vec::new();
+        while let Ok(Ok(Some(output))) =
+            tokio::time::timeout_at(deadline, session.recv_output()).await
+        {
+            let RuntimeData::Video { timestamp_us, .. } = output.data else {
+                panic!("expected video")
+            };
+            seen.push((base.elapsed().as_micros() as u64).saturating_sub(timestamp_us));
+        }
+        session.close().await.unwrap();
+        seen.sort_unstable();
+        seen
+    }
+
+    fn percentile(sorted: &[u64], p: f64) -> u64 {
+        sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_delivery_modes_produce_frames_with_no_client_input() {
+        for delivery in ["tick", "body"] {
+            let seen = latencies(delivery, 30, Duration::from_millis(700)).await;
+            assert!(seen.len() >= 10, "{delivery}: {} frames", seen.len());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_body_delivers_a_frame_without_waiting_for_a_tick() {
+        // On the clock a frame waits for the next tick: up to one period.
+        // The body emits it when it arrives.
+        let body = latencies("body", 30, Duration::from_secs(1)).await;
+        assert!(
+            percentile(&body, 0.5) < 5_000,
+            "median capture-to-client latency on a body: {} us",
+            percentile(&body, 0.5)
+        );
+    }
+
+    /// The measurement of `add-source-node-lifecycle` task 7.3. Run with
+    /// `--ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "timing measurement"]
+    async fn measure_tick_polling_against_a_body() {
+        for fps in [30, 60] {
+            for delivery in ["tick", "body"] {
+                let run = Duration::from_secs(10);
+                let seen = latencies(delivery, fps, run).await;
+                println!(
+                    "capture {fps} fps, delivery {delivery:>4}: {} of ~{} frames, latency us p50 {} p95 {} max {}",
+                    seen.len(),
+                    fps as u64 * run.as_secs(),
+                    percentile(&seen, 0.5),
+                    percentile(&seen, 0.95),
+                    seen.last().copied().unwrap_or(0),
+                );
+            }
+        }
+    }
 
     #[test]
     fn rgba_is_converted_to_the_output_layout() {

@@ -51,7 +51,12 @@ pub mod video;
 pub mod video_scaler;
 
 // Self-driven video sources: screen / app window and webcam capture.
-#[cfg(any(feature = "microphone", feature = "screen-capture", feature = "webcam"))]
+#[cfg(any(
+    test,
+    feature = "microphone",
+    feature = "screen-capture",
+    feature = "webcam"
+))]
 pub mod capture;
 
 // Speaker playback sink.
