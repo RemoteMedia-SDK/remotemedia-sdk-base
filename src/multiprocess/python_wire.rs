@@ -98,8 +98,10 @@ pub fn start_signal_enabled() -> bool {
     std::env::var(START_ENV).map_or(true, |value| value != "0")
 }
 
-/// Wire type of the start signal: a frame with no payload.
-pub const START_FRAME_TYPE: u8 = 9;
+/// Wire type of the start signal: a frame with no payload. Not a data type:
+/// 1 to 9 are data and the end-of-input marker, 10 and 11 exist on the mapped
+/// transport.
+pub const START_FRAME_TYPE: u8 = 12;
 
 /// The start signal for a worker of `session_id`.
 pub fn start_frame(session_id: &str) -> Vec<u8> {
