@@ -176,10 +176,6 @@ dashmap = "6.1"
 hyper = { version = "1.1", features = ["full"] }
 http-body-util = { version = "0.1", optional = true }
 
-# Force vendored OpenSSL to avoid system version mismatch (OPENSSL_API_COMPAT error)
-openssl = { version = "0.10", features = ["vendored"] }
-openssl-sys = { version = "0.9", features = ["vendored"] }
-
 # Plugin resolver deps (Phase 1C). flate2 for Python source-load
 # tarball decompression. `tar`/`toml` are already declared above
 # unconditionally. Declared BEFORE the
@@ -240,6 +236,14 @@ bytes = { version = "1.0", optional = true }
 hyper = { version = "1.1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 glob = { version = "0.3", optional = true }
+
+# Force vendored OpenSSL to avoid system version mismatch (OPENSSL_API_COMPAT
+# error) for crates that link it transitively. Nothing in this crate calls
+# OpenSSL, so Android builds (where it would need a Unix perl and make on the
+# build host) leave it out.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [dev-dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "." }
