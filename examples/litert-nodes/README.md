@@ -76,6 +76,44 @@ move are told apart.
 | `respond` | `mention` | `mention` or `all` |
 | `follow_up_secs` | 8 | how long a bare "Hey Pixel" waits for its question |
 | `system_prompt` | built in | asks for one to three short spoken sentences |
+| `publish` | unset | `room`: run as a room agent (below) |
+
+### As a room agent
+
+With `"publish": "room"` the node runs in an agent's own session, between a
+`RoomSourceNode` and a `RoomSinkNode` (`GemmaAssistantNode -> KokoroTtsNode ->
+RoomSinkNode` for the voice), and speaks the participant link's frames instead
+of the `assistant` messages above.
+
+It reads room-log lines (`{"kind": "text" | "voice", "text", "seq",
+"author_kind"}`, attributed to their author by `participant.id` and
+`participant.display_name`) and answers people's lines by the same rules.
+Lines of agents are context and are never answered, whatever `respond` says.
+Lines with `"history": true` are context too: its own (an agent author whose
+display name or id is `name`, in any case) are kept under `name`, and a
+speaker whose last history line was only the name is waiting for their
+question again, for `follow_up_secs` from the moment that line arrives.
+
+```json
+{"kind": "presence", "state": "listening", "to": "alice"}
+{"kind": "presence", "state": "thinking", "reply": "9183-7", "to": "alice", "line": 41}
+{"kind": "text", "text": "The Pacific is the largest ocean.", "say": "The Pacific is the largest ocean.", "reply": "9183-7"}
+{"kind": "presence", "state": "idle", "reply": "9183-7"}
+```
+
+`line` is the `seq` of the line being answered (of the question, when it
+followed a bare name); it is left out when the line had none. The room posts
+`text`; `KokoroTtsNode` speaks `say`. There is no message with the whole
+reply.
+
+`{"kind": "reply_interrupted", "reply"}` and `{"kind": "floor", "event":
+"refused", "reason": "chain_limit", "reply"}` stop that reply if it is still
+being generated: nothing more is published for it, the model is cancelled, and
+the next reply starts a new conversation that is given the last 24 lines. The
+runtime hands a node one input at a time, so a frame that arrives while a
+reply is being generated is read only after that reply has ended, and then
+changes nothing. Other frames (`floor` granted, waiting, not_held or refused
+for `floor_busy`, `turn`, `presence`) are ignored.
 
 ## KokoroTtsNode
 
