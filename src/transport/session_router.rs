@@ -2798,7 +2798,11 @@ impl SessionRouter {
                 // means it had no state to clear.
                 if let Some(port) = aux_port_of(&input) {
                     if port == BARGE_IN_PORT {
-                        if let Err(e) = node_ref.process_control_message(input, &bound_ctx).await {
+                        // The barge is attributed like any input: the node
+                        // can tell whose start it stands for.
+                        let mut control_ctx = bound_ctx.clone();
+                        control_ctx.origin = origin.clone();
+                        if let Err(e) = node_ref.process_control_message(input, &control_ctx).await {
                             tracing::debug!(
                                 node_id = %main_node_id,
                                 "process_control_message(barge_in) error (ignored): {}",
