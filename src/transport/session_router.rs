@@ -117,6 +117,9 @@ pub struct ClientOutputRouter {
     audio_tx: mpsc::Sender<TransportData>,
     video_tx: mpsc::Sender<TransportData>,
     data_tx: mpsc::Sender<TransportData>,
+    /// Set on the handle of a sink whose outputs go only to the participant
+    /// whose input produced them (`deliver: "author"`).
+    to_author: bool,
 }
 
 /// Owning consumer end of a [`ClientOutputRouter`]: three receivers, one per
@@ -141,6 +144,7 @@ impl ClientOutputRouter {
                 audio_tx,
                 video_tx,
                 data_tx,
+                to_author: false,
             },
             ClientOutputReceivers {
                 audio_rx,
@@ -148,6 +152,19 @@ impl ClientOutputRouter {
                 data_rx,
             },
         )
+    }
+
+    /// This handle for a sink that delivers to the author only: each of its
+    /// outputs is addressed (`participant.to`) to the participant whose input
+    /// produced it, and an output nobody's input produced to nobody.
+    pub fn to_author(mut self) -> Self {
+        self.to_author = true;
+        self
+    }
+
+    /// Whether outputs sent through this handle are addressed to their author.
+    pub fn is_to_author(&self) -> bool {
+        self.to_author
     }
 
     /// Route one piece of sink output to the channel for its kind.
@@ -1905,7 +1922,21 @@ impl SessionRouter {
                 .unwrap_or_else(|| self.output_allocator.clone());
             let materialization = self.node_materialization.context(&node_id)?;
             let client = if is_sink || is_output_node {
-                Some(self.output_router.clone())
+                // `deliver: "author"` on a client-facing node: what it produces
+                // is for the participant whose input it came from.
+                let to_author = self
+                    .manifest
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == node_id)
+                    .and_then(|n| n.params.get("deliver"))
+                    .and_then(|deliver| deliver.as_str())
+                    == Some("author");
+                Some(if to_author {
+                    self.output_router.clone().to_author()
+                } else {
+                    self.output_router.clone()
+                })
             } else {
                 None
             };
@@ -2280,8 +2311,17 @@ impl SessionRouter {
                         };
                         let egress_start = std::time::Instant::now();
                         let edge = egress_edge.and_then(|e| tel.edge(e));
-                        // Attributed to the participant whose input produced it.
-                        let kept = Routed::new(kept, origin).into_transport();
+                        // Attributed to the participant whose input produced it,
+                        // and, on a sink that delivers to the author, for it alone.
+                        let author = out_router
+                            .is_to_author()
+                            .then(|| origin.as_deref().map(|origin| origin.id().to_string()).unwrap_or_default());
+                        let mut kept = Routed::new(kept, origin).into_transport();
+                        if let Some(author) = author {
+                            kept.metadata
+                                .entry(crate::transport::data::participant::TO.to_string())
+                                .or_insert(author);
+                        }
                         let res = match out_router.try_send(kept) {
                             Ok(()) => Ok(()),
                             Err(mpsc::error::TrySendError::Full(v)) => {

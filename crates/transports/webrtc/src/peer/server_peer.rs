@@ -557,7 +557,17 @@ impl SharedPipelineSession {
                     continue;
                 }
 
+                // An addressed output (`participant.to`) goes to the peers it
+                // names; any other output goes to every peer. The frame itself
+                // is shared: addressing costs no copy.
+                let recipients = participant::recipients(&transport_data.metadata)
+                    .map(|to| to.into_iter().map(str::to_string).collect::<Vec<_>>());
                 for target in targets {
+                    if let Some(to) = &recipients {
+                        if !to.iter().any(|id| id == &target.dispatcher.peer_id) {
+                            continue;
+                        }
+                    }
                     #[cfg(feature = "ws-signaling")]
                     if let Some(ref tx) = target.event_tx {
                         let event = WebRtcEventBridge::pipeline_output_with_context(
