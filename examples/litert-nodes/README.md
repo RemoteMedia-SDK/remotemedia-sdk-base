@@ -106,14 +106,20 @@ followed a bare name); it is left out when the line had none. The room posts
 `text`; `KokoroTtsNode` speaks `say`. There is no message with the whole
 reply.
 
-`{"kind": "reply_interrupted", "reply"}` and `{"kind": "floor", "event":
-"refused", "reason": "chain_limit", "reply"}` stop that reply if it is still
+`{"kind": "reply_interrupted", "reply"}` stops that reply if it is still
 being generated: nothing more is published for it, the model is cancelled, and
 the next reply starts a new conversation that is given the last 24 lines. The
 runtime hands a node one input at a time, so a frame that arrives while a
 reply is being generated is read only after that reply has ended, and then
-changes nothing. Other frames (`floor` granted, waiting, not_held or refused
-for `floor_busy`, `turn`, `presence`) are ignored.
+changes nothing. Other frames (`floor` events, `turn`, `presence`) are ignored.
+
+To stop a reply while it is being generated, wire a barge to the node: an
+`InterruptNode` fed with what the session sends (a person's start signal comes
+with a subscription to that person's lines) and connected to the assistant
+and to the text-to-speech node. The runtime drops the call in flight; the
+model is cancelled, what it had said is kept in the recent lines marked
+`[interrupted before finishing]`, and the next reply starts a new
+conversation that is given those lines.
 
 ## KokoroTtsNode
 

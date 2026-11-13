@@ -60,14 +60,20 @@
 //!   the name is waiting for their question again, for `follow_up_secs` from
 //!   the moment that line arrives (history lines carry no age).
 //!   `{"kind": "history_end"}` ends the history.
-//! * `{"kind": "reply_interrupted", "reply"}` and `{"kind": "floor", "event":
-//!   "refused", "reason": "chain_limit", "reply"}`: the room no longer wants
+//! * `{"kind": "reply_interrupted", "reply"}`: the session no longer wants
 //!   that reply. If it is still being generated it stops at the next piece of
 //!   text: nothing more is published for it, the model is cancelled and a new
 //!   conversation is started, which gets the recent lines with its first
 //!   prompt. The runtime hands a node one input at a time, so a frame that
 //!   arrives while `process_streaming_with_ctx` is generating is read only
 //!   after that reply has ended, and then changes nothing.
+//!
+//! A reply is also cancelled from outside: a barge wired to this node (an
+//! `InterruptNode` fed with the start signal) makes the runtime drop the call
+//! in flight. The model is cancelled the same way, what had been generated is
+//! kept in the recent lines marked as cut off, and the next reply starts a
+//! new conversation that is given those lines: the assistant knows what it
+//! was saying and that it did not finish.
 //! * anything else (`floor` granted / waiting / not_held / refused with
 //!   `floor_busy`, `turn`, `presence`, `refused`) is ignored.
 //!
@@ -204,6 +210,33 @@ struct Room {
     waiting: HashMap<String, (Instant, String)>,
     /// The reply the room last said to stop.
     stopped: Option<String>,
+}
+
+/// What a reply has generated so far. Dropped before the reply ended (the
+/// runtime cancelled the call on a barge), it leaves that text in the room's
+/// recent lines, marked, for the conversation that is started next.
+struct Partial<'a> {
+    room: &'a std::sync::Mutex<Room>,
+    name: &'a str,
+    text: String,
+    ended: bool,
+}
+
+/// How a reply that was cut off is kept in the context.
+fn cut_off_line(name: &str, text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| format!("{name}: {text} [interrupted before finishing]"))
+}
+
+impl Drop for Partial<'_> {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        if let (Some(line), Ok(mut room)) = (cut_off_line(self.name, &self.text), self.room.lock()) {
+            room.note(line);
+        }
+    }
 }
 
 impl Room {
@@ -426,7 +459,6 @@ fn room_frame(data: &RuntimeData) -> Option<RoomFrame> {
         }
         "history_end" => Some(RoomFrame::HistoryEnd),
         "reply_interrupted" => stop(),
-        "floor" if v["event"] == "refused" && v["reason"] == "chain_limit" => stop(),
         _ => None,
     }
 }
@@ -570,7 +602,12 @@ impl GemmaAssistantNode {
         let start = Instant::now();
         let mut first_ms = None;
         let mut sentences = Sentences::first_clause();
-        let mut full = String::new();
+        let mut partial = Partial {
+            room: &self.room,
+            name: &self.config.name,
+            text: String::new(),
+            ended: false,
+        };
         let mut outputs = 1;
         let mut say = |sentence: String, outputs: &mut usize, callback: &mut F| -> Result<(), Error> {
             eprintln!(
@@ -597,7 +634,7 @@ impl GemmaAssistantNode {
             match piece {
                 Piece::Text(text) => {
                     first_ms.get_or_insert_with(|| start.elapsed().as_secs_f64() * 1000.0);
-                    full.push_str(&text);
+                    partial.text.push_str(&text);
                     for sentence in sentences.push(&text) {
                         say(sentence, &mut outputs, &mut callback)?;
                     }
@@ -618,7 +655,9 @@ impl GemmaAssistantNode {
             }
         }
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let text = full.trim().to_string();
+        // It ended here: what follows records it as it was.
+        partial.ended = true;
+        let text = partial.text.trim().to_string();
         if as_agent {
             // The sentences were the reply; what was generated of it stays
             // in the context.
@@ -840,14 +879,28 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_dropped_before_it_ended_stays_in_the_context_marked() {
+        let room = std::sync::Mutex::new(Room::default());
+        let mut partial = Partial { room: &room, name: "Pixel", text: String::new(), ended: false };
+        partial.text.push_str(" The largest ocean is ");
+        drop(partial);
+        assert_eq!(
+            room.lock().unwrap().recent.back().map(String::as_str),
+            Some("Pixel: The largest ocean is [interrupted before finishing]")
+        );
+        // A reply that ended, and one cut before any text, add nothing here.
+        let ended = Partial { room: &room, name: "Pixel", text: "done".into(), ended: true };
+        drop(ended);
+        let empty = Partial { room: &room, name: "Pixel", text: "  ".into(), ended: false };
+        drop(empty);
+        assert_eq!(room.lock().unwrap().recent.len(), 1);
+    }
+
+    #[test]
     fn room_stop_frames() {
         let stop = Some(RoomFrame::Stop("a1-2".into()));
         assert_eq!(
-            frame(json!({"kind": "reply_interrupted", "reply": "a1-2", "reason": "barge_in"})),
-            stop
-        );
-        assert_eq!(
-            frame(json!({"kind": "floor", "event": "refused", "reason": "chain_limit", "reply": "a1-2"})),
+            frame(json!({"kind": "reply_interrupted", "reply": "a1-2", "reason": "barge"})),
             stop
         );
         // Text of a reply refused for a busy floor is still posted.
