@@ -3633,6 +3633,127 @@ mod tests {
             .unwrap();
     }
 
+    /// Passes its input on; with `emit`, turns the text "barge" into a
+    /// `barge_in` envelope on its ordinary output.
+    struct BargeRelayNode {
+        emit: bool,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::nodes::AsyncStreamingNode for BargeRelayNode {
+        fn node_type(&self) -> &str {
+            "BargeRelayNode"
+        }
+        async fn process(&self, data: RuntimeData) -> crate::Result<RuntimeData> {
+            if self.emit && matches!(&data, RuntimeData::Text(text) if text == "barge") {
+                return Ok(crate::transport::session_control::wrap_aux_port(
+                    BARGE_IN_PORT,
+                    RuntimeData::Json(serde_json::json!({})),
+                ));
+            }
+            Ok(data)
+        }
+        async fn process_control_message(
+            &self,
+            data: RuntimeData,
+            _session: Option<String>,
+        ) -> crate::Result<bool> {
+            if aux_port_of(&data).as_deref() == Some(BARGE_IN_PORT) {
+                self.stopped
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+
+    /// A barge is an ordinary frame: a node can emit it on a connection.
+    /// It stops the node it is wired to and goes no further.
+    #[tokio::test]
+    async fn a_barge_emitted_by_a_node_stops_the_next_node_only() {
+        let manifest = create_test_manifest(
+            vec![
+                ("S", "BargeRelayNode"),
+                ("A", "BlockingCloseNode"),
+                ("B", "BargeRelayNode"),
+            ],
+            vec![("S", "A"), ("A", "B")],
+        );
+        let (output, mut received) = ClientOutputRouter::new(64);
+        let (mut router, _) = SessionRouter::new(
+            "barge-graph".into(),
+            Arc::new(manifest),
+            Arc::new(StreamingNodeRegistry::new()),
+            output,
+        )
+        .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let flag = || Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (s_stopped, a_stopped, b_stopped) = (flag(), flag(), flag());
+        router.cached_nodes.insert(
+            "S".into(),
+            Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(BargeRelayNode {
+                emit: true,
+                stopped: s_stopped.clone(),
+            }))),
+        );
+        router.cached_nodes.insert(
+            "A".into(),
+            Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(
+                BlockingCloseNode {
+                    started: started.clone(),
+                    stopped: a_stopped.clone(),
+                },
+            ))),
+        );
+        router.cached_nodes.insert(
+            "B".into(),
+            Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(BargeRelayNode {
+                emit: false,
+                stopped: b_stopped.clone(),
+            }))),
+        );
+        let pipeline = router.spawn_pipeline_tasks().unwrap();
+        let input = &pipeline.input_txs["S"];
+        input.send(RuntimeData::Text("start".into())).await.unwrap();
+        started.notified().await;
+        for _ in 0..8 {
+            input
+                .send(RuntimeData::Text("obsolete speech".into()))
+                .await
+                .unwrap();
+        }
+        input.send(RuntimeData::Text("barge".into())).await.unwrap();
+        input
+            .send(RuntimeData::Text("fresh speech".into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let packet = received.data_rx.recv().await.unwrap().data;
+                assert!(
+                    aux_port_of(&packet).is_none(),
+                    "the barge must not leave the node it stopped"
+                );
+                if let RuntimeData::Text(text) = packet {
+                    assert_eq!(text, "fresh speech", "cancelled queue must not replay");
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let load = |flag: &Arc<std::sync::atomic::AtomicBool>| {
+            flag.load(std::sync::atomic::Ordering::Acquire)
+        };
+        assert!(load(&a_stopped), "the wired node is stopped");
+        assert!(!load(&s_stopped), "the emitter is not");
+        assert!(!load(&b_stopped), "nor the node after the stopped one");
+        SessionRouter::teardown_pipeline_tasks(pipeline, true)
+            .await
+            .unwrap();
+    }
+
     /// A node whose `initialize` panics (cpal asserting on an unsupported
     /// sample rate, say) or never returns.
     struct InitNode {
