@@ -132,7 +132,7 @@ async fn control_forwarders_keep_session_authority_and_owners_after_shutdown() {
                 deadline_ms: 5000,
             }),
         ] {
-            dispatch_frame(ControlFrame { op: Some(op) }, &control, &tx, &tasks, &scope)
+            dispatch_frame(ControlFrame { op: Some(op) }, &control, &tx, &tasks, &scope, None)
                 .await
                 .unwrap();
         }
@@ -299,6 +299,7 @@ async fn rejected_intercept_serialization_preserves_configured_timeout_passthrou
         &tx,
         &tasks,
         &RpcCallScope::default(),
+        None,
     )
     .await
     .unwrap();

@@ -2183,7 +2183,10 @@ impl SessionRouter {
                     }
                     tel.node(node_idx).outputs.fetch_add(1, RELAXED);
                     let kept = match &fan_control {
-                        Some(ctrl) => ctrl.on_node_output(&fan_node_id, None, out).await,
+                        Some(ctrl) => {
+                            let who = origin.as_deref().map(|origin| origin.id());
+                            ctrl.on_node_output_from(&fan_node_id, None, out, who).await
+                        }
                         None => Some(out.into_shared()),
                     };
                     let Some(kept) = kept else { continue };

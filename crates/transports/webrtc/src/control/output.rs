@@ -38,6 +38,35 @@ pub(super) async fn forward_taps(
     }
 }
 
+/// [`forward_taps`] for a member that may only see its own frames: output
+/// produced from another member's input, or from nobody's, is not sent.
+pub(super) async fn forward_own_taps(
+    mut rx: tokio::sync::broadcast::Receiver<remotemedia_core::transport::session_control::AttributedTap>,
+    tx: mpsc::Sender<Outbound>,
+    address: CoreAddress,
+    copies: CopyContext,
+    member: String,
+) {
+    let addr = core_addr_to_pb(&address);
+    loop {
+        let (who, data) = match rx.recv().await {
+            Ok(frame) => frame,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        };
+        if who.as_deref() != Some(member.as_str()) {
+            continue;
+        }
+        if tx
+            .send(Outbound::tap(addr.clone(), data, &copies))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
 pub(super) async fn forward_intercepts(
     mut rx: mpsc::Receiver<CoreEvent>,
     tx: mpsc::Sender<Outbound>,
