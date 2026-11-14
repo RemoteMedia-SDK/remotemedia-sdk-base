@@ -39,6 +39,7 @@
 //! | `respond` | `mention` | `mention` or `all` |
 //! | `follow_up_secs` | 8 | how long a bare "Hey Pixel" waits for its question |
 //! | `system_prompt` | built in | |
+//! | `sentences` | `json` | `text`: each sentence is emitted as Text instead of the `say` message, for a text-to-speech node that takes Text |
 //! | `publish` | unset | `room`: run as a room agent (below) |
 //!
 //! # As a room agent (`publish: "room"`)
@@ -129,6 +130,9 @@ pub struct AssistantConfig {
     /// Run as a room agent: read the participant link's frames and publish
     /// lines and presence.
     pub publish_room: bool,
+    /// Emit each sentence as Text instead of the `say` message (not as a
+    /// room agent).
+    pub sentences_as_text: bool,
 }
 
 /// Words that do not make a line a question ("hey Pixel", "ok Pixel").
@@ -178,9 +182,16 @@ pub fn config_from_params(params: &Value) -> Result<AssistantConfig, String> {
         Some("room") => true,
         Some(other) => return Err(format!("publish must be room when set, not {other:?}")),
     };
+    let sentences_as_text = match s("sentences").as_deref() {
+        None | Some("json") => false,
+        Some("text") if publish_room => return Err("sentences: text does not apply to a room agent (publish: room)".into()),
+        Some("text") => true,
+        Some(other) => return Err(format!("sentences must be json or text, not {other:?}")),
+    };
     Ok(AssistantConfig {
         lm,
         publish_room,
+        sentences_as_text,
         system_prompt: s("system_prompt").unwrap_or_else(|| default_system(&name)),
         name,
         wake_words,
@@ -619,6 +630,9 @@ impl GemmaAssistantNode {
                 start.elapsed().as_secs_f64() * 1000.0
             );
             *outputs += 1;
+            if self.config.sentences_as_text {
+                return callback(RuntimeData::Text(sentence));
+            }
             callback(RuntimeData::Json(if as_agent {
                 sentence_line(&sentence, &reply)
             } else {
@@ -849,6 +863,20 @@ mod tests {
             history,
             agent,
         })
+    }
+
+    #[test]
+    fn sentences_param() {
+        let base = json!({"model_path": "m.litertlm"});
+        assert!(!config_from_params(&base).unwrap().sentences_as_text);
+        let mut text = base.clone();
+        text["sentences"] = json!("text");
+        assert!(config_from_params(&text).unwrap().sentences_as_text);
+        text["publish"] = json!("room");
+        assert!(config_from_params(&text).is_err());
+        let mut bad = base.clone();
+        bad["sentences"] = json!("words");
+        assert!(config_from_params(&bad).is_err());
     }
 
     #[test]

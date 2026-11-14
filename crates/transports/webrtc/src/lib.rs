@@ -95,6 +95,12 @@ mod transport;
 // Protobuf adapters
 pub mod adapters;
 
+// Admission tickets (plain Rust) and the ticket-admitting session host built
+// on the WebSocket signalling server.
+#[cfg(feature = "ws-signaling")]
+pub mod agent_host;
+pub mod agent_tickets;
+
 // Generated protobuf code
 pub mod generated {
     // Common types (DataBuffer, etc.) from remotemedia.v1 package

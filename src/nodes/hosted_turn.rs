@@ -44,6 +44,22 @@
 //! of it stays in the history, the host is told with a `turn_retracted`
 //! event, and `ui` carries a `data-turn` frame with status `retracted`. The
 //! merged transcript that follows is the one turn.
+//!
+//! # A turn cut by a unit move
+//!
+//! With host-kept history the node's unit may move to another runner. The
+//! instance that ran a turn in flight is then gone, and the new instance
+//! knows nothing of it. The host settles that turn itself, as interrupted,
+//! and calls the typed RPC `settle_turn { turn_id, spoken, member, to?,
+//! open?, heard? }` on the node. The instance that receives it sends the
+//! turn's member `abort` (unless `open` is false) and `data-turn`
+//! `interrupted` with `spoken`, as the lost instance would have, and repeats
+//! the settlement as `previous` on its next `turn` unless it settled a turn
+//! of its own first. When a turn of its own is already running, the turn's
+//! current status (`thinking` or `speaking`) follows, because a front end
+//! goes to `listening` at `interrupted`. It answers `{ settled: true }`, or `{ settled: false,
+//! reason }` with `own_turn` (the turn is this instance's, which settles it)
+//! or `already_settled`.
 
 use crate::data::{split_text_str, ControlMessageType, RuntimeData, TEXT_CHANNEL_DEFAULT};
 use crate::error::Error;
@@ -455,6 +471,19 @@ enum Cmd {
         member: String,
         instructions: Option<String>,
     },
+    /// The host's `settle_turn`: a turn an earlier instance of the node ran
+    /// was cut when its unit moved, and the host settled it.
+    SettleTurn {
+        turn_id: String,
+        spoken: String,
+        member: String,
+        /// Who is told; `None`: the node's `ui` audience for the member.
+        to: Option<Vec<String>>,
+        /// The turn's assistant message is open at the front end.
+        open: bool,
+        heard: Option<Value>,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 fn vad_flag(value: &Value, key: &str) -> Option<bool> {
@@ -757,6 +786,7 @@ impl AsyncStreamingNode for HostedTurnNode {
             "speak",
             "send_ui",
             "set_client_instructions",
+            "settle_turn",
         ]
         .into_iter()
         .map(|name| RpcMethod::new(name, RpcMode::Reply))
@@ -846,6 +876,42 @@ impl AsyncStreamingNode for HostedTurnNode {
                     .filter(|text| !text.trim().is_empty())
                     .map(str::to_string);
                 self.send(Cmd::ClientInstructions { member, instructions })
+            }
+            "settle_turn" => {
+                let turn_id = arg
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| Error::Execution("settle_turn needs a turn_id".into()))?
+                    .to_string();
+                // `member` is an id, or the member as `turn` carried it.
+                let member = match arg.get("member") {
+                    Some(Value::String(id)) => id.clone(),
+                    Some(member) => member
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    None => String::new(),
+                };
+                let (reply, done) = oneshot::channel();
+                self.send(Cmd::SettleTurn {
+                    turn_id,
+                    spoken: arg
+                        .get("spoken")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    member,
+                    to: arg.get("to").map(|to| string_list(Some(to))),
+                    open: arg.get("open").and_then(Value::as_bool).unwrap_or(true),
+                    heard: arg.get("heard").filter(|heard| heard.is_object()).cloned(),
+                    reply,
+                })?;
+                match done.await {
+                    Ok(outcome) => replies.value(outcome).await,
+                    Err(_) => Err(Error::Execution("the node stopped".into())),
+                }
             }
             "send_ui" => {
                 let Some(chunk) = arg.get("chunk").filter(|chunk| chunk.is_object()) else {
@@ -1128,6 +1194,8 @@ struct Actor {
     client_instructions: HashMap<String, String>,
     /// Each member's last settled turn of its own, by member id.
     settled: HashMap<String, Settled>,
+    /// Turns of earlier instances closed by the host's `settle_turn`.
+    settled_elsewhere: VecDeque<String>,
 }
 
 impl Actor {
@@ -1150,6 +1218,7 @@ impl Actor {
             unreported_logged: HashSet::new(),
             client_instructions: HashMap::new(),
             settled: HashMap::new(),
+            settled_elsewhere: VecDeque::new(),
         }
     }
 
@@ -1452,7 +1521,88 @@ impl Actor {
                     self.client_instructions.remove(&member);
                 }
             },
+            Cmd::SettleTurn {
+                turn_id,
+                spoken,
+                member,
+                to,
+                open,
+                heard,
+                reply,
+            } => {
+                let outcome = self.settle_elsewhere(turn_id, spoken, member, to, open, heard).await;
+                let _ = reply.send(outcome);
+            }
         }
+    }
+
+    /// The host's `settle_turn` (design D7, "In-flight turn when a unit
+    /// moves"). The instance that ran `turn_id` went away with its unit, in
+    /// the middle of the turn; the host settled the turn as interrupted with
+    /// the text that instance had accepted. This instance closes the turn at
+    /// the front end as the lost one would have (`abort` when the message is
+    /// open, then `data-turn` `interrupted`), and repeats the settlement as
+    /// `previous` on its next `turn` unless it has settled a turn of its own
+    /// since. A turn of this instance is refused: the node settles it.
+    async fn settle_elsewhere(
+        &mut self,
+        turn_id: String,
+        spoken: String,
+        member: String,
+        to: Option<Vec<String>>,
+        open: bool,
+        heard: Option<Value>,
+    ) -> Value {
+        let own = format!("{}-{}-", self.shared.node_id, self.instance);
+        if turn_id.starts_with(&own) {
+            return json!({ "settled": false, "reason": "own_turn" });
+        }
+        if self.settled_elsewhere.contains(&turn_id) {
+            return json!({ "settled": false, "reason": "already_settled" });
+        }
+        if self.settled_elsewhere.len() >= 32 {
+            self.settled_elsewhere.pop_front();
+        }
+        self.settled_elsewhere.push_back(turn_id.clone());
+        tracing::info!(
+            node = %self.shared.node_id, turn = %turn_id, %member,
+            "a turn of an earlier instance is settled as interrupted by the host"
+        );
+
+        let to = to.or_else(|| {
+            (self.config().ui == UiAudience::Member && !member.is_empty()).then(|| vec![member.clone()])
+        });
+        let who = self.members.get(&member).cloned().unwrap_or_else(|| Member::known(&member));
+        let origin = out_origin(&who, to.as_deref(), None);
+        if open {
+            self.emit(ui_frame(Some(&turn_id), json!({ "type": "abort" })), origin.clone())
+                .await;
+        }
+        let status = json!({
+            "type": "data-turn", "id": turn_id, "transient": true,
+            "data": { "status": "interrupted", "spoken": spoken },
+        });
+        self.emit(ui_frame(Some(&turn_id), status), origin).await;
+        // A front end goes to `listening` at `interrupted`. A turn of this
+        // instance that is already running says where it stands again.
+        if let Some(turn) = self.current.as_ref().filter(|turn| turn.cancelled.is_none()) {
+            let status = if turn.text_started { "speaking" } else { "thinking" };
+            self.ui_status(status).await;
+        }
+
+        if self.previous.is_none() {
+            let heard = heard.unwrap_or_else(|| {
+                let mut heard = Map::new();
+                if !member.is_empty() {
+                    heard.insert(member.clone(), spoken.clone().into());
+                }
+                Value::Object(heard)
+            });
+            self.previous = Some(json!({
+                "turn_id": turn_id, "spoken": spoken, "interrupted": true, "heard": heard,
+            }));
+        }
+        json!({ "settled": true })
     }
 
     fn can_hear(&self, to: &[String]) -> bool {

@@ -29,7 +29,12 @@ pub mod auth;
 pub mod builder;
 pub mod client;
 pub mod control;
-pub use control::{serve_control, serve_control_with_incoming, ControlServiceImpl};
+pub mod control_host;
+pub use control::{
+    serve_control, serve_control_with_host, serve_control_with_host_incoming,
+    serve_control_with_incoming, ControlServiceImpl,
+};
+pub use control_host::{ControlHost, MemberLifecycle, RuntimeControlService};
 pub mod deployment;
 pub mod execution;
 pub mod embedded_plugin;

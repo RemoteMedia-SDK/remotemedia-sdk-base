@@ -1,0 +1,178 @@
+// RuntimeControl — what an application's backend needs from a runtime it
+// does not embed (openspec: add-ai-sdk-voice-library, task 6.2).
+//
+// `PipelineControl` (control.proto) observes and steers sessions that exist.
+// This service is about what comes before and around them: admitting a
+// front-end member to a session by application key, listing and removing
+// members, ending a session, running a pipeline once, and reaching the
+// runtime's managed LLM server.
+//
+// Design choices:
+//
+//   - A service of its own, served on the same address as `PipelineControl`
+//     and behind the same bearer token (`authorization: Bearer <token>`).
+//     `PipelineControl` and its messages are unchanged, so servers that
+//     implement only that service (an Entry, an older runtime) keep
+//     compiling and answer every call here `UNIMPLEMENTED`.
+//
+//   - Each call is answered by the process hosting the runtime. A host that
+//     cannot do one of them answers `UNIMPLEMENTED` with a message naming
+//     the operation, so a client can tell exactly what a runtime does not do.
+//
+//   - Admission is a single-use ticket for the runtime's own WebSocket
+//     signalling server: the member's identity, name, metadata and control
+//     grants are the ticket's, never what the browser says about itself.
+//
+//   - RuntimeData payloads reuse `remotemedia.v1.DataBuffer` (common.proto).
+
+syntax = "proto3";
+
+package remotemedia.v1;
+
+import "common.proto";
+
+service RuntimeControl {
+  // Admit one member to the session of `(pipeline, session_key)`, starting
+  // the session if it is not running. Returns a single-use ticket.
+  rpc AdmitMember(AdmitMemberRequest) returns (AdmitMemberResponse);
+  // The application's key of a session started by `AdmitMember`. NOT_FOUND
+  // for any other session. Answers once a session start in progress has
+  // finished, so it can be called as soon as `WatchSessions` reports the id.
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  // The connected members of a session, as they were admitted.
+  rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
+  // Disconnect a member and forget its unused tickets for the session.
+  rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
+  // End a session: members are disconnected, unused tickets are forgotten.
+  rpc EndSession(EndSessionRequest) returns (EndSessionResponse);
+  // Members joining and leaving sessions started by `AdmitMember`, from the
+  // moment the stream opens (`ListMembers` gives the members already there).
+  // The first message is always `ready`.
+  rpc WatchMembers(WatchMembersRequest) returns (stream MemberEvent);
+  // Run a manifest on `inputs` in a session of its own and stream every
+  // output of its sinks; the stream ends when the pipeline has drained.
+  // Cancelling the call ends the run.
+  rpc RunPipeline(RunPipelineRequest) returns (stream RunPipelineOutput);
+  // The runtime's managed OpenAI-compatible LLM server for a model, started
+  // on demand. The address is a loopback address on the runtime's host.
+  rpc ManagedLlm(ManagedLlmRequest) returns (ManagedLlmResponse);
+}
+
+// A member of a session, as it was admitted.
+message MemberInfo {
+  // The member's identity (`participant.id`).
+  string id = 1;
+  // Display name (`participant.display_name`); empty = none.
+  string name = 2;
+  // Each entry travels as `participant.metadata.<key>`.
+  map<string, string> metadata = 3;
+}
+
+// One control grant of a ticket (Entry's grant shape).
+message MemberGrant {
+  // "tap" | "publish" | "rpc" | "intercept" | "node_state".
+  string op = 1;
+  string node = 2;
+  // `tap` only: just the output produced from the member's own input.
+  bool own = 3;
+  // `rpc` only: the methods the member may call.
+  repeated string methods = 4;
+}
+
+message AdmitMemberRequest {
+  // Name of a pipeline the runtime serves (its manifest's `metadata.name`).
+  string pipeline = 1;
+  // The application's session key: members admitted with the same key share
+  // one session.
+  string session_key = 2;
+  MemberInfo member = 3;
+  // Lifetime of the ticket in seconds (at least 1).
+  uint32 ttl_secs = 4;
+  // Empty: media and the pipeline data channel only, no control channel.
+  repeated MemberGrant grants = 5;
+}
+
+message AdmitMemberResponse {
+  // Present it as `ticket` in `peer.announce`, or as the realtime socket's
+  // token. Valid once.
+  string ticket = 1;
+  // The WebSocket signalling URL browsers connect to.
+  string signal_url = 2;
+  // The AI SDK realtime socket of the same listener; empty when the runtime
+  // serves none.
+  string realtime_url = 3;
+  // When the ticket stops being accepted (Unix milliseconds).
+  uint64 expires_at_ms = 4;
+  // The runtime id of the session the member will join.
+  string session_id = 5;
+}
+
+message GetSessionRequest { string session_id = 1; }
+
+message GetSessionResponse {
+  string session_id = 1;
+  string pipeline = 2;
+  // The application's session key.
+  string session_key = 3;
+}
+
+message ListMembersRequest { string session_id = 1; }
+message ListMembersResponse { repeated MemberInfo members = 1; }
+
+message RemoveMemberRequest {
+  string session_id = 1;
+  string member_id = 2;
+}
+// `removed` is false when the member was not connected to that session.
+message RemoveMemberResponse { bool removed = 1; }
+
+message EndSessionRequest {
+  string session_id = 1;
+  // Reported to watchers as the reason the session ended (default "ended").
+  string reason = 2;
+}
+// `ended` is false when the session is not live.
+message EndSessionResponse { bool ended = 1; }
+
+message WatchMembersRequest {}
+
+message MemberChange {
+  string session_id = 1;
+  MemberInfo member = 2;
+  // `left` only: "disconnected" | "replaced" | "removed" | "session_ended".
+  string reason = 3;
+}
+
+message WatchMembersReady {}
+
+message MemberEvent {
+  oneof event {
+    // The stream is open: members that join from now on are reported.
+    WatchMembersReady ready  = 1;
+    MemberChange      joined = 2;
+    MemberChange      left   = 3;
+  }
+}
+
+message RunPipelineRequest {
+  // The pipeline manifest as JSON.
+  string manifest_json = 1;
+  // Fed to the pipeline in order; the input then ends.
+  repeated DataBuffer inputs = 2;
+}
+
+message RunPipelineOutput { DataBuffer data = 1; }
+
+message ManagedLlmRequest {
+  // The model id (the name of a preset the runtime's host configured).
+  string model = 1;
+}
+
+message ManagedLlmResponse {
+  // OpenAI-compatible base URL (`http://127.0.0.1:<port>/v1`): a loopback
+  // address on the runtime's host.
+  string base_url = 1;
+  string api_key = 2;
+  // The model id to send in requests.
+  string model = 3;
+}

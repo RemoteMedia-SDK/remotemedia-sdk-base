@@ -76,6 +76,7 @@ move are told apart.
 | `respond` | `mention` | `mention` or `all` |
 | `follow_up_secs` | 8 | how long a bare "Hey Pixel" waits for its question |
 | `system_prompt` | built in | asks for one to three short spoken sentences |
+| `sentences` | `json` | `text`: each sentence is emitted as Text instead of the `say` message, for a text-to-speech node that takes Text (the other messages stay JSON) |
 | `publish` | unset | `room`: run as a room agent (below) |
 
 ### As a room agent

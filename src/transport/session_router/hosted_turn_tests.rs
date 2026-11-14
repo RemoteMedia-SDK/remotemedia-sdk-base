@@ -1484,6 +1484,139 @@ async fn send_ui_emits_a_frame_outside_any_turn() {
     assert!(rig.rpc("send_ui", Some(json!({ "chunk": "x" }))).await.is_err());
 }
 
+// -- a turn cut by a unit move (design D7) -------------------------------------------------------
+
+/// The unit moved mid-turn: the instance that ran the turn is gone, and the
+/// host, which settled the turn itself, has this (new) instance tell the
+/// turn's member and carry the settlement as `previous`.
+#[tokio::test]
+async fn settle_turn_closes_a_turn_of_an_earlier_instance_and_carries_it_as_previous() {
+    let mut rig = rig(json!({ "history": "host" })).await;
+    let mut host = rig.host();
+    let reply = rig
+        .rpc(
+            "settle_turn",
+            Some(json!({ "turn_id": "turn-0ld000-3", "spoken": "One. ", "member": "alice" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, json!({ "settled": true }));
+    let Out::Ui { frame, meta } = rig.next().await else { panic!("a ui frame") };
+    assert_eq!(frame, json!({ "v": 1, "turn": "turn-0ld000-3", "chunk": { "type": "abort" } }));
+    assert_eq!(meta["participant.to"], "alice");
+    let Out::Ui { frame, meta } = rig.next().await else { panic!("a ui frame") };
+    assert_eq!(
+        frame,
+        json!({ "v": 1, "turn": "turn-0ld000-3", "chunk": {
+            "type": "data-turn", "id": "turn-0ld000-3", "transient": true,
+            "data": { "status": "interrupted", "spoken": "One. " },
+        } })
+    );
+    assert_eq!(meta["participant.to"], "alice");
+
+    // Told once: a repeated call (the host retries) emits nothing.
+    let again = rig
+        .rpc(
+            "settle_turn",
+            Some(json!({ "turn_id": "turn-0ld000-3", "spoken": "One. ", "member": "alice" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again, json!({ "settled": false, "reason": "already_settled" }));
+    rig.quiet().await;
+
+    // The next `turn` repeats the settlement, like one of the node's own.
+    rig.transcript("alice", "And then?").await;
+    let request = host.answer(&["Then two."]).await;
+    assert_eq!(
+        request["previous"],
+        json!({
+            "turn_id": "turn-0ld000-3", "spoken": "One. ", "interrupted": true,
+            "heard": { "alice": "One. " },
+        })
+    );
+    rig.until_listening().await;
+}
+
+#[tokio::test]
+async fn settle_turn_leaves_this_instances_own_turns_alone() {
+    let mut rig = rig(json!({ "history": "host" })).await;
+    let mut host = rig.host();
+    rig.transcript("alice", "First?").await;
+    let (call, request) = host.turn().await;
+    let id = request["turn_id"].as_str().unwrap().to_string();
+    host.text(&call, "One. ");
+    rig.until("text-delta", None).await;
+    // The node runs this turn and settles it itself.
+    let reply = rig
+        .rpc("settle_turn", Some(json!({ "turn_id": id, "spoken": "", "member": "alice" })))
+        .await
+        .unwrap();
+    assert_eq!(reply, json!({ "settled": false, "reason": "own_turn" }));
+    rig.quiet().await;
+    host.end(&call);
+    rig.until_listening().await;
+    let settled = host.settled().await;
+    assert_eq!(settled["interrupted"], false);
+
+    // A settlement of the node's own is not replaced by an older one.
+    let reply = rig
+        .rpc("settle_turn", Some(json!({ "turn_id": "turn-0ld000-9", "spoken": "x", "member": "alice", "open": false })))
+        .await
+        .unwrap();
+    assert_eq!(reply, json!({ "settled": true }));
+    let Out::Ui { frame, .. } = rig.next().await else { panic!("a ui frame") };
+    assert_eq!(frame["chunk"]["data"]["status"], "interrupted", "no abort when the message is not open");
+    rig.transcript("alice", "Second?").await;
+    let request = host.answer(&["Again."]).await;
+    assert_eq!(request["previous"], settled);
+    rig.until_listening().await;
+
+    assert!(rig.rpc("settle_turn", Some(json!({ "spoken": "x" }))).await.is_err());
+}
+
+/// The member's next turn overtook the host's `settle_turn`: the front end,
+/// sent to `listening` by `interrupted`, is told the running turn's status.
+#[tokio::test]
+async fn settle_turn_during_a_turn_repeats_that_turns_status() {
+    let mut rig = rig(json!({ "history": "host" })).await;
+    let mut host = rig.host();
+    rig.transcript("alice", "After?").await;
+    let (call, request) = host.turn().await;
+    assert!(request.get("previous").is_none());
+    host.text(&call, "Here. ");
+    rig.until("text-delta", None).await;
+    rig.rpc("settle_turn", Some(json!({ "turn_id": "turn-0ld000-3", "spoken": "One. ", "member": "alice" })))
+        .await
+        .unwrap();
+    let outs = rig.until("data-turn", Some("speaking")).await;
+    assert_eq!(ui_types(&outs), ["abort", "data-turn:interrupted", "data-turn:speaking"]);
+    let Out::Ui { frame, .. } = &outs[2] else { panic!("a ui frame") };
+    assert_eq!(frame["turn"], request["turn_id"]);
+    host.end(&call);
+    rig.until_listening().await;
+}
+
+#[tokio::test]
+async fn settle_turn_follows_the_ui_audience() {
+    let mut rig = rig(json!({ "history": "host", "ui": "all" })).await;
+    rig.rpc("settle_turn", Some(json!({ "turn_id": "turn-0ld000-1", "spoken": "", "member": "alice" })))
+        .await
+        .unwrap();
+    let Out::Ui { meta, .. } = rig.next().await else { panic!("a ui frame") };
+    assert!(!meta.contains_key("participant.to"));
+    rig.next().await;
+    // `to` overrides it.
+    rig.rpc(
+        "settle_turn",
+        Some(json!({ "turn_id": "turn-0ld000-2", "spoken": "", "member": "alice", "to": ["bob"] })),
+    )
+    .await
+    .unwrap();
+    let Out::Ui { meta, .. } = rig.next().await else { panic!("a ui frame") };
+    assert_eq!(meta["participant.to"], "bob");
+}
+
 // -- 3.8: barge-in to host-cancel latency ---------------------------------------------------------
 
 /// From a member's speech start entering the session to the host seeing the

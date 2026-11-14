@@ -1164,3 +1164,66 @@ pub async fn serve_control_with_incoming(
         .serve_with_incoming(incoming)
         .await
 }
+
+/// [`serve_control`] plus the `RuntimeControl` service answered by `host`
+/// (admission, members, one-shot runs, the managed LLM server; openspec:
+/// add-ai-sdk-voice-library, task 6.2), on one address and behind one token.
+pub async fn serve_control_with_host(
+    addr: std::net::SocketAddr,
+    bus: Arc<SessionControlBus>,
+    token: Option<String>,
+    host: Arc<dyn crate::control_host::ControlHost>,
+) -> Result<(), tonic::transport::Error> {
+    serve_control_with_host_incoming(
+        tokio_stream::wrappers::TcpListenerStream::new(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("bind control address"),
+        ),
+        bus,
+        token,
+        host,
+    )
+    .await
+}
+
+/// Like [`serve_control_with_host`] but on a pre-bound listener stream.
+pub async fn serve_control_with_host_incoming(
+    incoming: tokio_stream::wrappers::TcpListenerStream,
+    bus: Arc<SessionControlBus>,
+    token: Option<String>,
+    host: Arc<dyn crate::control_host::ControlHost>,
+) -> Result<(), tonic::transport::Error> {
+    use crate::control_host::{RuntimeControlService, MAX_RUNTIME_CONTROL_REQUEST_BYTES};
+    use crate::generated::runtime_control_server::RuntimeControlServer;
+    let mut control = ControlServiceImpl::new(bus);
+    let mut runtime = RuntimeControlService::new(host);
+    if let Some(t) = token {
+        control = control.with_token(t.clone());
+        runtime = runtime.with_token(t);
+    }
+    use tonic::service::LayerExt as _;
+    let control = tower::ServiceBuilder::new()
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(tonic_web::GrpcWebLayer::new())
+        .into_inner()
+        .named_layer(
+            crate::generated::pipeline_control_server::PipelineControlServer::new(control),
+        );
+    let runtime = tower::ServiceBuilder::new()
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(tonic_web::GrpcWebLayer::new())
+        .into_inner()
+        .named_layer(
+            RuntimeControlServer::new(runtime)
+                .max_decoding_message_size(MAX_RUNTIME_CONTROL_REQUEST_BYTES),
+        );
+    tonic::transport::Server::builder()
+        .accept_http1(true)
+        .tcp_nodelay(true)
+        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+        .add_service(control)
+        .add_service(runtime)
+        .serve_with_incoming(incoming)
+        .await
+}
