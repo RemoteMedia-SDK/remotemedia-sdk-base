@@ -25,7 +25,9 @@ use remotemedia_core::{
     data::RuntimeData,
     manifest::Manifest,
     transport::{
-        data::participant, session_control::SessionControl, Participant, ParticipantSessionHandle,
+        data::participant, session_control::SessionControl,
+        turn_audio::{FlushTarget, TurnTag},
+        Participant, ParticipantSessionHandle,
         PipelineSessionHost, SharedPipelineOutputReceivers,
         SharedPipelineSession as CoreSharedPipelineSession, TransportData,
     },
@@ -252,6 +254,18 @@ impl PerTrackDispatcher {
         dropped
     }
 
+    /// Drop the queued audio of one turn on this peer's audio tracks
+    /// (`AudioTrack::flush_turn`).
+    async fn flush_audio_turn(&self, turn_id: &str, drop_rest: bool) -> usize {
+        let mut dropped = 0;
+        for stream_id in self.track_registry.audio_stream_ids().await {
+            if let Some(track) = self.track_registry.get_audio_track(&stream_id).await {
+                dropped += track.flush_turn(turn_id, drop_rest).await;
+            }
+        }
+        dropped
+    }
+
     async fn get_or_spawn_audio(self: &Arc<Self>, stream_id: &str) -> mpsc::Sender<TransportData> {
         let mut map = self.audio_txs.lock().await;
         if let Some(tx) = map.get(stream_id) {
@@ -268,12 +282,17 @@ impl PerTrackDispatcher {
             while let Some(td) = rx.recv().await {
                 if matches!(&td.data, RuntimeData::Json(v) if v.get("kind").and_then(|k| k.as_str()) == Some("speech_end")) {
                     if let Some(track) = registry.get_audio_track(&stream).await {
-                        if let Err(e) = track.finish_audio().await {
+                        // A `speech_end` of a turn's text chunk carries its tag.
+                        let tag = TurnTag::from_metadata(&td.metadata);
+                        if let Err(e) = track.finish_audio_tagged(tag).await {
                             warn!("audio speech_end flush failed for '{}' (peer {}): {}", stream, peer, e);
                         }
                     }
                     continue;
                 }
+                // The turn and text chunk this audio renders, as the router
+                // carried them from the text (`participant.turn_id`).
+                let turn_tag = TurnTag::from_metadata(&td.metadata);
                 let RuntimeData::Audio {
                     samples,
                     sample_rate,
@@ -310,7 +329,7 @@ impl PerTrackDispatcher {
                     first = false;
                 }
                 let res = track
-                    .send_audio_with_context(samples.into_shared(), sample_rate, &copies)
+                    .send_audio_tagged(samples.into_shared(), sample_rate, &copies, turn_tag)
                     .await;
                 let send_ms = send_start.elapsed().as_millis();
                 if let Err(e) = res {
@@ -413,6 +432,12 @@ pub struct SharedPipelineSession {
     observer_copies: remotemedia_types::CopyContext,
     output_targets: Arc<RwLock<HashMap<String, PeerOutputTarget>>>,
     close_when_empty: bool,
+    /// Members attached by another transport of this listener (the realtime
+    /// socket): they keep the session open like a peer does.
+    external_members: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Every audio flush asked of the session, for those members' transport:
+    /// `None` is the session-wide flush, `Some` a targeted one.
+    flushes: broadcast::Sender<Option<FlushTarget>>,
 }
 
 impl SharedPipelineSession {
@@ -431,6 +456,8 @@ impl SharedPipelineSession {
             observer_copies,
             output_targets: Arc::new(RwLock::new(HashMap::new())),
             close_when_empty,
+            external_members: std::sync::Mutex::new(std::collections::HashSet::new()),
+            flushes: broadcast::channel(32).0,
         });
 
         shared.spawn_output_drainers(receivers);
@@ -439,8 +466,10 @@ impl SharedPipelineSession {
             let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(4);
             ctrl.install_flush_audio_hook(flush_tx).await;
             let output_targets = Arc::clone(&shared.output_targets);
+            let flushes = shared.flushes.clone();
             tokio::spawn(async move {
                 while flush_rx.recv().await.is_some() {
+                    let _ = flushes.send(None);
                     let targets: Vec<PeerOutputTarget> =
                         output_targets.read().await.values().cloned().collect();
                     let mut dropped = 0usize;
@@ -454,6 +483,42 @@ impl SharedPipelineSession {
                             dropped
                         );
                     }
+                }
+            });
+
+            // Targeted flush (openspec: add-ai-sdk-voice-library, D11): only
+            // the named peers' tracks, only frames of the named turn.
+            let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<FlushTarget>(32);
+            ctrl.install_flush_audio_for_hook(flush_tx);
+            let output_targets = Arc::clone(&shared.output_targets);
+            let session_id = shared.session_id().to_string();
+            let flushes = shared.flushes.clone();
+            tokio::spawn(async move {
+                while let Some(target) = flush_rx.recv().await {
+                    let _ = flushes.send(Some(target.clone()));
+                    let targets: Vec<PeerOutputTarget> = output_targets
+                        .read()
+                        .await
+                        .iter()
+                        .filter(|(peer_id, _)| {
+                            target.members.is_empty() || target.members.contains(peer_id)
+                        })
+                        .map(|(_, target)| target.clone())
+                        .collect();
+                    let mut dropped = 0usize;
+                    for peer in targets {
+                        dropped += peer
+                            .dispatcher
+                            .flush_audio_turn(&target.turn_id, target.drop_rest)
+                            .await;
+                    }
+                    tracing::debug!(
+                        "[shared_pipeline_session] session {} flushed {} queued frames of turn {} for {:?}",
+                        session_id,
+                        dropped,
+                        target.turn_id,
+                        target.members
+                    );
                 }
             });
         }
@@ -475,6 +540,48 @@ impl SharedPipelineSession {
 
     pub async fn is_active(&self) -> bool {
         self.core.is_active().await
+    }
+
+    /// The session's outputs, for a transport that delivers them itself
+    /// (the realtime socket). Addressing (`participant.to`) is the
+    /// subscriber's to apply.
+    pub fn subscribe_outputs(&self) -> SharedPipelineOutputReceivers {
+        self.core.subscribe_outputs()
+    }
+
+    /// The audio flushes asked of this session: `None` for the session-wide
+    /// flush, `Some` for a targeted one. Peers' tracks are flushed here; a
+    /// transport with its own send queue subscribes.
+    pub fn subscribe_flushes(&self) -> broadcast::Receiver<Option<FlushTarget>> {
+        self.flushes.subscribe()
+    }
+
+    /// A member served by another transport joined: the session stays open
+    /// for it as for a peer.
+    pub fn attach_member(&self, member: &str) {
+        self.external_members
+            .lock()
+            .expect("external members lock")
+            .insert(member.to_string());
+    }
+
+    /// The member attached with [`Self::attach_member`] left. Closes the
+    /// session when it was the last one and the session closes when empty.
+    pub async fn detach_member(&self, member: &str) {
+        let none_left = {
+            let mut members = self.external_members.lock().expect("external members lock");
+            members.remove(member);
+            members.is_empty()
+        };
+        if self.close_when_empty && none_left && self.output_targets.read().await.is_empty() {
+            if let Err(e) = self.close().await {
+                warn!(
+                    "Error closing shared pipeline session {} after last member left: {}",
+                    self.session_id(),
+                    e
+                );
+            }
+        }
     }
 
     pub async fn attach_peer(
@@ -500,7 +607,13 @@ impl SharedPipelineSession {
         let should_close = {
             let mut targets = self.output_targets.write().await;
             targets.remove(peer_id);
-            self.close_when_empty && targets.is_empty()
+            self.close_when_empty
+                && targets.is_empty()
+                && self
+                    .external_members
+                    .lock()
+                    .expect("external members lock")
+                    .is_empty()
         };
 
         if should_close {
@@ -650,6 +763,10 @@ pub struct ServerPeer {
 
     /// The peer's display name, when the host that admitted it gave one.
     display_name: Arc<std::sync::RwLock<Option<String>>>,
+
+    /// Extra `participant.*` attribution the host that admitted the peer
+    /// gave it (`participant.metadata.<key>`).
+    participant_metadata: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 impl ServerPeer {
@@ -664,6 +781,18 @@ impl ServerPeer {
     /// handling the offer.
     pub fn set_display_name(&self, display_name: Option<String>) {
         *self.display_name.write().expect("display name lock") = display_name;
+    }
+
+    /// Attribution the peer's input carries besides its id, role and display
+    /// name: each `(key, value)` is stamped on every frame the peer sends
+    /// into a shared session, under the key as given (use
+    /// `participant.metadata.<name>` so the router carries it to the outputs
+    /// produced from that input). Call before handling the offer.
+    pub fn set_participant_metadata(&self, metadata: HashMap<String, String>) {
+        *self
+            .participant_metadata
+            .write()
+            .expect("participant metadata lock") = metadata;
     }
 
     /// Create a new server peer without event forwarding
@@ -709,6 +838,7 @@ impl ServerPeer {
             track_senders: Arc::new(RwLock::new(Vec::new())),
             control_policy: Default::default(),
             display_name: Default::default(),
+            participant_metadata: Default::default(),
         })
     }
 
@@ -757,6 +887,7 @@ impl ServerPeer {
             track_senders: Arc::new(RwLock::new(Vec::new())),
             control_policy: Default::default(),
             display_name: Default::default(),
+            participant_metadata: Default::default(),
         })
     }
 
@@ -781,6 +912,77 @@ impl ServerPeer {
             }
         }
         dropped
+    }
+
+    /// Drop the queued audio of one turn on this peer's audio tracks,
+    /// leaving other turns queued. With `drop_rest` the peer's tracks also
+    /// refuse the turn's later audio. See [`AudioTrack::flush_turn`].
+    pub async fn flush_audio_turn(&self, turn_id: &str, drop_rest: bool) -> usize {
+        let mut dropped = 0;
+        for stream_id in self.track_registry.audio_stream_ids().await {
+            if let Some(track) = self.track_registry.get_audio_track(&stream_id).await {
+                dropped += track.flush_turn(turn_id, drop_rest).await;
+            }
+        }
+        dropped
+    }
+
+    /// Publish `media_ready` for this peer on the session bus once it is
+    /// connected and its outbound audio is bound, `media_lost` when the
+    /// connection ends, and `media_ready` again if it comes back
+    /// (openspec: add-ai-sdk-voice-library, task 2.1).
+    ///
+    /// The connection state is polled: webrtc-rs keeps one state-change
+    /// handler per connection and the signalling layers install their own.
+    fn spawn_media_ready_monitor(
+        &self,
+        control: Arc<SessionControl>,
+        audio_senders: Vec<Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>>,
+    ) {
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as State;
+        let member = self.peer_id.clone();
+        let connection = self.peer_connection.connection_id().to_string();
+        let rtc = Arc::clone(self.peer_connection.peer_connection());
+        // Bound: every outbound audio track's RTP sender has started.
+        let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let has_audio = !audio_senders.is_empty();
+        let binding = {
+            let bound = Arc::clone(&bound);
+            tokio::spawn(async move {
+                for sender in &audio_senders {
+                    sender.wait_for_send().await;
+                }
+                bound.store(has_audio, std::sync::atomic::Ordering::Release);
+            })
+        };
+        tokio::spawn(async move {
+            let mut gate = super::media_ready::MediaReadyGate::default();
+            let mut ever_connected = false;
+            loop {
+                let state = rtc.connection_state();
+                let connected = state == State::Connected;
+                ever_connected |= connected;
+                let audio_bound = bound.load(std::sync::atomic::Ordering::Acquire);
+                match gate.observe(connected, audio_bound) {
+                    Some(super::media_ready::MediaChange::Ready) => {
+                        info!("media_ready: peer {} (connection {})", member, connection);
+                        control.publish_media_ready(&member, "webrtc", &connection);
+                    }
+                    Some(super::media_ready::MediaChange::Lost) => {
+                        info!("media_lost: peer {} (connection {})", member, connection);
+                        control.publish_media_lost(&member, "webrtc", &connection);
+                    }
+                    None => {}
+                }
+                // A closed connection never comes back; a failed one does
+                // only through an ICE restart, which this loop still sees.
+                if state == State::Closed || (state == State::Failed && !ever_connected) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            binding.abort();
+        });
     }
 
     /// Handle incoming SDP offer from client
@@ -839,13 +1041,16 @@ impl ServerPeer {
         // Phase 5.1/5.2 (Option C): hand SessionControl to this peer's
         // TrackRegistry so registered tracks publish media_clock on the
         // shared pipeline session bus at `<medium>:<stream_id>`.
-        if let Some(ctrl) = self.executor.control_bus().get(shared_session.session_id()) {
+        let session_control = self.executor.control_bus().get(shared_session.session_id());
+        if let Some(ctrl) = &session_control {
             // Discovery metadata (openspec: add-live-pipeline-observer).
             ctrl.set_transport_info("webrtc", Some(self.peer_id.clone()));
             self.track_registry
-                .attach_session_control(Arc::clone(&ctrl))
+                .attach_session_control(Arc::clone(ctrl))
                 .await;
         }
+        // RTP senders of this peer's outbound audio, for `media_ready`.
+        let mut audio_rtp_senders = Vec::new();
 
         // Scan the manifest for outbound media streams. Pre-registering
         // tracks before set_remote_description guarantees the answer SDP
@@ -903,6 +1108,18 @@ impl ServerPeer {
                 let track = self.peer_connection.audio_track().await.ok_or_else(|| {
                     Error::InternalError("audio_track missing after add_audio_track".into())
                 })?;
+                if let Some(sender) = self.peer_connection.audio_rtp_sender().await {
+                    audio_rtp_senders.push(sender);
+                }
+                if let Some(ctrl) = &session_control {
+                    track
+                        .set_release_reporter(crate::media::audio_sender::ReleaseReporter::session(
+                            Arc::clone(ctrl),
+                            &self.peer_id,
+                            &spec.stream_id,
+                        ))
+                        .await;
+                }
                 self.track_registry
                     .register_audio_track(&spec.stream_id, track)
                     .await
@@ -918,7 +1135,17 @@ impl ServerPeer {
                             spec.stream_id, e
                         ))
                     })?;
+                audio_rtp_senders.push(Arc::clone(&sender));
                 self.track_senders.write().await.push(sender);
+                if let Some(ctrl) = &session_control {
+                    track
+                        .set_release_reporter(crate::media::audio_sender::ReleaseReporter::session(
+                            Arc::clone(ctrl),
+                            &self.peer_id,
+                            &spec.stream_id,
+                        ))
+                        .await;
+                }
                 self.track_registry
                     .register_audio_track(&spec.stream_id, track)
                     .await
@@ -989,6 +1216,11 @@ impl ServerPeer {
             .map_err(|e| Error::WebRtcError(format!("Failed to set local description: {}", e)))?;
 
         info!("Generated SDP answer for peer {}", self.peer_id);
+
+        // Tell the session when this member can hear output.
+        if let Some(ctrl) = session_control {
+            self.spawn_media_ready_monitor(ctrl, audio_rtp_senders);
+        }
 
         Ok(answer.sdp)
     }
@@ -1368,6 +1600,14 @@ impl ServerPeer {
         if let Some(name) = self.display_name.read().expect("display name lock").clone() {
             participant = participant.with_display_name(name);
         }
+        for (key, value) in self
+            .participant_metadata
+            .read()
+            .expect("participant metadata lock")
+            .iter()
+        {
+            participant = participant.with_metadata(key.clone(), value.clone());
+        }
         let participant_session = shared_session.participant_handle(participant);
         let participant_for_leave = participant_session.clone();
         let peer_id_for_input = peer_id.clone();
@@ -1429,6 +1669,23 @@ impl ServerPeer {
             "ICE candidate: candidate={}, sdp_mid={:?}, sdp_mline_index={:?}",
             candidate, sdp_mid, sdp_mline_index
         );
+
+        // A candidate of an m-section that BUNDLE folded into another one is
+        // for a transport the browser closes once it has the answer (Chrome
+        // gathers one per m-section unless its bundle policy is max-bundle).
+        // Checking it reaches a closed port; on Windows the ICMP reply makes
+        // the next `recv_from` on our socket fail (WSAECONNRESET), and the ICE
+        // agent's receive loop of that local candidate ends for good, so the
+        // connection never completes. The bundle's own candidates are enough.
+        if let Some(remote) = self.peer_connection.peer_connection().remote_description().await {
+            if bundled_away(&remote.sdp, sdp_mid.as_deref(), sdp_mline_index) {
+                debug!(
+                    "ServerPeer {} ignoring ICE candidate of a bundled-away m-section (mid={:?}, index={:?})",
+                    self.peer_id, sdp_mid, sdp_mline_index
+                );
+                return Ok(());
+            }
+        }
 
         // Create ICE candidate init
         let ice_candidate_init = RTCIceCandidateInit {
@@ -1523,6 +1780,14 @@ impl Drop for ServerPeer {
 #[path = "audio_dispatch_tests.rs"]
 mod audio_dispatch_tests;
 
+#[cfg(test)]
+#[path = "turn_flush_tests.rs"]
+mod turn_flush_tests;
+
+#[cfg(test)]
+#[path = "media_ready_tests.rs"]
+mod media_ready_tests;
+
 #[cfg(all(test, feature = "video"))]
 #[path = "video_dispatch_tests.rs"]
 mod video_dispatch_tests;
@@ -1536,5 +1801,77 @@ mod tests {
         // This is a placeholder test
         // Real tests would require mock WebRTC and pipeline components
         assert!(true);
+    }
+}
+
+/// Whether a remote ICE candidate belongs to an m-section that the session
+/// description bundles into another one: its mid is in the `BUNDLE` group and
+/// is not the group's first. A candidate without a mid is placed by its
+/// m-line index. Without a `BUNDLE` group nothing is bundled away.
+pub(crate) fn bundled_away(sdp: &str, sdp_mid: Option<&str>, sdp_mline_index: Option<u16>) -> bool {
+    let Some(group) = sdp
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("a=group:BUNDLE"))
+    else {
+        return false;
+    };
+    let mut mids = group.split_whitespace();
+    let Some(first) = mids.next() else {
+        return false;
+    };
+    let rest: Vec<&str> = mids.collect();
+    let mid = match sdp_mid.filter(|mid| !mid.is_empty()) {
+        Some(mid) => Some(mid),
+        // The mid of the m-section at that index.
+        None => sdp_mline_index.and_then(|index| {
+            let mut section: i64 = -1;
+            sdp.lines().map(str::trim).find_map(|line| {
+                if line.starts_with("m=") {
+                    section += 1;
+                    None
+                } else if section == i64::from(index) {
+                    line.strip_prefix("a=mid:")
+                } else {
+                    None
+                }
+            })
+        }),
+    };
+    matches!(mid, Some(mid) if mid != first && rest.contains(&mid))
+}
+
+#[cfg(test)]
+mod bundled_away_tests {
+    use super::bundled_away;
+
+    const OFFER: &str = "v=0
+a=group:BUNDLE 0 1
+m=audio 9 UDP/TLS/RTP/SAVPF 111
+a=mid:0
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+a=mid:1
+";
+
+    #[test]
+    fn only_candidates_of_the_first_bundled_section_are_kept() {
+        assert!(!bundled_away(OFFER, Some("0"), Some(0)));
+        assert!(bundled_away(OFFER, Some("1"), Some(1)));
+        // Without a mid, the m-line index decides.
+        assert!(!bundled_away(OFFER, None, Some(0)));
+        assert!(!bundled_away(OFFER, Some(""), Some(0)));
+        assert!(bundled_away(OFFER, None, Some(1)));
+        assert!(bundled_away(OFFER, Some(""), Some(1)));
+        // Nothing to place it by: kept.
+        assert!(!bundled_away(OFFER, None, None));
+        // A mid the group does not name: kept.
+        assert!(!bundled_away(OFFER, Some("2"), Some(2)));
+    }
+
+    #[test]
+    fn nothing_is_bundled_away_without_a_bundle_group() {
+        let sdp = OFFER.replace("a=group:BUNDLE 0 1
+", "");
+        assert!(!bundled_away(&sdp, Some("1"), Some(1)));
+        assert!(!bundled_away("", Some("1"), Some(1)));
     }
 }

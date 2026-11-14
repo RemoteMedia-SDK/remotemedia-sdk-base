@@ -20,6 +20,7 @@ use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use remotemedia_core::transport::session_control::{MediaClock, SessionControl};
+use remotemedia_core::transport::turn_audio::{AudioReleased, ReleaseReport, ReleaseTracker, TurnTag};
 
 /// Per-stream media_clock publisher. Attached to an AudioSender via
 /// [`AudioSender::with_media_clock`]; when present, the transmission
@@ -92,8 +93,51 @@ impl MediaClockPublisher {
     }
 }
 
-/// Audio frame ready for transmission
+/// Where a sender's `audio_released` reports go, and for which member.
+/// Attached with [`AudioSender::set_release_reporter`]; the transmission
+/// thread then reports each turn's released audio at most every 100 ms while
+/// sending it, once after a flush, at an end mark and when the queue drains
+/// (openspec: add-ai-sdk-voice-library, design D7).
 #[derive(Clone)]
+pub struct ReleaseReporter {
+    member: Arc<str>,
+    stream_id: Arc<str>,
+    sink: Arc<dyn Fn(AudioReleased) + Send + Sync>,
+}
+
+impl ReleaseReporter {
+    /// Reports for `member`'s stream `stream_id`, handed to `sink` on the
+    /// transmission thread.
+    pub fn new(
+        member: impl AsRef<str>,
+        stream_id: impl AsRef<str>,
+        sink: impl Fn(AudioReleased) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            member: Arc::from(member.as_ref()),
+            stream_id: Arc::from(stream_id.as_ref()),
+            sink: Arc::new(sink),
+        }
+    }
+
+    /// Reports published on the session bus (`__media__.out`).
+    pub fn session(
+        control: Arc<SessionControl>,
+        member: impl AsRef<str>,
+        stream_id: impl AsRef<str>,
+    ) -> Self {
+        Self::new(member, stream_id, move |report| control.publish_audio_released(report))
+    }
+
+    fn publish(&self, reports: &mut Vec<ReleaseReport>) {
+        for report in reports.drain(..) {
+            (self.sink)(report.for_member(&self.member, Some(&self.stream_id)));
+        }
+    }
+}
+
+/// Audio frame ready for transmission
+#[derive(Clone, Default)]
 struct AudioFrame {
     /// Encoded Opus data
     data: bytes::Bytes,
@@ -101,6 +145,11 @@ struct AudioFrame {
     sample_count: u32,
     /// Frame duration
     duration: Duration,
+    /// The turn and text chunk the frame's audio belongs to, if any.
+    tag: Option<TurnTag>,
+    /// An end mark, not audio: everything queued before it for the tagged
+    /// chunk (untagged: the chunk being sent) is all there is of that chunk.
+    mark: bool,
 }
 
 /// Ring buffer for audio frames
@@ -122,6 +171,9 @@ struct AudioRingBuffer {
     /// Separate from capacity notifications so the sender cannot consume a
     /// producer's space-available wakeup while waiting for closure.
     closed: Notify,
+    /// Flushes the transmission thread has not reported yet: the flushed
+    /// turn, or `None` for a flush of everything.
+    flushes: parking_lot::Mutex<Vec<Option<Arc<str>>>>,
 }
 
 impl AudioRingBuffer {
@@ -136,6 +188,7 @@ impl AudioRingBuffer {
             space_available: Notify::new(),
             shutdown: AtomicBool::new(false),
             closed: Notify::new(),
+            flushes: Default::default(),
         }
     }
 
@@ -236,7 +289,46 @@ impl AudioRingBuffer {
         // once. A single `notify_one` would only wake one of them and
         // leave the rest sleeping despite the buffer being empty.
         self.space_available.notify_waiters();
+        self.flushes.lock().push(None);
         dropped
+    }
+
+    /// Drop the queued frames (and end marks) tagged with `turn_id`, keeping
+    /// every other frame in order. With `report`, the transmission thread
+    /// reports the turn once afterwards.
+    fn remove_turn(&self, turn_id: &str, report: bool) -> usize {
+        let mut buffer = self.buffer.lock();
+        let before = buffer.iter().filter(|frame| !frame.mark).count();
+        let mut discarded = Vec::new();
+        buffer.retain(|frame| {
+            let of_turn = frame.tag.as_ref().is_some_and(|tag| &*tag.turn_id == turn_id);
+            if of_turn {
+                discarded.push(frame.clone());
+            }
+            !of_turn
+        });
+        let dropped = before - buffer.iter().filter(|frame| !frame.mark).count();
+        drop(buffer);
+        drop(discarded);
+        self.space_available.notify_waiters();
+        if report {
+            self.flushes.lock().push(Some(Arc::from(turn_id)));
+        }
+        dropped
+    }
+
+    /// Queued audio frames of `turn_id`; with `None`, of no turn.
+    fn count_turn(&self, turn_id: Option<&str>) -> usize {
+        self.buffer
+            .lock()
+            .iter()
+            .filter(|frame| !frame.mark)
+            .filter(|frame| frame.tag.as_ref().map(|tag| &*tag.turn_id) == turn_id)
+            .count()
+    }
+
+    fn take_flushes(&self) -> Vec<Option<Arc<str>>> {
+        std::mem::take(&mut *self.flushes.lock())
     }
 
     /// Mark the ring buffer as shutting down and wake every parked
@@ -294,6 +386,8 @@ pub struct AudioSender {
     /// `parking_lot::RwLock` because it's set once at construction and
     /// otherwise only read by the transmission thread.
     media_clock: Arc<parking_lot::RwLock<Option<MediaClockPublisher>>>,
+    /// Optional `audio_released` reporter, read by the transmission thread.
+    release_reporter: Arc<parking_lot::RwLock<Option<ReleaseReporter>>>,
     /// Only sender handles own this guard; the transmission thread must not.
     lifetime: Arc<SenderLifetime>,
 }
@@ -339,6 +433,9 @@ impl AudioSender {
         let media_clock: Arc<parking_lot::RwLock<Option<MediaClockPublisher>>> =
             Arc::new(parking_lot::RwLock::new(None));
 
+        let release_reporter: Arc<parking_lot::RwLock<Option<ReleaseReporter>>> =
+            Arc::new(parking_lot::RwLock::new(None));
+
         let sender = Self {
             buffer: Arc::clone(&buffer),
             track: Arc::clone(&track),
@@ -346,6 +443,7 @@ impl AudioSender {
             timestamp: Arc::clone(&timestamp),
             thread_handle: Arc::new(Mutex::new(None)),
             media_clock: Arc::clone(&media_clock),
+            release_reporter: Arc::clone(&release_reporter),
             lifetime: Arc::new(SenderLifetime {
                 buffer: buffer.clone(),
                 shutdown: shutdown.clone(),
@@ -359,6 +457,7 @@ impl AudioSender {
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_timestamp = Arc::clone(&timestamp);
         let thread_media_clock = Arc::clone(&media_clock);
+        let thread_release_reporter = Arc::clone(&release_reporter);
 
         let handle = std::thread::Builder::new()
             .name("audio-sender".to_string())
@@ -369,6 +468,7 @@ impl AudioSender {
                     thread_shutdown,
                     thread_timestamp,
                     thread_media_clock,
+                    thread_release_reporter,
                 )
             })
             .expect("Failed to spawn audio sender thread");
@@ -395,6 +495,7 @@ impl AudioSender {
         shutdown: Arc<AtomicBool>,
         timestamp: Arc<AtomicU32>,
         media_clock: Arc<parking_lot::RwLock<Option<MediaClockPublisher>>>,
+        release_reporter: Arc<parking_lot::RwLock<Option<ReleaseReporter>>>,
     ) {
         use tracing::info;
         // Use println as a backup in case tracing isn't working
@@ -438,6 +539,20 @@ impl AudioSender {
         // and continue.
         const MAX_CATCHUP: Duration = Duration::from_millis(100);
 
+        // Spoken-so-far accounting: what this thread has written, per turn.
+        // Reports go out only while a reporter is attached.
+        let mut released = ReleaseTracker::default();
+        let mut reports: Vec<ReleaseReport> = Vec::new();
+        let publish_reports = |reports: &mut Vec<ReleaseReport>| {
+            if reports.is_empty() {
+                return;
+            }
+            match release_reporter.read().clone() {
+                Some(reporter) => reporter.publish(reports),
+                None => reports.clear(),
+            }
+        };
+
         info!(
             "Audio transmission thread: entering main loop, shutdown={}",
             shutdown.load(Ordering::Acquire)
@@ -457,8 +572,18 @@ impl AudioSender {
                 );
             }
 
+            // A flush since the last frame: report the flushed turn once.
+            // Every frame written before the flush is already counted, and
+            // dropped frames never reach this thread.
+            for flushed in buffer.take_flushes() {
+                released.flushed(flushed.as_deref(), Instant::now(), &mut reports);
+            }
+            publish_reports(&mut reports);
+
             // Try to get a frame from the buffer
             let Some(frame) = buffer.try_pop() else {
+                released.drained(Instant::now(), &mut reports);
+                publish_reports(&mut reports);
                 // Empty streams re-anchor pacing at the next arrival.
                 next_deadline = None;
                 if !buffer.wait_for(&rt, Duration::from_millis(5)) {
@@ -466,6 +591,13 @@ impl AudioSender {
                 }
                 continue;
             };
+            if frame.mark {
+                // An end mark carries no audio and takes no time.
+                released.chunk_end(frame.tag.as_ref(), Instant::now(), &mut reports);
+                publish_reports(&mut reports);
+                continue;
+            }
+            let frame_tag = frame.tag.clone();
             // Update RTP timestamp
             let old_ts = timestamp.fetch_add(frame.sample_count, Ordering::AcqRel);
 
@@ -503,6 +635,15 @@ impl AudioSender {
                 if let Some(publisher) = publisher {
                     publisher.publish(frame.duration);
                 }
+
+                // The frame has left: count it for its turn.
+                released.frame_written(
+                    frame_tag.as_ref(),
+                    frame.duration,
+                    Instant::now(),
+                    &mut reports,
+                );
+                publish_reports(&mut reports);
 
                 // Log first frame and periodically
                 if frame_count == 1 {
@@ -592,6 +733,38 @@ impl AudioSender {
         .await
     }
 
+    /// [`Self::enqueue_frame`] for audio of a turn: the queued frame keeps
+    /// the turn and text chunk it belongs to, for release reports and
+    /// [`Self::flush_turn`].
+    pub async fn enqueue_frame_tagged(
+        &self,
+        encoded_data: Vec<u8>,
+        sample_count: u32,
+        duration: Duration,
+        tag: Option<TurnTag>,
+    ) -> Result<()> {
+        let frame = AudioFrame {
+            data: encoded_data.into(),
+            sample_count,
+            duration,
+            tag,
+            mark: false,
+        };
+        self.buffer.push(frame).await
+    }
+
+    /// Queue an end mark behind the audio queued so far: when the
+    /// transmission thread reaches it, the tagged chunk (untagged: the chunk
+    /// being sent) counts as wholly released.
+    pub async fn enqueue_end_mark(&self, tag: Option<TurnTag>) -> Result<()> {
+        let frame = AudioFrame {
+            tag,
+            mark: true,
+            ..Default::default()
+        };
+        self.buffer.push(frame).await
+    }
+
     async fn enqueue_packet(
         &self,
         data: bytes::Bytes,
@@ -602,6 +775,8 @@ impl AudioSender {
             data,
             sample_count,
             duration,
+            tag: None,
+            mark: false,
         };
         self.buffer.push(frame).await
     }
@@ -619,6 +794,24 @@ impl AudioSender {
     /// finds the buffer empty and waits for the next push.
     pub fn flush_buffer(&self) -> usize {
         self.buffer.clear()
+    }
+
+    /// Drop only the queued frames tagged with `turn_id`; frames of other
+    /// turns and untagged frames stay queued in order. With `report`, the
+    /// turn's released audio is reported once afterwards. Returns the number
+    /// of audio frames dropped.
+    pub fn flush_turn(&self, turn_id: &str, report: bool) -> usize {
+        self.buffer.remove_turn(turn_id, report)
+    }
+
+    /// Queued audio frames of `turn_id`; with `None`, of no turn.
+    pub fn queued_frames_for_turn(&self, turn_id: Option<&str>) -> usize {
+        self.buffer.count_turn(turn_id)
+    }
+
+    /// Attach the `audio_released` reporter. Replaces any previous one.
+    pub fn set_release_reporter(&self, reporter: ReleaseReporter) {
+        *self.release_reporter.write() = Some(reporter);
     }
 
     /// Get the current RTP timestamp
@@ -684,6 +877,7 @@ impl Clone for AudioSender {
             timestamp: Arc::clone(&self.timestamp),
             thread_handle: Arc::clone(&self.thread_handle),
             media_clock: Arc::clone(&self.media_clock),
+            release_reporter: Arc::clone(&self.release_reporter),
             lifetime: Arc::clone(&self.lifetime),
         }
     }
@@ -706,6 +900,7 @@ mod tests {
             data: vec![1, 2, 3].into(),
             sample_count: 480,
             duration: Duration::from_millis(20),
+            ..Default::default()
         };
 
         assert!(buffer.try_push(frame.clone()).is_ok());
@@ -725,6 +920,7 @@ mod tests {
             data: vec![1, 2, 3].into(),
             sample_count: 480,
             duration: Duration::from_millis(20),
+            ..Default::default()
         };
 
         // Fill buffer (capacity - 1 due to ring buffer semantics)
@@ -743,6 +939,7 @@ mod tests {
             data: vec![1, 2, 3].into(),
             sample_count: 480,
             duration: Duration::from_millis(20),
+            ..Default::default()
         };
 
         // Push and pop multiple times to test wraparound

@@ -81,6 +81,15 @@ impl NodeProvider for CoreNodesProvider {
         // Text processing nodes
         registry.register(Arc::new(TextCollectorNodeFactory));
         registry.register(Arc::new(ConversationCoordinatorNodeFactory));
+        // Turns answered by a client-hosted endpoint (openspec:
+        // add-ai-sdk-voice-library).
+        registry.register(Arc::new(crate::nodes::hosted_turn::HostedTurnNodeFactory));
+        // A voice agent's turns as AI SDK realtime events (design D10).
+        registry.register(Arc::new(crate::nodes::realtime_events::RealtimeEventsNodeFactory));
+        // Test stand-in for a TTS node: a tone per text chunk, not speech.
+        registry.register(Arc::new(crate::nodes::test_tone_tts::TestToneTtsNodeFactory));
+        // Test stand-in for a VAD node: loud input is "speech".
+        registry.register(Arc::new(crate::nodes::test_energy_vad::TestEnergyVadNodeFactory));
 
         // Avatar control bridge — appends LLM/UI motion intents to an
         // NDJSON file the standalone avatar prototype watches.

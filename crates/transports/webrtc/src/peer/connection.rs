@@ -708,6 +708,11 @@ impl PeerConnection {
         Ok((audio_track, sender))
     }
 
+    /// The RTP sender of the default audio track (`add_audio_track`).
+    pub async fn audio_rtp_sender(&self) -> Option<Arc<RTCRtpSender>> {
+        self.audio_sender.read().await.clone()
+    }
+
     /// Get the audio track (if configured)
     pub async fn audio_track(&self) -> Option<Arc<AudioTrack>> {
         self.audio_track.read().await.clone()

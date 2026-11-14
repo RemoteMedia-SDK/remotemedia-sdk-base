@@ -56,6 +56,7 @@ pub mod session_control;
 pub mod session_recorder;
 pub mod session_router;
 pub mod shared_session;
+pub mod turn_audio;
 pub mod warm_session_pool;
 
 // PipelineExecutor facade (spec 026)
@@ -75,6 +76,9 @@ pub use endpoint::{
 };
 pub use data::{Participant, TransportData};
 pub use origin::{Origin, Routed};
+pub use turn_audio::{
+    AudioReleased, FlushTarget, MediaEvent, SpeechAccepted, SpeechRequest, TurnTag,
+};
 pub use executor::{
     ExecutorConfig, ParticipantSessionHandle, PipelineExecutor, PipelineSessionHost, SessionHandle,
     SessionInputSender,

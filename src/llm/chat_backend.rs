@@ -347,6 +347,11 @@ impl ChatBackend {
             .extend(entries);
     }
 
+    /// Forget everything stored for `session_id`.
+    pub fn clear_history(&self, session_id: &str) {
+        self.history.lock().remove(session_id);
+    }
+
     fn prune_history(&self, session_id: &str, turns: usize) {
         if let Some(entries) = self.history.lock().get_mut(session_id) {
             let start = window_start(entries, turns);

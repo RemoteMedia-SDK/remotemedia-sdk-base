@@ -239,7 +239,72 @@ impl ManagedServer {
 pub struct ManagedLlamaServers {
     servers: Mutex<BTreeMap<String, ManagedServer>>,
 }
+/// Where a managed server is reachable: an OpenAI-compatible base URL
+/// (`http://127.0.0.1:{port}/v1`), the per-execution API key the server
+/// requires, and the model name it answers to (the preset).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedEndpoint {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
 impl ManagedLlamaServers {
+    /// Start the server for `config` if it is not running, and return where it
+    /// is reachable. An embedding host calls this to point its own
+    /// OpenAI-compatible client at the managed server without a pipeline
+    /// (openspec `add-ai-sdk-voice-library`, task 1.5). A second call with the
+    /// same configuration reuses the running server.
+    ///
+    /// Fails with `model preset not found: <preset>` when the INI has no such
+    /// section, so a caller can report an unknown model by name.
+    pub async fn ensure(&self, config: &ManagedLlamaServerConfig) -> Result<ManagedEndpoint> {
+        let source_text = tokio::fs::read_to_string(&config.models_ini)
+            .await
+            .map_err(|e| failure(format!("cannot read models INI: {e}")))?;
+        let mut source = parse_preset(&source_text, &config.preset)?;
+        if let Some(context) = config.context_size {
+            if context == 0 {
+                return Err(failure("context_size override must be positive"));
+            }
+            source.insert("c".into(), context.to_string());
+        }
+        let key = serde_json::to_string(config).map_err(|e| failure(e.to_string()))?;
+        let mut servers = self.servers.lock().await;
+        if let Some(server) = servers.get_mut(&key) {
+            if source != server.source {
+                return Err(failure(
+                    "model preset changed; restart the executor to apply it",
+                ));
+            }
+            if let Some(status) = server
+                .child
+                .try_wait()
+                .map_err(|e| failure(e.to_string()))?
+            {
+                return Err(failure(format!("managed llama-server died: {status}")));
+            }
+        } else {
+            servers.insert(key.clone(), ManagedServer::start(config, source).await?);
+        }
+        let server = &servers[&key];
+        Ok(ManagedEndpoint {
+            base_url: server.base_url.clone(),
+            api_key: server.api_key.clone(),
+            model: config.preset.clone(),
+        })
+    }
+
+    /// Stop every managed server this owner started. Dropping the owner does
+    /// the same; a host that keeps the owner in a process-wide static calls
+    /// this on shutdown, because statics are not dropped at exit.
+    pub async fn shutdown(&self) {
+        let mut servers = self.servers.lock().await;
+        for (_, mut server) in std::mem::take(&mut *servers) {
+            let _ = server.child.kill().await;
+        }
+    }
+
     pub async fn prepare(&self, manifest: &Manifest) -> Result<Manifest> {
         let mut prepared = manifest.clone();
         for node in &mut prepared.nodes {
@@ -264,36 +329,10 @@ impl ManagedLlamaServers {
             {
                 return Err(failure("managed llama-server requires the OpenAI provider"));
             }
-            let source_text = tokio::fs::read_to_string(&config.models_ini)
-                .await
-                .map_err(|e| failure(format!("cannot read models INI: {e}")))?;
-            let mut source = parse_preset(&source_text, &config.preset)?;
-            if let Some(context) = config.context_size {
-                if context == 0 { return Err(failure("context_size override must be positive")); }
-                source.insert("c".into(), context.to_string());
-            }
-            let key = serde_json::to_string(&config).map_err(|e| failure(e.to_string()))?;
-            let mut servers = self.servers.lock().await;
-            if let Some(server) = servers.get_mut(&key) {
-                if source != server.source {
-                    return Err(failure(
-                        "model preset changed; restart the executor to apply it",
-                    ));
-                }
-                if let Some(status) = server
-                    .child
-                    .try_wait()
-                    .map_err(|e| failure(e.to_string()))?
-                {
-                    return Err(failure(format!("managed llama-server died: {status}")));
-                }
-            } else {
-                servers.insert(key.clone(), ManagedServer::start(&config, source).await?);
-            }
-            let server = &servers[&key];
-            node.params["base_url"] = server.base_url.clone().into();
-            node.params["api_key"] = server.api_key.clone().into();
-            node.params["model"] = config.preset.into();
+            let endpoint = self.ensure(&config).await?;
+            node.params["base_url"] = endpoint.base_url.into();
+            node.params["api_key"] = endpoint.api_key.into();
+            node.params["model"] = endpoint.model.into();
             node.params
                 .as_object_mut()
                 .unwrap()
@@ -342,6 +381,33 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod ensure_tests {
+    use super::*;
+    #[tokio::test]
+    async fn unknown_preset_is_named_and_nothing_is_started() {
+        let root = tempfile::tempdir().unwrap();
+        let ini = root.path().join("models.ini");
+        std::fs::write(&ini, "[known]
+model=/nowhere/model.gguf
+").unwrap();
+        let config = ManagedLlamaServerConfig {
+            executable: root.path().join("no-such-llama-server"),
+            models_ini: ini,
+            preset: "lfm2".into(),
+            gpu: "0".into(),
+            context_size: None,
+            startup_timeout_secs: 1,
+        };
+        let owner = ManagedLlamaServers::default();
+        let error = owner.ensure(&config).await.unwrap_err().to_string();
+        assert!(error.contains("model preset not found: lfm2"), "{error}");
+        assert!(owner.servers.lock().await.is_empty());
+        // shutdown with nothing running is a no-op
+        owner.shutdown().await;
+    }
+}
+
 #[cfg(all(test, unix))]
 mod lifecycle_tests {
     use super::*;
@@ -384,6 +450,20 @@ HTTPServer(('127.0.0.1', int(sys.argv[sys.argv.index('--port')+1])), Handler).se
         let params = &first.nodes[0].params;
         assert_eq!(params, &second.nodes[0].params);
         assert!(params.get("max_tokens").is_none());
+        let config: ManagedLlamaServerConfig = serde_json::from_value(
+            manifest.nodes[0].params["managed_server"].clone(),
+        )
+        .unwrap();
+        let endpoint = owner.ensure(&config).await.unwrap();
+        assert_eq!(endpoint.base_url, params["base_url"].as_str().unwrap());
+        assert_eq!(endpoint.api_key, params["api_key"].as_str().unwrap());
+        assert_eq!(endpoint.model, "fixture");
+        let missing = ManagedLlamaServerConfig {
+            preset: "absent".into(),
+            ..config.clone()
+        };
+        let error = owner.ensure(&missing).await.unwrap_err().to_string();
+        assert!(error.contains("model preset not found: absent"), "{error}");
         let url = format!("{}/models", params["base_url"].as_str().unwrap());
         let client = reqwest::Client::new();
         assert_eq!(client.get(&url).send().await.unwrap().status(), 401);

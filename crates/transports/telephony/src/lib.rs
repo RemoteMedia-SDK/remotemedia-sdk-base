@@ -13,6 +13,7 @@ pub mod config;
 pub mod error;
 pub mod hermes;
 pub mod jitter;
+pub mod media_loop;
 pub mod metrics;
 pub mod plugin;
 pub mod rtp;
@@ -27,6 +28,7 @@ pub use config::{
     SipRateLimitConfig, TelephonyTransportConfig,
 };
 pub use error::{Error, Result};
+pub use media_loop::{CallAudioSender, CallMedia};
 pub use hermes::{CallControlCommand, HermesToolState, TelephonyHermesEvent};
 pub use metrics::{CallMetrics, RtpCounters};
 pub use plugin::TelephonyTransportPlugin;

@@ -4,12 +4,19 @@
 #[path = "rtp_copy_tests.rs"]
 mod copy_tests;
 
+#[cfg(test)]
+#[path = "rtp_turn_tests.rs"]
+mod turn_tests;
+
 use crate::codec::{decode_g711, encode_g711, CodecMap, OpusCodec};
 use crate::jitter::{JitterBuffer, JitterDecision};
 use crate::session::{apply_frame_metadata, CallId, CallLegId, ParticipantRole};
 use crate::{AudioCodec, Error, Result};
 use remotemedia_core::audio::pcm_frames::AudioPcmPacketizer;
 use remotemedia_core::data::{AudioSamples, RuntimeData};
+use remotemedia_core::transport::turn_audio::{
+    AudioReleased, DroppedTurns, FlushTarget, ReleaseReport, ReleaseTracker, TurnSegments, TurnTag,
+};
 use remotemedia_core::transport::TransportData;
 use remotemedia_types::{CopyContext, CopyReason, SharedBuffer, SharedBytes};
 use std::collections::BTreeSet;
@@ -459,6 +466,24 @@ pub struct RtpOutboundMediaSession {
     opus: Option<OpusCodec>,
     expected_samples_per_frame: usize,
     pcm: AudioPcmPacketizer,
+    /// Turn-tagged audio (and end marks) waiting behind `pcm`, whole inputs
+    /// in order, so one turn can be dropped (openspec:
+    /// add-ai-sdk-voice-library). Untagged audio bypasses it while it is
+    /// empty, as before.
+    waiting: std::collections::VecDeque<Waiting>,
+    /// Tags of the PCM in `pcm`.
+    segments: TurnSegments,
+    dropped: DroppedTurns,
+    released: ReleaseTracker,
+    reports: Vec<ReleaseReport>,
+    frame_duration: std::time::Duration,
+}
+
+#[derive(Debug)]
+enum Waiting {
+    Audio(Option<TurnTag>, SharedBuffer<f32>),
+    /// Everything of the tagged chunk is queued before this point.
+    End(Option<TurnTag>),
 }
 
 impl RtpOutboundMediaSession {
@@ -495,7 +520,18 @@ impl RtpOutboundMediaSession {
             },
             expected_samples_per_frame: samples_per_frame as usize,
             pcm: AudioPcmPacketizer::new(samples_per_frame as usize),
+            waiting: Default::default(),
+            segments: Default::default(),
+            dropped: Default::default(),
+            released: Default::default(),
+            reports: Vec::new(),
+            frame_duration: std::time::Duration::from_millis(u64::from(frame_duration_ms)),
         })
+    }
+
+    /// Samples of one RTP frame at the codec's clock rate.
+    pub fn samples_per_frame(&self) -> usize {
+        self.expected_samples_per_frame
     }
 
     /// Encode and packetize one f32 PCM audio frame.
@@ -540,6 +576,24 @@ impl RtpOutboundMediaSession {
         sample_rate: u32,
         channels: u32,
     ) -> Result<()> {
+        self.queue_audio_tagged(samples, sample_rate, channels, None)
+    }
+
+    /// [`Self::queue_audio`] for audio of a turn (`TurnTag::from_metadata`
+    /// on the pipeline output). Each packet then knows its turn and text
+    /// chunk, so the call reports what it released
+    /// ([`Self::take_release_reports`]) and one turn can be dropped
+    /// ([`Self::flush_turn`]). Audio of a refused turn is dropped here.
+    pub fn queue_audio_tagged(
+        &mut self,
+        samples: SharedBuffer<f32>,
+        sample_rate: u32,
+        channels: u32,
+        tag: Option<TurnTag>,
+    ) -> Result<()> {
+        if tag.as_ref().is_some_and(|tag| self.dropped.contains(&tag.turn_id)) {
+            return Ok(());
+        }
         let samples = prepare_pcm(
             samples,
             sample_rate,
@@ -547,21 +601,123 @@ impl RtpOutboundMediaSession {
             self.codec.clock_rate_hz(),
             &self.copies,
         )?;
-        self.pcm
-            .append(samples, &self.copies)
-            .map_err(|error| Error::Rtp(error.to_string()))
+        if tag.is_none() && self.waiting.is_empty() {
+            let count = samples.len();
+            self.pcm
+                .append(samples, &self.copies)
+                .map_err(|error| Error::Rtp(error.to_string()))?;
+            self.segments.push(None, count);
+        } else {
+            self.waiting.push_back(Waiting::Audio(tag, samples));
+        }
+        Ok(())
+    }
+
+    /// The tagged text chunk's audio is all queued (a `speech_end`). Once the
+    /// packets before this point have been taken, the chunk is reported as
+    /// wholly released.
+    pub fn mark_chunk_end(&mut self, tag: Option<TurnTag>) {
+        if tag.as_ref().is_some_and(|tag| self.dropped.contains(&tag.turn_id)) {
+            return;
+        }
+        self.waiting.push_back(Waiting::End(tag));
+    }
+
+    /// Move waiting inputs into the frame assembler until a frame is ready.
+    fn feed(&mut self) -> Result<()> {
+        while self.pcm.queued_samples() < self.expected_samples_per_frame {
+            match self.waiting.pop_front() {
+                Some(Waiting::Audio(tag, samples)) => {
+                    let count = samples.len();
+                    self.pcm
+                        .append(samples, &self.copies)
+                        .map_err(|error| Error::Rtp(error.to_string()))?;
+                    self.segments.push(tag.as_ref(), count);
+                }
+                Some(Waiting::End(tag)) => {
+                    self.released
+                        .chunk_end(tag.as_ref(), std::time::Instant::now(), &mut self.reports)
+                }
+                None => break,
+            }
+        }
+        Ok(())
     }
 
     /// Encode the next complete frame. Fragment assembly rejection retains the
     /// queued owners; clear the queue when abandoning the failed stream.
+    ///
+    /// A packet counts as released for its turn when it is taken here: the
+    /// caller's paced loop sends it next.
     pub fn next_audio_packet(&mut self) -> Result<Option<RtpPacket>> {
+        self.feed()?;
         let frame = self
             .pcm
             .next_frame()
             .map_err(|error| Error::Rtp(error.to_string()))?;
-        frame
-            .map(|frame| self.packetize_audio_frame(&frame))
-            .transpose()
+        let Some(frame) = frame else {
+            self.released
+                .drained(std::time::Instant::now(), &mut self.reports);
+            return Ok(None);
+        };
+        let tag = self.segments.take(frame.len());
+        let packet = self.packetize_audio_frame(&frame)?;
+        self.released.frame_written(
+            tag.as_ref(),
+            self.frame_duration,
+            std::time::Instant::now(),
+            &mut self.reports,
+        );
+        Ok(Some(packet))
+    }
+
+    /// Targeted flush for this call: drop the queued audio of `turn_id`
+    /// only. Audio of other turns stays queued, except that a partial frame
+    /// (under one frame duration) sharing the assembler with the turn goes
+    /// with it. With `drop_rest`, later audio of the turn is refused. The
+    /// next [`Self::take_release_reports`] carries the turn's `flushed`
+    /// report. Returns the number of samples dropped.
+    pub fn flush_turn(&mut self, turn_id: &str, drop_rest: bool) -> usize {
+        if drop_rest {
+            self.dropped.drop_turn(turn_id);
+        }
+        let of_turn = |tag: &Option<TurnTag>| tag.as_ref().is_some_and(|tag| &*tag.turn_id == turn_id);
+        let mut dropped = 0;
+        self.waiting.retain(|waiting| match waiting {
+            Waiting::Audio(tag, samples) if of_turn(tag) => {
+                dropped += samples.len();
+                false
+            }
+            Waiting::End(tag) if of_turn(tag) => false,
+            _ => true,
+        });
+        if self.segments.has_turn(turn_id) {
+            dropped += self.pcm.queued_samples();
+            self.pcm.clear();
+            self.segments.clear();
+        }
+        self.released
+            .flushed(Some(turn_id), std::time::Instant::now(), &mut self.reports);
+        dropped
+    }
+
+    /// Apply a session's targeted flush to this call if it names `member`
+    /// (the call leg's participant id) or names nobody.
+    pub fn apply_flush(&mut self, target: &FlushTarget, member: &str) -> Option<usize> {
+        (target.members.is_empty() || target.members.iter().any(|m| m == member))
+            .then(|| self.flush_turn(&target.turn_id, target.drop_rest))
+    }
+
+    /// The `audio_released` reports that became due since the last call, for
+    /// `member` (the call leg's participant id): at most one per 100 ms while
+    /// a turn's packets are taken, one after a flush, at an end mark and when
+    /// the queue drains. Publish them with
+    /// `SessionControl::publish_audio_released`.
+    pub fn take_release_reports(&mut self, member: &str) -> Vec<AudioReleased> {
+        self.reports
+            .drain(..)
+            .map(|report| report.for_member(member, None))
+            .collect()
     }
 
     /// Encode and serialize the next complete frame under the session policy.
@@ -574,6 +730,10 @@ impl RtpOutboundMediaSession {
     /// Discard incomplete or rejected audio and release its retained owners.
     pub fn clear_pending_audio(&mut self) {
         self.pcm.clear();
+        self.waiting.clear();
+        self.segments.clear();
+        self.released
+            .flushed(None, std::time::Instant::now(), &mut self.reports);
     }
 }
 

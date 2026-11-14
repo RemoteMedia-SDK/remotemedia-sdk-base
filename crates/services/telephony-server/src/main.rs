@@ -4,23 +4,18 @@
 //! binds a SIP listener socket, and bridges inbound calls to streaming pipeline sessions.
 
 use clap::Parser;
-use remotemedia_core::data::RuntimeData;
-use remotemedia_core::manifest::{self, Manifest};
-use remotemedia_core::transport::{PipelineExecutor, StreamSession, TransportData};
-use remotemedia_telephony::codec::CodecMap;
-use remotemedia_telephony::rtp::{RtpMediaSession, RtpOutboundMediaSession};
-use remotemedia_telephony::sdp::NegotiatedAudio;
-use remotemedia_telephony::session::ParticipantRole;
+use remotemedia_core::manifest;
+use remotemedia_core::transport::PipelineExecutor;
+use remotemedia_telephony::media_loop::CallMedia;
 use remotemedia_telephony::{
-    parse_request, AudioCodec, SipMethod, TelephonyTransport, TelephonyTransportConfig,
+    parse_request, SipMethod, TelephonyTransport, TelephonyTransportConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// RemoteMedia Telephony Server
@@ -126,118 +121,19 @@ impl Default for ServerConfig {
     }
 }
 
-/// Active call session containing its pipeline stream session and RTP media state
-struct ActiveSession {
-    call_id: String,
-    peer: SocketAddr,
-    stream: Box<dyn StreamSession>,
-    rtp_socket: Arc<tokio::net::UdpSocket>,
-    local_rtp_addr: SocketAddr,
-    remote_rtp_addr: SocketAddr,
-    negotiated_audio: NegotiatedAudio,
-    codec_map: CodecMap,
-    leg_id: String,
-    inbound_media: RtpMediaSession,
-    outbound_media: RtpOutboundMediaSession,
-}
+/// The running calls by Call-ID: the sender that stops a call's media loop.
+type ActiveCalls = Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>;
 
-/// Spawn a per-call RTP media loop: receive RTP from caller, decode, send to pipeline,
-/// receive pipeline output, encode, send RTP back to caller.
-fn spawn_media_loop(
-    call_id: String,
-    mut session: ActiveSession,
-    active_sessions: Arc<tokio::sync::Mutex<HashMap<String, ActiveSession>>>,
-) {
+/// Spawn the call's media loop (`remotemedia_telephony::media_loop`): caller
+/// RTP into the pipeline, pipeline audio back as paced RTP, with the call's
+/// `audio_released` reports and flushes. It runs until the call is removed
+/// from `active_calls` (BYE, CANCEL, shutdown) or its pipeline session ends.
+async fn spawn_media_loop(call_id: String, media: CallMedia, active_calls: ActiveCalls) {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    active_calls.lock().await.insert(call_id.clone(), stop);
     tokio::spawn(async move {
-        let mut buf = vec![0u8; 1500];
-        let mut pending_samples: Vec<f32> = Vec::new();
-        let mut latched = false;
-        let mut remote_rtp_addr = session.remote_rtp_addr;
-
-        // NAT Punching: Send 5 initial silence frames to remote_rtp_addr to open firewall/NAT bindings
-        let target_rate = session.negotiated_audio.clock_rate_hz;
-        let samples_per_frame = (target_rate / 1000) * u32::from(session.negotiated_audio.ptime_ms);
-        let silence_frame = vec![0.0f32; samples_per_frame as usize];
-        info!(
-            "RTP NAT Punching: Sending 5 initial silence frames to remote {} to punch NAT hole...",
-            remote_rtp_addr
-        );
-        for _ in 0..5 {
-            if let Ok(rtp_bytes) = session.outbound_media.packetize_audio_datagram(&silence_frame)
-                .map_err(|error| warn!("RTP silence output rejected for call {}: {}", call_id, error)) {
-                let _ = session
-                    .rtp_socket
-                    .send_to(&rtp_bytes, remote_rtp_addr)
-                    .await;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        }
-
-        loop {
-            // Read inbound RTP
-            let mut read_ok = false;
-            match session.rtp_socket.recv_from(&mut buf).await {
-                Ok((len, mut src)) => {
-                    let mut packet_buf = std::mem::replace(&mut buf, vec![0; 1500]);
-                    packet_buf.truncate(len);
-                    loop {
-                        if !latched {
-                            info!(
-                                "RTP Latching: Latched Call-ID: {} to actual remote RTP source: {}",
-                                call_id, src
-                            );
-                            remote_rtp_addr = src;
-                            latched = true;
-                        }
-                        if src.ip() == remote_rtp_addr.ip() {
-                            match session.inbound_media.receive_owned_datagram(packet_buf.into()) {
-                                Ok(frames) => {
-                                    for frame in frames {
-                                        // Send decoded audio to pipeline
-                                        if let Err(e) = session.stream.send_input(frame).await {
-                                            error!(
-                                                "Failed to send audio to pipeline for call {}: {}",
-                                                call_id, e
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!("RTP decode error for call {}: {}", call_id, e);
-                                }
-                            }
-                        }
-
-                        // Try to receive next pending packet non-blocking to prevent queue backup
-                        match session.rtp_socket.try_recv_from(&mut buf) {
-                            Ok((next_len, next_src)) => {
-                                src = next_src;
-                                packet_buf = std::mem::replace(&mut buf, vec![0; 1500]);
-                                packet_buf.truncate(next_len);
-                            }
-                            Err(_) => {
-                                break;
-                            }
-                        }
-                    }
-                    read_ok = true;
-                }
-                Err(e) => {
-                    warn!("RTP recv error for call {}: {}", call_id, e);
-                }
-            }
-        }
-
-        // Close pipeline stream on exit
-        if let Err(e) = session.stream.close().await {
-            error!("Error closing pipeline stream for call {}: {}", call_id, e);
-        }
-
-        // Remove from active sessions
-        let mut active = active_sessions.lock().await;
-        active.remove(&call_id);
-        info!("Media loop ended for call {}", call_id);
+        media.run(stopped).await;
+        active_calls.lock().await.remove(&call_id);
     });
 }
 
@@ -440,7 +336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let socket = Arc::new(socket);
-        let active_sessions = Arc::new(tokio::sync::Mutex::new(HashMap::<String, ActiveSession>::new()));
+        let active_sessions: ActiveCalls = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
         // Spawn signal handling task
@@ -487,69 +383,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         if let Err(e) = socket_clone.send_to(&accepted.response.bytes, peer).await {
                                                             error!("Failed to send 200 OK SIP response to {}: {}", peer, e);
                                                         } else {
-                                                            // Build inbound RTP media session (decode caller audio)
-                                                            let inbound_media = RtpMediaSession::new(
-                                                                call_id.clone(),
-                                                                accepted.leg_id.clone(),
-                                                                ParticipantRole::User,
-                                                                accepted.codec_map.clone(),
-                                                                4, // jitter buffer depth
-                                                            ).with_copy_context(accepted.copies.clone());
-
-                                                            // Build outbound RTP media session (encode pipeline output)
-                                                            let outbound_media = RtpOutboundMediaSession::new(
-                                                                accepted.negotiated_audio.codec,
-                                                                accepted.negotiated_audio.payload_type,
-                                                                0xABCDEF01, // random SSRC
-                                                                1,            // initial sequence
-                                                                0,            // initial timestamp
-                                                                accepted.negotiated_audio.ptime_ms,
-                                                            ).unwrap_or_else(|e| {
-                                                                error!("Failed to create outbound RTP media: {}", e);
-                                                                // Fallback to PCMU
-                                                                RtpOutboundMediaSession::new(
-                                                                    AudioCodec::Pcmu,
-                                                                    0,
-                                                                    0xABCDEF01,
-                                                                    1,
-                                                                    0,
-                                                                    20,
-                                                                ).expect("fallback outbound RTP creation failed")
-                                                            }).with_copy_context(accepted.copies.clone());
-
-                                                            let rtp_socket = Arc::new(accepted.rtp_socket);
-                                                            let local_rtp_addr = accepted.local_rtp_addr;
-                                                            let remote_rtp_addr = accepted.remote_rtp_addr;
-                                                            let negotiated_audio = accepted.negotiated_audio;
-                                                            let codec_map = accepted.codec_map;
-                                                            let leg_id = accepted.leg_id;
-
                                                             info!(
                                                                 "RTP media: local {} -> remote {}, codec {:?}",
-                                                                local_rtp_addr, remote_rtp_addr, negotiated_audio.codec
+                                                                accepted.local_rtp_addr, accepted.remote_rtp_addr, accepted.negotiated_audio.codec
                                                             );
-
-                                                            let session = ActiveSession {
-                                                                call_id: call_id.clone(),
-                                                                peer,
-                                                                stream: accepted.stream,
-                                                                rtp_socket,
-                                                                local_rtp_addr,
-                                                                remote_rtp_addr,
-                                                                negotiated_audio,
-                                                                codec_map,
-                                                                leg_id,
-                                                                inbound_media,
-                                                                outbound_media,
-                                                            };
-
-                                                            // Spawn the RTP media processing loop for this call
-                                                            // (session is owned by the media loop, which cleans up on exit)
+                                                            // The media loop owns the call's pipeline stream and RTP
+                                                            // socket and closes them when it ends.
                                                             spawn_media_loop(
                                                                 call_id.clone(),
-                                                                session,
+                                                                CallMedia::from_accepted(accepted),
                                                                 active_sessions_clone.clone(),
-                                                            );
+                                                            ).await;
                                                         }
                                                     }
                                                     Err(e) => {
@@ -577,16 +421,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             let call_id = request.call_id().unwrap_or("unknown").to_string();
                                             info!("Terminating call (method: {:?}) for Call-ID: {}", request.method, call_id);
 
-                                            // Teardown: Remove and close the pipeline session
-                                            let mut active = active_sessions.lock().await;
-                                            if let Some(session) = active.remove(&call_id) {
+                                            // Teardown: stop the call's media loop, which closes its pipeline stream
+                                            if let Some(stop) = active_sessions.lock().await.remove(&call_id) {
                                                 info!("Tearing down pipeline session for call {}", call_id);
-                                                let mut stream = session.stream;
-                                                tokio::spawn(async move {
-                                                    if let Err(e) = stream.close().await {
-                                                        error!("Error closing pipeline session for terminated call {}: {}", call_id, e);
-                                                    }
-                                                });
+                                                let _ = stop.send(());
                                             }
 
                                             // Handle signaling Response
@@ -631,12 +469,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Close all active pipeline streams
         let mut active = active_sessions.lock().await;
-        for (call_id, session) in active.drain() {
+        for (call_id, stop) in active.drain() {
             info!("Teardown: Closing pipeline session for call {} during server shutdown", call_id);
-            let mut stream = session.stream;
-            if let Err(e) = stream.close().await {
-                error!("Error closing pipeline session for call {} on shutdown: {}", call_id, e);
-            }
+            let _ = stop.send(());
         }
         info!("Shutdown complete. Exiting.");
         Ok(())
@@ -646,7 +481,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remotemedia_core::manifest::ManifestMetadata;
+    use remotemedia_core::manifest::{Manifest, ManifestMetadata};
+    use remotemedia_telephony::rtp::RtpPacket;
     use std::sync::Arc;
     use tokio::net::UdpSocket;
     use tokio::time::Duration;
@@ -785,9 +621,7 @@ mod tests {
         let socket = Arc::new(transport.bind_sip_socket().await.unwrap());
         let server_addr = socket.local_addr().unwrap();
 
-        let active_sessions = Arc::new(tokio::sync::Mutex::new(
-            HashMap::<String, ActiveSession>::new(),
-        ));
+        let active_sessions: ActiveCalls = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
 
         let socket_clone = Arc::clone(&socket);
@@ -812,41 +646,13 @@ mod tests {
                                         let call_id = request.call_id().unwrap_or("unknown").to_string();
                                         if let Ok(accepted) = transport_clone.accept_inbound_call(datagram, manifest_clone.clone()).await {
                                             let _ = socket_clone.send_to(&accepted.response.bytes, peer).await;
-                                            let mut active = active_sessions_clone.lock().await;
-                                            active.insert(call_id, ActiveSession {
-                                                call_id: "call-smoke-1".to_string(),
-                                                peer,
-                                                stream: accepted.stream,
-                                                rtp_socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
-                                                local_rtp_addr: "127.0.0.1:0".parse().unwrap(),
-                                                remote_rtp_addr: "127.0.0.1:0".parse().unwrap(),
-                                                negotiated_audio: accepted.negotiated_audio,
-                                                codec_map: accepted.codec_map.clone(),
-                                                leg_id: accepted.leg_id,
-                                                inbound_media: RtpMediaSession::new(
-                                                    "call-smoke-1".to_string(),
-                                                    "leg-smoke".to_string(),
-                                                    ParticipantRole::User,
-                                                    accepted.codec_map.clone(),
-                                                    4,
-                                                ),
-                                                outbound_media: RtpOutboundMediaSession::new(
-                                                    AudioCodec::Pcmu,
-                                                    0,
-                                                    0xABCDEF01,
-                                                    1,
-                                                    0,
-                                                    20,
-                                                ).unwrap(),
-                                            });
+                                            spawn_media_loop(call_id, CallMedia::from_accepted(accepted), active_sessions_clone.clone()).await;
                                         }
                                     }
                                     SipMethod::Bye => {
                                         let call_id = request.call_id().unwrap_or("unknown").to_string();
-                                        let mut active = active_sessions_clone.lock().await;
-                                        if let Some(session) = active.remove(&call_id) {
-                                            let mut stream = session.stream;
-                                            let _ = stream.close().await;
+                                        if let Some(stop) = active_sessions_clone.lock().await.remove(&call_id) {
+                                            let _ = stop.send(());
                                         }
                                         if let Ok(Some(resp)) = transport_clone.handle_sip_datagram_from(datagram, peer) {
                                             let _ = socket_clone.send_to(&resp.bytes, peer).await;
@@ -863,7 +669,10 @@ mod tests {
 
         // Send INVITE
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let invite_req = b"INVITE sip:bot@example.com SIP/2.0\r\n\
+        // The caller's RTP socket, offered in the SDP.
+        let caller_rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let invite_req = format!(
+            "INVITE sip:bot@example.com SIP/2.0\r\n\
             Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK1\r\n\
             From: <sip:a@example.com>;tag=1\r\n\
             To: <sip:bot@example.com>\r\n\
@@ -876,10 +685,12 @@ mod tests {
             s=-\r\n\
             c=IN IP4 127.0.0.1\r\n\
             t=0 0\r\n\
-            m=audio 49170 RTP/AVP 0\r\n\
+            m=audio {} RTP/AVP 0\r\n\
             a=rtpmap:0 PCMU/8000\r\n\
-            a=ptime:20\r\n";
-        client.send_to(invite_req, server_addr).await.unwrap();
+            a=ptime:20\r\n",
+            caller_rtp.local_addr().unwrap().port()
+        );
+        client.send_to(invite_req.as_bytes(), server_addr).await.unwrap();
 
         let mut resp_buf = [0_u8; 2048];
         let (resp_len, _) =
@@ -890,6 +701,16 @@ mod tests {
 
         let resp_str = std::str::from_utf8(&resp_buf[..resp_len]).unwrap();
         assert!(resp_str.starts_with("SIP/2.0 200 OK"));
+
+        // The call's media loop runs: its RTP reaches the caller.
+        let mut rtp_buf = [0_u8; 1500];
+        let (rtp_len, _) =
+            tokio::time::timeout(Duration::from_millis(1500), caller_rtp.recv_from(&mut rtp_buf))
+                .await
+                .expect("RTP from the call's media loop")
+                .unwrap();
+        let packet = RtpPacket::parse(&rtp_buf[..rtp_len]).unwrap();
+        assert_eq!((packet.info.payload_type, packet.payload.len()), (0, 160));
 
         // Verify session is active
         {
