@@ -18,7 +18,7 @@
 //!
 //! | Port | Direction | Carries |
 //! |---|---|---|
-//! | default | in | Text (a transcript), or a browser frame `{ "v": 1, "type": "text" \| "interrupt" }` |
+//! | default | in | Text (a transcript), a browser frame `{ "v": 1, "type": "text" \| "interrupt" }`, or the retraction of the member's last utterance |
 //! | `vad` | in | The VAD node's speech start / stop events |
 //! | default | out | Reply text chunks, tagged with the turn id, chunk index and audience |
 //! | `ui` | out | Frames of the D6 wire contract |
@@ -30,11 +30,26 @@
 //! published to `<node>.in.vad`. A `ui` output is an `__aux_port__: "ui"`
 //! envelope; the router delivers its payload to the connections that read
 //! `from_port: "ui"` and to no other (see `Successor::port`).
+//!
+//! # Retracted utterances
+//!
+//! A member who pauses briefly mid-sentence is heard as two utterances: the
+//! accumulator emits the first at the pause, and when the speech goes on
+//! within its merge window it emits both again as one. It says so with a
+//! `CancelSpeculation` control message whose metadata has
+//! `retract_utterance: true`, which the transcription node passes on, in
+//! order, between the two transcripts. The member's last spoken turn is then
+//! taken back, wherever it is: dropped from the queue, cancelled in flight
+//! (host call cancelled, audio flushed), or removed after it settled. Nothing
+//! of it stays in the history, the host is told with a `turn_retracted`
+//! event, and `ui` carries a `data-turn` frame with status `retracted`. The
+//! merged transcript that follows is the one turn.
 
-use crate::data::{split_text_str, RuntimeData, TEXT_CHANNEL_DEFAULT};
+use crate::data::{split_text_str, ControlMessageType, RuntimeData, TEXT_CHANNEL_DEFAULT};
 use crate::error::Error;
 use crate::llm::history::HistoryEntry;
 use crate::llm::{ChatBackend, ChatBackendConfig, ProviderKind};
+use crate::nodes::audio_buffer_accumulator::RETRACT_UTTERANCE_KEY;
 use crate::nodes::ports::PortKind;
 use crate::nodes::schema::{NodeSchema, RuntimeDataType};
 use crate::nodes::{
@@ -430,6 +445,9 @@ enum Cmd {
         interruptible: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// The pipeline took back the member's last utterance: its speech went
+    /// on, and the whole of it follows as one transcript.
+    Retract { member: Member },
     /// What a member's browser asked for as instructions (design D10): sent
     /// as `client_instructions` on that member's later turns, typed or
     /// spoken. `None` forgets it.
@@ -532,6 +550,15 @@ fn classify(data: &RuntimeData, member: &Member) -> Option<Cmd> {
                 client_instructions: None,
             })
         }
+        RuntimeData::ControlMessage {
+            message_type: ControlMessageType::CancelSpeculation { .. },
+            metadata,
+            ..
+        } => (metadata.get(RETRACT_UTTERANCE_KEY).and_then(Value::as_bool) == Some(true)).then(|| {
+            Cmd::Retract {
+                member: member.clone(),
+            }
+        }),
         // The VAD node also forwards the audio it analysed.
         _ => None,
     }
@@ -973,6 +1000,8 @@ struct Turn {
     /// Whose turn it is (empty id: an unattributed input, or the agent).
     member: Member,
     transcript: String,
+    /// The transcript was spoken (not typed): the pipeline may retract it.
+    spoken_input: bool,
     audience: Audience,
     /// The members the turn's `ui` frames are for; `None`: everyone.
     ui_to: Option<Vec<String>>,
@@ -1017,6 +1046,19 @@ enum Pending {
         client_instructions: Option<String>,
     },
     Utterance(Utterance),
+}
+
+/// A member's last turn, after it settled: what a retraction takes back.
+struct Settled {
+    id: String,
+    member: Member,
+    ui_to: Option<Vec<String>>,
+    transcript: String,
+    /// The assistant text the settlement put in the history.
+    spoken: String,
+    spoken_input: bool,
+    /// `previous` before this turn settled.
+    previous_before: Option<Value>,
 }
 
 struct Utterance {
@@ -1070,6 +1112,10 @@ struct Actor {
     /// The last settlement, repeated on the next `turn`.
     previous: Option<Value>,
     seq: u64,
+    /// Distinguishes this instance's turn ids from those of an earlier instance
+    /// of the node in the same session (the unit can move to another runner),
+    /// so an id is never reused within a session.
+    instance: String,
     /// A `turn` was issued: later ones do not hold for a host.
     called: bool,
     /// Members the host was told are media-ready.
@@ -1080,6 +1126,8 @@ struct Actor {
     unreported_logged: HashSet<String>,
     /// Instructions a member's browser set (`set_client_instructions`).
     client_instructions: HashMap<String, String>,
+    /// Each member's last settled turn of its own, by member id.
+    settled: HashMap<String, Settled>,
 }
 
 impl Actor {
@@ -1095,11 +1143,13 @@ impl Actor {
             current: None,
             previous: None,
             seq: 0,
+            instance: uuid::Uuid::new_v4().simple().to_string()[..6].to_string(),
             called: false,
             ready_told: HashSet::new(),
             reporters: HashSet::new(),
             unreported_logged: HashSet::new(),
             client_instructions: HashMap::new(),
+            settled: HashMap::new(),
         }
     }
 
@@ -1393,6 +1443,7 @@ impl Actor {
             } => {
                 let _ = reply.send(self.speak(text, to, interruptible));
             }
+            Cmd::Retract { member } => self.retract(&member).await,
             Cmd::ClientInstructions { member, instructions } => match instructions {
                 Some(instructions) => {
                     self.client_instructions.insert(member, instructions);
@@ -1421,7 +1472,7 @@ impl Actor {
         }
         self.seq += 1;
         let utterance = Utterance {
-            id: format!("{}-{}", self.shared.node_id, self.seq),
+            id: format!("{}-{}-{}", self.shared.node_id, self.instance, self.seq),
             text,
             to,
             interruptible,
@@ -1519,6 +1570,7 @@ impl Actor {
             Some(MemberEvent::MemberLeft { member, .. }) => {
                 self.host_event("member_left", &member, Some("left"));
                 self.members.remove(&member);
+                self.settled.remove(&member);
                 self.client_instructions.remove(&member);
                 self.ready_told.remove(&member);
                 let mut nobody_left = false;
@@ -1811,6 +1863,93 @@ impl Actor {
         }
     }
 
+    // -- retraction --------------------------------------------------------
+
+    /// The member's last utterance was taken back (see the module docs):
+    /// its turn is dropped from the queue, cancelled, or removed after the
+    /// fact, whichever state it is in.
+    async fn retract(&mut self, member: &Member) {
+        // Transcripts and the retraction arrive in order, so the utterance
+        // is the member's most recent spoken input.
+        let queued = self.queue.iter().rposition(|pending| {
+            matches!(pending, Pending::Turn { source: "speech", member: of, .. } if of.id == member.id)
+        });
+        if let Some(at) = queued {
+            self.queue.remove(at);
+            tracing::info!(node = %self.shared.node_id, member = %member.id, "queued utterance retracted");
+            return;
+        }
+        let in_flight = self.current.as_ref().is_some_and(|turn| {
+            turn.kind == TurnKind::Reply && turn.spoken_input && turn.member.id == member.id
+        });
+        if in_flight {
+            // Cancels the host's call, flushes the turn's audio, stops TTS.
+            self.cancel("its utterance was retracted").await;
+            let Some(turn) = self.current.take() else { return };
+            self.ui_retracted(&turn.id, &turn.member, turn.ui_to.as_deref(), true).await;
+            self.forget(&turn.transcript, "");
+            self.host_retracted(&turn.id, &turn.member, &turn.transcript, "");
+            return;
+        }
+        if !self.settled.get(&member.id).is_some_and(|last| last.spoken_input) {
+            tracing::debug!(node = %self.shared.node_id, member = %member.id, "retraction of no known turn; ignored");
+            return;
+        }
+        let Some(last) = self.settled.remove(&member.id) else { return };
+        tracing::info!(node = %self.shared.node_id, turn = %last.id, "settled turn retracted");
+        self.ui_retracted(&last.id, &last.member, last.ui_to.as_deref(), false).await;
+        self.forget(&last.transcript, &last.spoken);
+        // The next `turn` repeats the settlement before the retracted one.
+        if self.previous.as_ref().is_some_and(|previous| previous["turn_id"] == last.id.as_str()) {
+            self.previous = last.previous_before.clone();
+        }
+        self.host_retracted(&last.id, &last.member, &last.transcript, &last.spoken);
+    }
+
+    /// The `ui` frames of a retraction: `abort` when the turn's message is
+    /// still open, then `data-turn` `retracted`.
+    async fn ui_retracted(&self, id: &str, member: &Member, to: Option<&[String]>, open: bool) {
+        let origin = out_origin(member, to, None);
+        if open {
+            self.emit(ui_frame(Some(id), json!({ "type": "abort" })), origin.clone()).await;
+        }
+        let status = json!({
+            "type": "data-turn", "id": id, "transient": true, "data": { "status": "retracted" },
+        });
+        self.emit(ui_frame(Some(id), status), origin).await;
+    }
+
+    /// Remove a retracted turn from the node's history: its user message
+    /// and, when it settled with one, the assistant message after it.
+    fn forget(&self, transcript: &str, spoken: &str) {
+        if self.config().history != HistoryMode::Node {
+            return;
+        }
+        let is = |entry: &HistoryEntry, role: &str, content: &str| {
+            entry.message["role"] == role && entry.message["content"] == content
+        };
+        let mut history = self.shared.history.lock();
+        let Some(at) = history.iter().rposition(|entry| is(entry, "user", transcript)) else {
+            return;
+        };
+        if !spoken.is_empty() && history.get(at + 1).is_some_and(|entry| is(entry, "assistant", spoken)) {
+            history.remove(at + 1);
+        }
+        history.remove(at);
+    }
+
+    /// Tell the host a turn was retracted, so a history it keeps drops it.
+    fn host_retracted(&self, id: &str, member: &Member, transcript: &str, spoken: &str) {
+        let event = json!({
+            "type": "turn_retracted",
+            "turn_id": id,
+            "transcript": transcript,
+            "spoken": spoken,
+            "member": member.wire(),
+        });
+        self.notify_host("event", event, false);
+    }
+
     // -- the turn slot -----------------------------------------------------
 
     /// Settle the current turn when it is over, and start the next.
@@ -1983,7 +2122,7 @@ impl Actor {
 
     fn next_id(&mut self) -> String {
         self.seq += 1;
-        format!("{}-{}", self.shared.node_id, self.seq)
+        format!("{}-{}-{}", self.shared.node_id, self.instance, self.seq)
     }
 
     fn new_turn(&self, id: String, kind: TurnKind, member: Member, audience: Audience) -> Turn {
@@ -1992,6 +2131,7 @@ impl Actor {
             kind,
             member,
             transcript: String::new(),
+            spoken_input: false,
             audience,
             ui_to: None,
             source: None,
@@ -2025,6 +2165,7 @@ impl Actor {
         };
         let mut turn = self.new_turn(id.clone(), TurnKind::Reply, member.clone(), audience);
         turn.transcript = transcript.clone();
+        turn.spoken_input = source == "speech";
         if self.config().ui == UiAudience::Member && addressed {
             turn.ui_to = Some(vec![member.id.clone()]);
         }
@@ -2249,6 +2390,20 @@ impl Actor {
             "interrupted": interrupted,
             "heard": heard,
         });
+        if turn.kind == TurnKind::Reply {
+            self.settled.insert(
+                turn.member.id.clone(),
+                Settled {
+                    id: turn.id.clone(),
+                    member: turn.member.clone(),
+                    ui_to: turn.ui_to.clone(),
+                    transcript: turn.transcript.clone(),
+                    spoken: spoken.clone(),
+                    spoken_input: turn.spoken_input,
+                    previous_before: self.previous.clone(),
+                },
+            );
+        }
         self.previous = Some(settlement.clone());
         self.notify_host("turn_settled", settlement, false);
     }

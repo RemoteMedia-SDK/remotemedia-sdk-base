@@ -191,6 +191,8 @@ pub use conversation_flow::{
 pub mod hosted_turn;
 pub use hosted_turn::{HostedTurnConfig, HostedTurnNode, HostedTurnNodeFactory};
 pub mod realtime_events;
+/// Passes on only the listed kinds of data; heads the audio and text paths of a voice pipeline.
+pub mod media_kind_filter;
 /// Test stand-in for a TTS node (a tone per text chunk); not speech synthesis.
 pub mod test_tone_tts;
 /// Test stand-in for a VAD node (loud = speech); not a speech detector.

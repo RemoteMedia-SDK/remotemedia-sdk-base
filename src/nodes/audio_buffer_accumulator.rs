@@ -104,6 +104,14 @@ pub struct AudioBufferAccumulatorNode {
 /// capture still gets its pre-roll.
 const MAX_PENDING_AGE_MS: u128 = 500;
 
+/// Key in the metadata of the `CancelSpeculation` this node emits at a speech
+/// start: `true` when the speech continues the last emitted utterance. That
+/// utterance is then retracted: its audio comes again, merged with the new
+/// speech, as one utterance. A node that acted on the retracted utterance
+/// (a transcript, a turn) takes it back. Absent on a speech start that
+/// continues nothing.
+pub const RETRACT_UTTERANCE_KEY: &str = "retract_utterance";
+
 /// Default `continuation_merge_ms`.
 pub const DEFAULT_CONTINUATION_MERGE_MS: u32 = 3000;
 
@@ -391,7 +399,11 @@ impl AudioBufferAccumulatorNode {
                     },
                     segment_id: None,
                     timestamp_ms: 0,
-                    metadata: serde_json::Value::Null,
+                    metadata: if restored {
+                        serde_json::json!({ RETRACT_UTTERANCE_KEY: true })
+                    } else {
+                        serde_json::Value::Null
+                    },
                 }])
             } else {
                 Ok(vec![])
@@ -742,6 +754,30 @@ mod tests {
         assert_eq!(utterance(&node, &mut states, 0.5), 16_000);
         // Within 3 s: the turn continues, the first second comes again.
         assert_eq!(utterance(&node, &mut states, 0.5), 32_000);
+    }
+
+    #[test]
+    fn a_continued_utterance_is_retracted_by_the_cancel_message() {
+        let node = AudioBufferAccumulatorNode::new(None, None, Some(true));
+        let mut states = HashMap::new();
+        let retracts = |out: Vec<RuntimeData>| match out.as_slice() {
+            [RuntimeData::ControlMessage {
+                message_type: ControlMessageType::CancelSpeculation { .. },
+                metadata,
+                ..
+            }] => metadata.get(RETRACT_UTTERANCE_KEY).and_then(|v| v.as_bool()) == Some(true),
+            other => panic!("expected one CancelSpeculation, got {other:?}"),
+        };
+        // The first speech start continues nothing.
+        assert!(!retracts(vad(&node, &mut states, true)));
+        let st = states.get_mut("s").unwrap();
+        st.sample_rate = 16_000;
+        st.accumulated_samples.extend(std::iter::repeat(0.5).take(16_000));
+        vad(&node, &mut states, false);
+        // Speech again within the merge window: the utterance just emitted is taken back.
+        assert!(retracts(vad(&node, &mut states, true)));
+        // Nothing was emitted since: this start retracts nothing.
+        assert!(!retracts(vad(&node, &mut states, true)));
     }
 
     #[test]

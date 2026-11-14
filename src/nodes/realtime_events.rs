@@ -518,14 +518,28 @@ impl Core {
                     self.end_or_hold(&turn_id, &member, out);
                 }
             }
-            "data-turn" => {
-                if chunk["data"]["status"] == "interrupted" {
+            "data-turn" => match chunk["data"]["status"].as_str() {
+                Some("interrupted") => {
                     let spoken = chunk["data"]["spoken"].as_str().unwrap_or_default().to_string();
                     for member in members {
                         self.end_response(&turn_id, &member, Some(&spoken), out);
                     }
                 }
-            }
+                // The utterance was taken back (its speech went on): a
+                // response still open ends as cancelled, and the browser is
+                // told which items were never a turn.
+                Some("retracted") => {
+                    for member in members {
+                        self.end_response(&turn_id, &member, Some(""), out);
+                        out.push(custom(
+                            &member,
+                            "remotemedia.turn-retracted",
+                            &json!({ "turnId": turn_id, "itemId": format!("{turn_id}:user") }),
+                        ));
+                    }
+                }
+                _ => {}
+            },
             "data-client-tool-call" => self.client_tool_call(&turn_id, owner, chunk, out),
             "error" => {
                 for member in members {

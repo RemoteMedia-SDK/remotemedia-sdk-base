@@ -162,6 +162,25 @@ impl Rig {
         self.send(RuntimeData::Text(text.into()), member(who, None)).await;
     }
 
+    /// The accumulator's control message at a speech start, as it reaches
+    /// the node through the transcription node. `retract`: the speech
+    /// continues `who`'s last utterance, which is emitted again, merged.
+    async fn cancel_speculation(&self, who: &str, retract: bool) {
+        self.send(
+            RuntimeData::ControlMessage {
+                message_type: crate::data::ControlMessageType::CancelSpeculation {
+                    from_timestamp: 0,
+                    to_timestamp: 0,
+                },
+                segment_id: None,
+                timestamp_ms: 0,
+                metadata: if retract { json!({ "retract_utterance": true }) } else { Value::Null },
+            },
+            member(who, None),
+        )
+        .await;
+    }
+
     /// `who` started speaking, as the VAD node reports it.
     async fn speech_start(&self, who: &HashMap<String, String>) {
         self.send(
@@ -1568,4 +1587,148 @@ async fn a_flush_report_replaces_what_progress_reports_counted() {
     assert_eq!(settled["interrupted"], true);
     assert_eq!(settled["spoken"], "One. ");
     assert_eq!(settled["heard"]["alice"], "One. ");
+}
+
+// -- a retracted utterance ---------------------------------------------------
+
+/// "Hello. <pause> This is a test.": the accumulator emits "Hello." at the
+/// pause, then takes it back when the speech goes on and emits the whole
+/// sentence. The barge-in of the resumed speech has already settled the
+/// first turn when the retraction arrives.
+#[tokio::test]
+async fn a_retracted_utterance_and_its_continuation_are_one_turn() {
+    let mut rig = rig(json!({})).await;
+    let mut host = rig.host();
+    rig.transcript("alice", "Earlier?").await;
+    host.answer(&["Earlier."]).await;
+    rig.until_listening().await;
+    let earlier = host.settled().await;
+
+    rig.transcript("alice", "Hello.").await;
+    let (call, request) = host.turn().await;
+    let turn = request["turn_id"].as_str().unwrap().to_string();
+    rig.until("start", None).await;
+
+    // The speech goes on: a barge-in first, as the VAD reports it.
+    rig.speech_start(&member("alice", None)).await;
+    host.cancelled(&call).await;
+    let outs = rig.until("data-turn", Some("interrupted")).await;
+    assert_eq!(ui_types(&outs), ["abort", "data-turn:interrupted"]);
+    assert_eq!(host.settled().await["turn_id"], turn.as_str());
+
+    // A speech start that continues nothing retracts nothing.
+    rig.cancel_speculation("alice", false).await;
+    rig.quiet().await;
+
+    rig.cancel_speculation("alice", true).await;
+    let outs = rig.until("data-turn", Some("retracted")).await;
+    assert_eq!(ui_types(&outs), ["data-turn:retracted"]);
+    let Out::Ui { frame, meta } = &outs[0] else { panic!("a ui frame") };
+    assert_eq!(
+        frame,
+        &json!({ "v": 1, "turn": turn, "chunk": {
+            "type": "data-turn", "id": turn, "transient": true, "data": { "status": "retracted" },
+        } })
+    );
+    assert_eq!(meta["participant.to"], "alice");
+    let event = host.host_event("turn_retracted").await;
+    assert_eq!(event["turn_id"], turn.as_str());
+    assert_eq!(event["transcript"], "Hello.");
+    assert_eq!(event["spoken"], "");
+    assert_eq!(event["member"]["id"], "alice");
+    let before = json!([
+        { "role": "user", "content": "Earlier?" },
+        { "role": "assistant", "content": "Earlier." }
+    ]);
+    assert_eq!(rig.rpc("get_history", None).await.unwrap(), before);
+
+    // The whole sentence is the one turn; the retracted one never was.
+    rig.transcript("alice", "Hello. This is a test.").await;
+    let request = host.answer(&["Thank you."]).await;
+    assert_eq!(request["transcript"], "Hello. This is a test.");
+    assert_eq!(request["messages"], before);
+    assert_eq!(request["previous"], earlier);
+    rig.until_listening().await;
+    assert_eq!(
+        rig.rpc("get_history", None).await.unwrap(),
+        json!([
+            { "role": "user", "content": "Earlier?" },
+            { "role": "assistant", "content": "Earlier." },
+            { "role": "user", "content": "Hello. This is a test." },
+            { "role": "assistant", "content": "Thank you." }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn a_retraction_cancels_the_turn_in_flight_and_keeps_nothing_of_it() {
+    // No barge-in, so the turn is still running when it is retracted.
+    let mut rig = rig(json!({ "barge_in": { "scope": "none" } })).await;
+    let mut host = rig.host();
+    rig.transcript("alice", "Hello.").await;
+    let (call, request) = host.turn().await;
+    let turn = request["turn_id"].as_str().unwrap().to_string();
+    host.text(&call, "Hi there. ");
+    host.text(&call, "How can I help?");
+    for _ in 0..2 {
+        rig.speech().await;
+    }
+
+    rig.cancel_speculation("alice", true).await;
+    // The host's call is cancelled and the turn's audio flushed.
+    host.cancelled(&call).await;
+    assert_eq!(
+        rig.flush().await,
+        FlushTarget { members: vec!["alice".into()], turn_id: turn.clone(), drop_rest: true }
+    );
+    assert!(host.meta(&call, json!({})).is_err());
+    let outs = rig.until("data-turn", Some("retracted")).await;
+    assert!(speech(&outs).is_empty());
+    assert_eq!(ui_types(&outs), ["abort", "data-turn:retracted"]);
+    let event = host.host_event("turn_retracted").await;
+    assert_eq!((event["turn_id"].as_str(), event["transcript"].as_str()), (Some(turn.as_str()), Some("Hello.")));
+    assert_eq!(rig.rpc("get_history", None).await.unwrap(), json!([]));
+
+    rig.transcript("alice", "Hello. This is a test.").await;
+    let request = host.answer(&["Thank you."]).await;
+    assert_eq!(request["messages"], json!([]));
+    // It was never a turn: there is no settlement of it to repeat.
+    assert!(request.get("previous").is_none());
+    rig.until_listening().await;
+    let settled = host.settled().await;
+    assert_ne!(settled["turn_id"], turn.as_str(), "the retracted turn is never settled");
+    assert_eq!(
+        rig.rpc("get_history", None).await.unwrap(),
+        json!([
+            { "role": "user", "content": "Hello. This is a test." },
+            { "role": "assistant", "content": "Thank you." }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn a_retracted_utterance_still_waiting_for_the_slot_never_becomes_a_turn() {
+    let mut rig = rig(json!({ "barge_in": { "scope": "none" } })).await;
+    let mut host = rig.host();
+    rig.transcript("bob", "A long question").await;
+    let (call, _) = host.turn().await;
+    rig.transcript("alice", "Hello.").await;
+    rig.cancel_speculation("alice", true).await;
+    rig.transcript("alice", "Hello. This is a test.").await;
+    // Alice's inputs reach the node while Bob's turn still holds the slot.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    host.text(&call, "Answer.");
+    host.end(&call);
+    let request = host.answer(&["Thank you."]).await;
+    assert_eq!(request["transcript"], "Hello. This is a test.");
+    assert_eq!(
+        request["messages"],
+        json!([
+            { "role": "user", "content": "A long question" },
+            { "role": "assistant", "content": "Answer." }
+        ])
+    );
+    // Bob's turn is untouched by Alice's retraction.
+    let outs = rig.until_listening().await;
+    assert!(!ui_types(&outs).iter().any(|kind| kind == "data-turn:retracted"));
 }
