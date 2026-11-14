@@ -496,6 +496,9 @@ fn decode_wire(wire: WireRuntimeData) -> Result<RuntimeData, Error> {
             let text = String::from_utf8_lossy(&wire.payload).into_owned();
             Ok(RuntimeData::Text(text))
         }
+        WireDataType::Json => serde_json::from_slice(&wire.payload)
+            .map(RuntimeData::Json)
+            .map_err(|e| Error::Execution(format!("decode json: {e}"))),
         WireDataType::Audio => {
             let (samples, sample_rate, channels) = wire
                 .decode_audio()
@@ -526,7 +529,7 @@ fn decode_wire(wire: WireRuntimeData) -> Result<RuntimeData, Error> {
             })
         }
         other => Err(Error::Execution(format!(
-            "SourcePythonNode decodes only Text/Audio/Tensor output (got {other:?})"
+            "SourcePythonNode decodes only Text/Json/Audio/Tensor output (got {other:?})"
         ))),
     }
 }
@@ -560,6 +563,23 @@ mod wire_copy_tests {
         let allowed = CopyContext::new(CopyPolicy::AllowCopies, "source-python-allowed");
         let ctx = NodeRuntimeContext::for_test("s", "n").with_copy_context(allowed.clone());
         assert!(wire_copies("Echo", &ctx).unwrap().same_authority(&allowed));
+    }
+
+    #[test]
+    fn json_output_from_the_runner_decodes_as_json() {
+        // `MultiprocessNode._send_output` writes RuntimeData.json(...) as type 9.
+        let payload = br#"{"kind":"turn_end","complete":true}"#;
+        let mut bytes = vec![9u8];
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.push(b's');
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        let copies = CopyContext::new(CopyPolicy::AllowCopies, "source-python-json");
+        let RuntimeData::Json(value) = decode_output(&bytes, &copies).unwrap() else {
+            panic!("expected json")
+        };
+        assert_eq!(value, serde_json::json!({"kind": "turn_end", "complete": true}));
     }
 
     #[test]
