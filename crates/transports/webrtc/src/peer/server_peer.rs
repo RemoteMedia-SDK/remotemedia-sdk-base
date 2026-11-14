@@ -557,7 +557,17 @@ impl SharedPipelineSession {
                     continue;
                 }
 
+                // An addressed output (`participant.to`) goes to the peers it
+                // names; any other output goes to every peer. The frame itself
+                // is shared: addressing costs no copy.
+                let recipients = participant::recipients(&transport_data.metadata)
+                    .map(|to| to.into_iter().map(str::to_string).collect::<Vec<_>>());
                 for target in targets {
+                    if let Some(to) = &recipients {
+                        if !to.iter().any(|id| id == &target.dispatcher.peer_id) {
+                            continue;
+                        }
+                    }
                     #[cfg(feature = "ws-signaling")]
                     if let Some(ref tx) = target.event_tx {
                         let event = WebRtcEventBridge::pipeline_output_with_context(
@@ -633,9 +643,29 @@ pub struct ServerPeer {
     /// Stored to keep `Arc<RTCRtpSender>` alive for the duration of the
     /// peer (avoids any reliance on webrtc-rs's internal retention).
     track_senders: Arc<RwLock<Vec<Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>>>>,
+
+    /// How this peer's `remotemedia-control` data channel is treated. Set
+    /// before the offer is handled.
+    control_policy: Arc<std::sync::RwLock<crate::control::ControlChannelPolicy>>,
+
+    /// The peer's display name, when the host that admitted it gave one.
+    display_name: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl ServerPeer {
+    /// How this peer's `remotemedia-control` data channel is treated: open to
+    /// the whole bus (the default), refused, or bound to the peer's own
+    /// session with a member's access. Call before handling the offer.
+    pub fn set_control_policy(&self, policy: crate::control::ControlChannelPolicy) {
+        *self.control_policy.write().expect("control policy lock") = policy;
+    }
+
+    /// The display name the peer joins its session with. Call before
+    /// handling the offer.
+    pub fn set_display_name(&self, display_name: Option<String>) {
+        *self.display_name.write().expect("display name lock") = display_name;
+    }
+
     /// Create a new server peer without event forwarding
     ///
     /// # Arguments
@@ -677,6 +707,8 @@ impl ServerPeer {
             shutdown_rx: Arc::new(RwLock::new(Some(shutdown_rx))),
             session_id: Arc::new(RwLock::new(None)),
             track_senders: Arc::new(RwLock::new(Vec::new())),
+            control_policy: Default::default(),
+            display_name: Default::default(),
         })
     }
 
@@ -723,6 +755,8 @@ impl ServerPeer {
             shutdown_rx: Arc::new(RwLock::new(Some(shutdown_rx))),
             session_id: Arc::new(RwLock::new(None)),
             track_senders: Arc::new(RwLock::new(Vec::new())),
+            control_policy: Default::default(),
+            display_name: Default::default(),
         })
     }
 
@@ -1000,6 +1034,10 @@ impl ServerPeer {
         // prost-generated ControlFrame/ControlEvent types live under that feature.
         #[cfg(feature = "grpc-signaling")]
         let control_bus_for_dc = self.executor.control_bus();
+        #[cfg(feature = "grpc-signaling")]
+        let control_policy_for_dc = Arc::clone(&self.control_policy);
+        #[cfg(feature = "grpc-signaling")]
+        let control_session_for_dc = shared_session.session_id().to_string();
         self.peer_connection
             .peer_connection()
             .on_data_channel(Box::new(move |data_channel| {
@@ -1011,6 +1049,13 @@ impl ServerPeer {
                 let event_tx = event_tx_for_dc_clone.clone();
                 #[cfg(feature = "grpc-signaling")]
                 let control_bus = Arc::clone(&control_bus_for_dc);
+                #[cfg(feature = "grpc-signaling")]
+                let control_policy = control_policy_for_dc
+                    .read()
+                    .expect("control policy lock")
+                    .clone();
+                #[cfg(feature = "grpc-signaling")]
+                let control_session = control_session_for_dc.clone();
                 let data_channel = Arc::new(data_channel);
 
                 Box::pin(async move {
@@ -1021,13 +1066,49 @@ impl ServerPeer {
                     // Session Control Bus instead of the data plane.
                     #[cfg(feature = "grpc-signaling")]
                     if data_channel.label() == crate::control::CONTROL_CHANNEL_LABEL {
-                        info!("Data channel '{}' routed to Session Control Bus (peer {})",
-                            data_channel.label(), peer_id);
-                        crate::control::attach_control_channel(
-                            Arc::clone(&data_channel),
-                            control_bus,
-                        )
-                        .await;
+                        use crate::control::ControlChannelPolicy;
+                        match control_policy {
+                            ControlChannelPolicy::Open => {
+                                info!("Data channel '{}' routed to Session Control Bus (peer {})",
+                                    data_channel.label(), peer_id);
+                                crate::control::attach_control_channel(
+                                    Arc::clone(&data_channel),
+                                    control_bus,
+                                )
+                                .await;
+                            }
+                            ControlChannelPolicy::Bound(binding) => {
+                                match control_bus.get(&control_session) {
+                                    Some(ctrl) => {
+                                        info!("Data channel '{}' bound to session {} for member {}",
+                                            data_channel.label(), control_session, binding.member);
+                                        crate::control::attach_bound_control_channel(
+                                            Arc::clone(&data_channel),
+                                            ctrl,
+                                            binding,
+                                        )
+                                        .await;
+                                    }
+                                    None => {
+                                        warn!("Control channel of peer {} refused: session {} has no control",
+                                            peer_id, control_session);
+                                        crate::control::refuse_control_channel(
+                                            Arc::clone(&data_channel),
+                                            "this session has no control",
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            ControlChannelPolicy::Refused => {
+                                warn!("Control channel of peer {} refused: it has no control grant", peer_id);
+                                crate::control::refuse_control_channel(
+                                    Arc::clone(&data_channel),
+                                    "not granted: this member has no control grant",
+                                )
+                                .await;
+                            }
+                        }
                         return;
                     }
 
@@ -1281,9 +1362,12 @@ impl ServerPeer {
         // has its own backpressure path.
 
         // Input forwarder: dc_input_rx -> shared session input.
-        let participant = Participant::new(peer_id.clone(), participant::role::CLIENT)
+        let mut participant = Participant::new(peer_id.clone(), participant::role::CLIENT)
             .with_track_id(format!("{peer_id}:webrtc"))
             .with_modality(participant::modality::CONTROL);
+        if let Some(name) = self.display_name.read().expect("display name lock").clone() {
+            participant = participant.with_display_name(name);
+        }
         let participant_session = shared_session.participant_handle(participant);
         let participant_for_leave = participant_session.clone();
         let peer_id_for_input = peer_id.clone();

@@ -39,6 +39,8 @@ const CONTROL_CAPACITY: usize = 64;
 const CONTROL_TICK: Duration = Duration::from_millis(5);
 /// How long a detach may take before the lane is given up on.
 const DETACH_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a dropped lease waits for its lane's final copy report.
+const DROPPED_LANE_REPORT: Duration = Duration::from_secs(5);
 /// How long a worker may take to exit after `shutdown` before it is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
@@ -62,6 +64,10 @@ pub struct WorkerSharingConfig {
     pub max_workers_per_key: usize,
     /// How long a worker with no sessions stays loaded.
     pub idle_ttl_secs: u64,
+    /// Whether a manifest node may turn sharing on for itself with
+    /// `__share__: true` while `enabled` is off. Turn this off on hosts that
+    /// accept client-supplied manifests.
+    pub allow_manifest_opt_in: bool,
 }
 
 impl Default for WorkerSharingConfig {
@@ -72,6 +78,7 @@ impl Default for WorkerSharingConfig {
             max_sessions_per_worker: 8,
             max_workers_per_key: 4,
             idle_ttl_secs: 300,
+            allow_manifest_opt_in: true,
         }
     }
 }
@@ -81,6 +88,9 @@ impl WorkerSharingConfig {
     pub fn with_env_overrides(mut self) -> Self {
         if let Ok(value) = std::env::var("REMOTEMEDIA_SHARE_WORKERS") {
             self.enabled = matches!(value.trim(), "1" | "true" | "yes" | "on");
+        }
+        if let Ok(value) = std::env::var("REMOTEMEDIA_SHARE_MANIFEST_OPT_IN") {
+            self.allow_manifest_opt_in = matches!(value.trim(), "1" | "true" | "yes" | "on");
         }
         if let Ok(value) = std::env::var("REMOTEMEDIA_SHARE_NODE_TYPES") {
             self.node_types = value
@@ -95,11 +105,16 @@ impl WorkerSharingConfig {
 
     /// Whether the policy allows sharing this node. The node class must still
     /// declare `@shareable`; that is learned from its first worker. A manifest
-    /// node opts out with `__share__: false`.
+    /// node opts out with `__share__: false`, and opts in with `__share__: true`
+    /// when `allow_manifest_opt_in` permits it (the node-type list still applies).
     pub fn applies_to(&self, node_type: &str, params: &Value) -> bool {
-        self.enabled
-            && (self.node_types.is_empty() || self.node_types.iter().any(|t| t == node_type))
-            && params.get("__share__").and_then(Value::as_bool) != Some(false)
+        let listed =
+            self.node_types.is_empty() || self.node_types.iter().any(|t| t == node_type);
+        match params.get("__share__").and_then(Value::as_bool) {
+            Some(false) => false,
+            Some(true) => listed && (self.enabled || self.allow_manifest_opt_in),
+            None => listed && self.enabled,
+        }
     }
 }
 
@@ -760,10 +775,24 @@ impl Drop for Lease {
         }
         let lane_id = (self.session_id.clone(), self.node_id.clone());
         self.worker.lanes.lock().unwrap().remove(&lane_id);
-        if self.worker.alive() {
-            let _ = self
+        let detaching = self.worker.alive()
+            && self
                 .worker
-                .send(serde_json::json!({"op": "detach", "session": self.session_id, "node": self.node_id}));
+                .send(serde_json::json!({"op": "detach", "session": self.session_id, "node": self.node_id}))
+                .is_ok();
+        if let (true, Some(authority)) = (detaching, self.copy_authority.take()) {
+            // The lane reports its copies once its node has stopped. Keep the
+            // reporter until then; dropping it here would cut the report off
+            // and the lane would log a failed stop.
+            let node = self.node_id.clone();
+            let report = move || {
+                if authority.finish_within(DROPPED_LANE_REPORT).is_err() {
+                    tracing::error!("copy accounting for shared lane {node} did not close cleanly");
+                }
+            };
+            let _ = std::thread::Builder::new()
+                .name("lane-copy-report".into())
+                .spawn(report);
         }
         // `release` schedules the idle timer on the runtime.
         if tokio::runtime::Handle::try_current().is_ok() {

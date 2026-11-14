@@ -77,6 +77,7 @@ impl LoadableNodeAdapter {
         &self,
         data: RuntimeData,
         session: Option<String>,
+        origin: abi_stable::std_types::ROption<RString>,
         copies: &CopyContext,
         callback: F,
     ) -> Result<usize, Error>
@@ -85,12 +86,13 @@ impl LoadableNodeAdapter {
     {
         let bytes = self.legacy_encode(&data, copies)?;
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let sink: OutputSinkBox = OutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
+        let sink: OutputSinkBox = OutputSink_TO::from_value(self.sink(tx), TD_Opaque);
         let future = self.inner.process_streaming_with_context(
             bytes,
             FfiCallContext {
                 session_id: session.map(RString::from).into(),
                 node_id: self.node_id.clone().into(),
+                origin,
             },
             sink,
         );
@@ -105,7 +107,7 @@ impl LoadableNodeAdapter {
         callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
     ) -> Result<(), Error> {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let sink = OutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
+        let sink = OutputSink_TO::from_value(self.sink(tx), TD_Opaque);
         let future = self.inner.tick(
             loadable_node_abi::FfiTick {
                 clock_id: tick.clock_id.into(),

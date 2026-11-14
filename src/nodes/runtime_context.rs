@@ -86,6 +86,10 @@ pub use crate::nodes::ports::SnapshotPort;
 #[derive(Clone)]
 pub struct NodeRuntimeContext {
     pub(crate) source_completion: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// The instance's output emitter; detached outside a streaming session.
+    pub(crate) emitter: crate::nodes::Emitter,
+    /// The participant whose input is being processed, if any.
+    pub(crate) origin: Option<Arc<crate::transport::origin::Origin>>,
     /// Policy and attributed ledger for explicit host node materializations.
     pub materialization: remotemedia_types::CopyContext,
     /// Output storage provider. Clones retain the selected provider; loans and
@@ -190,6 +194,8 @@ impl NodeRuntimeContext {
         let session_id: Arc<str> = session_id.into();
         let node_id: Arc<str> = node_id.into();
         Self {
+            emitter: crate::nodes::Emitter::detached(node_id.as_ref()),
+            origin: None,
             materialization: remotemedia_types::CopyContext::new(
                 remotemedia_types::CopyPolicy::AllowCopies,
                 format!("session/{session_id}/node/{node_id}/materialization"),
@@ -215,6 +221,34 @@ impl NodeRuntimeContext {
     pub fn with_cancel_gate(mut self, cancel_gate: Arc<CancelGate>) -> Self {
         self.cancel_gate = cancel_gate;
         self
+    }
+
+    /// The host context behind the trait object a node's per-call methods
+    /// receive; `None` when the call does not come from this runtime.
+    pub fn of(ctx: &dyn NodeRuntimeContextRead) -> Option<&Self> {
+        ctx.as_any().downcast_ref::<Self>()
+    }
+
+    /// Install the instance's output emitter.
+    pub(crate) fn with_emitter(mut self, emitter: crate::nodes::Emitter) -> Self {
+        self.emitter = emitter;
+        self
+    }
+
+    /// The instance's output emitter (openspec: add-node-initiated-output):
+    /// puts data on the node's output edge whether or not an input is being
+    /// processed. Cloneable, so a node can move it into a task. What the node
+    /// returns or yields from a call stays that input's output.
+    pub fn emitter(&self) -> crate::nodes::Emitter {
+        self.emitter.clone()
+    }
+
+    /// The participant whose input this call is processing; `None` for an
+    /// unattributed input and outside a call (ticks, RPC, capability
+    /// updates). A node keeps it to attribute a later emit:
+    /// `ctx.emitter().emit_as(data, origin)`.
+    pub fn origin(&self) -> Option<Arc<crate::transport::origin::Origin>> {
+        self.origin.clone()
     }
 
     /// Install the provider selected for this node's output memory domain.
@@ -388,6 +422,15 @@ impl NodeRuntimeContext {
 // — no edits needed at the call site for the common case.
 
 impl NodeRuntimeContextRead for NodeRuntimeContext {
+    fn origin(&self) -> Option<Arc<crate::transport::origin::Origin>> {
+        self.origin.clone()
+    }
+    fn emitter_any(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(&self.emitter)
+    }
+    fn emit_handle(&self) -> Option<Arc<dyn remotemedia_traits::emit::Emit>> {
+        Some(Arc::new(self.emitter.clone()))
+    }
     fn finish_source(&self) -> crate::Result<()> {
         NodeRuntimeContext::finish_source(self)
     }
@@ -550,6 +593,8 @@ mod tests {
         struct B;
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            emitter: crate::nodes::Emitter::detached(String::new()),
+            origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
@@ -576,6 +621,8 @@ mod tests {
 
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            emitter: crate::nodes::Emitter::detached(String::new()),
+            origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
@@ -628,6 +675,8 @@ mod tests {
         });
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            emitter: crate::nodes::Emitter::detached(String::new()),
+            origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
@@ -668,6 +717,8 @@ mod tests {
 
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            emitter: crate::nodes::Emitter::detached(String::new()),
+            origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
@@ -699,6 +750,8 @@ mod tests {
 
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            emitter: crate::nodes::Emitter::detached(String::new()),
+            origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),
@@ -777,6 +830,8 @@ mod tests {
         snapshots.insert("weights".into(), Arc::new(out.input()));
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            emitter: crate::nodes::Emitter::detached(String::new()),
+            origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
             session_id: Arc::from("sess-1"),
             node_id: Arc::from("node-x"),

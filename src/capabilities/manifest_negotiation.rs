@@ -167,15 +167,19 @@ fn splice_inserted_nodes(manifest: &Manifest, inserted: &[InsertedNode]) -> Mani
                         to: inserted_node.id.clone(),
                         from_port: prev_port,
                         to_port: None,
+                        edge_transport: None,
                     });
                     prev = inserted_node.id.clone();
                     prev_port = None;
                 }
+                // The hop into the original target keeps how the original
+                // connection crosses processes.
                 new_connections.push(Connection {
                     from: prev,
                     to: conn.to.clone(),
                     from_port: prev_port,
                     to_port: conn.to_port.clone(),
+                    edge_transport: conn.edge_transport.clone(),
                 });
             }
         }
@@ -251,6 +255,7 @@ mod tests {
                 to: "b".into(),
                 from_port: None,
                 to_port: None,
+                edge_transport: None,
             }],
         );
 
@@ -286,6 +291,7 @@ mod tests {
                 to: "b".into(),
                 from_port: Some("audio_out".into()),
                 to_port: Some("audio_in".into()),
+                edge_transport: None,
             }],
             python_env: None,
             plugins: Vec::new(),

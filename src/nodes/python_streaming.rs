@@ -14,8 +14,27 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Where a Python node's class comes from when it is not on the host's default
+/// import path: a Python source plugin, for example.
+#[derive(Debug, Clone, Default)]
+pub struct PythonSpawnSettings {
+    /// Directories put first on the worker's import path.
+    pub python_path: Vec<std::path::PathBuf>,
+    /// Modules the worker imports before it looks the node type up; importing
+    /// them registers the node classes.
+    pub register_modules: Vec<String>,
+    /// Extra environment variables for the worker. They are part of the
+    /// shared-worker key, so a value that identifies the code (a plugin
+    /// digest) keeps different versions in different workers.
+    pub env: Vec<(String, String)>,
+    /// Deliver JSON inputs as text holding the JSON (`json_input = "text"`).
+    pub json_as_text: bool,
+}
+
 /// Wrapper that adapts a Python node to the AsyncStreamingNode trait
 pub struct PythonStreamingNode {
+    /// Per-node spawn settings; `None` for nodes on the default import path.
+    spawn: Option<PythonSpawnSettings>,
     node_id: String,
     node_type: String,
     params: Value,
@@ -28,6 +47,11 @@ pub struct PythonStreamingNode {
     /// Control bus handle for progress reporting during initialization.
     /// Set by `initialize()` from the `InitializeContext`.
     control: Mutex<Option<Arc<SessionControl>>>,
+    /// The node instance's emitter, handed to the executor so the Python
+    /// node can emit output on its own (openspec: add-node-initiated-output).
+    emitter: std::sync::Mutex<Option<crate::nodes::Emitter>>,
+    /// `@self_driven` of the Python class, learned at initialization.
+    declared_self_driven: std::sync::OnceLock<bool>,
 }
 
 impl PythonStreamingNode {
@@ -49,6 +73,7 @@ impl PythonStreamingNode {
         }
 
         Ok(Self {
+            spawn: None,
             node_id,
             node_type: node_type.to_string(),
             params: params.clone(),
@@ -56,7 +81,16 @@ impl PythonStreamingNode {
             declared_instance_scope: std::sync::OnceLock::new(),
             session_id,
             control: Mutex::new(None),
+            emitter: std::sync::Mutex::new(None),
+            declared_self_driven: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Run this node's worker with per-node spawn settings (import path,
+    /// modules to import, environment). Must be set before first use.
+    pub fn with_spawn_settings(mut self, settings: PythonSpawnSettings) -> Self {
+        self.spawn = Some(settings);
+        self
     }
 
     /// Create with session ID for multiprocess execution (spec 002)
@@ -67,6 +101,7 @@ impl PythonStreamingNode {
         session_id: String,
     ) -> Result<Self, Error> {
         Ok(Self {
+            spawn: None,
             node_id,
             node_type: node_type.to_string(),
             params: params.clone(),
@@ -74,6 +109,8 @@ impl PythonStreamingNode {
             declared_instance_scope: std::sync::OnceLock::new(),
             session_id: Some(session_id),
             control: Mutex::new(None),
+            emitter: std::sync::Mutex::new(None),
+            declared_self_driven: std::sync::OnceLock::new(),
         })
     }
 
@@ -89,6 +126,7 @@ impl PythonStreamingNode {
             let _ = declared_instance_scope.set(scope);
         }
         Ok(Self {
+            spawn: None,
             node_id,
             node_type: node_type.to_string(),
             params: params.clone(),
@@ -96,6 +134,8 @@ impl PythonStreamingNode {
             declared_instance_scope,
             session_id: None,
             control: Mutex::new(None),
+            emitter: std::sync::Mutex::new(None),
+            declared_self_driven: std::sync::OnceLock::new(),
         })
     }
 
@@ -135,12 +175,31 @@ impl PythonStreamingNode {
             );
 
             // Load config from runtime.toml or use defaults
-            let config = crate::python::multiprocess::MultiprocessConfig::from_default_file()
+            let mut config = crate::python::multiprocess::MultiprocessConfig::from_default_file()
                 .unwrap_or_default();
+            if let Some(spawn) = &self.spawn {
+                // The node's own directories go first on the import path.
+                for (index, path) in spawn.python_path.iter().enumerate() {
+                    if !config.python_path.contains(path) {
+                        config.python_path.insert(index, path.clone());
+                    }
+                }
+            }
 
             let mut executor = crate::python::multiprocess::MultiprocessExecutor::new(config);
+            if let Some(spawn) = &self.spawn {
+                for module in &spawn.register_modules {
+                    executor.register_module(module).await;
+                }
+                for (key, value) in &spawn.env {
+                    executor.set_spawn_env(key, value).await;
+                }
+            }
             if let Some(copies) = copies {
                 executor.bind_initial_copy_context(copies)?;
+            }
+            if let Some(emitter) = self.emitter.lock().unwrap().clone() {
+                executor.set_emitter(emitter);
             }
             let mut py_executor: Box<dyn NodeExecutor> = Box::new(executor);
 
@@ -167,6 +226,13 @@ impl PythonStreamingNode {
             if let Some(scope) = Self::scope_of(py_executor.as_mut()) {
                 let _ = self.declared_instance_scope.set(scope);
             }
+            if let Some(self_driven) = py_executor
+                .as_any_mut()
+                .downcast_mut::<crate::python::multiprocess::MultiprocessExecutor>()
+                .and_then(|mp| mp.declared_self_driven())
+            {
+                let _ = self.declared_self_driven.set(self_driven);
+            }
 
             *executor_guard = Some(py_executor);
         }
@@ -187,11 +253,21 @@ impl PythonStreamingNode {
         session_id: Option<String>,
         callback: F,
         copies: remotemedia_types::CopyContext,
+        origin: Option<Arc<crate::transport::origin::Origin>>,
     ) -> Result<usize, Error>
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
         let session_id_opt = session_id.or_else(|| self.session_id.clone());
+        // `json_input = "text"`: this node asked for JSON inputs as text.
+        let data = match data {
+            RuntimeData::Json(value)
+                if self.spawn.as_ref().is_some_and(|spawn| spawn.json_as_text) =>
+            {
+                RuntimeData::Text(value.to_string())
+            }
+            other => other,
+        };
         // First-use initialization binds lifetime output authority. Later request
         // contexts remain input/decode authority without rebinding the worker.
         self.ensure_initialized_with_copies(Some(copies.clone()), session_id_opt.clone())
@@ -249,12 +325,7 @@ impl PythonStreamingNode {
         };
 
         let result = executor
-            .process_runtime_data_streaming_with_copy_context(
-                data,
-                session_id_opt,
-                callback,
-                &copies,
-            )
+            .process_turn(data, session_id_opt, callback, &copies, origin.as_deref())
             .await;
 
         tracing::info!("[PythonStreamingNode] Node {}: mp_executor.process_runtime_data_streaming returned {:?}", self.node_id, result);
@@ -295,6 +366,11 @@ impl AsyncStreamingNode for PythonStreamingNode {
     /// The Python class's `@instance_scope(...)`, once initialized.
     fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
         self.declared_instance_scope.get().copied()
+    }
+
+    /// The Python class's `@self_driven`, once initialized.
+    fn self_driven(&self) -> Option<bool> {
+        self.declared_self_driven.get().copied()
     }
 
     fn rpc_methods(&self) -> Vec<remotemedia_traits::rpc::RpcMethod> {
@@ -383,6 +459,9 @@ impl AsyncStreamingNode for PythonStreamingNode {
                 *self.control.lock().await = Some(Arc::clone(ctrl));
             }
         }
+        if ctx.emitter_any().is_some() {
+            *self.emitter.lock().unwrap() = Some(crate::nodes::Emitter::of(ctx));
+        }
         let copies = ctx.copy_context();
         self.ensure_initialized_with_copies(copies.clone(), Some(ctx.session_id().to_owned()))
             .await?;
@@ -453,6 +532,7 @@ impl AsyncStreamingNode for PythonStreamingNode {
             session_id,
             callback,
             remotemedia_types::CopyContext::legacy().clone(),
+            None,
         )
         .await
     }
@@ -468,7 +548,14 @@ impl AsyncStreamingNode for PythonStreamingNode {
     {
         let copies = Self::legacy_copies(ctx)?;
         let session = (!ctx.session_id().is_empty()).then(|| ctx.session_id().to_owned());
-        self.stream_with_copies(data, session, callback, copies)
+        // A node that starts its worker on its first input still gets the
+        // instance's emitter; the input's sender travels with the input.
+        let host = crate::nodes::NodeRuntimeContext::of(ctx);
+        if let Some(host) = host {
+            self.emitter.lock().unwrap().get_or_insert_with(|| host.emitter());
+        }
+        let origin = host.and_then(|host| host.origin());
+        self.stream_with_copies(data, session, callback, copies, origin)
             .await
     }
 

@@ -23,6 +23,30 @@ pub mod participant {
     pub const MODALITY: &str = "participant.modality";
     /// Human-readable label for UI/logging only.
     pub const DISPLAY_NAME: &str = "participant.display_name";
+    /// The participants an output is for: one id, or several separated by
+    /// commas. An output without it is for every participant. A transport
+    /// that serves several participants delivers an addressed output only to
+    /// the ones it names (see [`recipients`]).
+    pub const TO: &str = "participant.to";
+
+    /// The participants an output with this metadata is addressed to. `None`:
+    /// it is for everyone. An empty list: it is for nobody.
+    pub fn recipients(metadata: &std::collections::HashMap<String, String>) -> Option<Vec<&str>> {
+        metadata.get(TO).map(|to| {
+            to.split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .collect()
+        })
+    }
+
+    /// Whether an output with this metadata is delivered to `participant_id`.
+    pub fn is_for(metadata: &std::collections::HashMap<String, String>, participant_id: &str) -> bool {
+        match recipients(metadata) {
+            None => true,
+            Some(to) => to.contains(&participant_id),
+        }
+    }
 
     /// Conventional participant roles. Roles remain open strings; these values
     /// are the shared vocabulary used by SDK helpers and built-in integrations.

@@ -506,6 +506,7 @@ fn manifest(nodes: &[(&str, &str, Value)], conns: &[(&str, &str)]) -> Manifest {
                 to: t.to_string(),
                 from_port: None,
                 to_port: None,
+                edge_transport: None,
             })
             .collect(),
         ..Default::default()

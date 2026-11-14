@@ -283,7 +283,7 @@ impl WarmSessionPool {
             state.refill_in_flight.insert(hash, notify.clone());
         }
 
-        let outcome = self.executor.cold_build_session(manifest).await;
+        let outcome = self.executor.cold_build_parked_session(manifest).await;
 
         let mut state = self.state.lock().await;
         state.refill_in_flight.remove(&hash);
@@ -389,6 +389,8 @@ impl WarmSessionPool {
 
             // Phase 2: act on the snapshot (lock dropped).
             if let Some(handle) = warm {
+                // The session is acquired: its node instances start.
+                handle.start();
                 if let Some(control) = self.executor.control_bus().get(&handle.session_id) {
                     control.set_phase(crate::transport::session_control::SessionPhase::Active);
                 }
@@ -665,7 +667,7 @@ impl WarmSessionPool {
                 }
 
                 // Cold-build outside the lock.
-                let result = this.executor.cold_build_session(manifest.clone()).await;
+                let result = this.executor.cold_build_parked_session(manifest.clone()).await;
 
                 match result {
                     Ok(handle) => {

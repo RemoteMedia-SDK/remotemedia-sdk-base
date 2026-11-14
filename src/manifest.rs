@@ -144,6 +144,33 @@ pub struct PluginSpecExplicit {
     /// hash doesn't match — pin-by-hash for reproducibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+
+    /// Node types this plugin provides. Optional; when given, a runtime that
+    /// splits the manifest across hosts gives each part only the plugins its
+    /// nodes use, so a host never resolves a plugin it has no build for
+    /// (e.g. a phone and a desktop plugin in one manifest).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_types: Vec<String>,
+}
+
+impl PluginSpec {
+    /// The node types the spec declares it provides, if it declares any.
+    pub fn declared_node_types(&self) -> Option<&[String]> {
+        match self {
+            PluginSpec::Explicit(e) if !e.node_types.is_empty() => Some(&e.node_types),
+            _ => None,
+        }
+    }
+
+    /// Whether a manifest part containing `node_types` needs this plugin:
+    /// yes when the spec declares none of its types (it might provide any),
+    /// or one of them is present.
+    pub fn needed_for<'a>(&self, mut node_types: impl Iterator<Item = &'a str>) -> bool {
+        match self.declared_node_types() {
+            None => true,
+            Some(declared) => node_types.any(|t| declared.iter().any(|d| d == t)),
+        }
+    }
 }
 
 /// Python environment settings declared at the manifest level.
@@ -316,6 +343,13 @@ pub struct NodeManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_scope: Option<crate::nodes::InstanceScope>,
 
+    /// `false`: the node is self-driven. It does not take the session's
+    /// client input, also when nothing is connected to its input, and
+    /// produces through its emitter. Overrides the node's own declaration
+    /// (openspec: add-node-initiated-output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_input: Option<bool>,
+
     /// For a per-participant node: the most instances it may run in one
     /// session (default: `ExecutorConfig::max_participant_instances`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -436,6 +470,13 @@ pub struct Connection {
     /// the connection is a streaming mpsc or a snapshot read handle.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub to_port: Option<String>,
+
+    /// How this connection crosses between processes when a distributed
+    /// deployment splits the pipeline there: `"media"` (an RTP media track)
+    /// or `"data"` (a data channel carrying each frame with its metadata).
+    /// `None` leaves the choice to the deployment. Ignored in one process.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub edge_transport: Option<String>,
 }
 
 fn default_required() -> bool {
@@ -825,6 +866,37 @@ mod tests {
         for spec in &manifest.plugins {
             assert!(matches!(spec, PluginSpec::Shorthand(_)));
         }
+    }
+
+    #[test]
+    fn plugin_specs_declare_the_node_types_they_provide() {
+        let json = r#"{
+            "version": "v1",
+            "metadata": { "name": "test-pipeline" },
+            "plugins": [
+                "silero-vad@v0.5.0",
+                { "path": "./plugins/litert-nodes", "node_types": ["WhisperLiteRtNode"] }
+            ],
+            "nodes": [{ "id": "n", "node_type": "X", "params": {} }],
+            "connections": []
+        }"#;
+        let manifest = parse(json).expect("parse");
+        let (any, litert) = (&manifest.plugins[0], &manifest.plugins[1]);
+        assert_eq!(any.declared_node_types(), None);
+        assert_eq!(
+            litert.declared_node_types(),
+            Some(&["WhisperLiteRtNode".to_string()][..])
+        );
+        assert!(any.needed_for(["ChatRoom"].into_iter()));
+        assert!(!litert.needed_for(["ChatRoom", "SileroVADNode"].into_iter()));
+        assert!(litert.needed_for(["WhisperLiteRtNode"].into_iter()));
+        // Round-trips without the field when empty.
+        let plain = serde_json::to_value(PluginSpec::Explicit(PluginSpecExplicit {
+            path: Some("./x".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert!(plain.get("node_types").is_none());
     }
 
     #[test]

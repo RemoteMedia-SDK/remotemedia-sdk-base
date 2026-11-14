@@ -204,6 +204,9 @@ pub struct SessionHandle {
     shutdown_tx: mpsc::Sender<()>,
     /// Handle to the session router task
     task_handle: JoinHandle<Result<()>>,
+    /// Starts the session's node instances; already started unless the
+    /// session was built for the warm pool.
+    start: super::session_router::SessionStart,
     /// Whether the session is still active
     is_active: bool,
     /// Active trace recorder, if `REMOTEMEDIA_RECORD_DIR` was set when
@@ -219,6 +222,19 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Start the session's node instances: bodies run, clocks tick, emits
+    /// go through (openspec: add-source-node-lifecycle). A session is
+    /// started when it is created; one parked in the warm pool is started
+    /// when it is acquired. Idempotent.
+    pub fn start(&self) {
+        self.start.start();
+    }
+
+    /// Whether the session's node instances have been started.
+    pub fn is_started(&self) -> bool {
+        self.start.is_started()
+    }
+
     /// Static declaration report captured during cold build and retained when
     /// prewarmed/reused. An empty issue list is not zero-copy certification.
     pub fn buffer_preflight(&self) -> Option<&super::buffer_preflight::BufferPreflightReport> {
@@ -560,6 +576,15 @@ impl SessionInputSender {
     }
 }
 
+/// A unary execution answers one input: some node has to take it.
+fn no_input_taking_node() -> crate::Error {
+    crate::Error::ConfigError(
+        "no node of this pipeline takes the session's input: every source is self-driven. \
+         Run it as a streaming session"
+            .to_string(),
+    )
+}
+
 /// Participant-scoped ingress handle for a shared pipeline session.
 #[derive(Clone)]
 pub struct ParticipantSessionHandle {
@@ -586,6 +611,23 @@ impl ParticipantSessionHandle {
     pub async fn send(&self, data: TransportData) -> Result<()> {
         self.input
             .send(data.with_participant_descriptor(&self.participant))
+            .await
+    }
+
+    /// Tell the session this participant joined, without sending input.
+    /// Per-participant self-driven nodes start their instance for it
+    /// (openspec: add-node-initiated-output). A participant's first input
+    /// announces it as well.
+    pub async fn join(&self) -> Result<()> {
+        self.input
+            .send(
+                TransportData::new(RuntimeData::Json(serde_json::json!({})))
+                    .with_participant_descriptor(&self.participant)
+                    .with_metadata(
+                        crate::transport::origin::LIFECYCLE.to_string(),
+                        crate::transport::origin::JOIN.to_string(),
+                    ),
+            )
             .await
     }
 
@@ -997,15 +1039,45 @@ impl PipelineExecutor {
         }
         #[cfg(feature = "python-source-plugin")]
         {
+            // `[python].module_root` is relative to the plugin's root.
+            let module_root = match py.module_root.trim() {
+                "" | "." | "./" => module_root,
+                relative => module_root.join(relative),
+            };
+            let json_as_text = match py.json_input.as_deref() {
+                None | Some("json") => false,
+                Some("text") => true,
+                Some(other) => {
+                    return Err(Error::Manifest(format!(
+                        "source-python plugin '{}': json_input must be \"json\" or \"text\", got {other:?}",
+                        plugin_toml.plugin.name
+                    )))
+                }
+            };
+            // The digest covers the plugin's source files, so an edited
+            // local plugin is a different plugin.
+            let digest = format!(
+                "sha256:{}",
+                crate::loadable::source_python::content_digest(&module_root)
+            );
+            {
+                // Loading the same plugin again is a no-op.
+                let registry = self.registry.read().await;
+                if !py.node_types.is_empty()
+                    && py.node_types.iter().all(|node_type| {
+                        registry.has_node_type(node_type)
+                            && registry.implementation(node_type).digest.as_deref()
+                                == Some(digest.as_str())
+                    })
+                {
+                    return Ok(());
+                }
+            }
             let implementation = crate::telemetry::NodeImplementation {
                 kind: crate::telemetry::ImplementationKind::Python,
                 plugin_name: Some(plugin_toml.plugin.name.clone()),
                 plugin_version: Some(plugin_toml.plugin.version.clone()),
-                digest: Some(if hash.starts_with("sha256:") {
-                    hash.clone()
-                } else {
-                    format!("sha256:{hash}")
-                }),
+                digest: Some(digest.clone()),
                 loaded_at_ms: Some(
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1023,7 +1095,8 @@ impl PipelineExecutor {
                     hash: hash.clone(),
                 };
                 let factory = std::sync::Arc::new(
-                    crate::loadable::source_python::SourcePythonFactory::new(plugin),
+                    crate::loadable::source_python::SourcePythonFactory::new(plugin)
+                        .json_as_text(json_as_text),
                 );
                 registry.register_with_implementation(factory, implementation.clone());
             }
@@ -1238,6 +1311,9 @@ impl PipelineExecutor {
         manifest: Arc<Manifest>,
     ) -> Result<Arc<Manifest>> {
         let registry = self.registry.read().await;
+        // A self-driven source declares what it puts out: nothing upstream
+        // and nothing the client sends would otherwise say.
+        crate::capabilities::sources::check_self_driven_sources(&manifest, &registry)?;
         let outcome = negotiate_manifest(manifest.clone(), &registry);
         drop(registry);
 
@@ -1306,8 +1382,33 @@ impl PipelineExecutor {
         self.validate_manifest(&manifest).await?;
         let manifest = self.negotiate_capabilities(manifest).await?;
 
+        // A unary execution answers one input: some node has to take it.
+        {
+            let registry = self.registry.read().await;
+            let takes_input = manifest.nodes.iter().any(|node| {
+                let is_source = !manifest.connections.iter().any(|c| c.to == node.id);
+                let self_driven = match node.session_input {
+                    Some(takes) => !takes,
+                    None => registry
+                        .get_factory(&node.node_type)
+                        .and_then(|factory| factory.self_driven())
+                        .unwrap_or(false),
+                };
+                is_source && !self_driven
+            });
+            if !takes_input {
+                return Err(no_input_taking_node());
+            }
+        }
+
         // Create a temporary session
         let mut session = self.create_session(manifest).await?;
+        // Node instances can declare themselves self-driven too (a Python
+        // `SourceNode` does, once its worker is ready).
+        if session.input_control.takes_session_input() == Some(false) {
+            session.close().await?;
+            return Err(no_input_taking_node());
+        }
 
         // Send input
         session.send_input(input).await?;
@@ -1466,6 +1567,20 @@ impl PipelineExecutor {
         &self,
         manifest: Arc<Manifest>,
     ) -> Result<SessionHandle> {
+        self.build_session(manifest, false).await
+    }
+
+    /// [`Self::cold_build_session`] for the warm pool: the session's nodes
+    /// are loaded but not started. No body runs and no clock ticks until
+    /// [`SessionHandle::start`] (openspec: add-source-node-lifecycle).
+    pub(crate) async fn cold_build_parked_session(
+        &self,
+        manifest: Arc<Manifest>,
+    ) -> Result<SessionHandle> {
+        self.build_session(manifest, true).await
+    }
+
+    async fn build_session(&self, manifest: Arc<Manifest>, parked: bool) -> Result<SessionHandle> {
         // Resolve + load any plugin dependencies the manifest declares
         // BEFORE validation runs — otherwise unknown-node-type errors
         // would fire even though the plugin would have contributed
@@ -1608,6 +1723,10 @@ impl PipelineExecutor {
 
         // Get input sender before moving router
         let input_tx = router.get_input_sender();
+        let start = router.session_start();
+        if parked {
+            start.hold();
+        }
         // Snapshot the perf aggregator handle before the router is
         // moved into the spawned task — performance tooling reads
         // merged HDR-histogram percentiles off this at end-of-run.
@@ -1684,6 +1803,7 @@ impl PipelineExecutor {
             output_data_rx: Some(data_rx),
             shutdown_tx,
             task_handle,
+            start,
             is_active: true,
             _recorder: recorder,
             perf_aggregator,
@@ -1753,6 +1873,8 @@ mod tests {
 
     mod output_drain;
     mod provenance;
+    mod body;
+    mod emit;
     mod participants;
 
     fn create_test_manifest() -> Manifest {

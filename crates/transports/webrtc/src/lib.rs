@@ -114,6 +114,11 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub use peer::{ConnectionState, PeerInfo};
+/// The WebRTC side of a shared room session: fans one core session out to
+/// the room's peers. A host builds one to serve a room it owns
+/// (`SharedState::host_room`).
+#[cfg(feature = "grpc-signaling")]
+pub use peer::SharedPipelineSession as SharedRoomSession;
 pub use plugin::WebRtcTransportPlugin;
 pub use session::{Session, SessionId, SessionManager, SessionState};
 pub use transport::WebRtcTransport;

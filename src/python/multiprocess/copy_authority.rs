@@ -262,10 +262,16 @@ impl CopyAuthority {
     /// After confirmed worker exit, briefly drain buffered terminal reports.
     /// A missing close, disconnect or forced stop is an accounting failure.
     pub(crate) fn finish(&self) -> io::Result<()> {
+        self.finish_within(Duration::from_millis(250))
+    }
+
+    /// [`finish`](Self::finish) for a worker that is still stopping: wait up
+    /// to `grace` for its terminal report before treating it as missing.
+    pub(crate) fn finish_within(&self, grace: Duration) -> io::Result<()> {
         let mut joined = self.joined.lock().unwrap();
         if joined.result.is_none() {
             let task = joined.task.take().unwrap();
-            let deadline = Instant::now() + Duration::from_millis(250);
+            let deadline = Instant::now() + grace;
             while !task.is_finished() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(2));
             }

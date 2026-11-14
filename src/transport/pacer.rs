@@ -102,6 +102,10 @@ pub trait TickSource: Send + 'static {
     /// disconnected on a wire-bound source); the Pacer treats `None`
     /// as a clean shutdown signal.
     async fn next(&mut self) -> Option<Tick>;
+
+    /// The node instance has started: a source that keeps its own time
+    /// begins counting here, not when it was built.
+    fn restart(&mut self) {}
 }
 
 /// Build the `<medium>:<stream_id>` address used on the media_clock
@@ -225,6 +229,11 @@ impl WallTickSource {
 
 #[async_trait]
 impl TickSource for WallTickSource {
+    fn restart(&mut self) {
+        self.interval.reset_immediately();
+        self.started = Instant::now();
+    }
+
     async fn next(&mut self) -> Option<Tick> {
         self.interval.tick().await;
         let pts_us = self.started.elapsed().as_micros() as u64;
@@ -251,7 +260,6 @@ impl TickSource for WallTickSource {
 /// stored alongside the node's main + fan-out tasks and aborted on
 /// session shutdown.
 pub struct Pacer {
-    completion: Option<tokio::sync::oneshot::Sender<()>>,
     node_id: String,
     node: Arc<dyn StreamingNode>,
     ctx: NodeRuntimeContext,
@@ -285,7 +293,6 @@ impl Pacer {
     ) -> Self {
         Self {
             node_id: node_id.into(),
-            completion: None,
             node,
             ctx,
             fan_tx,
@@ -300,14 +307,6 @@ impl Pacer {
     /// don't care about telemetry stay terse.
     pub fn with_perf(mut self, perf: Arc<PerfAggregator>) -> Self {
         self.perf = Some(perf);
-        self
-    }
-
-    pub(crate) fn with_completion(
-        mut self,
-        completion: Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Self {
-        self.completion = completion;
         self
     }
 
@@ -344,6 +343,23 @@ impl Pacer {
             count: 0,
             last_log: Instant::now() - TRANSIENT_ERROR_LOG_INTERVAL,
         };
+
+        // Clock-driven ticks start with the instance, like a body: not while
+        // sibling nodes load, and not while the session is parked.
+        let emitter = self.ctx.emitter();
+        if !emitter.is_running() && !emitter.is_closed() {
+            tokio::select! {
+                biased;
+                _ = async {
+                    match &mut stopping {
+                        Some(stop) => { let _ = stop.wait_for(|requested| *requested).await; }
+                        None => std::future::pending().await,
+                    }
+                } => return Ok(()),
+                _ = emitter.started() => {}
+            }
+            self.source.restart();
+        }
 
         loop {
             let next = tokio::select! {
@@ -477,9 +493,10 @@ impl Pacer {
         if !requested {
             return Ok(false);
         }
-        if let Some(completion) = self.completion.take() {
-            let _ = completion.send(());
-        }
+        // The source has finished producing. Its emitter closes, which is
+        // how the session stops counting a self-driven instance as running:
+        // the same signal an emitter-based source gives.
+        self.ctx.emitter().finish();
         Ok(true)
     }
 }

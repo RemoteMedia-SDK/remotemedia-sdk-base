@@ -2,60 +2,58 @@
 name = "remotemedia-litert-nodes"
 version = "0.1.0"
 edition = "2021"
-rust-version.workspace = true
 license = "MIT OR Apache-2.0"
-description = "LiteRT/TFLite-backed RemoteMedia nodes for Android and mobile targets"
-repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk"
+description = "LiteRT nodes for RemoteMedia: Whisper speech-to-text, Gemma (LiteRT-LM) chat and Kokoro text-to-speech, the same models on Android and desktop"
+repository = "https://github.com/RemoteMedia-SDK/remotemedia-sdk-base"
 publish = false
+
+# Its own workspace: a loadable plugin built per target (Android, Windows,
+# Linux), not part of the sdk-base build.
+[workspace]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "whisper-litert"
+path = "src/bin/whisper_litert.rs"
+
+[[bin]]
+name = "kokoro-litert"
+path = "src/bin/kokoro_litert.rs"
+required-features = ["kokoro"]
+
+[[bin]]
+name = "gemma-litert"
+path = "src/bin/gemma_litert.rs"
+
 [features]
-default = []
-whisper = []
-loadable-export = ["remotemedia-plugin-sdk/loadable-export"]
+default = ["kokoro"]
+# Kokoro text-to-speech: compiles LiteRT-LM's English phonemizer (C++) with
+# Abseil, so the build needs CMake, Ninja and a C++ compiler.
+kokoro = []
 
 [dependencies]
-# RemoteMedia SDK dependencies
+# Same plugin SDK checkout as the host runner, so the plugin ABI matches.
 remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk" }
-remotemedia-core = { path = "../../../", default-features = false, features = ["inprocess-python", "loadable"] }
-remotemedia-traits = { path = "../../../remotemedia-plugin-sdk/crates/traits" }
-remotemedia-types = { path = "../../../remotemedia-plugin-sdk/crates/types" }
-
-# Audio processing
-rubato = { workspace = true }
-rustfft = { workspace = true }
-bytemuck = { workspace = true }
-ndarray = { workspace = true }
-
-# Async
-tokio = { workspace = true }
-async-trait = { workspace = true }
-
-# Serialization
-serde = { workspace = true }
-serde_json = { workspace = true }
-schemars = { workspace = true }
-
-# Error handling
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-
-# Logging
-tracing = { workspace = true }
-log = { version = "0.4", features = ["std"] }
-
-# Platform-specific
-libc = { workspace = true }
-
-# Android logging (optional, only for Android target)
-android_logger = { version = "0.15", optional = true }
+abi_stable = "0.11"
+async-trait = "0.1"
+serde_json = "1"
+# LiteRT is loaded at run time (liblitert_lm.so on Android, litert-lm.dll on
+# Windows), so the plugin builds without it.
+libloading = "0.8"
+rustfft = "6"
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
+hound = "3.5"
+memmap2 = "0.9"
+regex = "1"
+matrixmultiply = { version = "0.3", features = ["threading"] }
 
 [build-dependencies]
-cc = "1.0"
-bindgen = "0.69"
+cc = "1"
+cmake = "0.1"
 
-[dev-dependencies]
-tempfile = { workspace = true }
-hound = { workspace = true }
+[profile.release]
+debug = false
+strip = true

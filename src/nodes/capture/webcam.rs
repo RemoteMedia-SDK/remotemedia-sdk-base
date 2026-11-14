@@ -52,6 +52,10 @@ pub struct WebcamCaptureConfig {
     pub pixel_format: PixelOut,
     #[serde(default)]
     pub stream_id: Option<String>,
+    /// `"tick"` (default): the session clock polls for a frame `fps` times a
+    /// second. `"body"`: each frame is emitted when it is captured.
+    #[serde(default)]
+    pub delivery: super::Delivery,
 }
 
 impl Default for WebcamCaptureConfig {
@@ -216,13 +220,17 @@ impl StreamingNodeFactory for WebcamCaptureNodeFactory {
     ) -> Result<Box<dyn StreamingNode>, Error> {
         let cfg: WebcamCaptureConfig = serde_json::from_value(params.clone())
             .map_err(|e| Error::Execution(format!("WebcamCapture params: {e}")))?;
-        Ok(Box::new(CaptureSourceNode::new(
-            node_id,
-            cfg.fps,
-            cfg.pixel_format,
-            cfg.stream_id.clone(),
-            Box::new(WebcamBackend { cfg }),
-        )))
+        let delivery = cfg.delivery;
+        Ok(Box::new(
+            CaptureSourceNode::new(
+                node_id,
+                cfg.fps,
+                cfg.pixel_format,
+                cfg.stream_id.clone(),
+                Box::new(WebcamBackend { cfg }),
+            )
+            .with_delivery(delivery),
+        ))
     }
 
     fn node_type(&self) -> &str {

@@ -24,8 +24,11 @@ use std::time::SystemTime;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{
-    accept_async,
-    tungstenite::{Message, Result as WsResult},
+    accept_hdr_async,
+    tungstenite::{
+        handshake::server::{Request as HandshakeRequest, Response as HandshakeResponse},
+        Message, Result as WsResult,
+    },
 };
 use tracing::{debug, error, info, warn};
 
@@ -37,6 +40,30 @@ mod control_live_tests;
 #[path = "room_tests.rs"]
 mod room_tests;
 
+/// A peer the host admitted: who it is, where it joins and what it may do.
+/// Everything a peer says about itself is replaced by this.
+#[derive(Debug, Clone)]
+pub struct AdmittedPeer {
+    /// The peer's identity (`participant.id`).
+    pub peer_id: String,
+    /// The hosted room it joins.
+    pub room: String,
+    pub display_name: Option<String>,
+    /// Shown to the room's other peers in place of the peer's `user_data`.
+    pub metadata: HashMap<String, Value>,
+    /// What the peer's control channel may do.
+    pub control: crate::control::ControlAccess,
+}
+
+/// Decides who may join. A server with an admission accepts a
+/// `peer.announce` only when the admission accepts its `ticket`; the peer's
+/// own `peer_id`, `user_data` and `?room=` are ignored.
+pub trait PeerAdmission: Send + Sync {
+    /// Admit the holder of `ticket`, or say why not. A ticket is the
+    /// admission's to invalidate: a single-use ticket is consumed here.
+    fn admit(&self, ticket: Option<&str>) -> Result<AdmittedPeer, String>;
+}
+
 /// Peer connection info for WebSocket clients
 pub struct WsPeerConnection {
     pub peer_id: String,
@@ -44,6 +71,16 @@ pub struct WsPeerConnection {
     pub metadata: HashMap<String, Value>,
     pub connected_at: u64,
     pub tx: mpsc::Sender<String>,
+    /// The room this peer joined: the connection's `?room=` query, else the
+    /// server's configured room (`None` when peers do not share sessions).
+    pub room: Option<String>,
+    /// What the peer's control channel may do, when the peer was admitted
+    /// (`None` on a server without an admission: the channel is open).
+    pub control: Option<crate::control::ControlAccess>,
+    /// The admitted peer's display name.
+    pub display_name: Option<String>,
+    /// Ends the peer's signaling connection when notified.
+    pub closed: Arc<tokio::sync::Notify>,
 }
 
 /// Shared state across all WebSocket connections
@@ -60,6 +97,12 @@ pub struct SharedState {
     /// peer of a room joins one session as its own participant (openspec:
     /// add-multi-participant-sessions).
     pub rooms: Arc<tokio::sync::Mutex<HashMap<String, Arc<crate::peer::SharedPipelineSession>>>>,
+    /// Rooms whose session the host created and registered with
+    /// [`SharedState::host_room`]. The server never creates or replaces their
+    /// session; a peer joining one that has ended is refused.
+    pub hosted_rooms: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Who may join, when the host admits peers.
+    admission: std::sync::RwLock<Option<Arc<dyn PeerAdmission>>>,
 }
 
 impl SharedState {
@@ -87,7 +130,39 @@ impl SharedState {
             manifest,
             event_tx,
             rooms: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            hosted_rooms: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            admission: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Admit peers only through `admission`: a `peer.announce` needs a ticket
+    /// it accepts, and the peer's identity, room and control access come
+    /// from it.
+    pub fn set_admission(&self, admission: Arc<dyn PeerAdmission>) {
+        *self.admission.write().expect("admission lock") = Some(admission);
+    }
+
+    fn admission(&self) -> Option<Arc<dyn PeerAdmission>> {
+        self.admission.read().expect("admission lock").clone()
+    }
+
+    /// End `peer_id`'s connection: its signaling socket closes and its server
+    /// peer shuts down, so it leaves its session. `false` when it is not
+    /// connected.
+    pub async fn disconnect_peer(&self, peer_id: &str) -> bool {
+        let closed = self
+            .peers
+            .read()
+            .await
+            .get(peer_id)
+            .map(|peer| Arc::clone(&peer.closed));
+        let Some(closed) = closed else {
+            return false;
+        };
+        // `notify_one` stores a permit, so a connection busy with a message
+        // still ends when it next waits.
+        closed.notify_one();
+        true
     }
 
     /// The room key when peers share one session, else `None` (one session
@@ -96,13 +171,57 @@ impl SharedState {
         self.config.shared_session_key.as_deref().filter(|key| !key.is_empty())
     }
 
-    /// The live shared session of room `key`, created on first use and again
-    /// after the previous one ended (it closes when its last peer leaves).
+    /// The room a connection joins: the `?room=` it asked for, else the
+    /// server's configured room.
+    pub fn room_for_connection(&self, requested: Option<&str>) -> Option<String> {
+        requested
+            .filter(|key| !key.is_empty())
+            .or(self.room_key())
+            .map(str::to_string)
+    }
+
+    /// Serve `room` as room `key`. The host owns the session: it was created
+    /// (and usually wired up) before any peer joins, peers attach to it as
+    /// participants, and it is not closed when its last peer leaves; build it
+    /// with `close_when_empty = false`. Replaces a previous room of that key.
+    pub async fn host_room(&self, key: &str, room: Arc<crate::peer::SharedPipelineSession>) {
+        self.hosted_rooms
+            .lock()
+            .expect("hosted rooms lock")
+            .insert(key.to_string());
+        self.rooms.lock().await.insert(key.to_string(), room);
+        info!("Hosting room '{}'", key);
+    }
+
+    /// Stop serving hosted room `key`. The key stays reserved, so later joins
+    /// are refused rather than given a new session; the session itself is the
+    /// host's to close. Returns the room's session.
+    pub async fn end_room(&self, key: &str) -> Option<Arc<crate::peer::SharedPipelineSession>> {
+        self.rooms.lock().await.remove(key)
+    }
+
+    fn is_hosted(&self, key: &str) -> bool {
+        self.hosted_rooms
+            .lock()
+            .expect("hosted rooms lock")
+            .contains(key)
+    }
+
+    /// The live shared session of room `key`. A hosted room's session is the
+    /// host's ([`Self::host_room`]). Any other room's session is created on
+    /// first use and again after the previous one ended (it closes when its
+    /// last peer leaves).
     pub async fn room(
         &self,
         key: &str,
     ) -> crate::Result<Arc<crate::peer::SharedPipelineSession>> {
         let mut rooms = self.rooms.lock().await;
+        if self.is_hosted(key) {
+            return match rooms.get(key) {
+                Some(room) if room.is_active().await => Ok(Arc::clone(room)),
+                _ => Err(crate::Error::InternalError(format!("Room '{key}' has ended"))),
+            };
+        }
         if let Some(room) = rooms.get(key) {
             if room.is_active().await {
                 return Ok(Arc::clone(room));
@@ -135,7 +254,17 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
     let addr = stream.peer_addr()?;
     info!("New WebSocket connection from: {}", addr);
 
-    let ws_stream = accept_async(stream).await?;
+    // The handshake's `?room=<key>` picks the room this connection joins.
+    let mut requested_room: Option<String> = None;
+    let ws_stream = accept_hdr_async(
+        stream,
+        |request: &HandshakeRequest, response: HandshakeResponse| {
+            requested_room = request.uri().query().and_then(room_from_query);
+            Ok(response)
+        },
+    )
+    .await?;
+    let connection_room = state.room_for_connection(requested_room.as_deref());
 
     let (ws_tx, ws_rx) = ws_stream.split();
 
@@ -144,6 +273,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
 
     // Current peer ID for this connection
     let peer_id: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
+    // Notified to end this connection (the peer was replaced or removed).
+    let closed = Arc::new(tokio::sync::Notify::new());
 
     // Per-connection control-plane subscriptions. Dropped on disconnect
     // to abort forwarder tasks and release broadcast receivers.
@@ -168,7 +300,17 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
     let tx_clone = tx.clone();
 
     let mut ws_rx = ws_rx;
-    while let Some(msg) = ws_rx.next().await {
+    loop {
+        let msg = tokio::select! {
+            msg = ws_rx.next() => msg,
+            _ = closed.notified() => {
+                info!("WebSocket connection ended by the host: {}", addr);
+                let mut ws_tx = ws_tx.write().await;
+                let _ = ws_tx.send(Message::Close(None)).await;
+                break;
+            }
+        };
+        let Some(msg) = msg else { break };
         match msg {
             Ok(Message::Text(text)) => {
                 if let Err(e) = handle_message(
@@ -177,6 +319,8 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
                     &peer_id_clone,
                     &tx_clone,
                     &control_state,
+                    connection_room.as_deref(),
+                    &closed,
                 )
                 .await
                 {
@@ -210,8 +354,23 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
     // half-torn-down session.
     control_state.shutdown().await;
 
-    // Cleanup on disconnect
-    if let Some(peer_id) = peer_id.read().await.clone() {
+    // Cleanup on disconnect. A connection that was replaced by a newer one of
+    // the same peer owns nothing any more: the peer's records are the newer
+    // connection's.
+    let owned_peer = match peer_id.read().await.clone() {
+        Some(peer_id) => {
+            let owns = state
+                .peers
+                .read()
+                .await
+                .get(&peer_id)
+                .map(|peer| Arc::ptr_eq(&peer.closed, &closed))
+                .unwrap_or(false);
+            owns.then_some(peer_id)
+        }
+        None => None,
+    };
+    if let Some(peer_id) = owned_peer {
         info!("Cleaning up peer: {}", peer_id);
 
         // Emit peer disconnected event for FFI integration BEFORE cleanup
@@ -234,10 +393,15 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
         }
 
         // Remove from peers
-        state.peers.write().await.remove(&peer_id);
+        let room = state
+            .peers
+            .write()
+            .await
+            .remove(&peer_id)
+            .and_then(|peer| peer.room);
 
-        // Broadcast peer left
-        broadcast_peer_left(&state, &peer_id).await;
+        // Broadcast peer left to the rest of its room
+        broadcast_peer_left(&state, &peer_id, room.as_deref()).await;
     }
 
     forward_task.abort();
@@ -262,6 +426,8 @@ async fn handle_message(
     peer_id: &Arc<RwLock<Option<String>>>,
     tx: &mpsc::Sender<String>,
     control_state: &Arc<ControlSessionState>,
+    connection_room: Option<&str>,
+    closed: &Arc<tokio::sync::Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Parse JSON-RPC request
     let request: Request<'_> = match serde_json::from_str(text) {
@@ -270,6 +436,71 @@ async fn handle_message(
     };
 
     let request_id = request.id.clone().unwrap_or(json!(null));
+
+    // With an admission, a peer does what it was admitted for and nothing
+    // else: it talks to the server, in the room its ticket named.
+    let admitting = state.admission().is_some();
+    let mut admitted_room: Option<String> = None;
+    if admitting && request.method != "peer.announce" {
+        let current = peer_id.read().await.clone();
+        let record = match &current {
+            Some(id) => state
+                .peers
+                .read()
+                .await
+                .get(id)
+                .map(|peer| (peer.room.clone(), peer.control.clone())),
+            None => None,
+        };
+        let refusal = match (&record, request.method.as_str()) {
+            (None, _) => Some("Not admitted: call peer.announce with a ticket first".to_string()),
+            (Some((_, control)), method) if method.starts_with("control.") => {
+                (!matches!(control, Some(crate::control::ControlAccess::Full))).then(|| {
+                    "control.* on the signaling socket is not available to this member; \
+                     use the control data channel"
+                        .to_string()
+                })
+            }
+            (Some(_), "peer.offer" | "peer.answer" | "peer.ice_candidate") => {
+                let to = serde_json::from_str::<Value>(request.params.get())
+                    .ok()
+                    .and_then(|params| params.get("to").and_then(Value::as_str).map(str::to_string));
+                // The server, or a peer of the same room.
+                let allowed = match to.as_deref() {
+                    Some("remotemedia-server") => true,
+                    Some(other) => {
+                        let my_room = record.as_ref().and_then(|(room, _)| room.clone());
+                        state
+                            .peers
+                            .read()
+                            .await
+                            .get(other)
+                            .map(|peer| peer.room == my_room)
+                            .unwrap_or(false)
+                    }
+                    None => false,
+                };
+                (!allowed).then(|| {
+                    "an admitted peer signals only with the server and the peers of its room".to_string()
+                })
+            }
+            (Some(_), "peer.disconnect") => {
+                Some("an admitted peer cannot disconnect peers".to_string())
+            }
+            _ => None,
+        };
+        if let Some(message) = refusal {
+            let error = JsonRpcError::new(error_codes::INVALID_REQUEST, message, request_id);
+            tx.send(error.to_json()?).await?;
+            return Ok(());
+        }
+        admitted_room = record.and_then(|(room, _)| room);
+    }
+    let connection_room = if admitting {
+        admitted_room.as_deref()
+    } else {
+        connection_room
+    };
 
     // Control-plane methods proxy the Session Control Bus on the
     // peer's session. They require peer.announce to have run and the
@@ -318,7 +549,7 @@ async fn handle_message(
     };
     match request.method.as_str() {
         "peer.announce" => {
-            handle_announce(request, state, peer_id, tx).await?;
+            handle_announce(request, state, peer_id, tx, connection_room, closed).await?;
         }
         "peer.offer" => {
             handle_offer(request, state, peer_id, tx).await?;
@@ -333,7 +564,7 @@ async fn handle_message(
             handle_disconnect(request, state, tx).await?;
         }
         "peer.list" | "list_peers" => {
-            handle_list_peers(request, state, tx).await?;
+            handle_list_peers(request, state, tx, connection_room).await?;
         }
         "server.info" => {
             handle_server_info(request, tx).await?;
@@ -357,10 +588,80 @@ async fn handle_announce(
     state: &Arc<SharedState>,
     peer_id_ref: &Arc<RwLock<Option<String>>>,
     tx: &mpsc::Sender<String>,
+    connection_room: Option<&str>,
+    closed: &Arc<tokio::sync::Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let request_id = request.id.clone().unwrap_or(json!(null));
 
-    let params: PeerAnnounceParams = serde_json::from_value(request.params.clone())?;
+    let mut params: PeerAnnounceParams = serde_json::from_value(request.params.clone())?;
+
+    // With an admission, the ticket says who this is. What the peer declared
+    // about itself is replaced.
+    let mut admitted: Option<AdmittedPeer> = None;
+    if let Some(admission) = state.admission() {
+        if peer_id_ref.read().await.is_some() {
+            let error = JsonRpcError::new(
+                error_codes::INVALID_REQUEST,
+                "This connection has already announced".to_string(),
+                request_id,
+            );
+            tx.send(error.to_json()?).await?;
+            return Ok(());
+        }
+        let ticket = request.params.get("ticket").and_then(Value::as_str);
+        match admission.admit(ticket) {
+            Ok(peer) => {
+                params.peer_id = peer.peer_id.clone();
+                params.user_data = Some(peer.metadata.clone());
+                admitted = Some(peer);
+            }
+            Err(reason) => {
+                warn!("Peer refused at announce: {}", reason);
+                let error = JsonRpcError::new(
+                    error_codes::INVALID_REQUEST,
+                    format!("Not admitted: {reason}"),
+                    request_id,
+                );
+                tx.send(error.to_json()?).await?;
+                // End the connection once the refusal has had time to reach
+                // the client.
+                let closed = Arc::clone(closed);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    closed.notify_one();
+                });
+                return Ok(());
+            }
+        }
+    }
+    let admitted_room = admitted.as_ref().map(|peer| peer.room.clone());
+    let connection_room = match &admitted_room {
+        Some(room) => Some(room.as_str()),
+        None => connection_room,
+    };
+
+    // An admitted peer that is already connected is reconnecting: the new
+    // connection replaces the earlier one.
+    if admitted.is_some() {
+        let earlier = state.peers.write().await.remove(&params.peer_id);
+        if let Some(earlier) = earlier {
+            info!("Peer {} reconnected; ending its earlier connection", params.peer_id);
+            earlier.closed.notify_one();
+            if let Some(server_peer) = state.server_peers.write().await.remove(&params.peer_id) {
+                if let Err(e) = server_peer.shutdown().await {
+                    warn!("Failed to shutdown replaced ServerPeer: {}", e);
+                }
+            }
+            // The earlier connection's own cleanup no longer owns the peer, so
+            // its departure is reported here, before the new arrival.
+            state
+                .emit_event(WebRtcEventBridge::peer_disconnected(
+                    params.peer_id.clone(),
+                    Some("replaced by a newer connection".to_string()),
+                ))
+                .await;
+        }
+    }
 
     let mut peers = state.peers.write().await;
 
@@ -375,8 +676,12 @@ async fn handle_announce(
         return Ok(());
     }
 
-    // Get list of existing peers
-    let other_peers: Vec<String> = peers.keys().cloned().collect();
+    // Get list of existing peers in the same room
+    let other_peers: Vec<String> = peers
+        .values()
+        .filter(|peer| peer.room.as_deref() == connection_room)
+        .map(|peer| peer.peer_id.clone())
+        .collect();
 
     // Register peer
     let peer_conn = WsPeerConnection {
@@ -385,6 +690,10 @@ async fn handle_announce(
         metadata: params.user_data.clone().unwrap_or_default(),
         connected_at: current_timestamp(),
         tx: tx.clone(),
+        room: connection_room.map(str::to_string),
+        control: admitted.as_ref().map(|peer| peer.control.clone()),
+        display_name: admitted.as_ref().and_then(|peer| peer.display_name.clone()),
+        closed: Arc::clone(closed),
     };
 
     peers.insert(params.peer_id.clone(), peer_conn);
@@ -398,12 +707,17 @@ async fn handle_announce(
 
     drop(peers);
 
-    // Emit peer connected event for FFI integration
+    // Emit peer connected event for FFI integration. The peer's room rides
+    // along as `__room__` so hosts serving several rooms can tell them apart.
+    let mut event_metadata = params.user_data.clone().unwrap_or_default();
+    if let Some(room) = connection_room {
+        event_metadata.insert("__room__".to_string(), json!(room));
+    }
     state
         .emit_event(WebRtcEventBridge::peer_connected(
             params.peer_id.clone(),
             params.capabilities.clone(),
-            params.user_data.clone().unwrap_or_default(),
+            event_metadata,
         ))
         .await;
 
@@ -425,6 +739,7 @@ async fn handle_announce(
         &params.peer_id,
         &params.capabilities,
         &params.user_data,
+        connection_room,
     )
     .await;
 
@@ -522,7 +837,28 @@ async fn handle_offer(
         };
 
         // Handle offer and get SDP answer: in a room, join its shared session.
-        let answered = match state.room_key() {
+        let (peer_room, peer_control, peer_name) = state
+            .peers
+            .read()
+            .await
+            .get(&from_peer_id)
+            .map(|peer| (peer.room.clone(), peer.control.clone(), peer.display_name.clone()))
+            .unwrap_or_else(|| (state.room_key().map(str::to_string), None, None));
+        // An admitted peer's control channel is bound to its own session and
+        // its access; without anything granted there is no channel.
+        if let Some(access) = peer_control {
+            use crate::control::{ControlBinding, ControlChannelPolicy};
+            server_peer.set_control_policy(if access.allows_anything() {
+                ControlChannelPolicy::Bound(ControlBinding {
+                    member: from_peer_id.clone(),
+                    access,
+                })
+            } else {
+                ControlChannelPolicy::Refused
+            });
+            server_peer.set_display_name(peer_name);
+        }
+        let answered = match peer_room.as_deref() {
             Some(key) => match state.room(key).await {
                 Ok(room) => server_peer.handle_offer_with_shared_session(params.sdp, room).await,
                 Err(e) => Err(e),
@@ -948,6 +1284,7 @@ async fn handle_list_peers(
     request: JsonRpcRequest,
     state: &Arc<SharedState>,
     tx: &mpsc::Sender<String>,
+    connection_room: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let request_id = request.id.clone().unwrap_or(json!(null));
 
@@ -955,6 +1292,7 @@ async fn handle_list_peers(
 
     let peer_list: Vec<Value> = peers
         .values()
+        .filter(|peer| peer.room.as_deref() == connection_room)
         .map(|peer| {
             json!({
                 "peer_id": peer.peer_id,
@@ -1021,6 +1359,7 @@ async fn broadcast_peer_joined(
     peer_id: &str,
     capabilities: &[String],
     metadata: &Option<HashMap<String, Value>>,
+    room: Option<&str>,
 ) {
     let notification = json!({
         "jsonrpc": "2.0",
@@ -1039,14 +1378,14 @@ async fn broadcast_peer_joined(
 
     let peers = state.peers.read().await;
     for (id, peer) in peers.iter() {
-        if id != peer_id {
+        if id != peer_id && peer.room.as_deref() == room {
             let _ = peer.tx.send(msg.clone()).await;
         }
     }
 }
 
 /// Broadcast peer left notification
-async fn broadcast_peer_left(state: &Arc<SharedState>, peer_id: &str) {
+async fn broadcast_peer_left(state: &Arc<SharedState>, peer_id: &str, room: Option<&str>) {
     let notification = json!({
         "jsonrpc": "2.0",
         "method": "peer.left",
@@ -1061,9 +1400,17 @@ async fn broadcast_peer_left(state: &Arc<SharedState>, peer_id: &str) {
     };
 
     let peers = state.peers.read().await;
-    for peer in peers.values() {
+    for peer in peers.values().filter(|peer| peer.room.as_deref() == room) {
         let _ = peer.tx.send(msg.clone()).await;
     }
+}
+
+/// The `room` parameter of a handshake query string (`a=1&room=standup`).
+fn room_from_query(query: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "room" && !value.is_empty()).then(|| value.to_string())
+    })
 }
 
 /// Get current Unix timestamp

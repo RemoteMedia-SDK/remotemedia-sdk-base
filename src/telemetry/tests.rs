@@ -29,6 +29,7 @@ fn manifest(nodes: &[&str], conns: &[(&str, &str)]) -> Manifest {
                 to: t.to_string(),
                 from_port: None,
                 to_port: None,
+                edge_transport: None,
             })
             .collect(),
         ..Default::default()

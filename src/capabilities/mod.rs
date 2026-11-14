@@ -55,6 +55,7 @@ pub mod dynamic;
 
 // Pipeline capability resolver (spec 023)
 pub mod resolver;
+pub mod sources;
 
 // Manifest-level negotiation entry point (ties registry + negotiation together)
 pub mod manifest_negotiation;

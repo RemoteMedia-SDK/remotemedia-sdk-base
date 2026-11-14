@@ -88,6 +88,13 @@ impl MappedPythonPluginRuntime {
                 mapped.runner_protocol
             )));
         }
+        if let Some(version) = mapped.background_protocol {
+            if version != 1 {
+                return Err(Error::ConfigError(format!(
+                    "mapped Python background protocol {version} is unsupported; expected 1"
+                )));
+            }
+        }
         if let Some(version) = mapped.output_copy_protocol {
             if version != 1 {
                 return Err(Error::ConfigError(format!(
@@ -161,6 +168,11 @@ impl MappedPythonPluginRuntime {
         };
         let factory = if mapped.output_copy_protocol.is_some() {
             factory.with_output_copies()
+        } else {
+            factory
+        };
+        let factory = if mapped.background_protocol.is_some() {
+            factory.with_background()
         } else {
             factory
         };

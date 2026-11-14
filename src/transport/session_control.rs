@@ -323,6 +323,11 @@ pub struct ControlAuth {
 }
 
 type TapKey = (String, Option<String>); // (node_id, port)
+
+/// A tapped output together with the id of the participant whose input
+/// produced it (`None` for unattributed output). See
+/// [`SessionControl::subscribe_attributed`].
+pub type AttributedTap = (Option<Arc<str>>, RuntimeData);
 type InterceptKey = (String, Option<String>);
 
 /// One active interception. The router awaits `reply_rx` for at most `deadline`.
@@ -619,6 +624,9 @@ struct ControlIngress {
 /// handed to the router via `attach_control`.
 pub struct SessionControl {
     session_id: String,
+    /// How many nodes take the session's client input, once the router has
+    /// initialized its nodes (openspec: add-node-initiated-output).
+    entry_points: std::sync::OnceLock<usize>,
     transport_copies: remotemedia_types::CopyContext,
     /// Latest office observation, read at the start of an LLM turn. This is
     /// replaceable state, not a queued input that could stall the media router.
@@ -626,6 +634,10 @@ pub struct SessionControl {
     /// Broadcasts a node output to every subscriber of (node_id, port).
     /// `broadcast::Sender` is cheap to clone; slow receivers lag, not block.
     taps: DashMap<TapKey, broadcast::Sender<RuntimeData>>,
+    /// Taps that also carry the output's participant, for subscribers that
+    /// may only see one participant's frames. Empty unless such a subscriber
+    /// exists, so ordinary sessions pay one `is_empty` per output.
+    attributed_taps: DashMap<TapKey, broadcast::Sender<AttributedTap>>,
     /// Active intercepts keyed by (node_id, port). Only one intercept per
     /// output port in v1 — stacking is possible but adds ordering ambiguity.
     intercepts: DashMap<InterceptKey, Arc<InterceptSlot>>,
@@ -826,9 +838,11 @@ impl SessionControl {
 
         Arc::new(Self {
             session_id: session_id.clone(),
+            entry_points: std::sync::OnceLock::new(),
             transport_copies,
             office_observation: parking_lot::RwLock::new(None),
             taps: DashMap::new(),
+            attributed_taps: DashMap::new(),
             intercepts: DashMap::new(),
             input_tx: parking_lot::RwLock::new(None),
             rpc_inputs: DashMap::new(),
@@ -882,6 +896,17 @@ impl SessionControl {
     }
 
     /// Hot-path telemetry handle, when available.
+    /// Record how many nodes take the session's client input.
+    pub(crate) fn set_entry_points(&self, count: usize) {
+        let _ = self.entry_points.set(count);
+    }
+
+    /// Whether some node takes the session's client input. `None` until the
+    /// session's nodes are initialized.
+    pub fn takes_session_input(&self) -> Option<bool> {
+        self.entry_points.get().map(|count| *count > 0)
+    }
+
     pub fn telemetry(&self) -> Option<Arc<crate::telemetry::SessionTelemetry>> {
         self.telemetry.get().cloned()
     }
@@ -1126,6 +1151,28 @@ impl SessionControl {
         let key: TapKey = (addr.node_id.clone(), addr.port.clone());
         let sender = self
             .taps
+            .entry(key)
+            .or_insert_with(|| broadcast::channel(DEFAULT_TAP_CAPACITY).0)
+            .clone();
+        Ok(sender.subscribe())
+    }
+
+    /// Subscribe to a node's output with each frame's participant: the id
+    /// of the participant whose input produced the frame, as the router
+    /// carried it. A transport that may show a subscriber only its own
+    /// frames filters on it.
+    pub fn subscribe_attributed(
+        &self,
+        addr: &ControlAddress,
+    ) -> Result<broadcast::Receiver<AttributedTap>> {
+        if addr.direction != Direction::Out {
+            return Err(crate::Error::Execution(
+                "subscribe requires Direction::Out".into(),
+            ));
+        }
+        let key: TapKey = (addr.node_id.clone(), addr.port.clone());
+        let sender = self
+            .attributed_taps
             .entry(key)
             .or_insert_with(|| broadcast::channel(DEFAULT_TAP_CAPACITY).0)
             .clone();
@@ -1925,8 +1972,36 @@ impl SessionControl {
         port: Option<&str>,
         data: RuntimeData,
     ) -> Option<RuntimeData> {
+        self.on_node_output_from(node_id, port, data, None).await
+    }
+
+    /// [`Self::on_node_output`] with the id of the participant whose input
+    /// produced the output, for [`Self::subscribe_attributed`].
+    pub async fn on_node_output_from(
+        &self,
+        node_id: &str,
+        port: Option<&str>,
+        data: RuntimeData,
+        participant: Option<&str>,
+    ) -> Option<RuntimeData> {
         let data = data.into_shared();
         let port_owned = port.map(|s| s.to_string());
+
+        if !self.attributed_taps.is_empty() {
+            let who: Option<Arc<str>> = participant.map(Arc::from);
+            let key: TapKey = (node_id.to_string(), port_owned.clone());
+            if let Some(tap) = self.attributed_taps.get(&key) {
+                let _ = tap.send((who.clone(), data.clone()));
+            }
+            if let Some(aux) = aux_port_of(&data) {
+                if Some(aux.as_str()) != port_owned.as_deref() {
+                    let aux_key: TapKey = (node_id.to_string(), Some(aux));
+                    if let Some(tap) = self.attributed_taps.get(&aux_key) {
+                        let _ = tap.send((who, data.clone()));
+                    }
+                }
+            }
+        }
 
         // 1. Broadcast to tap subscribers (fire-and-forget; slow subs lag).
         let tap_key: TapKey = (node_id.to_string(), port_owned.clone());

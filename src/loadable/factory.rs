@@ -86,10 +86,73 @@ enum NativeFrame {
 
 struct ChannelSink {
     tx: tokio::sync::mpsc::Sender<NativeFrame>,
+    /// Counts frames pushed here until the host has forwarded them.
+    outputs: Arc<SinkOutputs>,
+}
+
+/// Outputs a plugin pushed into a call's sink that the host has not
+/// forwarded yet. The plugin's emitter waits for this to reach zero, so a
+/// frame emitted after a reply is delivered after it: a call's sink and the
+/// instance's emitter are two paths onto the same output edge.
+#[derive(Default)]
+struct SinkOutputs {
+    pending: std::sync::atomic::AtomicUsize,
+    forwarded: tokio::sync::Notify,
+}
+
+impl SinkOutputs {
+    fn pushed(&self) {
+        self.pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn forwarded(&self) {
+        self.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.forwarded.notify_waiters();
+    }
+
+    fn any(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// Resolves when every pushed output has been forwarded.
+    async fn settled(&self) {
+        loop {
+            let forwarded = self.forwarded.notified();
+            if !self.any() {
+                return;
+            }
+            forwarded.await;
+        }
+    }
+}
+
+/// The receiving end of a call's sink. Frames still queued when the call
+/// ends (an error, a cancelled call) are counted as forwarded, so an emit
+/// never waits for a frame nobody will deliver.
+struct SinkReceiver {
+    rx: tokio::sync::mpsc::Receiver<NativeFrame>,
+    outputs: Arc<SinkOutputs>,
+}
+
+impl Drop for SinkReceiver {
+    fn drop(&mut self) {
+        self.rx.close();
+        while self.rx.try_recv().is_ok() {
+            self.outputs.forwarded();
+        }
+    }
 }
 
 impl ChannelSink {
     fn send(&self, bytes: NativeFrame) -> RResult<(), RString> {
+        let sent = self.send_frame(bytes);
+        if matches!(sent, ROk(())) {
+            self.outputs.pushed();
+        }
+        sent
+    }
+
+    fn send_frame(&self, bytes: NativeFrame) -> RResult<(), RString> {
         match self.tx.try_send(bytes) {
             Ok(()) => ROk(()),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -166,6 +229,7 @@ impl LoadableNodeBundle {
                     inner: f,
                     node_type,
                     schema: None,
+                    declared: Default::default(),
                 }) as Arc<dyn StreamingNodeFactory>
             })
             .collect();
@@ -273,6 +337,7 @@ where
         inner: boxed,
         node_type,
         schema,
+        declared: Default::default(),
     })
 }
 
@@ -280,6 +345,34 @@ struct LoadableFactoryAdapter {
     inner: FfiNodeFactoryBox,
     node_type: String,
     schema: Option<crate::nodes::schema::NodeSchema>,
+    /// What the plugin declares for a node with no parameters.
+    declared: std::sync::OnceLock<remotemedia_traits::NodeDescription>,
+}
+
+impl LoadableFactoryAdapter {
+    /// What the plugin declares about a node with these parameters, without
+    /// creating it (`FfiNodeFactory::describe`).
+    fn describe(&self, params: &Value) -> remotemedia_traits::NodeDescription {
+        let params = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
+        let declared = self
+            .inner
+            .describe(RString::from(params))
+            .into_result()
+            .map_err(|error| Error::Execution(error.into_string()))
+            .and_then(|json| remotemedia_traits::NodeDescription::from_json(json.as_str()));
+        match declared {
+            Ok(description) => description,
+            Err(error) => {
+                tracing::warn!(node_type = %self.node_type, %error, "plugin declaration ignored");
+                Default::default()
+            }
+        }
+    }
+
+    fn declared(&self) -> &remotemedia_traits::NodeDescription {
+        self.declared
+            .get_or_init(|| self.describe(&Value::Object(Default::default())))
+    }
 }
 
 impl StreamingNodeFactory for LoadableFactoryAdapter {
@@ -342,6 +435,27 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
         self.schema.clone()
     }
 
+    fn self_driven(&self) -> Option<bool> {
+        self.declared().self_driven
+    }
+
+    fn instance_scope(&self) -> Option<remotemedia_traits::streaming::InstanceScope> {
+        self.declared()
+            .instance_scope
+            .as_deref()
+            .and_then(remotemedia_traits::streaming::InstanceScope::parse)
+    }
+
+    fn capability_behavior(&self) -> crate::capabilities::CapabilityBehavior {
+        self.declared()
+            .capability_behavior
+            .unwrap_or(crate::capabilities::CapabilityBehavior::Passthrough)
+    }
+
+    fn media_capabilities(&self, params: &Value) -> Option<crate::capabilities::MediaCapabilities> {
+        self.describe(params).media_capabilities
+    }
+
     fn node_type(&self) -> &str {
         &self.node_type
     }
@@ -394,6 +508,9 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
                     .ok_or_else(|| Error::Execution(format!("invalid plugin instance scope: {value}")))?,
             ),
         };
+        // Instance declarations (openspec: add-source-node-lifecycle).
+        let self_driven = pacing.get("self_driven").and_then(Value::as_bool);
+        let background = pacing.get("background").and_then(Value::as_bool).unwrap_or(false);
         let rpc_methods: Vec<RpcMethod> = serde_json::from_str(ffi_node.rpc_methods().as_str())
             .map_err(|e| Error::Execution(format!("invalid plugin RPC descriptors: {e}")))?;
         let snapshots = loadable_node_abi::snapshot::runtime::import_ports(
@@ -410,6 +527,9 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
             rate,
             clocked_media_addr,
             instance_scope,
+            self_driven,
+            background,
+            outputs: Default::default(),
             node_type: self.node_type.clone(),
             node_id,
         }))))
@@ -426,12 +546,39 @@ struct LoadableNodeAdapter {
     rate: u32,
     clocked_media_addr: Option<(String, String)>,
     instance_scope: Option<remotemedia_traits::streaming::InstanceScope>,
+    self_driven: Option<bool>,
+    /// The plugin node has a background body.
+    background: bool,
+    /// Outputs of in-flight calls that are not forwarded yet.
+    outputs: Arc<SinkOutputs>,
     node_type: String,
     node_id: String,
 }
 
 #[async_trait]
 impl AsyncStreamingNode for LoadableNodeAdapter {
+    fn self_driven(&self) -> Option<bool> {
+        self.self_driven
+    }
+
+    fn has_background(&self) -> bool {
+        self.background
+    }
+
+    /// The plugin's body. Dropping this future drops the plugin's, which
+    /// cancels the body on the plugin's side.
+    async fn background(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<(), Error> {
+        self.inner
+            .background(FfiCallContext {
+                session_id: context_session(ctx).map(RString::from).into(),
+                node_id: self.node_id.clone().into(),
+                origin: abi_stable::std_types::RNone,
+            })
+            .await
+            .into_result()
+            .map_err(|e| Error::from_plugin(e.into_string(), &self.node_id, &self.node_type))
+    }
+
     fn validate_snapshot_input(
         &self,
         port: &str,
@@ -559,6 +706,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
                     }
                     .into(),
                     node_id: ctx.node_id().into(),
+                    origin: ffi_origin(ctx),
                 },
                 sink,
             )
@@ -661,6 +809,15 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
     /// Plugins that do all work eagerly inside the factory's `create()`
     /// see a no-op (FFI default impl returns `Ok(())`).
     async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
+        // The plugin gets the instance's emitter before it initializes, so
+        // it can start producing on its own from `initialize`.
+        if ctx.emitter_any().is_some() {
+            self.inner
+                .bind_emitter(loadable_node_abi::buffer::NodeEmitter_TO::from_value(
+                    HostEmitter(crate::nodes::Emitter::of(ctx), self.outputs.clone()),
+                    abi_stable::sabi_trait::TD_Opaque,
+                ));
+        }
         match self
             .inner
             .initialize(
@@ -732,8 +889,14 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
                 .shared_stream(data, self.execution_context(session_id, None), callback)
                 .await;
         }
-        self.legacy_stream(data, session_id, CopyContext::legacy(), callback)
-            .await
+        self.legacy_stream(
+            data,
+            session_id,
+            abi_stable::std_types::RNone,
+            CopyContext::legacy(),
+            callback,
+        )
+        .await
     }
 
     /// Ctx-aware streaming entry point — same per-frame FFI path,
@@ -756,6 +919,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         self.legacy_stream(
             data,
             context_session(ctx),
+            ffi_origin(ctx),
             &self.legacy_copies(ctx)?,
             callback,
         )
@@ -764,6 +928,14 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
 }
 
 impl LoadableNodeAdapter {
+    /// The sink of one call.
+    fn sink(&self, tx: tokio::sync::mpsc::Sender<NativeFrame>) -> ChannelSink {
+        ChannelSink {
+            tx,
+            outputs: self.outputs.clone(),
+        }
+    }
+
     fn uses_shared(&self) -> Result<bool, Error> {
         match self.inner.shared_buffer_protocol() {
             0 => Ok(false),
@@ -785,6 +957,7 @@ impl LoadableNodeAdapter {
             identity: FfiCallContext {
                 session_id: session_id.map(RString::from).into(),
                 node_id: self.node_id.clone().into(),
+                origin: abi_stable::std_types::RNone,
             },
             allocator: allocator.map(runtime_buffer::export_allocator).into(),
             snapshots: RVec::new(),
@@ -793,6 +966,7 @@ impl LoadableNodeAdapter {
 
     fn context_from(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<FfiExecutionContext, Error> {
         let mut context = self.execution_context(context_session(ctx), ctx.output_allocator());
+        context.identity.origin = ffi_origin(ctx);
         context.materialization = ctx
             .copy_context()
             .map(loadable_node_abi::copy_ledger::runtime::export)
@@ -845,7 +1019,7 @@ impl LoadableNodeAdapter {
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let sink = SharedOutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
+        let sink = SharedOutputSink_TO::from_value(self.sink(tx), TD_Opaque);
         let future = self
             .inner
             .process_streaming_shared(encode_shared(data)?, context, sink);
@@ -859,7 +1033,7 @@ impl LoadableNodeAdapter {
         callback: Box<dyn FnMut(RuntimeData) -> Result<(), Error> + Send>,
     ) -> Result<(), Error> {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let sink = SharedOutputSink_TO::from_value(ChannelSink { tx }, TD_Opaque);
+        let sink = SharedOutputSink_TO::from_value(self.sink(tx), TD_Opaque);
         let tick = loadable_node_abi::FfiTick {
             clock_id: tick.clock_id.into(),
             pts_us: tick.pts_us,
@@ -879,7 +1053,7 @@ impl LoadableNodeAdapter {
     async fn drain_outputs<F>(
         &self,
         ffi_fut: async_ffi::FfiFuture<RResult<usize, RString>>,
-        mut frame_rx: tokio::sync::mpsc::Receiver<NativeFrame>,
+        frame_rx: tokio::sync::mpsc::Receiver<NativeFrame>,
         legacy_copies: Option<&CopyContext>,
         mut callback: F,
     ) -> Result<usize, Error>
@@ -887,22 +1061,32 @@ impl LoadableNodeAdapter {
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
         tokio::pin!(ffi_fut);
+        let mut frames = SinkReceiver {
+            rx: frame_rx,
+            outputs: self.outputs.clone(),
+        };
 
         let mut count = 0usize;
         let mut ffi_result: Option<RResult<usize, RString>> = None;
         loop {
             tokio::select! {
                 biased;
-                maybe_frame = frame_rx.recv() => {
+                maybe_frame = frames.rx.recv() => {
                     match maybe_frame {
                         Some(frame) => {
-                            let out_data = match frame {
-                                NativeFrame::Shared(message) => runtime_buffer::decode(message)
-                                    .map_err(|error| Error::Execution(error.into_string()))?,
-                                NativeFrame::Legacy(bytes) => self.legacy_decode(bytes.as_slice(), legacy_copies.ok_or_else(||
-                                    Error::Execution("unexpected legacy frame on shared plugin path".into()))?)?,
-                            };
-                            callback(out_data)?;
+                            let forwarded = (|| {
+                                let out_data = match frame {
+                                    NativeFrame::Shared(message) => runtime_buffer::decode(message)
+                                        .map_err(|error| Error::Execution(error.into_string()))?,
+                                    NativeFrame::Legacy(bytes) => self.legacy_decode(bytes.as_slice(), legacy_copies.ok_or_else(||
+                                        Error::Execution("unexpected legacy frame on shared plugin path".into()))?)?,
+                                };
+                                callback(out_data)
+                            })();
+                            // On the node's output edge (or failed): an emit
+                            // made after this frame may go now.
+                            self.outputs.forwarded();
+                            forwarded?;
                             count += 1;
                         }
                         None => {
@@ -945,6 +1129,116 @@ fn context_session(ctx: &dyn NodeRuntimeContextRead) -> Option<String> {
         None
     } else {
         Some(ctx.session_id().to_string())
+    }
+}
+
+/// The participant of the input a call processes, as the plugin ABI
+/// carries it.
+fn ffi_origin(ctx: &dyn NodeRuntimeContextRead) -> abi_stable::std_types::ROption<RString> {
+    ctx.origin().map(|origin| RString::from(origin.to_json())).into()
+}
+
+/// The host emitter behind the plugin ABI's `NodeEmitter`.
+struct HostEmitter(crate::nodes::Emitter, Arc<SinkOutputs>);
+
+impl HostEmitter {
+    fn frame(
+        message: FfiMessage,
+        origin: u8,
+        participant: RString,
+    ) -> Result<(RuntimeData, crate::nodes::EmitOrigin), RString> {
+        use loadable_node_abi::buffer::{
+            EMIT_AS_DEFAULT, EMIT_AS_ORIGIN, EMIT_AS_PARTICIPANT, EMIT_UNATTRIBUTED,
+        };
+        let origin = match origin {
+            EMIT_AS_DEFAULT => crate::nodes::EmitOrigin::Default,
+            EMIT_UNATTRIBUTED => crate::nodes::EmitOrigin::Unattributed,
+            EMIT_AS_PARTICIPANT => crate::nodes::EmitOrigin::Participant(participant.into_string()),
+            // An origin the plugin read from an input and kept.
+            EMIT_AS_ORIGIN => match crate::transport::origin::Origin::from_json(participant.as_str()) {
+                Some(origin) => crate::nodes::EmitOrigin::Origin(Arc::new(origin)),
+                None => return Err("emit origin names no participant".into()),
+            },
+            other => return Err(format!("unknown emit origin {other}").into()),
+        };
+        Ok((runtime_buffer::decode(message)?, origin))
+    }
+}
+
+impl loadable_node_abi::buffer::NodeEmitter for HostEmitter {
+    fn emit(
+        &self,
+        message: FfiMessage,
+        origin: u8,
+        participant: RString,
+    ) -> async_ffi::FfiFuture<RResult<(), RString>> {
+        let emitter = self.0.clone();
+        let outputs = self.1.clone();
+        async move {
+            let (data, origin) = match Self::frame(message, origin, participant) {
+                Ok(frame) => frame,
+                Err(error) => return RErr(error),
+            };
+            // Replies the plugin pushed before this emit go out first.
+            outputs.settled().await;
+            match emitter.emit_as(data, origin).await {
+                Ok(()) => ROk(()),
+                Err(error) => RErr(error.to_string().into()),
+            }
+        }
+        .into_ffi()
+    }
+
+    fn try_emit(
+        &self,
+        message: FfiMessage,
+        origin: u8,
+        participant: RString,
+    ) -> loadable_node_abi::buffer::FfiTryEmit {
+        use crate::nodes::TryEmitError;
+        use loadable_node_abi::buffer::{
+            FfiTryEmit, TRY_EMIT_FULL, TRY_EMIT_NOT_STARTED, TRY_EMIT_QUEUED, TRY_EMIT_REJECTED,
+        };
+        // The plugin keeps the frame it tried to emit; nothing is handed
+        // back across the boundary.
+        let outcome = |status, error: String| FfiTryEmit {
+            status,
+            message: abi_stable::std_types::RNone,
+            error: error.into(),
+        };
+        let (data, origin) = match Self::frame(message, origin, participant) {
+            Ok(frame) => frame,
+            Err(error) => return outcome(TRY_EMIT_REJECTED, error.into_string()),
+        };
+        // Replies pushed before this emit are still on their way out: it
+        // cannot go ahead of them without waiting.
+        if self.1.any() {
+            return outcome(TRY_EMIT_FULL, String::new());
+        }
+        match self.0.try_emit_as(data, origin) {
+            Ok(()) => outcome(TRY_EMIT_QUEUED, String::new()),
+            Err(TryEmitError::Full(_)) => outcome(TRY_EMIT_FULL, String::new()),
+            Err(TryEmitError::NotStarted(_)) => outcome(TRY_EMIT_NOT_STARTED, String::new()),
+            Err(TryEmitError::Rejected(_, error)) => outcome(TRY_EMIT_REJECTED, error.to_string()),
+        }
+    }
+
+    fn started(&self) -> async_ffi::FfiFuture<()> {
+        let emitter = self.0.clone();
+        async move { emitter.started().await }.into_ffi()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+
+    fn closed(&self) -> async_ffi::FfiFuture<()> {
+        let emitter = self.0.clone();
+        async move { emitter.closed().await }.into_ffi()
+    }
+
+    fn finish(&self) {
+        self.0.finish();
     }
 }
 
@@ -1077,5 +1371,137 @@ impl FfiRpcReplySink for RpcChannelSink {
             }
         }
         .into_ffi()
+    }
+}
+
+#[cfg(all(test, feature = "loadable-export"))]
+mod body_tests;
+
+/// A plugin built on the SDK emits through the host's emitter (openspec:
+/// add-node-initiated-output).
+#[cfg(all(test, feature = "loadable-export"))]
+mod emitter_contract_tests {
+    use super::*;
+    use remotemedia_plugin_sdk::adapter::StreamingNodeFfiAdapter;
+    use remotemedia_plugin_sdk::Emitter as PluginEmitter;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Emits three frames from a task it starts in `initialize`, then one as
+    /// a participant who is not in the session, and records how that went.
+    struct Ticker {
+        rejected: Arc<AtomicBool>,
+        saw_close: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl AsyncStreamingNode for Ticker {
+        fn node_type(&self) -> &str {
+            "Ticker"
+        }
+        async fn initialize(&self, ctx: &dyn InitializeContextRead) -> Result<(), Error> {
+            let emitter = PluginEmitter::of(ctx);
+            let (rejected, saw_close) = (self.rejected.clone(), self.saw_close.clone());
+            tokio::spawn(async move {
+                for n in 0..3 {
+                    if emitter.emit(RuntimeData::Text(format!("tick-{n}"))).await.is_err() {
+                        rejected.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                if emitter.emit_as(RuntimeData::Text("boo".into()), "ghost").await.is_err() {
+                    rejected.store(true, Ordering::SeqCst);
+                }
+                emitter.closed().await;
+                saw_close.store(true, Ordering::SeqCst);
+            });
+            Ok(())
+        }
+        async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
+            Ok(data)
+        }
+    }
+
+    struct TickerFactory(Arc<AtomicBool>, Arc<AtomicBool>);
+    impl FfiNodeFactory for TickerFactory {
+        fn node_type(&self) -> RString {
+            "Ticker".into()
+        }
+        fn create(&self, _: RString) -> RResult<FfiNodeBox, RString> {
+            ROk(loadable_node_abi::FfiNode_TO::from_value(
+                StreamingNodeFfiAdapter::new(Ticker {
+                    rejected: self.0.clone(),
+                    saw_close: self.1.clone(),
+                }),
+                TD_Opaque,
+            ))
+        }
+    }
+
+    fn node(rejected: &Arc<AtomicBool>, saw_close: &Arc<AtomicBool>) -> Box<dyn crate::nodes::StreamingNode> {
+        wrap_ffi_factory(TickerFactory(rejected.clone(), saw_close.clone()))
+            .create("ticker".into(), &serde_json::json!({}), Some("session".into()))
+            .unwrap()
+    }
+
+    fn init_ctx() -> crate::nodes::InitializeContext {
+        crate::nodes::InitializeContext {
+            session_id: "session".into(),
+            node_id: "ticker".into(),
+            control: None,
+        }
+    }
+
+    async fn wait_for(flag: &AtomicBool) {
+        for _ in 0..200 {
+            if flag.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("flag was not set in time");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plugin_emits_from_a_task_through_the_hosts_emitter() {
+        let (rejected, saw_close) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let node = node(&rejected, &saw_close);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let emitter = crate::nodes::Emitter::pending("ticker");
+        emitter.bind(tx, None, Default::default(), None);
+        emitter.start();
+        let ctx = init_ctx().for_instance(CopyContext::legacy().clone(), emitter.clone());
+        node.initialize(&ctx).await.unwrap();
+
+        for n in 0..3 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("emitted frame")
+                .unwrap();
+            assert!(matches!(frame.data, RuntimeData::Text(body) if body == format!("tick-{n}")));
+            assert!(frame.origin.is_none());
+        }
+        // A participant who is not in the session: the plugin gets an error
+        // and nothing is queued.
+        wait_for(&rejected).await;
+        assert!(rx.try_recv().is_err());
+        // The instance stops: the plugin's task sees the emitter close.
+        emitter.finish();
+        wait_for(&saw_close).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plugin_on_a_host_without_an_emitter_gets_an_error_and_keeps_running() {
+        let (rejected, saw_close) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let node = node(&rejected, &saw_close);
+        // What a host that predates the emitter does: it binds nothing.
+        node.initialize(&init_ctx()).await.unwrap();
+        wait_for(&rejected).await;
+        let ctx = crate::nodes::NodeRuntimeContext::for_test("session", "ticker");
+        let out = node
+            .process_async(RuntimeData::Text("still here".into()), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(out, RuntimeData::Text(body) if body == "still here"));
     }
 }

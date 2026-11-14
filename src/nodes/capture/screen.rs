@@ -47,6 +47,10 @@ pub struct ScreenCaptureConfig {
     pub pixel_format: PixelOut,
     #[serde(default)]
     pub stream_id: Option<String>,
+    /// `"tick"` (default): the session clock polls for a frame `fps` times a
+    /// second. `"body"`: each frame is emitted when it is captured.
+    #[serde(default)]
+    pub delivery: super::Delivery,
 }
 
 impl Default for ScreenCaptureConfig {
@@ -283,13 +287,17 @@ impl StreamingNodeFactory for ScreenCaptureNodeFactory {
     ) -> Result<Box<dyn StreamingNode>, Error> {
         let cfg: ScreenCaptureConfig = serde_json::from_value(params.clone())
             .map_err(|e| Error::Execution(format!("ScreenCapture params: {e}")))?;
-        Ok(Box::new(CaptureSourceNode::new(
-            node_id,
-            cfg.fps,
-            cfg.pixel_format,
-            cfg.stream_id.clone(),
-            Box::new(ScreenBackend { cfg }),
-        )))
+        let delivery = cfg.delivery;
+        Ok(Box::new(
+            CaptureSourceNode::new(
+                node_id,
+                cfg.fps,
+                cfg.pixel_format,
+                cfg.stream_id.clone(),
+                Box::new(ScreenBackend { cfg }),
+            )
+            .with_delivery(delivery),
+        ))
     }
 
     fn node_type(&self) -> &str {

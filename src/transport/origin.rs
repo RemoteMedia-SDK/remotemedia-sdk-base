@@ -11,7 +11,7 @@
 //!
 //! [`DataPacket`]: super::session_router::DataPacket
 
-use super::data::{participant, TransportData};
+use super::data::TransportData;
 use crate::data::RuntimeData;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,35 +21,44 @@ use std::sync::Arc;
 pub const LIFECYCLE: &str = "participant.lifecycle";
 /// [`LIFECYCLE`] value: the participant in `participant.id` left the session.
 pub const LEAVE: &str = "leave";
+/// [`LIFECYCLE`] value: the participant in the packet joined the session. A
+/// participant's first input announces it as well.
+pub const JOIN: &str = "join";
 
-/// Who produced a frame: the sender's canonical `participant.*` fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Origin {
-    id: String,
-    fields: HashMap<String, String>,
+pub use remotemedia_traits::emit::Origin;
+
+/// The participants currently in a session, as the router has seen them: a
+/// participant is known from its first input until it leaves. Lets a node
+/// attribute emitted output to a participant by id without inventing identity
+/// fields (openspec: add-node-initiated-output).
+#[derive(Debug, Default)]
+pub struct Roster {
+    current: parking_lot::RwLock<HashMap<String, Arc<Origin>>>,
 }
 
-impl Origin {
-    /// The identity in `metadata`, or `None` without a `participant.id`.
-    /// Only `participant.*` keys are kept.
-    pub fn from_metadata(metadata: &HashMap<String, String>) -> Option<Self> {
-        let id = metadata.get(participant::ID)?.clone();
-        let fields = metadata
-            .iter()
-            .filter(|(key, _)| key.starts_with("participant.") && key.as_str() != LIFECYCLE)
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        Some(Self { id, fields })
+impl Roster {
+    /// Record the sender of an input. The latest fields win. `true` when the
+    /// participant was not known: it has just joined.
+    pub fn note(&self, origin: &Arc<Origin>) -> bool {
+        if let Some(known) = self.current.read().get(origin.id()) {
+            if Arc::ptr_eq(known, origin) || **known == **origin {
+                return false;
+            }
+        }
+        self.current
+            .write()
+            .insert(origin.id().to_string(), Arc::clone(origin))
+            .is_none()
     }
 
-    /// `participant.id`.
-    pub fn id(&self) -> &str {
-        &self.id
+    /// The participant left the session.
+    pub fn leave(&self, id: &str) {
+        self.current.write().remove(id);
     }
 
-    /// All carried `participant.*` fields.
-    pub fn fields(&self) -> &HashMap<String, String> {
-        &self.fields
+    /// The identity of a current participant.
+    pub fn get(&self, id: &str) -> Option<Arc<Origin>> {
+        self.current.read().get(id).cloned()
     }
 }
 
@@ -97,6 +106,7 @@ impl From<RuntimeData> for Routed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::data::participant;
 
     fn alice() -> Arc<Origin> {
         let metadata = HashMap::from([

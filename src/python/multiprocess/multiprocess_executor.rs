@@ -185,6 +185,14 @@ enum IpcCommand {
 pub(super) enum IpcResponse {
     /// Data received from the node's output channel (serialized Python wire bytes)
     OutputData(SharedBytes),
+    /// The same, from a worker that tags its frames: `seq` is the input the
+    /// frame answers, or 0 for a frame the node emitted (with the attribution
+    /// it asked for). The tag is already removed from `frame`.
+    Tagged {
+        seq: u64,
+        origin: crate::multiprocess::python_wire::EmitTag,
+        frame: SharedBytes,
+    },
     /// Acknowledgment that data was sent successfully
     SendComplete,
     /// Error occurred during IPC operation
@@ -196,6 +204,7 @@ pub(super) enum IpcResponse {
 #[cfg(feature = "multiprocess")]
 fn deliver_ipc_output(
     output: SharedBytes,
+    turn: Option<crate::multiprocess::python_wire::OutputTurn>,
     callback: &mut Option<tokio::sync::mpsc::Sender<SharedBytes>>,
     response: &tokio::sync::mpsc::Sender<IpcResponse>,
 ) {
@@ -205,7 +214,14 @@ fn deliver_ipc_output(
             *callback = None;
         }
     }
-    let _ = response.blocking_send(IpcResponse::OutputData(output));
+    let _ = response.blocking_send(match turn {
+        Some(turn) => IpcResponse::Tagged {
+            seq: turn.seq,
+            origin: turn.origin,
+            frame: output,
+        },
+        None => IpcResponse::OutputData(output),
+    });
 }
 
 /// Handle a single runtime control message read from a Python node's
@@ -373,6 +389,8 @@ pub struct NodeIpcThread {
     response_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<IpcResponse>>>,
     /// Turns that ended before their EndOfInput; their responses are still queued.
     abandoned: Arc<super::legacy_call::AbandonedTurns>,
+    /// Hands the response lane between turns and the between-turns reader.
+    gate: Arc<super::legacy_call::LaneGate>,
     /// Handle to the OS thread (for cleanup)
     thread_handle: Option<std::thread::JoinHandle<()>>,
     /// Node ID this thread serves
@@ -716,6 +734,18 @@ pub struct MultiprocessExecutor {
     /// `SCOPE:` control message, else the source probe.
     declared_instance_scope: Option<crate::nodes::InstanceScope>,
 
+    /// `@self_driven` as the worker reported it before READY.
+    declared_self_driven: Option<bool>,
+
+    /// The node instance's emitter (openspec: add-node-initiated-output):
+    /// where frames the Python node emits on its own are delivered.
+    emitter: Arc<std::sync::Mutex<Option<crate::nodes::Emitter>>>,
+    /// Set once the worker announced that it tags its frames with the input
+    /// they answer; inputs are then sent with a sequence number.
+    wire_turns: Arc<std::sync::atomic::AtomicBool>,
+    /// Sequence number of the last input sent to the worker.
+    turn_seq: Arc<std::sync::atomic::AtomicU64>,
+
     /// Fixed before initialization; owns startup and background-output accounting.
     initial_copies: Option<remotemedia_types::CopyContext>,
     /// Canonical identity survives cleanup so the bound ledger cannot migrate.
@@ -766,8 +796,48 @@ impl MultiprocessExecutor {
         &self,
         input: crate::data::RuntimeData,
         session_id: Option<String>,
+        callback: F,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Result<usize>
+    where
+        F: FnMut(crate::data::RuntimeData) -> Result<()> + Send,
+    {
+        self.process_turn(input, session_id, callback, copies, None)
+            .await
+    }
+
+    /// Hand the node instance's emitter to the executor before it starts its
+    /// worker, so frames the Python node emits reach the node's output edge.
+    pub fn set_emitter(&self, emitter: crate::nodes::Emitter) {
+        *self.emitter.lock().unwrap() = Some(emitter);
+    }
+
+    /// Where the worker's emitted frames go, if the node has an emitter.
+    #[cfg(feature = "multiprocess")]
+    fn emit_sink(
+        &self,
+        node_id: &str,
+        copies: &remotemedia_types::CopyContext,
+    ) -> Option<super::legacy_call::EmitSink> {
+        let emitter = self.emitter.lock().unwrap().clone()?;
+        Some(super::legacy_call::EmitSink {
+            emitter,
+            copies: self.initial_copies.clone().unwrap_or_else(|| copies.clone()),
+            node_id: node_id.to_string(),
+        })
+    }
+
+    /// One input's turn. `origin` is the participant whose input this is; a
+    /// worker that tags its frames receives it with the input, so the node
+    /// can read it and keep it for a later emit.
+    #[cfg(feature = "multiprocess")]
+    pub async fn process_turn<F>(
+        &self,
+        input: crate::data::RuntimeData,
+        session_id: Option<String>,
         mut callback: F,
         copies: &remotemedia_types::CopyContext,
+        origin: Option<&crate::transport::origin::Origin>,
     ) -> Result<usize>
     where
         F: FnMut(crate::data::RuntimeData) -> Result<()> + Send,
@@ -793,12 +863,26 @@ impl MultiprocessExecutor {
         );
 
         // Convert input to Python IPC wire bytes
-        let ipc_data = crate::multiprocess::data_transfer::to_python_wire_with_copy_context(
+        let mut ipc_data = crate::multiprocess::data_transfer::to_python_wire_with_copy_context(
             &input,
             &session_id,
             copies,
         )
         .map_err(Error::Execution)?;
+        // A tagging worker gets the input's sequence number and its sender.
+        let turn_seq = self
+            .wire_turns
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then(|| self.turn_seq.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1);
+        if let Some(seq) = turn_seq {
+            crate::multiprocess::python_wire::append_input_turn(
+                &mut ipc_data,
+                seq,
+                origin.map(|origin| origin.fields()),
+            )
+            .map_err(Error::Execution)?;
+        }
+        let emit_sink = self.emit_sink(&ctx.node_id, copies);
 
         tracing::debug!(
             "[Multiprocess] Converted input data for node '{}': {} bytes",
@@ -818,11 +902,14 @@ impl MultiprocessExecutor {
         let ipc_thread_cmd_tx = thread.command_tx.clone();
         let ipc_thread_resp_rx = thread.response_rx.clone();
         let abandoned = thread.abandoned.clone();
+        let gate = thread.gate.clone();
 
         drop(sessions); // Release read lock
 
         // Hold the node's response lane for the whole turn, including the send,
-        // so concurrent turns cannot interleave their outputs.
+        // so concurrent turns cannot interleave their outputs. The reader that
+        // forwards emitted frames between turns gives the lane up first.
+        let _wanted = gate.want();
         let mut resp_rx = ipc_thread_resp_rx.lock().await;
         let node_id = ctx.node_id.clone();
         let send = async {
@@ -834,7 +921,7 @@ impl MultiprocessExecutor {
                 .await
                 .map_err(|e| Error::Execution(format!("Failed to send to IPC thread: {}", e)))
         };
-        super::legacy_call::run(
+        super::legacy_call::run_turn(
             &mut resp_rx,
             &abandoned,
             super::legacy_call::Timeouts::default(),
@@ -847,6 +934,10 @@ impl MultiprocessExecutor {
                 .map_err(Error::Execution)
             },
             &mut callback,
+            turn_seq.map(|seq| super::legacy_call::Turn {
+                seq,
+                emits: emit_sink.as_ref(),
+            }),
         )
         .await
     }
@@ -1148,6 +1239,10 @@ impl MultiprocessExecutor {
             config,
             current_context: None,
             declared_instance_scope: None,
+            declared_self_driven: None,
+            emitter: Default::default(),
+            wire_turns: Default::default(),
+            turn_seq: Default::default(),
             initial_copies: None,
             initial_scope: None,
             env_lease: None,
@@ -1239,6 +1334,17 @@ impl MultiprocessExecutor {
             .await;
     }
 
+    /// Set an environment variable for this executor's worker processes.
+    /// It is part of the shared-worker key.
+    pub async fn set_spawn_env(&self, key: &str, value: &str) {
+        self.process_manager
+            .spawn_config()
+            .write()
+            .await
+            .env_vars
+            .insert(key.to_string(), value.to_string());
+    }
+
     /// Get the list of registered modules
     pub async fn get_registered_modules(&self) -> Vec<String> {
         self.process_manager.get_registered_modules().await
@@ -1248,6 +1354,11 @@ impl MultiprocessExecutor {
     /// known once [`NodeExecutor::initialize`] returned.
     pub fn declared_instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
         self.declared_instance_scope
+    }
+
+    /// Whether the Python class is `@self_driven`, once the worker is ready.
+    pub fn declared_self_driven(&self) -> Option<bool> {
+        self.declared_self_driven
     }
 
     /// Get the channel registry for IPC communication
@@ -1472,6 +1583,16 @@ def _scan_file(path, want_node_type, want_class=None):
             return (deps or []), True, scope
     return None, False, None
 
+def _module_source(module):
+    """Source file of an importable module, found on sys.path without importing it."""
+    relative = Path(*module.split("."))
+    for entry in sys.path:
+        base = Path(entry) if entry else Path.cwd()
+        for candidate in (base / relative.with_suffix(".py"), base / relative / "__init__.py"):
+            if candidate.is_file():
+                return candidate
+    return None
+
 def _dotted_class_source(node_type):
     """(source file, class name) of a node registered by dotted path
     (`pkg.module.ClassName`), found on sys.path without importing it."""
@@ -1557,6 +1678,19 @@ try:
         if matched:
             break
     if not matched:
+        # A class registered by name in a module the worker imports first.
+        for module in os.environ.get("REMOTEMEDIA_DEPS_PROBE_MODULES", "").split(","):
+            module_path = _module_source(module) if module else None
+            if module_path is None:
+                continue
+            deps, found, scope = _scan_file(module_path, NODE_TYPE)
+            if found:
+                RESULT["deps"] = _merge_dedup(deps or [], _extract_pep723(module_path))
+                RESULT["instance_scope"] = scope
+                RESULT["source_file"] = str(module_path)
+                matched = True
+                break
+    if not matched:
         dotted_path, dotted_class = _dotted_class_source(NODE_TYPE)
         if dotted_path is not None:
             deps, found, scope = _scan_file(dotted_path, NODE_TYPE, dotted_class)
@@ -1579,6 +1713,12 @@ sys.stdout.flush()
         let mut cmd = tokio::process::Command::new(python);
         cmd.args(["-c", &script]);
         cmd.env("REMOTEMEDIA_DEPS_PROBE_NODE_TYPE", node_type);
+        // Modules the worker will import to register node classes (a source
+        // plugin's entry module): the probe looks for the node type in them.
+        cmd.env(
+            "REMOTEMEDIA_DEPS_PROBE_MODULES",
+            self.process_manager.get_registered_modules().await.join(","),
+        );
         #[cfg(windows)]
         if let Some(flags) = super::process_manager::no_window_flag() {
             cmd.creation_flags(flags);
@@ -2176,7 +2316,7 @@ sys.stdout.flush()
         session_id: &str,
         node_id: &str,
         timeout: std::time::Duration,
-    ) -> Result<(bool, Option<crate::nodes::InstanceScope>)> {
+    ) -> Result<(bool, Option<crate::nodes::InstanceScope>, bool, bool, bool)> {
         let start = std::time::Instant::now();
         let control_channel_name = format!("control/{}_{}", session_id, node_id);
 
@@ -2203,11 +2343,17 @@ sys.stdout.flush()
 
         // Control channel was already created in initialize() before spawning Python
         // Now poll for the READY signal - need direct iceoryx2 subscriber (not RuntimeData wrapper)
-        type Readiness = (bool, Option<crate::nodes::InstanceScope>);
+        type Readiness = (bool, Option<crate::nodes::InstanceScope>, bool, bool, bool);
         let ready = tokio::task::spawn_blocking(move || -> Result<Readiness> {
             let handle = tokio::runtime::Handle::current();
             // `@instance_scope` as the worker reports it before READY.
             let mut scope = None;
+            // Whether the worker tags its frames with the input they answer.
+            let mut turns = false;
+            // Whether the node class is `@self_driven`.
+            let mut self_driven = false;
+            // The worker's node has a body that waits for the start signal.
+            let mut awaits_start = false;
 
             // Create raw subscriber for control channel (bypasses RuntimeData deserialization)
             let subscriber = handle.block_on(registry.create_raw_subscriber(&channel_name))?;
@@ -2223,7 +2369,7 @@ sys.stdout.flush()
                         node_id_clone,
                         poll_count
                     );
-                    return Ok((false, scope));
+                    return Ok((false, scope, turns, self_driven, awaits_start));
                 }
 
                 poll_count += 1;
@@ -2277,7 +2423,13 @@ sys.stdout.flush()
                         // Check if it's the READY signal
                         if bytes == b"READY" {
                             tracing::debug!("Node {} signaled READY via iceoryx2", node_id_clone);
-                            return Ok((true, scope));
+                            return Ok((true, scope, turns, self_driven, awaits_start));
+                        } else if bytes == b"START:1" {
+                            awaits_start = true;
+                        } else if bytes == b"TURNS:1" {
+                            turns = true;
+                        } else if bytes == b"SELF:1" {
+                            self_driven = true;
                         } else if let Some(declared) = bytes.strip_prefix(b"SCOPE:") {
                             let declared = std::str::from_utf8(declared).unwrap_or("");
                             scope = crate::nodes::InstanceScope::parse(declared);
@@ -2602,6 +2754,23 @@ sys.stdout.flush()
                             initial_copies.as_ref().unwrap_or(&callback_copies),
                         ) {
                             Ok(Some(output_data)) => {
+                                // A tagging worker names the input each frame
+                                // answers after the payload.
+                                let (output_data, turn) =
+                                    match crate::multiprocess::python_wire::split_output_turn(
+                                        &output_data,
+                                    ) {
+                                        Ok(Some((frame, turn))) => (frame, Some(turn)),
+                                        Ok(None) => (output_data, None),
+                                        Err(error) => {
+                                            tracing::error!(
+                                                "Turn tag from node {} rejected: {}",
+                                                node_id_clone,
+                                                error
+                                            );
+                                            (output_data, None)
+                                        }
+                                    };
                                 // A version 2 worker reports its copies in its
                                 // end-of-input frame: account them before the
                                 // frame completes the turn.
@@ -2621,7 +2790,7 @@ sys.stdout.flush()
                                         }
                                     }
                                 }
-                                deliver_ipc_output(output_data, &mut output_callback, &resp_tx);
+                                deliver_ipc_output(output_data, turn, &mut output_callback, &resp_tx);
                             }
                             Ok(None) if event_driven => {
                                 // Idle: block until a command arrives or the
@@ -2664,6 +2833,7 @@ sys.stdout.flush()
             command_tx: cmd_tx,
             response_rx: Arc::new(tokio::sync::Mutex::new(resp_rx)),
             abandoned: Arc::default(),
+            gate: Arc::default(),
             thread_handle: Some(handle),
             node_id: node_id.to_string(),
         })
@@ -3117,8 +3287,17 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             // Pre-discover node-declared deps (via @python_requires decorator)
             // by running a lightweight Python probe BEFORE spawning the real process.
             // This ensures the managed venv includes all required packages upfront.
-            let (node_deps, probed_scope) = self.discover_node_deps(&ctx.node_type).await;
+            let (mut node_deps, probed_scope) = self.discover_node_deps(&ctx.node_type).await;
             self.declared_instance_scope = probed_scope;
+            // A source plugin's `plugin.toml` `requires` are base dependencies,
+            // like the class's own declaration.
+            if let Some(plugin_deps) = ctx.params.get("__python_plugin_deps__").and_then(|v| v.as_array()) {
+                for dep in plugin_deps.iter().filter_map(|v| v.as_str()) {
+                    if !node_deps.iter().any(|existing| existing == dep) {
+                        node_deps.push(dep.to_string());
+                    }
+                }
+            }
 
             // Collect deps from:
             // 1. Node class __python_requires__ (discovered via probe above)
@@ -3486,7 +3665,7 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             // Python creates its input subscriber BEFORE sending READY, so when we receive
             // READY signal, Python is fully prepared to receive data
             // Wait for READY signal with configured timeout (allows time for heavy model loading)
-            let (ready, reported_scope) = self
+            let (ready, reported_scope, worker_tags_turns, worker_self_driven, worker_awaits_start) = self
                 .wait_for_ready_signal_ipc(
                     &session_id,
                     &ctx.node_id,
@@ -3525,6 +3704,62 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 "✅ Received READY signal - Python subscriber is ready to receive data"
             );
             self.watch_shared_lane(&session_id, &ctx.node_id).await;
+
+            if worker_self_driven {
+                self.declared_self_driven = Some(true);
+            }
+
+            // The node's `background()` waits for the session to start: tell
+            // the worker when this instance's start gate opens. Without an
+            // emitter (no streaming session) there is no gate to wait for.
+            if worker_awaits_start {
+                let command_tx = global_sessions()
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .and_then(|session| session.get(&ctx.node_id))
+                    .cloned();
+                let emitter = self.emitter.lock().unwrap().clone();
+                let bytes = crate::multiprocess::python_wire::start_frame(&session_id);
+                let node_id = ctx.node_id.clone();
+                match command_tx {
+                    Some(command_tx) => {
+                        tokio::spawn(async move {
+                            if let Some(emitter) = emitter {
+                                emitter.started().await;
+                                if emitter.is_closed() {
+                                    return;
+                                }
+                            }
+                            if command_tx.send(IpcCommand::SendDataNoAck { bytes }).await.is_err() {
+                                tracing::debug!(node = %node_id, "worker stopped before its session started");
+                            }
+                        });
+                    }
+                    None => tracing::warn!(
+                        node = %node_id,
+                        "no IPC thread to send the start signal to; the node's background() will not run"
+                    ),
+                }
+            }
+
+            // A worker that tags its frames can emit output between inputs:
+            // read its response lane while no turn runs.
+            if worker_tags_turns && crate::multiprocess::python_wire::turn_tags_enabled() {
+                self.wire_turns
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let lane = self
+                    .sessions
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .and_then(|session| session.ipc_threads.get(&ctx.node_id))
+                    .map(|thread| (thread.response_rx.clone(), thread.gate.clone()));
+                let sink = self.emit_sink(&ctx.node_id, CopyContext::legacy());
+                if let (Some((lane, gate)), Some(sink)) = (lane, sink) {
+                    tokio::spawn(super::legacy_call::read_between_turns(lane, gate, sink));
+                }
+            }
 
             // No settling delay is needed here. The worker creates its input
             // subscriber when it connects, before it loads its model and long

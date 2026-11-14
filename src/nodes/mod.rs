@@ -20,6 +20,9 @@ pub mod builder;
 pub mod calculator;
 pub mod core_provider;
 pub mod debug_log;
+pub mod emitter;
+pub mod interval_source;
+pub use emitter::{Emit, EmitOrigin, Emitter, TryEmitError};
 pub mod envelope_first_notifier;
 pub mod motion;
 pub mod passthrough;
@@ -48,7 +51,12 @@ pub mod video;
 pub mod video_scaler;
 
 // Self-driven video sources: screen / app window and webcam capture.
-#[cfg(any(feature = "microphone", feature = "screen-capture", feature = "webcam"))]
+#[cfg(any(
+    test,
+    feature = "microphone",
+    feature = "screen-capture",
+    feature = "webcam"
+))]
 pub mod capture;
 
 // Speaker playback sink.

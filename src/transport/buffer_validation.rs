@@ -413,6 +413,15 @@ impl StreamingNode for BufferCheckedNode {
     fn instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
         self.inner.instance_scope()
     }
+    fn self_driven(&self) -> Option<bool> {
+        self.inner.self_driven()
+    }
+    fn has_background(&self) -> bool {
+        self.inner.has_background()
+    }
+    async fn background(&self, ctx: &dyn NodeRuntimeContextRead) -> Result<(), Error> {
+        self.inner.background(ctx).await
+    }
     fn capability_subscriptions(&self) -> Vec<String> {
         self.inner.capability_subscriptions()
     }

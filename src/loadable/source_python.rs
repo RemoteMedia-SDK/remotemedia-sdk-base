@@ -23,7 +23,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use remotemedia_plugin_sdk::python_ipc::{IpcCommand, WireDataType, WireRuntimeData};
+use remotemedia_plugin_sdk::python_ipc::{
+    BodyState, EmittedFrame, IpcCommand, TurnFrame, WireDataType, WireRuntimeData,
+};
 use remotemedia_plugin_sdk::python_subprocess::{
     spawn_python_subprocess_with_handshake, PluginProvisioning,
 };
@@ -69,14 +71,130 @@ pub struct SourcePythonPlugin {
 /// to know anything new about plugins.
 pub struct SourcePythonFactory {
     plugin: Arc<SourcePythonPlugin>,
+    /// SHA-256 over the plugin's source files. Identifies the code a worker
+    /// runs, so two versions of a plugin never share a worker.
+    digest: String,
+    /// `json_input = "text"` in `plugin.toml`.
+    json_as_text: bool,
+}
+
+/// Environment switch that keeps the previous plugin-SDK runner for source
+/// plugins (`REMOTEMEDIA_SOURCE_PLUGIN_RUNTIME=legacy`). Rollback only.
+const RUNTIME_SWITCH: &str = "REMOTEMEDIA_SOURCE_PLUGIN_RUNTIME";
+
+/// SHA-256 (hex) over the Python sources and `plugin.toml` under `root`:
+/// each file's path relative to `root`, then its bytes, in path order.
+/// Hidden directories and `__pycache__` are skipped.
+pub fn content_digest(root: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn collect(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if !name.starts_with('.') && name != "__pycache__" {
+                    collect(&path, files);
+                }
+            } else if name.ends_with(".py") || name == "plugin.toml" {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(root, &mut files);
+    files.sort();
+    let mut hasher = Sha256::new();
+    for file in files {
+        let relative = file.strip_prefix(root).unwrap_or(&file);
+        hasher.update(relative.to_string_lossy().replace('\\', "/").as_bytes());
+        hasher.update([0u8]);
+        hasher.update(std::fs::read(&file).unwrap_or_default());
+        hasher.update([0u8]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl SourcePythonFactory {
     /// Wrap a resolved plugin spec into a factory.
     pub fn new(plugin: SourcePythonPlugin) -> Self {
+        let digest = content_digest(&plugin.module_root);
         Self {
             plugin: Arc::new(plugin),
+            digest,
+            json_as_text: false,
         }
+    }
+
+    /// Deliver JSON inputs to this plugin's nodes as text holding the JSON
+    /// (`json_input = "text"`).
+    pub fn json_as_text(mut self, on: bool) -> Self {
+        self.json_as_text = on;
+        self
+    }
+
+    /// SHA-256 (hex) of the plugin's source files.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// A node on the in-tree multiprocess executor, the runtime regular
+    /// Python nodes use: the plugin's module root on the worker's import
+    /// path, its entry module imported first, its `requires` as base
+    /// dependencies. (openspec: unify-python-source-plugin-runtime)
+    fn create_on_executor(
+        &self,
+        node_id: String,
+        params: &serde_json::Value,
+        session_id: Option<String>,
+    ) -> Result<Box<dyn StreamingNode>, Error> {
+        use crate::nodes::python_streaming::{PythonSpawnSettings, PythonStreamingNode};
+
+        let plugin = &self.plugin;
+        let mut params = params.clone();
+        if !params.is_object() {
+            params = serde_json::json!({});
+        }
+        if let Some(object) = params.as_object_mut() {
+            object.insert(
+                "__python_plugin_deps__".into(),
+                serde_json::json!(plugin.requires),
+            );
+            // An environment belongs to one plugin: two plugins with the same
+            // dependency list do not share one. The session's own scope
+            // setting, when present, still applies on top.
+            let scope = match object
+                .get("__python_env_scope_context__")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(session_scope) => format!("{session_scope};plugin:{}", plugin.hash),
+                None => format!("plugin:{}", plugin.hash),
+            };
+            object.insert("__python_env_scope_context__".into(), scope.into());
+        }
+        let settings = PythonSpawnSettings {
+            python_path: vec![plugin.module_root.clone()],
+            register_modules: vec![plugin.entry_module.clone()],
+            env: vec![("REMOTEMEDIA_PLUGIN_DIGEST".into(), self.digest.clone())],
+            json_as_text: self.json_as_text,
+        };
+        let node = match session_id {
+            Some(session) if !session.is_empty() => {
+                PythonStreamingNode::with_session(node_id, &plugin.node_type, &params, session)?
+            }
+            _ => PythonStreamingNode::new(node_id, &plugin.node_type, &params)?,
+        }
+        .with_spawn_settings(settings);
+        Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(node))))
     }
 
     /// Access the resolved plugin metadata.
@@ -90,12 +208,23 @@ impl StreamingNodeFactory for SourcePythonFactory {
         &self.plugin.node_type
     }
 
+    fn is_python_node(&self) -> bool {
+        true
+    }
+
+    fn is_multi_output_streaming(&self) -> bool {
+        true
+    }
+
     fn create(
         &self,
         node_id: String,
         params: &serde_json::Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
+        if std::env::var(RUNTIME_SWITCH).as_deref() != Ok("legacy") {
+            return self.create_on_executor(node_id, params, session_id);
+        }
         let plugin = self.plugin.clone();
         let params_json = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string());
 
@@ -181,8 +310,12 @@ impl StreamingNodeFactory for SourcePythonFactory {
         Ok(Box::new(SourcePythonNode {
             node_type: plugin.node_type.clone(),
             session_id,
+            node_id,
             cmd_tx,
             declared_instance_scope: handshake.instance_scope,
+            declared_self_driven: handshake.self_driven,
+            declared_background: handshake.background,
+            body: Default::default(),
             _child: child,
             _env_lease: provisioning.venv.clone(),
         }))
@@ -222,6 +355,15 @@ struct SourcePythonNode {
     /// The node class's `@instance_scope(...)`, as the worker reported it
     /// before READY.
     declared_instance_scope: Option<crate::nodes::InstanceScope>,
+    /// Whether the node class is self-driven, as the worker reported it.
+    declared_self_driven: bool,
+    /// The worker's node has a `background()` that waits for the start
+    /// signal: this node's body starts it and reports how it ended.
+    declared_background: bool,
+    /// How the worker's `background()` stands.
+    body: tokio::sync::watch::Sender<BodyState>,
+    /// The id the runner was started with (it names the runner's stop event).
+    node_id: String,
     /// Held so the subprocess is killed on drop.
     _child: Arc<std::sync::Mutex<std::process::Child>>,
     /// Environment cache lease. Fields drop after `Drop::drop`, so this is
@@ -232,6 +374,48 @@ struct SourcePythonNode {
 impl Drop for SourcePythonNode {
     fn drop(&mut self) {
         remotemedia_plugin_sdk::python_ipc::terminate_runner(&self._child);
+    }
+}
+
+/// Deliver one frame the Python node emitted on its own. `runtime_owns_body`:
+/// the node's body is run by the router, which finishes the emitter when the
+/// body returns.
+async fn deliver_emitted(
+    mut frame: EmittedFrame,
+    emitter: &crate::nodes::Emitter,
+    body: &tokio::sync::watch::Sender<BodyState>,
+    runtime_owns_body: bool,
+    node_type: &str,
+) {
+    if let Some(error) = frame.failed.take() {
+        if !runtime_owns_body {
+            tracing::error!(node_type = %node_type, "the Python runner exited: {error}");
+        }
+        body.send_replace(BodyState::Failed(error));
+        return;
+    }
+    if frame.finished {
+        if runtime_owns_body {
+            body.send_replace(BodyState::Finished);
+        } else {
+            emitter.body_finished();
+        }
+        return;
+    }
+    let origin = match frame.origin_mode {
+        0 => crate::nodes::EmitOrigin::Default,
+        1 => crate::nodes::EmitOrigin::Unattributed,
+        _ => crate::nodes::EmitOrigin::Participant(frame.participant),
+    };
+    let result = match WireRuntimeData::from_bytes(&frame.frame)
+        .map_err(Error::Execution)
+        .and_then(decode_wire)
+    {
+        Ok(data) => emitter.emit_as(data, origin).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        tracing::error!(node_type = %node_type, "emitted frame was not delivered: {error}");
     }
 }
 
@@ -271,8 +455,74 @@ impl StreamingNode for SourcePythonNode {
         self.declared_instance_scope
     }
 
+    fn self_driven(&self) -> Option<bool> {
+        self.declared_self_driven.then_some(true)
+    }
+
     fn is_multi_input(&self) -> bool {
         false
+    }
+
+    /// Frames the Python node emits on its own go to the node instance's
+    /// emitter, in the order the node sent them (openspec:
+    /// add-node-initiated-output).
+    async fn initialize(&self, ctx: &dyn crate::nodes::InitializeContextRead) -> Result<(), Error> {
+        if ctx.emitter_any().is_none() {
+            return Ok(());
+        }
+        let emitter = crate::nodes::Emitter::of(ctx);
+        let (frames, mut emitted) =
+            mpsc::channel::<remotemedia_plugin_sdk::python_ipc::EmittedFrame>(64);
+        self.cmd_tx
+            .send(IpcCommand::EmitSink { frames })
+            .await
+            .map_err(|e| Error::Execution(format!("ipc cmd send: {e}")))?;
+        let node_type = self.node_type.clone();
+        let (body, runtime_owns_body) = (self.body.clone(), self.declared_background);
+        tokio::spawn(async move {
+            while let Some(frame) = emitted.recv().await {
+                deliver_emitted(frame, &emitter, &body, runtime_owns_body, &node_type).await;
+            }
+        });
+        Ok(())
+    }
+
+    fn has_background(&self) -> bool {
+        self.declared_background
+    }
+
+    /// The Python node's `background()`: the router calls this when the
+    /// instance starts. It tells the worker to start the body and resolves
+    /// when the body returned, or fails when the worker exited (a failing
+    /// `background()` ends the worker).
+    async fn background(&self, _ctx: &dyn NodeRuntimeContextRead) -> Result<(), Error> {
+        remotemedia_plugin_sdk::python_ipc::run_body(&self.cmd_tx, &self.session_id, &self.body)
+            .await
+            .map_err(|error| Error::Execution(format!("node type '{}': {error}", self.node_type)))
+    }
+
+    /// The runtime's `shutdown` notice: ask the worker to stop, so it
+    /// cancels `background()` and runs `cleanup()`, before this node is
+    /// dropped and whatever is left of the runner is ended.
+    async fn process_control_message(
+        &self,
+        message: RuntimeData,
+        _ctx: &dyn NodeRuntimeContextRead,
+    ) -> Result<bool, Error> {
+        if crate::transport::session_control::aux_port_of(&message).as_deref() == Some("shutdown") {
+            let (child, session_id, node_id) =
+                (self._child.clone(), self.session_id.clone(), self.node_id.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                remotemedia_plugin_sdk::python_ipc::stop_runner(
+                    &child,
+                    &session_id,
+                    &node_id,
+                    remotemedia_plugin_sdk::python_ipc::STOP_GRACE,
+                )
+            })
+            .await;
+        }
+        Ok(false)
     }
 
     /// Only the runtime-delivered `__call_reply__` uses the native lane
@@ -357,22 +607,41 @@ impl StreamingNode for SourcePythonNode {
         // real generator — the consumer (router) drains in the same
         // event loop tick and `blocking_send` on the IPC thread will
         // park if the consumer ever falls behind.
-        let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(32);
+        //
+        // One turn: the input carries the participant it came from, and the
+        // input's replies and the frames the node emits meanwhile arrive on
+        // one channel, in the order the node produced them.
+        let (frame_tx, mut frame_rx) = mpsc::channel::<TurnFrame>(32);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .send(IpcCommand::RoundStreaming {
+            .send(IpcCommand::Turn {
                 req_bytes,
-                frame_tx,
+                origin: ctx.origin().map(|origin| origin.to_json()),
+                frames: frame_tx,
                 reply: reply_tx,
             })
             .await
             .map_err(|e| Error::Execution(format!("ipc cmd send: {e}")))?;
 
+        let emitter = crate::nodes::Emitter::for_call(ctx);
         let mut count = 0usize;
         while let Some(frame) = frame_rx.recv().await {
-            let runtime_data = decode_output(&frame, &copies)?;
-            callback(runtime_data)?;
-            count += 1;
+            match frame {
+                TurnFrame::Reply(frame) => {
+                    callback(decode_output(&frame, &copies)?)?;
+                    count += 1;
+                }
+                TurnFrame::Emitted(frame) => {
+                    deliver_emitted(
+                        frame,
+                        &emitter,
+                        &self.body,
+                        self.declared_background,
+                        &self.node_type,
+                    )
+                    .await
+                }
+            }
         }
         // `frame_rx` returns `None` only after the IPC thread drops its
         // sender, which happens immediately before it sends on `reply`.

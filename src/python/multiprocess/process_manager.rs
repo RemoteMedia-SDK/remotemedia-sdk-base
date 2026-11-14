@@ -374,28 +374,110 @@ pub struct ProcessManager {
     exit_handlers: Arc<RwLock<Vec<Box<dyn Fn(u32, ExitReason) + Send + Sync>>>>,
 }
 
+/// How long a dropped manager's workers get to stop on their own
+/// (`REMOTEMEDIA_PY_STOP_GRACE_MS`, default 2000; `0` kills them at once).
+fn stop_grace() -> Duration {
+    let millis = std::env::var("REMOTEMEDIA_PY_STOP_GRACE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(2000);
+    Duration::from_millis(millis)
+}
+
+impl ProcessHandle {
+    /// Ask the worker to stop and run its cleanup, without waiting. False
+    /// when the worker cannot be asked (it must then be killed).
+    fn request_stop(&self) -> bool {
+        #[cfg(windows)]
+        {
+            win_job::request_stop(&self.session_id, &self.node_id)
+        }
+        #[cfg(not(windows))]
+        {
+            self.tree.terminate()
+        }
+    }
+
+    /// Whether the worker process has exited; None while its handle is busy.
+    fn exited_now(&self) -> Option<bool> {
+        let mut guard = self.inner.try_lock().ok()?;
+        Some(match guard.as_mut() {
+            Some(child) => !matches!(child.try_wait(), Ok(None)),
+            None => true,
+        })
+    }
+
+    /// Kill the worker and its tree without waiting. Never blocks.
+    fn kill_now(&self) {
+        self.tree.kill();
+        if let Ok(mut guard) = self.inner.try_lock() {
+            if let Some(child) = guard.as_mut() {
+                let _ = child.kill();
+            }
+        } else {
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                let _ = kill(Pid::from_raw(self.id as i32), Signal::SIGKILL);
+            }
+        }
+    }
+}
+
 impl Drop for ProcessManager {
     fn drop(&mut self) {
-        // Best-effort synchronous kill of all tracked child processes.
-        // This runs even when the tokio runtime is shutting down (where async
-        // code would panic), so we use try_write() / try_lock() instead of
-        // .await variants.
-        if let Ok(processes) = self.processes.try_write() {
-            for (pid, handle) in processes.iter() {
-                // Try to kill via the Child handle first
-                if let Ok(mut guard) = handle.inner.try_lock() {
-                    if let Some(ref mut child) = *guard {
-                        let _ = child.kill();
-                    }
-                } else {
-                    // Fallback: send SIGKILL directly via pid
-                    #[cfg(unix)]
-                    {
-                        use nix::sys::signal::{kill, Signal};
-                        use nix::unistd::Pid;
-                        let _ = kill(Pid::from_raw(*pid as i32), Signal::SIGKILL);
-                    }
+        // A node was dropped without explicit termination (a session closed).
+        // Its workers are asked to stop, so each node's `cleanup()` runs, and
+        // are killed with their process trees once they exit or the grace
+        // period ends. The wait happens on its own thread: drop never blocks,
+        // and it also runs while the tokio runtime is shutting down (hence
+        // try_write / try_lock rather than their async forms). If the host
+        // exits first, the workers die with it (kill-on-close job on Windows,
+        // parent-death signal on Linux).
+        let Ok(mut processes) = self.processes.try_write() else {
+            return;
+        };
+        let workers: Vec<ProcessHandle> = processes.drain().map(|(_, handle)| handle).collect();
+        drop(processes);
+        if workers.is_empty() {
+            return;
+        }
+        let grace = stop_grace();
+        let waiting: Vec<ProcessHandle> = workers
+            .into_iter()
+            .filter(|worker| {
+                let asked = !grace.is_zero() && worker.request_stop();
+                if !asked {
+                    worker.kill_now();
                 }
+                asked
+            })
+            .collect();
+        if waiting.is_empty() {
+            return;
+        }
+        let wait = {
+            let waiting = waiting.clone();
+            move || {
+                let deadline = Instant::now() + grace;
+                while Instant::now() < deadline
+                    && waiting.iter().any(|worker| worker.exited_now() != Some(true))
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                for worker in &waiting {
+                    worker.kill_now();
+                }
+            }
+        };
+        if std::thread::Builder::new()
+            .name("py-worker-stop".into())
+            .spawn(wait)
+            .is_err()
+        {
+            for worker in &waiting {
+                worker.kill_now();
             }
         }
     }
@@ -537,6 +619,20 @@ impl ProcessManager {
         for module in &spawn_config.register_modules {
             command.args(["--register-module", module]);
         }
+
+        // This host reads turn tags on the output wire (openspec:
+        // add-node-initiated-output); the worker then tags its frames.
+        command.env(
+            crate::multiprocess::python_wire::TURN_TAG_ENV,
+            if crate::multiprocess::python_wire::turn_tags_enabled() { "1" } else { "0" },
+        );
+
+        // This host tells a worker when its session starts (openspec:
+        // add-source-node-lifecycle); a node's `background()` waits for it.
+        command.env(
+            crate::multiprocess::python_wire::START_ENV,
+            if crate::multiprocess::python_wire::start_signal_enabled() { "1" } else { "0" },
+        );
 
         // Set environment variables
         for (key, value) in &spawn_config.env_vars {
@@ -716,9 +812,14 @@ impl ProcessManager {
 
             #[cfg(windows)]
             {
-                // Windows has no SIGTERM: end the worker's whole job.
-                process.tree.kill();
-                let _ = child.kill();
+                // Windows has no SIGTERM. A worker that stops on request
+                // listens on a named event: set it and give the worker the
+                // grace period to run its cleanup. A worker without the
+                // event (an older client) is ended at once, with its job.
+                if !win_job::request_stop(&process.session_id, &process.node_id) {
+                    process.tree.kill();
+                    let _ = child.kill();
+                }
             }
 
             // Wait for graceful shutdown
@@ -1060,6 +1161,28 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn stop_request_reaches_only_a_worker_that_listens() {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let node = format!("node-{}", std::process::id());
+        assert!(!win_job::request_stop("stop-test", &node), "nothing listens yet");
+        let name: Vec<u16> = win_job::stop_event_name("stop-test", &node)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `name` is NUL-terminated and outlives the calls.
+        unsafe {
+            let event = CreateEventW(None, true, false, PCWSTR(name.as_ptr())).unwrap();
+            assert!(win_job::request_stop("stop-test", &node));
+            assert_eq!(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+            let _ = CloseHandle(event);
+        }
+    }
+
     #[test]
     fn killing_the_tree_ends_processes_the_worker_started() {
         let directory = tempfile::tempdir().unwrap();
@@ -1145,7 +1268,9 @@ mod win_job {
         SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
-    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    use windows::Win32::System::Threading::{
+        OpenEventW, OpenThread, ResumeThread, SetEvent, EVENT_MODIFY_STATE, THREAD_SUSPEND_RESUME,
+    };
 
     pub(super) const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
@@ -1200,6 +1325,36 @@ mod win_job {
         fn drop(&mut self) {
             // SAFETY: closes the handle this value owns, exactly once.
             let _ = unsafe { CloseHandle(HANDLE(self.0)) };
+        }
+    }
+
+    /// Name of the event a worker creates so the host can ask it to stop
+    /// (`stop_event_name` in the Python runner).
+    pub(super) fn stop_event_name(session_id: &str, node_id: &str) -> String {
+        format!(
+            "Local\\remotemedia-stop-{}",
+            format!("{session_id}-{node_id}").replace('\\', "_")
+        )
+    }
+
+    /// Ask the worker of `(session_id, node_id)` to stop. False when it has
+    /// no stop event, that is, it cannot stop on request.
+    pub(super) fn request_stop(session_id: &str, node_id: &str) -> bool {
+        let name: Vec<u16> = stop_event_name(session_id, node_id)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `name` is NUL-terminated and outlives the call; the handle
+        // is closed before returning.
+        unsafe {
+            match OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) {
+                Ok(event) => {
+                    let set = SetEvent(event).is_ok();
+                    let _ = CloseHandle(event);
+                    set
+                }
+                Err(_) => false,
+            }
         }
     }
 

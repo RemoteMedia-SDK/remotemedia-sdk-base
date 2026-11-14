@@ -11,6 +11,6 @@ mod server;
 
 pub use control_handlers::ControlSessionState;
 pub use events::{current_timestamp_ns, WebRtcErrorCode, WebRtcEventBridge};
-pub use handler::SharedState;
+pub use handler::{AdmittedPeer, PeerAdmission, SharedState};
 pub use server::WebSocketServerHandle;
 pub use server::WebSocketSignalingServer;

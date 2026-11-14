@@ -133,6 +133,12 @@ pub struct PluginPythonMeta {
     #[serde(default = "default_module_root")]
     pub module_root: String,
 
+    /// How JSON inputs reach this plugin's nodes: `"json"` (the default, as
+    /// JSON data, like a regular Python node) or `"text"` (as text holding the
+    /// JSON, for plugins written before JSON delivery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_input: Option<String>,
+
     /// Explicit mapped runner contract. Requires host-authorized mapped runtime;
     /// it must never fall back to the legacy serialized runner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +157,11 @@ pub struct PluginPythonMapped {
     /// Optional output-copy negotiation; a capability request, not permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_copy_protocol: Option<u16>,
+    /// Background calls (openspec: add-source-node-lifecycle): the worker
+    /// runs a node's `background()` in one long-lived call and delivers
+    /// `emit` on it. Requires client and buffer wheels that support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_protocol: Option<u16>,
     #[serde(default)]
     pub snapshot_inputs: Vec<String>,
     #[serde(default)]
@@ -205,6 +216,11 @@ pub struct PluginNativeWorker {
     pub snapshot_inputs: Vec<String>,
     #[serde(default)]
     pub snapshot_outputs: Vec<String>,
+    /// Background calls (openspec: add-source-node-lifecycle): the worker
+    /// runs its node's body in one long-lived call. Declare it only for a
+    /// worker built against a plugin SDK that has the protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_protocol: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
