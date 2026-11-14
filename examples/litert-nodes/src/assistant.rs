@@ -234,6 +234,10 @@ impl Drop for Partial<'_> {
             return;
         }
         if let (Some(line), Ok(mut room)) = (cut_off_line(self.name, &self.text), self.room.lock()) {
+            eprintln!(
+                "[{NODE_TYPE}] reply cut off after {} characters; kept in the context, marked",
+                self.text.trim().chars().count()
+            );
             room.note(line);
         }
     }
