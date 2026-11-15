@@ -548,10 +548,24 @@ enum InputPart {
     Sentinel,
 }
 
+/// A text generator (openspec: add-generator-cancellation); see
+/// `OpenAIChatNode`'s impl.
+#[async_trait::async_trait]
+impl remotemedia_traits::Cancellable for MultimodalLLMNode {
+    fn cancel_strategy(&self) -> remotemedia_traits::CancelStrategy {
+        remotemedia_traits::CancelStrategy::DropStopsWork
+    }
+}
+impl remotemedia_traits::TextGenerator for MultimodalLLMNode {}
+
 #[async_trait::async_trait]
 impl AsyncStreamingNode for MultimodalLLMNode {
     fn node_type(&self) -> &str {
         "MultimodalLLMNode"
+    }
+
+    fn generator(&self) -> Option<remotemedia_traits::GeneratorRole<'_>> {
+        remotemedia_traits::GeneratorRole::text(self)
     }
 
     async fn process_control_message(
@@ -664,6 +678,7 @@ impl AsyncStreamingNode for MultimodalLLMNode {
             .downcast_ref::<crate::nodes::NodeRuntimeContext>();
         let mut turn = ChatTurnContext {
             cancel_gate: runtime.map(|c| Arc::clone(&c.cancel_gate)),
+            cancel: Some(ctx.cancel_token()),
             node_id: self.node_id.clone(),
             control: None,
         };
@@ -836,6 +851,10 @@ impl crate::nodes::StreamingNodeFactory for MultimodalLLMNodeFactory {
                      semantic clustering via the `output_mode` config.",
                 )
                 .category("llm")
+                .generator(
+                    remotemedia_traits::GeneratedModality::Text,
+                    remotemedia_traits::CancelStrategy::DropStopsWork,
+                )
                 .accepts([
                     RuntimeDataType::Text,
                     RuntimeDataType::Image,

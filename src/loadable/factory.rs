@@ -456,6 +456,18 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
         self.describe(params).media_capabilities
     }
 
+    fn generator_declaration(&self, params: &Value) -> remotemedia_traits::GeneratorDeclaration {
+        let declared = self.describe(params).generator_declaration();
+        if declared.is_generator() {
+            declared
+        } else {
+            self.schema
+                .as_ref()
+                .map(|schema| schema.generator_declaration())
+                .unwrap_or_default()
+        }
+    }
+
     fn node_type(&self) -> &str {
         &self.node_type
     }
@@ -519,10 +531,26 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
                 .into_result()
                 .map_err(|e| Error::Execution(e.into_string()))?,
         )?;
+        // The generator role (openspec: add-generator-cancellation): what the
+        // created node declares must be admissible and match its factory.
+        let generator = remotemedia_traits::GeneratorDeclaration {
+            generates: serde_json::from_value(pacing["generates"].clone()).unwrap_or(None),
+            cancel: serde_json::from_value(pacing["cancel"].clone()).unwrap_or(None),
+        };
+        generator
+            .validate(&self.node_type)
+            .map_err(|e| Error::ConfigError(e.to_string()))?;
+        self.generator_declaration(params)
+            .check_instance(&self.node_type, generator)
+            .map_err(|e| Error::ConfigError(e.to_string()))?;
+        let default_dispositions: Option<remotemedia_traits::DefaultDispositions> =
+            serde_json::from_value(pacing["default_dispositions"].clone()).unwrap_or(None);
         Ok(Box::new(AsyncNodeWrapper(Arc::new(LoadableNodeAdapter {
             snapshots: parking_lot::RwLock::new(snapshots),
             rpc_methods,
-            inner: ffi_node,
+            inner: Arc::new(ffi_node),
+            generator,
+            default_dispositions,
             nature,
             rate,
             clocked_media_addr,
@@ -541,7 +569,13 @@ struct LoadableNodeAdapter {
         std::collections::HashMap<String, Arc<dyn remotemedia_traits::ports::SnapshotPort>>,
     >,
     rpc_methods: Vec<RpcMethod>,
-    inner: FfiNodeBox,
+    /// Shared so a call's cancel callback can reach `cancel_call`.
+    inner: Arc<FfiNodeBox>,
+    /// The generator role the plugin node declared in its `pacing()` JSON,
+    /// and its default disposition per reason (openspec:
+    /// add-generator-cancellation).
+    generator: remotemedia_traits::GeneratorDeclaration,
+    default_dispositions: Option<remotemedia_traits::DefaultDispositions>,
     nature: PacingNature,
     rate: u32,
     clocked_media_addr: Option<(String, String)>,
@@ -559,6 +593,20 @@ struct LoadableNodeAdapter {
 impl AsyncStreamingNode for LoadableNodeAdapter {
     fn self_driven(&self) -> Option<bool> {
         self.self_driven
+    }
+
+    fn generator_declaration(&self) -> remotemedia_traits::GeneratorDeclaration {
+        self.generator
+    }
+
+    fn default_disposition(
+        &self,
+        cancel: &remotemedia_traits::CancelContext,
+    ) -> remotemedia_traits::Disposition {
+        self.default_dispositions
+            .as_ref()
+            .and_then(|defaults| defaults.get(&cancel.reason).copied())
+            .unwrap_or_else(|| cancel.reason.default_disposition())
     }
 
     fn has_background(&self) -> bool {
@@ -609,6 +657,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         data: RuntimeData,
         ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
+        let _cancel = self.forward_cancel(ctx);
         if self.uses_shared()? {
             self.shared_result(
                 self.inner
@@ -633,6 +682,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
         inputs: std::collections::HashMap<String, RuntimeData>,
         ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<RuntimeData, Error> {
+        let _cancel = self.forward_cancel(ctx);
         self.shared_inputs(inputs, self.context_from(ctx)?).await
     }
 
@@ -911,6 +961,7 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
+        let _cancel = self.forward_cancel(ctx);
         if self.uses_shared()? {
             return self
                 .shared_stream(data, self.context_from(ctx)?, callback)
@@ -928,6 +979,28 @@ impl AsyncStreamingNode for LoadableNodeAdapter {
 }
 
 impl LoadableNodeAdapter {
+    /// Forward this call's cancellation to the plugin (openspec:
+    /// add-generator-cancellation): when the router fires the call's token,
+    /// before it drops the call's future, the plugin's `cancel_call` gets the
+    /// request with the explicit choices, so the plugin node re-resolves it
+    /// with its own default. Held for the call; dropping it unregisters.
+    fn forward_cancel(&self, ctx: &dyn NodeRuntimeContextRead) -> remotemedia_traits::CancelRegistration {
+        let inner = self.inner.clone();
+        let identity = FfiCallContext {
+            session_id: context_session(ctx).map(RString::from).into(),
+            node_id: self.node_id.clone().into(),
+            origin: ffi_origin(ctx),
+        };
+        let call_cancel = crate::nodes::NodeRuntimeContext::of(ctx).map(|c| c.call_cancel().clone());
+        ctx.cancel_token().on_cancel(move |cancellation| {
+            let request = match &call_cancel {
+                Some(call) => call.forwarded(cancellation),
+                None => remotemedia_traits::CancelRequest::exact(*cancellation),
+            };
+            inner.cancel_call(identity, RString::from(request.to_json()));
+        })
+    }
+
     /// The sink of one call.
     fn sink(&self, tx: tokio::sync::mpsc::Sender<NativeFrame>) -> ChannelSink {
         ChannelSink {

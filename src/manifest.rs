@@ -354,6 +354,13 @@ pub struct NodeManifest {
     /// session (default: `ExecutorConfig::max_participant_instances`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_instances: Option<usize>,
+
+    /// What a cancel of this node's call does with data, when the canceller
+    /// does not say: `{"partial_output": "retain"|"discard", "pending_input":
+    /// "retain"|"discard"}`, either field optional. Overrides the node's own
+    /// default (openspec: add-generator-cancellation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_cancel: Option<remotemedia_traits::DispositionOverride>,
 }
 
 /// Runtime hint for Python node execution (Phase 1.10.5)

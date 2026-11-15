@@ -76,6 +76,38 @@ use remotemedia_traits::runtime_context::NodeRuntimeContextRead;
 // reach across module boundaries.
 pub use crate::nodes::ports::SnapshotPort;
 
+/// One call's cancellation as a node context carries it (openspec:
+/// add-generator-cancellation): the token the router fires, and the request
+/// behind it (the explicit choices of the canceller and manifest), which
+/// adapters forward to a node in another library or process.
+#[derive(Clone, Debug, Default)]
+pub struct CallCancel {
+    pub token: remotemedia_traits::CancelToken,
+    pub request: Arc<std::sync::OnceLock<remotemedia_traits::CancelRequest>>,
+}
+
+impl CallCancel {
+    /// A fresh call: the router keeps the source, the context gets this.
+    pub fn new() -> (remotemedia_traits::CancelSource, Self) {
+        let source = remotemedia_traits::CancelSource::new();
+        let cancel = CallCancel {
+            token: source.token(),
+            request: Arc::default(),
+        };
+        (source, cancel)
+    }
+
+    /// The request to forward across a boundary once the token fired: the
+    /// router's request if it recorded one, else the token's cancellation as
+    /// final.
+    pub fn forwarded(&self, cancellation: &remotemedia_traits::Cancellation) -> remotemedia_traits::CancelRequest {
+        self.request
+            .get()
+            .copied()
+            .unwrap_or_else(|| remotemedia_traits::CancelRequest::exact(*cancellation))
+    }
+}
+
 /// Per-call runtime context handed to every per-call `StreamingNode`
 /// method.
 ///
@@ -86,6 +118,8 @@ pub use crate::nodes::ports::SnapshotPort;
 #[derive(Clone)]
 pub struct NodeRuntimeContext {
     pub(crate) source_completion: Option<Arc<std::sync::atomic::AtomicU8>>,
+    /// The current call's cancellation (openspec: add-generator-cancellation).
+    pub(crate) call_cancel: CallCancel,
     /// The instance's output emitter; detached outside a streaming session.
     pub(crate) emitter: crate::nodes::Emitter,
     /// The participant whose input is being processed, if any.
@@ -209,6 +243,7 @@ impl NodeRuntimeContext {
             cancel_gate: Arc::new(CancelGate::new()),
             output_allocator: Arc::new(remotemedia_types::HeapOutputAllocator),
             source_completion: None,
+            call_cancel: Default::default(),
         }
     }
 
@@ -221,6 +256,17 @@ impl NodeRuntimeContext {
     pub fn with_cancel_gate(mut self, cancel_gate: Arc<CancelGate>) -> Self {
         self.cancel_gate = cancel_gate;
         self
+    }
+
+    /// Builder: this call's cancellation (openspec: add-generator-cancellation).
+    pub fn with_call_cancel(mut self, cancel: CallCancel) -> Self {
+        self.call_cancel = cancel;
+        self
+    }
+
+    /// This call's cancellation, including the request behind the token.
+    pub fn call_cancel(&self) -> &CallCancel {
+        &self.call_cancel
     }
 
     /// The host context behind the trait object a node's per-call methods
@@ -422,6 +468,9 @@ impl NodeRuntimeContext {
 // — no edits needed at the call site for the common case.
 
 impl NodeRuntimeContextRead for NodeRuntimeContext {
+    fn cancel_token(&self) -> remotemedia_traits::CancelToken {
+        self.call_cancel.token.clone()
+    }
     fn origin(&self) -> Option<Arc<crate::transport::origin::Origin>> {
         self.origin.clone()
     }
@@ -593,6 +642,7 @@ mod tests {
         struct B;
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            call_cancel: Default::default(),
             emitter: crate::nodes::Emitter::detached(String::new()),
             origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
@@ -621,6 +671,7 @@ mod tests {
 
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            call_cancel: Default::default(),
             emitter: crate::nodes::Emitter::detached(String::new()),
             origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
@@ -675,6 +726,7 @@ mod tests {
         });
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            call_cancel: Default::default(),
             emitter: crate::nodes::Emitter::detached(String::new()),
             origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
@@ -717,6 +769,7 @@ mod tests {
 
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            call_cancel: Default::default(),
             emitter: crate::nodes::Emitter::detached(String::new()),
             origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
@@ -750,6 +803,7 @@ mod tests {
 
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            call_cancel: Default::default(),
             emitter: crate::nodes::Emitter::detached(String::new()),
             origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),
@@ -830,6 +884,7 @@ mod tests {
         snapshots.insert("weights".into(), Arc::new(out.input()));
         let ctx = NodeRuntimeContext {
             source_completion: None,
+            call_cancel: Default::default(),
             emitter: crate::nodes::Emitter::detached(String::new()),
             origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),

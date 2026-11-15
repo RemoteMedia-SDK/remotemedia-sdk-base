@@ -42,10 +42,13 @@ mod tasks;
 use tasks::TaskGroup;
 mod children;
 use children::Children;
+mod call_cancel;
 mod input_queue;
 mod partition;
 pub(crate) use partition::ParticipantEvent;
 use input_queue::InputQueue;
+#[cfg(test)]
+mod cancellation_tests;
 #[cfg(test)]
 mod children_tests;
 #[cfg(test)]
@@ -2026,6 +2029,7 @@ impl SessionRouter {
                     let roster = self.roster.clone();
                     let node_live = node_live.clone();
                     let start = self.start.clone();
+                    let on_cancel = spec.on_cancel;
                     Arc::new(move |node: Box<dyn StreamingNode>,
                                    input_rx: mpsc::Receiver<Routed>,
                                    emitter: crate::nodes::Emitter,
@@ -2058,6 +2062,7 @@ impl SessionRouter {
                             roster.clone(),
                             node_live.clone(),
                             start.clone(),
+                            on_cancel,
                         )
                     })
                 };
@@ -2126,6 +2131,7 @@ impl SessionRouter {
                 self.roster.clone(),
                 node_live,
                 self.start.clone(),
+                spec.and_then(|spec| spec.on_cancel),
             );
 
             handles.push((format!("{node_id} main"), main_handle));
@@ -2190,6 +2196,8 @@ impl SessionRouter {
         // running until its emitter closes.
         live: Option<Arc<SelfDrivenLive>>,
         start: SessionStart,
+        // The manifest node's `on_cancel` (openspec: add-generator-cancellation).
+        on_cancel: Option<remotemedia_traits::DispositionOverride>,
     ) -> (JoinHandle<Result<()>>, JoinHandle<Result<()>>) {
         let (fan_tx, mut fan_rx) = mpsc::channel::<Routed>(NODE_FANOUT_CAPACITY);
         // Emitted frames enter the same queue as the outputs of a call, so
@@ -2220,6 +2228,10 @@ impl SessionRouter {
         // Latest-input-wins opt-in (e.g. `OpenAIChatNode.supersede_on_new_input`):
         // a newer data input cancels the node's in-flight call.
         let supersede_on_new_input = node.supersede_on_new_input();
+        // What a cancel does with this node's data, and its in-flight call's
+        // token (openspec: add-generator-cancellation).
+        let cancel_profile = Arc::new(call_cancel::CancelProfile::of(node.as_ref(), on_cancel));
+        let call_slot = Arc::new(call_cancel::CallCancelSlot::default());
         let call_mode = super::call_routing::call_mode(&rpc_methods, control.is_some());
         let envelope_calls: super::call_routing::EnvelopeCalls = Default::default();
         let NodeTelemetryHandle {
@@ -2479,15 +2491,29 @@ impl SessionRouter {
         let filter_cancel = Arc::clone(&cancel);
         let filter_node_id = node_id.clone();
         let filter_session_id = session_id.clone();
+        let filter_profile = cancel_profile.clone();
+        let filter_slot = call_slot.clone();
         let children = Children::default();
         let filter_task = async move {
             while let Some(input) = input_rx.recv().await {
                 if let Some(port) = aux_port_of(&input.data) {
                     if port == BARGE_IN_PORT {
-                        // Invalidate queued work before waking the active call.
-                        // ProtectGuard preserves an irreversible in-flight call,
-                        // but cancellation still supersedes its queued inputs.
-                        filter_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        // What this cancel does with data: the envelope's
+                        // choice, else the manifest's, else the node's.
+                        let request = filter_profile.request(
+                            remotemedia_traits::CancelReason::BargeIn,
+                            crate::transport::session_control::barge_in_disposition(&input.data),
+                        );
+                        // Invalidate queued work before waking the active call
+                        // when the cancel discards pending input (an interrupt
+                        // keeps it for the next call). ProtectGuard preserves an
+                        // irreversible in-flight call, but a discard still
+                        // applies to its queued inputs.
+                        if filter_profile.discard_pending(&request) {
+                            filter_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        }
+                        // The main task fires the call's token with it.
+                        filter_slot.record(request);
                         // Try to fire the cancel. If a node currently
                         // holds a `ProtectGuard` (e.g. the chat
                         // backend mid-non-cancelable-tool-call) the
@@ -2496,6 +2522,9 @@ impl SessionRouter {
                         // `process_control_message` so any &self
                         // state-clearing logic runs.
                         let cancelled = filter_cancel.try_cancel();
+                        if !cancelled {
+                            filter_slot.forget();
+                        }
                         if cancelled {
                             tracing::debug!(
                                 session_id = %filter_session_id,
@@ -2534,22 +2563,28 @@ impl SessionRouter {
                 } else if supersede_on_new_input {
                     // Latest input wins. A plain data input (aux envelopes
                     // are excluded above) preempts the in-flight call
-                    // instead of queueing behind it. Unlike barge_in this
-                    // does NOT bump `input_generation`: the new input must
-                    // still run. `try_cancel` honours ProtectGuard, and is
-                    // a no-op when nothing is in flight.
-                    if filter_cancel.try_cancel() {
-                        tracing::info!(
-                            session_id = %filter_session_id,
-                            node_id = %filter_node_id,
-                            "Runtime: newer input arrived — superseding any in-flight call"
-                        );
-                    } else {
+                    // instead of queueing behind it. The new input always
+                    // runs: it is sent after any bump. `try_cancel` honours
+                    // ProtectGuard, and is a no-op when nothing is in flight.
+                    let request = filter_profile
+                        .request(remotemedia_traits::CancelReason::Superseded, None);
+                    if filter_profile.discard_pending(&request) {
+                        filter_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    }
+                    filter_slot.record(request);
+                    if !filter_cancel.try_cancel() {
+                        filter_slot.forget();
                         tracing::info!(
                             session_id = %filter_session_id,
                             node_id = %filter_node_id,
                             "Runtime: newer input arrived but supersede suppressed by \
                              active ProtectGuard (non-cancelable tool call in progress)"
+                        );
+                    } else {
+                        tracing::info!(
+                            session_id = %filter_session_id,
+                            node_id = %filter_node_id,
+                            "Runtime: newer input arrived — superseding any in-flight call"
                         );
                     }
                 }
@@ -2566,6 +2601,8 @@ impl SessionRouter {
         let main_node_id = node_id.clone();
         let main_session_id = session_id.clone();
         let main_cancel = Arc::clone(&cancel);
+        let main_call_slot = call_slot;
+        let main_profile = cancel_profile;
         let main_tel = tel.clone();
         let supervised_children = children.clone();
         let main_body = async move {
@@ -2988,6 +3025,9 @@ impl SessionRouter {
                 let mut ctx = bound_ctx.clone();
                 // The node can keep this to attribute a later emit.
                 ctx.origin = origin.clone();
+                // This call's cancellation token (openspec:
+                // add-generator-cancellation).
+                let ctx = ctx.with_call_cancel(main_call_slot.begin());
 
                 // Build the dispatch future (not yet awaited). Once
                 // we await it inside the select!, dropping it on
@@ -3076,15 +3116,51 @@ impl SessionRouter {
                     }
                 };
 
+                // `select!` drops the losing branches before it runs the
+                // winner's handler, so the call's token fires inside these
+                // branch futures: its callbacks (a plugin's `cancel_call`, a
+                // worker's cancel frame) run before the call's future is
+                // dropped.
+                let notified = main_cancel.notified();
+                let cancelled_by = async {
+                    notified.await;
+                    main_call_slot.fire(
+                        node_ref,
+                        remotemedia_traits::CancelReason::CallerCancelled,
+                        &main_profile,
+                    )
+                };
+                let closing = async {
+                    let _ = shutdown.changed().await;
+                    main_call_slot.fire(
+                        node_ref,
+                        remotemedia_traits::CancelReason::SessionClosed,
+                        &main_profile,
+                    )
+                };
                 let cancelled = tokio::select! {
                     biased;
-                    _ = shutdown.changed() => break false,
-                    _ = main_cancel.notified() => {
+                    fired = closing => {
+                        main_call_slot.end();
+                        if let Some(cancellation) = fired {
+                            call_cancel::spawn_on_cancel(
+                                &node, &main_session_id, &main_node_id, cancellation,
+                            );
+                        }
+                        break false;
+                    }
+                    fired = cancelled_by => {
                         tracing::info!(
                             session_id = %main_session_id,
                             node_id = %main_node_id,
-                            "Runtime: in-flight call cancelled by barge_in"
+                            reason = ?fired.map(|c| c.reason),
+                            "Runtime: in-flight call cancelled"
                         );
+                        if let Some(cancellation) = fired {
+                            call_cancel::spawn_on_cancel(
+                                &node, &main_session_id, &main_node_id, cancellation,
+                            );
+                        }
                         // Envelope-originated endpoint calls belong to the
                         // cancelled processing call: cancel them at the host.
                         if let Some(ctrl) = &control {
@@ -3123,6 +3199,7 @@ impl SessionRouter {
                         false
                     }
                 };
+                main_call_slot.end();
                 if node_trace_enabled() {
                     tracing::info!(
                         session_id = %main_session_id,

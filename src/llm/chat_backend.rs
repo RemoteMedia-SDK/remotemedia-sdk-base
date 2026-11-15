@@ -129,12 +129,49 @@ pub const LLM_FALLBACK_EVENT: &str = "llm_fallback";
 /// is sent to any provider.
 pub const HISTORY_PROVIDER_KEY: &str = "_rm_provider";
 
+/// Marks a reply kept in history after a cancel cut it off.
+pub const INTERRUPTED_MARKER: &str = "[interrupted before finishing]";
+
+/// A streamed reply in progress. Dropped unfinished — the call was cancelled
+/// — it keeps the text so far in history, marked interrupted, when the
+/// cancel's disposition retains partial output (openspec:
+/// add-generator-cancellation). A cancel that discards it, and a failure that
+/// is not a cancel, leave history as it was.
+struct InterruptedReply<'a> {
+    backend: &'a ChatBackend,
+    session_id: &'a str,
+    cancel: Option<remotemedia_traits::CancelToken>,
+    text: String,
+    finished: bool,
+}
+
+impl Drop for InterruptedReply<'_> {
+    fn drop(&mut self) {
+        if self.finished || self.text.is_empty() {
+            return;
+        }
+        let Some(cancellation) = self.cancel.as_ref().and_then(|c| c.cancellation()) else {
+            return;
+        };
+        if cancellation.disposition.partial_output == remotemedia_traits::Retention::Retain {
+            self.backend.append_history(
+                self.session_id,
+                HistoryEntry::assistant_text(&format!("{} {INTERRUPTED_MARKER}", self.text)),
+            );
+        }
+    }
+}
+
 /// Per-turn runtime context for [`ChatBackend::run_turn`]: the router's
 /// cancel gate and where fallback events / counters go.
 #[derive(Clone, Default)]
 pub struct ChatTurnContext {
     /// See [`ChatBackend::run`].
     pub cancel_gate: Option<Arc<CancelGate>>,
+    /// The call's cancellation token (openspec: add-generator-cancellation).
+    /// When a streamed reply is cut off by a cancel that retains partial
+    /// output, the text so far is kept in history, marked interrupted.
+    pub cancel: Option<remotemedia_traits::CancelToken>,
     /// Manifest node id, reported in `llm_fallback` events and counted in
     /// telemetry.
     pub node_id: Option<String>,
@@ -521,6 +558,7 @@ impl ChatBackend {
                 body,
                 deadline,
                 turn.cancel_gate.clone(),
+                turn.cancel.clone(),
                 primary_tag,
                 callback,
             )
@@ -561,6 +599,7 @@ impl ChatBackend {
             body,
             None,
             turn.cancel_gate.clone(),
+            turn.cancel.clone(),
             tag,
             callback,
         )
@@ -579,6 +618,7 @@ impl ChatBackend {
         body: Value,
         deadline: Option<Duration>,
         cancel_gate: Option<Arc<CancelGate>>,
+        cancel: Option<remotemedia_traits::CancelToken>,
         history_tag: Option<Value>,
         callback: &mut F,
     ) -> Result<usize, AttemptFailure>
@@ -594,6 +634,7 @@ impl ChatBackend {
                     target,
                     body,
                     cancel_gate,
+                    cancel,
                     &visible,
                     history_tag,
                     callback,
@@ -733,6 +774,7 @@ impl ChatBackend {
         target: &ChatTarget,
         body: Value,
         cancel_gate: Option<Arc<CancelGate>>,
+        cancel: Option<remotemedia_traits::CancelToken>,
         visible: &AtomicBool,
         history_tag: Option<Value>,
         callback: &mut F,
@@ -747,7 +789,17 @@ impl ChatBackend {
             .await
             .map_err(|(kind, message)| AttemptFailure::new(kind, visible, message))?;
 
-        let mut full_text = String::new();
+        // The reply so far. If the call is cancelled mid-stream with a
+        // disposition that retains partial output, it is kept in history,
+        // marked interrupted (openspec: add-generator-cancellation).
+        let mut reply = InterruptedReply {
+            backend: self,
+            session_id,
+            cancel,
+            text: String::new(),
+            finished: false,
+        };
+        let full_text = &mut reply.text;
         let mut full_reasoning = String::new();
         let mut token_count = 0usize;
         let mut tool_calls: HashMap<u64, ToolCallAccum> = HashMap::new();
@@ -947,6 +999,9 @@ impl ChatBackend {
         if let (Some(tag), Some(first)) = (history_tag, turn_entries.first_mut()) {
             first.message[HISTORY_PROVIDER_KEY] = tag;
         }
+        let chars = full_text.len();
+        // The reply is complete: it goes into history as it is.
+        reply.finished = true;
         self.extend_history(session_id, turn_entries);
 
         // End-of-turn sentinel on the configured output channel.
@@ -966,7 +1021,7 @@ impl ChatBackend {
         tracing::info!(
             provider = target.profile.name(),
             tokens = token_count,
-            chars = full_text.len(),
+            chars,
             "[llm] streaming complete"
         );
         Ok(token_count)
@@ -1492,9 +1547,73 @@ mod fallback_tests {
     fn turn(control: &Arc<SessionControl>) -> ChatTurnContext {
         ChatTurnContext {
             cancel_gate: None,
+            cancel: None,
             node_id: Some("llm".into()),
             control: Some(Arc::clone(control)),
         }
+    }
+
+    /// Run a turn that streams `Hello there` and then waits, cancel it with
+    /// `disposition`, and return the assistant history entries left.
+    async fn cut_off_reply(disposition: remotemedia_traits::Disposition) -> Vec<Value> {
+        let mut mock = mock(Script {
+            hold: true,
+            done: false,
+            ..Script::reply(vec!["Hello", " there"])
+        })
+        .await;
+        let backend = Arc::new(ChatBackend::new(Arc::new(
+            crate::llm::provider::OpenAIProfile,
+        )));
+        let source = remotemedia_traits::CancelSource::new();
+        let mut turn = turn(&SessionControl::new("s"));
+        turn.cancel = Some(source.token());
+        let cfg = cfg(&mock.base_url);
+        let running = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                let mut sink = |_: RuntimeData| Ok(());
+                backend
+                    .run_turn("s", json!({"role":"user","content":"hi"}), &cfg, &turn, &mut sink)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), mock.tokens_sent.recv())
+            .await
+            .unwrap();
+        // Let the client read the frames before the cut.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // As the router does: fire the token, then drop the call.
+        source.cancel(remotemedia_traits::Cancellation::with_disposition(
+            remotemedia_traits::CancelReason::BargeIn,
+            disposition,
+        ));
+        running.abort();
+        let _ = running.await;
+        let history = backend.history.lock();
+        history
+            .get("s")
+            .into_iter()
+            .flatten()
+            .filter(|e| e.message["role"] == "assistant")
+            .map(|e| e.message.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_keeps_the_cut_off_reply_marked_interrupted() {
+        let kept = cut_off_reply(remotemedia_traits::Disposition::INTERRUPT).await;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(
+            kept[0]["content"],
+            format!("Hello there {INTERRUPTED_MARKER}")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abort_rolls_the_cut_off_reply_back() {
+        let kept = cut_off_reply(remotemedia_traits::Disposition::ABORT).await;
+        assert!(kept.is_empty(), "{kept:?}");
     }
 
     async fn next_fallback_event(control: &SessionControl) -> Value {
