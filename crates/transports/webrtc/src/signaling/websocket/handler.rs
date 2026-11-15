@@ -67,7 +67,7 @@ pub trait PeerAdmission: Send + Sync {
 /// The handshake of a connection to a mounted [`SocketRoute`].
 #[derive(Debug, Clone)]
 pub struct SocketRequest {
-    /// The request path, without the query (`/realtime`).
+    /// The request path, without the query.
     pub path: String,
     pub query: Option<String>,
     /// The subprotocols the client offered (`Sec-WebSocket-Protocol`), in order.
@@ -180,7 +180,7 @@ impl SharedState {
         }
     }
 
-    /// Serve `route` at `path` (for example `/realtime`) on this listener.
+    /// Serve `route` at `path` on this listener.
     /// Replaces a route mounted at that path before.
     pub fn mount(&self, path: &str, route: Arc<dyn SocketRoute>) {
         self.routes

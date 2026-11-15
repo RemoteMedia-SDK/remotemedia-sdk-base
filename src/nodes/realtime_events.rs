@@ -1,12 +1,12 @@
 //! `RealtimeEventsNode`: a voice agent's turns as the AI SDK's normalized
-//! realtime events (openspec: add-ai-sdk-voice-library, design D10, tasks 9.3,
-//! 9.4 and the node half of 9.5).
+//! realtime events (openspec: add-ai-sdk-voice-library, designs D10 and D13).
 //!
-//! The realtime transport (`crates/transports/realtime`) owns the socket,
-//! the audio and the clock. This node owns the meaning: which turn, which
-//! response and item, which text was heard. It sits between TTS and the
-//! output, reads `HostedTurnNode`'s `ui` frames, the VAD events and the TTS
-//! audio, and talks to the member's socket through its `realtime` port.
+//! A member whose browser runs the AI SDK realtime hook connects over WebRTC
+//! like any other member. Its audio is on its media tracks; its events are
+//! JSON frames `{ "v": 1, "rt": <normalized v4 event> }` on its data channel,
+//! in both directions. This node produces and consumes those frames. It
+//! carries no audio: it sits on the event path only, and its output is the
+//! member's data channel.
 //!
 //! # Inputs
 //!
@@ -15,38 +15,32 @@
 //!
 //! | Input | Recognised as |
 //! |---|---|
-//! | `RuntimeData::Audio` tagged with a turn (`participant.turn_id`) | TTS audio: forwarded with `rm.turn_id` / `rm.item_id` |
-//! | `RuntimeData::Audio` without a turn tag | The member's own audio from VAD or the accumulator: dropped |
-//! | Json `{ "kind": "speech_end" }` | The TTS node's end mark of a text chunk: forwarded with the audio |
+//! | Json `{ "v": 1, "rt": <event> }` | A client event the member's browser sent on its data channel |
 //! | Json `{ "v": 1, "turn", "chunk" }` | A `ui` frame of `HostedTurnNode` |
 //! | Json with `is_speech_start` / `is_speech_end` | A VAD event |
-//! | Json `{ "__aux_port__": "realtime", "payload" }` | A client event, or an internal frame of the transport |
+//! | Anything else (the member's audio, typed-text frames) | Not this node's: dropped |
 //!
 //! # Outputs
 //!
-//! The TTS audio on the default output, and frames for a member's socket as
-//! `{ "__aux_port__": "realtime", "payload": <frame> }`, attributed and
-//! addressed to that member. The transport reads them from the tap
-//! `<node>.out.realtime`. Everything else the node does goes through the
-//! session's control: typed text and VAD events are published to the nodes
-//! named in the parameters, `interrupt` and `set_client_instructions` are
-//! typed-RPC calls on the turn node, client tool traffic is an `event` call
-//! on the agent's endpoint, and what a member heard is published as
-//! `audio_released`, which is how `HostedTurnNode` settles a turn.
+//! Server events as Json `{ "v": 1, "rt": <event> }`, attributed and
+//! addressed (`participant.to`) to the member they are for. Everything else
+//! the node does goes through the session's control: `interrupt` and
+//! `set_client_instructions` are typed-RPC calls on the turn node, client
+//! tool traffic is an `event` call on the agent's endpoint, and session
+//! settings are typed-RPC calls on the nodes named in the parameters.
 //!
-//! # Members on the WebRTC data channel (design D13)
+//! # What the node reads from elsewhere
 //!
-//! A member whose browser runs the AI SDK hook over WebRTC has no socket:
-//! its audio is on its media tracks, and the node carries none of it.
-//!
-//! | | Socket member (D10) | Data-channel member (D13) |
-//! |---|---|---|
-//! | Client events | `{ "__aux_port__": "realtime", "payload" }` from the transport | Json `{ "v": 1, "rt": <event> }` the browser sent on the data channel |
-//! | Server events | the same envelope, read by the transport from the tap | Json `{ "v": 1, "rt": <event> }` on the node's output, addressed to the member |
-//! | `session-created`, `session-updated`, the session policy | the transport | this node, from the member's admission (`participant.metadata.rm.realtime`) |
-//! | Transcript deltas, spoken text | the transport's `released` frames, the browser's truncation | the WebRTC sender's `audio_released` reports (`__media__`), as for any WebRTC member |
-//! | `conversation-item-truncate` | the spoken point | accepted and ignored |
-//! | Audio events | `audio-delta` by the transport, `audio-done` | none |
+//! - **The member's admission** (`participant.metadata.rm.realtime`, the JSON
+//!   string `{ "configurable", "client_tools", "transport" }` the backend put
+//!   in the admission metadata): which session fields the browser may set and
+//!   which client tools exist. A browser cannot change it.
+//! - **The WebRTC sender's `audio_released` reports** (`__media__`): the
+//!   transcript deltas of a response follow what was released to the member's
+//!   track. The spoken text of an interrupted response is the turn node's
+//!   settlement, which comes from the same reports. A
+//!   `conversation-item-truncate` from the browser is accepted and changes
+//!   nothing: the browser does not play the audio, the track does.
 //!
 //! # Instances
 //!
@@ -65,10 +59,8 @@ use crate::nodes::{
 use crate::transport::data::participant;
 use crate::transport::endpoint::CallOptions;
 use crate::transport::origin::Origin;
-use crate::transport::session_control::{
-    aux_port_of, wrap_aux_port, ControlAddress, RpcCallScope, SessionControl,
-};
-use crate::transport::turn_audio::{keys, AudioReleased, TurnTag};
+use crate::transport::session_control::{ControlAddress, RpcCallScope, SessionControl};
+use crate::transport::turn_audio::{keys, AudioReleased, MediaEvent, TurnTag};
 use remotemedia_traits::rpc::RpcMode;
 use remotemedia_traits::runtime_context::NodeRuntimeContextRead;
 use schemars::JsonSchema;
@@ -80,18 +72,6 @@ use std::time::Duration;
 
 /// The node type name in manifests.
 pub const REALTIME_EVENTS_NODE: &str = "RealtimeEventsNode";
-/// The node's port to and from the realtime transport.
-pub const REALTIME_PORT: &str = "realtime";
-/// Audio metadata: the item a frame belongs to.
-pub const ITEM_ID_KEY: &str = "rm.item_id";
-/// `participant.*` field a realtime member is joined with.
-const TRANSPORT_KEY: &str = "participant.transport";
-const TRANSPORT_NAME: &str = "realtime";
-
-const INTERNAL_JOINED: &str = "remotemedia.internal.joined";
-const INTERNAL_RELEASED: &str = "remotemedia.internal.released";
-const INTERNAL_FLUSH: &str = "remotemedia.internal.flush";
-const INTERNAL_PREFIX: &str = "remotemedia.internal.";
 
 /// Key of a data-channel frame's realtime event: `{ "v": 1, "rt": <event> }`.
 pub const RT_FRAME_KEY: &str = "rt";
@@ -125,9 +105,20 @@ pub fn admission_is_webrtc(admission: &str) -> bool {
         == Some(ADMISSION_TRANSPORT_WEBRTC)
 }
 
-/// What the backend allowed a data-channel member's browser to configure
-/// (design D10, "Session configuration policy"; enforced here for D13, where
-/// no realtime transport stands between the browser and the node).
+/// Whether an admission (the value of `rm.realtime`) lets the member's
+/// browser set `field` of the session (`voice`, `turnDetection`, `language`,
+/// `instructions`).
+pub fn admission_allows(admission: &str, field: &str) -> bool {
+    serde_json::from_str::<Value>(admission).ok().is_some_and(|value| {
+        value
+            .get("configurable")
+            .and_then(Value::as_array)
+            .is_some_and(|fields| fields.iter().any(|allowed| allowed == field))
+    })
+}
+
+/// What the backend allowed a member's browser to configure (design D10,
+/// "Session configuration policy").
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Admission {
     /// `voice`, `turnDetection`, `language`, `instructions`.
@@ -221,13 +212,10 @@ impl Admission {
     }
 }
 
-/// Slack when a released or truncated position is compared with a chunk's
-/// end: resampling and rounding to whole milliseconds.
-const POSITION_SLACK_MS: f64 = 5.0;
-/// A data-channel member's response whose turn has settled ends when its
-/// audio has left the member's track. This is how long the track's sender may
-/// report no progress before the response ends anyway (a member that hears
-/// nothing reports nothing).
+/// A response whose turn has settled ends when its audio has left the
+/// member's track. This is how long the track's sender may report no
+/// progress before the response ends anyway (a member that hears nothing
+/// reports nothing).
 const SETTLED_WAIT_MS: u64 = 1500;
 /// Turns remembered after they ended, to answer late frames.
 const REMEMBERED_TURNS: usize = 16;
@@ -261,14 +249,9 @@ pub struct ConfigRpc {
     pub language: Option<String>,
 }
 
-fn default_lead_ms() -> u64 {
-    500
-}
-fn default_truncate_grace_ms() -> u64 {
-    300
-}
-
-/// `RealtimeEventsNode` parameters. None is required.
+/// `RealtimeEventsNode` parameters. None is required. Parameters this node
+/// does not know are ignored, so a manifest written for an earlier version
+/// (`lead_ms`, `truncate_grace_ms`, `input_rate`, `output_rate`) still loads.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RealtimeEventsConfig {
     /// The `HostedTurnNode` whose turns these are. Default: the session's
@@ -281,19 +264,6 @@ pub struct RealtimeEventsConfig {
     pub endpoint: Option<String>,
     #[serde(default, alias = "toolActivity")]
     pub tool_activity: ToolActivity,
-    /// How far ahead of real time the transport sends audio. Read by the
-    /// transport.
-    #[serde(default = "default_lead_ms", alias = "leadMs")]
-    pub lead_ms: u64,
-    /// How long a cut waits for the browser's `conversation-item-truncate`.
-    #[serde(default = "default_truncate_grace_ms", alias = "truncateGraceMs")]
-    pub truncate_grace_ms: u64,
-    /// The rate member audio enters the pipeline at. Read by the transport.
-    #[serde(default, alias = "inputRate")]
-    pub input_rate: Option<u32>,
-    /// The rate of the TTS audio. Informational.
-    #[serde(default, alias = "outputRate")]
-    pub output_rate: Option<u32>,
     #[serde(default, alias = "vadNode")]
     pub vad_node: Option<String>,
     #[serde(default, alias = "accumulatorNode")]
@@ -313,11 +283,8 @@ pub struct RealtimeEventsConfig {
 /// One effect of an input. The node carries them out; tests read them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Action {
-    /// A frame for `member`'s socket (or, with an internal type, for its
-    /// transport).
+    /// A server event for `member`'s data channel.
     Frame { member: String, frame: Value },
-    /// What `member` heard of a turn, for the turn node's settlement.
-    Released(AudioReleased),
     /// A typed-RPC call on a node.
     Rpc { node: String, method: String, arg: Value },
     /// Data for a node's input, as `member`'s.
@@ -334,7 +301,7 @@ pub(crate) enum Action {
 
 #[derive(Debug, Default)]
 struct MemberState {
-    /// Connected through the realtime transport: it gets frames.
+    /// A member of the realtime hook: it gets frames.
     realtime: bool,
     /// Text of `conversation-item-create` waiting for `response-create`.
     held_text: Vec<String>,
@@ -342,74 +309,12 @@ struct MemberState {
     instructions: Option<String>,
     /// The browser turned server turn detection off, and the VAD node took it.
     manual_turns: bool,
-    /// On the WebRTC data channel (design D13): frames are `{ v: 1, rt }`
-    /// outputs, and the audio is the WebRTC sender's.
-    data: bool,
-    /// What the backend allowed a data-channel member to configure.
+    /// What the backend allowed the member to configure.
     admission: Admission,
     /// `session-created` was sent on this connection.
     created: bool,
     /// `remotemedia.config-ignored` was sent on this connection.
     ignored_reported: bool,
-}
-
-/// The audio of one response of a turn.
-#[derive(Debug, Default)]
-struct Item {
-    /// Index of the turn's first text chunk that belongs to this response.
-    first_chunk: usize,
-    /// `(text chunk, milliseconds)` in arrival order, one entry per chunk.
-    audio: Vec<(u64, f64)>,
-}
-
-impl Item {
-    /// How many of the turn's text chunks end at or before `ms` of this
-    /// item's audio. `open_last`: the last chunk with audio may still be
-    /// growing, so it does not count.
-    fn chunks_within(&self, ms: f64, open_last: bool) -> usize {
-        let mut cumulative = 0.0;
-        let mut chunks = self.first_chunk;
-        for (at, (chunk, length)) in self.audio.iter().enumerate() {
-            cumulative += length;
-            let last = at + 1 == self.audio.len();
-            if cumulative > ms + POSITION_SLACK_MS || (last && open_last) {
-                break;
-            }
-            chunks = chunks.max(*chunk as usize + 1);
-        }
-        chunks
-    }
-
-    /// The text chunk whose audio is at `ms`.
-    fn chunk_at(&self, ms: f64) -> u64 {
-        let mut cumulative = 0.0;
-        for (chunk, length) in &self.audio {
-            cumulative += length;
-            if cumulative > ms + POSITION_SLACK_MS {
-                return *chunk;
-            }
-        }
-        self.audio.last().map_or(self.first_chunk as u64, |(chunk, _)| *chunk)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct Position {
-    ms: u64,
-    /// The transport has nothing of the item left to send.
-    drained: bool,
-}
-
-/// A member is being cut off from a turn: barge-in, `response-cancel`, or
-/// the browser's own truncation.
-#[derive(Debug, Default)]
-struct Cut {
-    /// `audioEndMs` of the browser's `conversation-item-truncate`.
-    truncate_ms: Option<u64>,
-    /// The released position the transport reported with its flush.
-    flushed_ms: Option<u64>,
-    /// The spoken point was published to the turn node.
-    published: bool,
 }
 
 /// One member hearing one turn.
@@ -419,18 +324,15 @@ struct Listen {
     open: Option<usize>,
     /// Text chunks sent as `audio-transcript-delta`.
     sent_chunks: usize,
-    /// Released position per response.
-    positions: HashMap<usize, Position>,
-    cut: Option<Cut>,
     /// The response ended; its last events wait for the audio to leave.
     pending_end: bool,
-    /// Data-channel member: the turn's text chunks its WebRTC sender has
-    /// released, from the `audio_released` reports.
+    /// The turn's text chunks the member's WebRTC sender has released, from
+    /// the `audio_released` reports.
     released: Option<usize>,
-    /// Data-channel member: milliseconds of the turn the sender has released.
+    /// Milliseconds of the turn the sender has released.
     released_ms: u64,
-    /// Data-channel member: the turn node ended the turn, so all its text
-    /// counts as spoken; the response waits for the member's own audio.
+    /// The turn node ended the turn, so all its text counts as spoken; the
+    /// response waits for the member's own audio.
     settled: bool,
     /// `released_ms` when the settled response was last checked for progress.
     watched_ms: Option<u64>,
@@ -442,8 +344,8 @@ struct Turn {
     owner: Option<String>,
     /// The text chunks, in order.
     texts: Vec<String>,
-    /// One per response of the turn.
-    items: Vec<Item>,
+    /// Per response of the turn: the index of its first text chunk.
+    responses: Vec<usize>,
     /// A client tool was called: the next response starts at the browser's
     /// `response-create`.
     awaiting: bool,
@@ -464,18 +366,6 @@ fn item_id(turn: &str, response: usize) -> String {
     format!("{}:assistant", response_id(turn, response))
 }
 
-/// `(turn, response)` of an assistant item id.
-fn parse_item(item: &str) -> (String, usize) {
-    let response = item.strip_suffix(":assistant").unwrap_or(item);
-    match response.rsplit_once('#') {
-        Some((turn, number)) => match number.parse::<usize>() {
-            Ok(number) if number >= 2 => (turn.to_string(), number),
-            _ => (response.to_string(), 1),
-        },
-        None => (response.to_string(), 1),
-    }
-}
-
 fn vad_flag(value: &Value, key: &str) -> Option<bool> {
     value.get(key).and_then(Value::as_bool).or_else(|| {
         ["payload", "data", "event"].iter().find_map(|nested| {
@@ -485,11 +375,6 @@ fn vad_flag(value: &Value, key: &str) -> Option<bool> {
                 .and_then(Value::as_bool)
         })
     })
-}
-
-/// A TTS node's end mark: `{ "kind": "speech_end" }`.
-fn is_end_mark(value: &Value) -> bool {
-    value.get("kind").and_then(Value::as_str) == Some("speech_end")
 }
 
 /// `Some(true)` for a speech start, `Some(false)` for a speech end.
@@ -527,14 +412,15 @@ impl Core {
         }
     }
 
-    /// Whether `member` is on the WebRTC data channel.
-    pub(crate) fn is_data(&self, member: &str) -> bool {
-        self.members.get(member).is_some_and(|state| state.data)
+    /// Whether `member` is a member of the realtime hook.
+    pub(crate) fn is_realtime(&self, member: &str) -> bool {
+        self.members.get(member).is_some_and(|state| state.realtime)
     }
 
     /// A connection of `member` reached the node: what belongs to the
     /// connection starts over. With an admission for the hook over WebRTC
-    /// the member is a data-channel member from here on.
+    /// the member is a realtime member from here on; without one it becomes
+    /// one at its first `rt` frame.
     pub(crate) fn connected(&mut self, member: &str, admission: Admission) {
         let state = self.members.entry(member.to_string()).or_default();
         state.created = false;
@@ -542,18 +428,8 @@ impl Core {
         state.held_text.clear();
         if admission.webrtc {
             state.realtime = true;
-            state.data = true;
         }
         state.admission = admission;
-    }
-
-    fn is_realtime(&self, member: &str) -> bool {
-        self.members.get(member).is_some_and(|state| state.realtime)
-    }
-
-    /// The member connected through the realtime transport.
-    pub(crate) fn joined(&mut self, member: &str) {
-        self.members.entry(member.to_string()).or_default().realtime = true;
     }
 
     /// The realtime members among `to`; with nobody named, all of them.
@@ -583,26 +459,12 @@ impl Core {
             self.turns.insert(
                 id.to_string(),
                 Turn {
-                    items: vec![Item::default()],
+                    responses: vec![0],
                     ..Default::default()
                 },
             );
         }
         self.turns.get_mut(id).expect("turn")
-    }
-
-    // -- audio -------------------------------------------------------------
-
-    /// A piece of TTS audio of `turn_id`. Returns the item id to stamp on it.
-    pub(crate) fn on_audio(&mut self, turn_id: &str, chunk: u64, ms: f64) -> String {
-        let turn = self.turn_mut(turn_id);
-        let response = turn.items.len();
-        let item = turn.items.last_mut().expect("a turn has an item");
-        match item.audio.last_mut() {
-            Some((last, length)) if *last == chunk => *length += ms,
-            _ => item.audio.push((chunk, ms)),
-        }
-        item_id(turn_id, response)
     }
 
     // -- VAD ---------------------------------------------------------------
@@ -770,7 +632,8 @@ impl Core {
             self.end_response(&earlier, member, None, out);
         }
         let turn = self.turn_mut(turn_id);
-        let response = turn.items.len();
+        let response = turn.responses.len();
+        let first = turn.responses[response - 1];
         let listen = turn.listeners.entry(member.to_string()).or_default();
         if listen.open == Some(response) {
             return;
@@ -779,51 +642,37 @@ impl Core {
         listen.pending_end = false;
         listen.settled = false;
         listen.watched_ms = None;
-        listen.cut = None;
-        listen.sent_chunks = listen.sent_chunks.max(turn.items[response - 1].first_chunk);
+        listen.sent_chunks = listen.sent_chunks.max(first);
         out.push(Action::Frame {
             member: member.to_string(),
             frame: json!({ "type": "response-created", "responseId": response_id(turn_id, response) }),
         });
     }
 
-    /// End the member's response as completed, once its audio has left.
-    /// `settled`: the turn node ended the turn, which it does once the
-    /// turn's audio was released.
+    /// End the member's response as completed, once its audio has left the
+    /// member's track. `settled`: the turn node ended the turn.
     fn end_or_hold(&mut self, turn_id: &str, member: &str, settled: bool, out: &mut Vec<Action>) {
-        let data = self.is_data(member);
         let Some(turn) = self.turns.get_mut(turn_id) else { return };
+        let end = turn.texts.len();
         let Some(listen) = turn.listeners.get_mut(member) else { return };
         let Some(response) = listen.open else { return };
-        if data {
-            // The audio is the WebRTC sender's: the node sees none of it.
-            let first = turn.items[response - 1].first_chunk.min(turn.texts.len());
-            let end = turn.texts.len();
-            listen.settled |= settled;
-            if end > first && listen.released.unwrap_or(0) < end {
-                // Text of this response is still being spoken to the member.
-                // A turn node on the member's runner settles once the audio
-                // was released, and the last report is on its way here; one
-                // on another runner sees no reports and settles at once,
-                // while this node, which is with the member, follows them.
-                listen.pending_end = true;
-                if settled {
-                    listen.watched_ms = Some(listen.released_ms);
-                    out.push(Action::Timer {
-                        member: member.to_string(),
-                        turn: turn_id.to_string(),
-                        ms: SETTLED_WAIT_MS,
-                    });
-                }
-                return;
-            }
-            self.end_response(turn_id, member, None, out);
-            return;
-        }
-        let has_audio = !turn.items[response - 1].audio.is_empty();
-        let left = listen.positions.get(&response).is_some_and(|position| position.drained);
-        if has_audio && !left {
+        let first = turn.responses[response - 1].min(end);
+        listen.settled |= settled;
+        if end > first && listen.released.unwrap_or(0) < end {
+            // Text of this response is still being spoken to the member. A
+            // turn node on the member's runner settles once the audio was
+            // released, and the last report is on its way here; one on
+            // another runner sees no reports and settles at once, while this
+            // node, which is with the member, follows them.
             listen.pending_end = true;
+            if settled {
+                listen.watched_ms = Some(listen.released_ms);
+                out.push(Action::Timer {
+                    member: member.to_string(),
+                    turn: turn_id.to_string(),
+                    ms: SETTLED_WAIT_MS,
+                });
+            }
             return;
         }
         self.end_response(turn_id, member, None, out);
@@ -838,17 +687,15 @@ impl Core {
         interrupted: Option<&str>,
         out: &mut Vec<Action>,
     ) {
-        let data = self.is_data(member);
         let Some(turn) = self.turns.get_mut(turn_id) else { return };
         let Some(listen) = turn.listeners.get_mut(member) else { return };
         let Some(response) = listen.open.take() else { return };
         listen.pending_end = false;
-        let item = &turn.items[response - 1];
-        let first = item.first_chunk.min(turn.texts.len());
+        let first = turn.responses[response - 1].min(turn.texts.len());
         let end = turn
-            .items
+            .responses
             .get(response)
-            .map_or(turn.texts.len(), |next| next.first_chunk.min(turn.texts.len()));
+            .map_or(turn.texts.len(), |next| (*next).min(turn.texts.len()));
         let response_id = response_id(turn_id, response);
         let item_id = item_id(turn_id, response);
         let frame = |frame: Value| Action::Frame {
@@ -861,7 +708,7 @@ impl Core {
                 // the earlier responses' text.
                 let before = turn.texts[..first].concat();
                 let own = spoken.strip_prefix(before.as_str()).unwrap_or(spoken);
-                if data && !own.is_empty() && listen.sent_chunks <= first {
+                if !own.is_empty() && listen.sent_chunks <= first {
                     // The hook finalizes only an item it has a text part
                     // for, and a part starts with a delta.
                     out.push(frame(json!({
@@ -872,17 +719,12 @@ impl Core {
                 (own.to_string(), "cancelled")
             }
             None => {
-                // What the turn node counts as heard: everything once the
-                // audio has all left, else the chunks wholly released.
-                let position = listen.positions.get(&response).copied();
-                let heard = match position {
+                let heard = if listen.settled {
                     // The turn node counted everything as spoken.
-                    _ if data && listen.settled => end,
+                    end
+                } else {
                     // What the member's WebRTC sender reported.
-                    _ if data => listen.released.unwrap_or(first).clamp(first, end),
-                    Some(position) if position.drained => end,
-                    Some(position) => item.chunks_within(position.ms as f64, true).clamp(first, end),
-                    None => first,
+                    listen.released.unwrap_or(first).clamp(first, end)
                 };
                 for chunk in listen.sent_chunks.max(first)..heard {
                     out.push(frame(json!({
@@ -895,9 +737,6 @@ impl Core {
                 (turn.texts[first..heard].concat(), "completed")
             }
         };
-        if !data {
-            out.push(frame(json!({ "type": "audio-done", "responseId": response_id, "itemId": item_id })));
-        }
         out.push(frame(json!({
             "type": "audio-transcript-done",
             "responseId": response_id, "itemId": item_id, "transcript": transcript,
@@ -924,7 +763,7 @@ impl Core {
             other => other.to_string(),
         };
         let turn = self.turn_mut(turn_id);
-        let response = turn.items.len();
+        let response = turn.responses.len();
         turn.calls.push(call_id.clone());
         turn.awaiting = true;
         let response_id = response_id(turn_id, response);
@@ -944,8 +783,8 @@ impl Core {
                 "name": name, "arguments": arguments,
             }),
         });
-        // The response ends here; the hook answers with the tool output and
-        // a `response-create`.
+        // The response ends here; the browser answers with the tool output
+        // and a `response-create`.
         self.end_or_hold(turn_id, &owner, false, out);
     }
 
@@ -960,42 +799,23 @@ impl Core {
             self.end_response(turn_id, member, None, out);
         }
         let turn = self.turns.get_mut(turn_id).expect("turn");
-        turn.items.push(Item {
-            first_chunk,
-            audio: Vec::new(),
-        });
+        turn.responses.push(first_chunk);
         for member in &listeners {
             self.open_response(turn_id, member, out);
         }
     }
 
-    // -- frames from the transport and the browser ---------------------------
+    // -- events from the browser ---------------------------------------------
 
-    /// A frame that arrived on the `realtime` port for `member`.
+    /// A realtime event `member`'s browser sent on its data channel as
+    /// `{ "v": 1, "rt": <event> }`.
     pub(crate) fn on_client(&mut self, member: &str, frame: &Value, out: &mut Vec<Action>) {
         let Some(kind) = frame.get("type").and_then(Value::as_str) else {
             return;
         };
-        // Only the realtime transport writes to this port.
-        self.joined(member);
-        self.client_event(member, kind, frame, out);
-    }
-
-    /// A realtime event a member's browser sent on the WebRTC data channel
-    /// as `{ "v": 1, "rt": <event> }` (design D13).
-    pub(crate) fn on_data_client(&mut self, member: &str, frame: &Value, out: &mut Vec<Action>) {
-        let Some(kind) = frame.get("type").and_then(Value::as_str) else {
-            return;
-        };
-        // Internal frames are the socket transport's. A browser cannot send one.
-        if kind.starts_with(INTERNAL_PREFIX) {
-            tracing::warn!(%member, %kind, "a member sent an internal realtime frame; dropped");
-            return;
-        }
         let session = self.session.clone();
         let state = self.members.entry(member.to_string()).or_default();
         state.realtime = true;
-        state.data = true;
         if !std::mem::replace(&mut state.created, true) {
             out.push(Action::Frame {
                 member: member.to_string(),
@@ -1004,7 +824,10 @@ impl Core {
         }
         match kind {
             "session-update" => {
-                // The policy the socket transport applies for its members.
+                // The session-configuration policy (design D10): what the
+                // member's admission allows is applied, the rest is ignored
+                // and named once per connection. The answer is always
+                // `session-updated`.
                 let (forward, mut ignored, tools) = state.admission.filter(&frame["config"]);
                 let unsupported = self.apply_session_config(member, &Value::Object(forward), out);
                 ignored.extend(unsupported.into_iter().map(str::to_string));
@@ -1040,16 +863,19 @@ impl Core {
                     });
                 }
             }
-            // Audio is on the media track.
-            "input-audio-append" => {}
-            _ => self.client_event(member, kind, frame, out),
+            "conversation-item-create" => self.on_item_create(member, &frame["item"], out),
+            "response-create" => self.on_response_create(member, out),
+            "input-audio-commit" | "input-audio-clear" => self.on_manual_turn(member, kind, out),
+            // `input-audio-append` (audio is on the media track) and anything
+            // this node does not know.
+            _ => {}
         }
     }
 
-    /// What a member's WebRTC audio sender released of a turn (design D13):
-    /// the transcript follows it.
+    /// What a member's WebRTC audio sender released of a turn: the
+    /// transcript follows it.
     pub(crate) fn on_track_released(&mut self, report: &AudioReleased, out: &mut Vec<Action>) {
-        if !self.is_data(&report.member) {
+        if !self.is_realtime(&report.member) {
             return;
         }
         // After a flush the turn node settles the cut and says what was heard.
@@ -1058,6 +884,7 @@ impl Core {
         }
         let member = report.member.as_str();
         let Some(turn) = self.turns.get_mut(&report.turn_id) else { return };
+        let end = turn.texts.len();
         let Some(listen) = turn.listeners.get_mut(member) else { return };
         // Chunks wholly written; with a drained sender, also the chunk whose
         // audio so far has all been written (as the turn node counts).
@@ -1065,12 +892,11 @@ impl Core {
         if report.drained {
             counted = counted.max(report.chunk as usize + 1);
         }
-        let counted = counted.min(turn.texts.len());
+        let counted = counted.min(end);
         listen.released = Some(listen.released.map_or(counted, |known| known.max(counted)));
         listen.released_ms = listen.released_ms.max(report.released_ms);
         let Some(response) = listen.open else { return };
-        let first = turn.items[response - 1].first_chunk.min(turn.texts.len());
-        let end = turn.texts.len();
+        let first = turn.responses[response - 1].min(end);
         let (response_id, item_id) = (response_id(&report.turn_id, response), item_id(&report.turn_id, response));
         for chunk in listen.sent_chunks.max(first)..counted {
             out.push(Action::Frame {
@@ -1087,115 +913,8 @@ impl Core {
         }
     }
 
-    fn client_event(&mut self, member: &str, kind: &str, frame: &Value, out: &mut Vec<Action>) {
-        match kind {
-            INTERNAL_JOINED => {}
-            INTERNAL_RELEASED => self.on_released(member, frame, out),
-            "conversation-item-create" => self.on_item_create(member, &frame["item"], out),
-            "response-create" => self.on_response_create(member, out),
-            "response-cancel" => {
-                if let Some(turn_id) = self.open_turn(member) {
-                    self.start_cut(member, &turn_id, true, out);
-                }
-            }
-            "conversation-item-truncate" => self.on_truncate(member, frame, out),
-            "session-update" => self.on_session_update(member, &frame["config"], out),
-            "input-audio-commit" | "input-audio-clear" => self.on_manual_turn(member, kind, out),
-            _ => {}
-        }
-    }
-
-    /// The turn `member` has an open response of.
-    fn open_turn(&self, member: &str) -> Option<String> {
-        self.order
-            .iter()
-            .rev()
-            .find(|id| {
-                self.turns
-                    .get(*id)
-                    .and_then(|turn| turn.listeners.get(member))
-                    .is_some_and(|listen| listen.open.is_some())
-            })
-            .cloned()
-    }
-
-    fn turn_node(&self) -> Option<String> {
-        self.config.turn_node.clone().filter(|node| !node.is_empty())
-    }
-
-    /// Begin cutting `member` off from the turn. `ask`: this node asks for
-    /// the cut (flush at the transport, `interrupt` at the turn node); not
-    /// when the turn node already flushed.
-    fn start_cut(&mut self, member: &str, turn_id: &str, ask: bool, out: &mut Vec<Action>) {
-        let grace = self.config.truncate_grace_ms;
-        let turn_node = self.turn_node();
-        let Some(turn) = self.turns.get_mut(turn_id) else { return };
-        let Some(listen) = turn.listeners.get_mut(member) else { return };
-        let Some(response) = listen.open else { return };
-        if listen.cut.is_some() {
-            return;
-        }
-        listen.cut = Some(Cut::default());
-        if ask {
-            out.push(Action::Frame {
-                member: member.to_string(),
-                frame: json!({ "type": INTERNAL_FLUSH, "itemId": item_id(turn_id, response) }),
-            });
-            if let Some(node) = turn_node {
-                out.push(Action::Rpc {
-                    node,
-                    method: "interrupt".into(),
-                    arg: json!({ "member": member }),
-                });
-            }
-        }
-        // The browser's truncation gets this long to arrive.
-        out.push(Action::Timer {
-            member: member.to_string(),
-            turn: turn_id.to_string(),
-            ms: grace,
-        });
-    }
-
-    /// Publish what `member` heard of the turn it is being cut off from: up
-    /// to the browser's truncation point, else everything released.
-    fn publish_cut(&mut self, member: &str, turn_id: &str, out: &mut Vec<Action>) {
-        let Some(turn) = self.turns.get_mut(turn_id) else { return };
-        let Some(listen) = turn.listeners.get_mut(member) else { return };
-        let Some(response) = listen.open else { return };
-        let released = listen.positions.get(&response).map(|position| position.ms);
-        let Some(cut) = listen.cut.as_mut().filter(|cut| !cut.published) else {
-            return;
-        };
-        cut.published = true;
-        let released = cut.flushed_ms.or(released);
-        let spoken_ms = match (cut.truncate_ms, released) {
-            // The browser cannot have played more than it was sent.
-            (Some(truncated), Some(released)) => truncated.min(released),
-            (Some(truncated), None) => truncated,
-            (None, released) => released.unwrap_or(0),
-        };
-        let chunks = turn.items[response - 1].chunks_within(spoken_ms as f64, false);
-        out.push(Action::Released(AudioReleased {
-            member: member.to_string(),
-            turn_id: turn_id.to_string(),
-            released_ms: spoken_ms,
-            chunks_released: chunks as u64,
-            chunk: chunks.saturating_sub(1) as u64,
-            flushed: true,
-            drained: false,
-            stream_id: None,
-        }));
-    }
-
-    /// A timer of this node fired: the grace period of a socket member's cut
-    /// ended without a truncation, or a data-channel member's settled
-    /// response is checked for progress.
+    /// A settled response is checked for progress of the member's audio.
     pub(crate) fn on_timer(&mut self, member: &str, turn_id: &str, out: &mut Vec<Action>) {
-        if !self.is_data(member) {
-            self.publish_cut(member, turn_id, out);
-            return;
-        }
         let Some(listen) = self
             .turns
             .get_mut(turn_id)
@@ -1219,109 +938,22 @@ impl Core {
         self.end_response(turn_id, member, None, out);
     }
 
-    fn on_truncate(&mut self, member: &str, frame: &Value, out: &mut Vec<Action>) {
-        let Some(item) = frame.get("itemId").and_then(Value::as_str) else {
-            return;
-        };
-        let (turn_id, response) = parse_item(item);
-        let open = self
-            .turns
-            .get(&turn_id)
-            .and_then(|turn| turn.listeners.get(member))
-            .and_then(|listen| listen.open);
-        if open != Some(response) {
-            // The response is over: the whole reply counts as spoken.
-            return;
-        }
-        // The browser stopped playing, whatever the barge-in policy says.
-        self.start_cut(member, &turn_id, true, out);
-        let end_ms = frame
-            .get("audioEndMs")
-            .and_then(Value::as_f64)
-            .map_or(0, |ms| ms.max(0.0) as u64);
-        if let Some(cut) = self
-            .turns
-            .get_mut(&turn_id)
-            .and_then(|turn| turn.listeners.get_mut(member))
-            .and_then(|listen| listen.cut.as_mut())
-        {
-            cut.truncate_ms.get_or_insert(end_ms);
-        }
-        self.publish_cut(member, &turn_id, out);
+    /// The turn `member` has an open response of.
+    fn open_turn(&self, member: &str) -> Option<String> {
+        self.order
+            .iter()
+            .rev()
+            .find(|id| {
+                self.turns
+                    .get(*id)
+                    .and_then(|turn| turn.listeners.get(member))
+                    .is_some_and(|listen| listen.open.is_some())
+            })
+            .cloned()
     }
 
-    /// The transport's report of what it released of an item.
-    fn on_released(&mut self, member: &str, frame: &Value, out: &mut Vec<Action>) {
-        let Some(item) = frame.get("itemId").and_then(Value::as_str) else {
-            return;
-        };
-        let (turn_id, response) = parse_item(item);
-        let ms = frame.get("audioMs").and_then(Value::as_u64).unwrap_or(0);
-        let flushed = frame.get("flushed").and_then(Value::as_bool).unwrap_or(false);
-        let drained = frame.get("drained").and_then(Value::as_bool).unwrap_or(false);
-        let Some(turn) = self.turns.get_mut(&turn_id) else { return };
-        let Some(listen) = turn.listeners.get_mut(member) else { return };
-        if listen.open != Some(response) {
-            return;
-        }
-        if listen.cut.as_ref().is_some_and(|cut| cut.published) {
-            return;
-        }
-        if listen.cut.is_some() || flushed {
-            // The item's audio was dropped: by this node's flush, or by the
-            // turn node's (barge-in under its policy).
-            if listen.cut.is_none() {
-                self.start_cut(member, &turn_id, false, out);
-            }
-            let cut = self
-                .turns
-                .get_mut(&turn_id)
-                .and_then(|turn| turn.listeners.get_mut(member))
-                .and_then(|listen| listen.cut.as_mut());
-            if let (Some(cut), true) = (cut, flushed) {
-                cut.flushed_ms.get_or_insert(ms);
-                if cut.truncate_ms.is_some() {
-                    self.publish_cut(member, &turn_id, out);
-                }
-            }
-            return;
-        }
-        listen.positions.insert(response, Position { ms, drained });
-        let item = &turn.items[response - 1];
-        let strict = item.chunks_within(ms as f64, true);
-        let current = item.chunk_at(ms as f64);
-        // What the turn node counts: with a drained sender, also the chunk
-        // whose audio so far has all been written.
-        let counted = if drained && !item.audio.is_empty() {
-            strict.max(current as usize + 1)
-        } else {
-            strict
-        };
-        let (response_id, item_id) = (response_id(&turn_id, response), item_id(&turn_id, response));
-        for chunk in listen.sent_chunks..counted.min(turn.texts.len()) {
-            out.push(Action::Frame {
-                member: member.to_string(),
-                frame: json!({
-                    "type": "audio-transcript-delta",
-                    "responseId": response_id, "itemId": item_id, "delta": turn.texts[chunk],
-                }),
-            });
-        }
-        listen.sent_chunks = listen.sent_chunks.max(counted.min(turn.texts.len()));
-        let pending_end = listen.pending_end;
-        out.push(Action::Released(AudioReleased {
-            member: member.to_string(),
-            turn_id: turn_id.clone(),
-            released_ms: ms,
-            chunks_released: strict as u64,
-            chunk: current,
-            flushed: false,
-            drained,
-            stream_id: None,
-        }));
-        if pending_end && drained {
-            self.end_response(&turn_id, member, None, out);
-        }
+    fn turn_node(&self) -> Option<String> {
+        self.config.turn_node.clone().filter(|node| !node.is_empty())
     }
 
     fn on_item_create(&mut self, member: &str, item: &Value, out: &mut Vec<Action>) {
@@ -1361,7 +993,10 @@ impl Core {
     }
 
     fn on_response_create(&mut self, member: &str, out: &mut Vec<Action>) {
-        // Typed text: `sendTextMessage` sends the item, then this.
+        // Typed text as realtime events: the item, then this. (The model's
+        // own transport sends typed text as the member's text frame instead,
+        // which reaches the turn node without this node.) Allowed
+        // instructions reach the turn node by `set_client_instructions`.
         let held = self
             .members
             .get_mut(member)
@@ -1369,14 +1004,10 @@ impl Core {
             .unwrap_or_default();
         if !held.is_empty() {
             let Some(node) = self.turn_node() else { return };
-            let mut data = json!({ "v": 1, "type": "text", "text": held.join("\n") });
-            if let Some(instructions) = self.members.get(member).and_then(|state| state.instructions.clone()) {
-                data["client_instructions"] = instructions.into();
-            }
             out.push(Action::Publish {
                 node,
                 member: member.to_string(),
-                data,
+                data: json!({ "v": 1, "type": "text", "text": held.join("\n") }),
             });
             return;
         }
@@ -1391,25 +1022,6 @@ impl Core {
             self.continue_turn(&turn_id, out);
         }
         // Otherwise the pipeline's own turn detection starts turns.
-    }
-
-    /// The fields of a `session-update` the member's admission let through
-    /// (design D10, "Session configuration policy").
-    fn on_session_update(&mut self, member: &str, config: &Value, out: &mut Vec<Action>) {
-        let ignored = self.apply_session_config(member, config, out);
-        if !ignored.is_empty() {
-            out.push(Action::Frame {
-                member: member.to_string(),
-                frame: json!({
-                    "type": "custom",
-                    "rawType": "remotemedia.config-ignored",
-                    "raw": {
-                        "fields": ignored,
-                        "reason": "the pipeline's node does not accept this change at runtime",
-                    },
-                }),
-            });
-        }
     }
 
     /// Apply the admitted fields of a `session-update`. Returns the fields no
@@ -1479,8 +1091,6 @@ impl Core {
                         });
                     }
                 }
-                // Client tool definitions: the transport checked them against
-                // the admission; the host already has them.
                 _ => {}
             }
         }
@@ -1558,8 +1168,10 @@ pub struct RealtimeEventsNode {
     corr: std::sync::atomic::AtomicU64,
     /// The member whose connection this instance serves, once seen.
     connection: OnceLock<String>,
-    /// Follows the member's `audio_released` reports (design D13).
+    /// Follows the member's `audio_released` reports.
     media: OnceLock<AbortOnDrop>,
+    /// Audio reached the node: said once.
+    audio_warned: std::sync::atomic::AtomicBool,
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -1580,6 +1192,7 @@ impl RealtimeEventsNode {
             corr: std::sync::atomic::AtomicU64::new(0),
             connection: OnceLock::new(),
             media: OnceLock::new(),
+            audio_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1630,10 +1243,8 @@ impl RealtimeEventsNode {
     }
 
     /// Follow what `member`'s WebRTC audio sender releases, for as long as
-    /// this instance lives: the transcript deltas of a data-channel member
-    /// follow these reports (design D13).
+    /// this instance lives: the transcript deltas follow these reports.
     fn follow_media(&self, member: &str, core: &SharedCore, control: &Arc<SessionControl>, emitter: Emitter) {
-        use crate::transport::turn_audio::MediaEvent;
         let mut media = control.subscribe_media();
         let member = member.to_string();
         let core = core.clone();
@@ -1656,7 +1267,7 @@ impl RealtimeEventsNode {
                 core.lock().on_track_released(&report, &mut actions);
                 for action in actions {
                     if let Action::Frame { member, frame } = action {
-                        emit_frame(&node_id, &emitter, fields.clone(), &member, frame, true).await;
+                        emit_frame(&node_id, &emitter, fields.clone(), &member, frame).await;
                     }
                 }
             }
@@ -1676,8 +1287,7 @@ impl RealtimeEventsNode {
             match action {
                 Action::Frame { member, frame } => {
                     let fields = self.member_fields(&member);
-                    let data = core.lock().is_data(&member);
-                    emit_frame(&self.node_id, emitter, fields, &member, frame, data).await;
+                    emit_frame(&self.node_id, emitter, fields, &member, frame).await;
                 }
                 other => {
                     let Some(control) = control else { continue };
@@ -1696,7 +1306,6 @@ impl RealtimeEventsNode {
     ) {
         match action {
             Action::Frame { .. } => {}
-            Action::Released(report) => control.publish_audio_released(report),
             Action::Rpc { node, method, arg } => {
                 let corr = self.corr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let address = ControlAddress::node_in(&node).with_port(&method);
@@ -1744,7 +1353,6 @@ impl RealtimeEventsNode {
             }
             Action::Timer { member, turn, ms } => {
                 let core = core.clone();
-                let control = control.clone();
                 let emitter = emitter.clone();
                 let node_id = self.node_id.clone();
                 let fields = self.member_fields(&member);
@@ -1756,10 +1364,8 @@ impl RealtimeEventsNode {
                         core.lock().on_timer(&member, &turn, &mut actions);
                         for action in actions {
                             match action {
-                                Action::Released(report) => control.publish_audio_released(report),
                                 Action::Frame { member: to, frame } => {
-                                    let data = core.lock().is_data(&to);
-                                    emit_frame(&node_id, &emitter, fields.clone(), &to, frame, data).await;
+                                    emit_frame(&node_id, &emitter, fields.clone(), &to, frame).await;
                                 }
                                 // The same timer, again.
                                 Action::Timer { ms, .. } => wait = Some(ms),
@@ -1773,33 +1379,20 @@ impl RealtimeEventsNode {
     }
 }
 
-/// Emit a frame for `member`, attributed and addressed to it: its connection
-/// takes it, and no other member's output does. A data-channel member gets
-/// `{ "v": 1, "rt": <event> }` on the node's output; a socket member's frame
-/// goes to its transport on the `realtime` port.
+/// Emit a server event for `member` as `{ "v": 1, "rt": <event> }`,
+/// attributed and addressed to it: its data channel takes it, and no other
+/// member's does.
 async fn emit_frame(
     node_id: &str,
     emitter: &Emitter,
     mut fields: HashMap<String, String>,
     member: &str,
     frame: Value,
-    data: bool,
 ) {
     fields.insert(participant::ID.to_string(), member.to_string());
     fields.insert(participant::TO.to_string(), member.to_string());
     let origin = Origin::from_metadata(&fields).map(Arc::new);
-    let output = if data {
-        if frame
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind.starts_with(INTERNAL_PREFIX))
-        {
-            return;
-        }
-        RuntimeData::Json(json!({ "v": 1, RT_FRAME_KEY: frame }))
-    } else {
-        wrap_aux_port(REALTIME_PORT, RuntimeData::Json(frame))
-    };
+    let output = RuntimeData::Json(json!({ "v": 1, RT_FRAME_KEY: frame }));
     if let Err(error) = emitter.emit_as(output, origin).await {
         tracing::debug!(node = %node_id, %member, %error, "realtime frame not emitted");
     }
@@ -1837,24 +1430,52 @@ impl AsyncStreamingNode for RealtimeEventsNode {
         &self,
         data: RuntimeData,
         ctx: &dyn NodeRuntimeContextRead,
-        mut callback: F,
+        _callback: F,
     ) -> Result<usize, Error>
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
+        let value = match data {
+            RuntimeData::Json(value) => value,
+            RuntimeData::Audio { metadata, .. } => {
+                // The member's own audio, forwarded by the VAD node: not
+                // this node's. Audio of a turn is the speech: the node
+                // carries none, and a pipeline that still sends the speech
+                // through it loses that speech. Say so, once.
+                let mut tags: HashMap<String, String> = ctx
+                    .origin()
+                    .as_deref()
+                    .map(|origin| origin.fields().clone())
+                    .unwrap_or_default();
+                if let Some(own) = metadata.as_ref().and_then(Value::as_object) {
+                    for (key, value) in own {
+                        if let Some(value) = value.as_str() {
+                            tags.insert(key.clone(), value.to_string());
+                        }
+                    }
+                }
+                if TurnTag::from_metadata(&tags).is_some()
+                    && !self.audio_warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        node = %self.node_id,
+                        "RealtimeEventsNode received audio and dropped it: it is on the event path only. \
+                         Connect the speech output to the pipeline's sink, not to this node."
+                    );
+                }
+                return Ok(0);
+            }
+            _ => return Ok(0),
+        };
         let origin = ctx.origin();
         let core = self.core(ctx);
         let control = NodeRuntimeContext::of(ctx).map(|ctx| ctx.control.clone());
         if let Some(origin) = origin.as_deref() {
             self.note(origin);
-            if origin.fields().get(TRANSPORT_KEY).map(String::as_str) == Some(TRANSPORT_NAME) {
-                core.lock().joined(origin.id());
-            }
             // A member's own input marks its connection's instance. (A
-            // turn's `ui` frames and audio carry the turn's member, who may
-            // be another one.)
-            let own = matches!(&data, RuntimeData::Json(value)
-                if rt_frame_event(value).is_some() || vad_edge(value).is_some());
+            // turn's `ui` frames carry the turn's member, who may be
+            // another one.)
+            let own = rt_frame_event(&value).is_some() || vad_edge(&value).is_some();
             if own && self.connection.get().is_none() && self.connection.set(origin.id().to_string()).is_ok() {
                 core.lock()
                     .connected(origin.id(), Admission::from_fields(origin.fields()));
@@ -1866,85 +1487,16 @@ impl AsyncStreamingNode for RealtimeEventsNode {
         let owner = origin.as_deref().map(|origin| origin.id().to_string());
 
         let mut actions = Vec::new();
-        match data {
-            RuntimeData::Audio {
-                samples,
-                sample_rate,
-                channels,
-                stream_id,
-                timestamp_us,
-                arrival_ts_us,
-                metadata,
-            } => {
-                let mut tags: HashMap<String, String> = origin
-                    .as_deref()
-                    .map(|origin| origin.fields().clone())
-                    .unwrap_or_default();
-                if let Some(own) = metadata.as_ref().and_then(Value::as_object) {
-                    for (key, value) in own {
-                        if let Some(value) = value.as_str() {
-                            tags.insert(key.clone(), value.to_string());
-                        }
-                    }
-                }
-                // Audio without a turn is the member's own, forwarded by the
-                // VAD node or the accumulator: it is not output.
-                let Some(tag) = TurnTag::from_metadata(&tags) else {
-                    return Ok(0);
-                };
-                let frames = samples.len() as f64 / f64::from(channels.max(1));
-                let ms = frames * 1000.0 / f64::from(sample_rate.max(1));
-                let item = core.lock().on_audio(&tag.turn_id, tag.chunk, ms);
-                let mut stamped = match metadata {
-                    Some(Value::Object(map)) => map,
-                    _ => Map::new(),
-                };
-                stamped.insert(keys::TURN_ID_ALIAS.to_string(), tag.turn_id.to_string().into());
-                stamped.insert(ITEM_ID_KEY.to_string(), item.into());
-                callback(RuntimeData::Audio {
-                    samples,
-                    sample_rate,
-                    channels,
-                    stream_id,
-                    timestamp_us,
-                    arrival_ts_us,
-                    metadata: Some(Value::Object(stamped)),
-                })?;
-                return Ok(1);
+        if let Some(event) = rt_frame_event(&value) {
+            // Only the member's own data channel speaks for it.
+            if let Some(member) = owner.as_deref() {
+                core.lock().on_client(member, event, &mut actions);
             }
-            RuntimeData::Json(value) if is_end_mark(&value) => {
-                // The TTS node's mark that a text chunk's audio is complete
-                // belongs to the audio stream: a WebRTC or telephony sender
-                // reads it to close the chunk and send its last partial
-                // frame. Without it a turn ends only once the sender has
-                // stayed drained (`drain_quiet_ms` of the turn node).
-                callback(RuntimeData::Json(value))?;
-                return Ok(1);
-            }
-            RuntimeData::Json(value) => {
-                if let Some(event) = rt_frame_event(&value) {
-                    // Only the member's own data channel speaks for it.
-                    if let Some(member) = owner.as_deref() {
-                        core.lock().on_data_client(member, event, &mut actions);
-                    }
-                } else if let Some(port) = aux_port_of(&RuntimeData::Json(value.clone())) {
-                    if port == REALTIME_PORT {
-                        let member = owner.clone().or_else(|| {
-                            value.get(participant::ID).and_then(Value::as_str).map(str::to_string)
-                        });
-                        if let Some(member) = member {
-                            let frame = value.get("payload").unwrap_or(&Value::Null);
-                            core.lock().on_client(&member, frame, &mut actions);
-                        }
-                    }
-                } else if value.get("v").and_then(Value::as_u64) == Some(1) && value.get("chunk").is_some() {
-                    let to = addressed_to(origin.as_deref());
-                    core.lock().on_ui(owner.as_deref(), to.as_deref(), &value, &mut actions);
-                } else if let (Some(start), Some(member)) = (vad_edge(&value), owner.as_deref()) {
-                    core.lock().on_vad(member, start, &mut actions);
-                }
-            }
-            _ => {}
+        } else if is_ui_frame(&value) {
+            let to = addressed_to(origin.as_deref());
+            core.lock().on_ui(owner.as_deref(), to.as_deref(), &value, &mut actions);
+        } else if let (Some(start), Some(member)) = (vad_edge(&value), owner.as_deref()) {
+            core.lock().on_vad(member, start, &mut actions);
         }
         if !actions.is_empty() {
             let emitter = Emitter::for_call(ctx);
@@ -1990,14 +1542,16 @@ impl StreamingNodeFactory for RealtimeEventsNodeFactory {
             NodeSchema::new(REALTIME_EVENTS_NODE)
                 .description(
                     "Reports a voice agent's turns as the AI SDK's normalized realtime events \
-                     for members connected through the realtime transport, and forwards TTS \
-                     audio stamped with its turn and item. Inputs, told apart by shape: TTS \
-                     audio, `HostedTurnNode` `ui` frames, VAD events, and client events on the \
-                     `realtime` port. One instance per participant.",
+                     for members of the AI SDK realtime hook, who connect over WebRTC: it sends \
+                     and receives `{ v: 1, rt: <event> }` frames on the member's data channel, \
+                     while the reply is heard on the member's media track. It carries no audio. \
+                     Inputs, told apart by shape: `rt` frames, `HostedTurnNode` `ui` frames and \
+                     VAD events. One instance per participant.",
                 )
                 .category("conversation")
+                // The VAD node forwards the member's audio with its events; it is dropped here.
                 .accepts([RuntimeDataType::Audio, RuntimeDataType::Json])
-                .produces([RuntimeDataType::Audio, RuntimeDataType::Json])
+                .produces([RuntimeDataType::Json])
                 .config_schema_from::<RealtimeEventsConfig>(),
         )
     }

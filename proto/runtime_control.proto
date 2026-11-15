@@ -93,14 +93,13 @@ message AdmitMemberRequest {
 }
 
 message AdmitMemberResponse {
-  // Present it as `ticket` in `peer.announce`, or as the realtime socket's
-  // token. Valid once.
+  // Field 3 was the address of a realtime WebSocket, which no longer exists.
+  reserved 3;
+  reserved "realtime_url";
+  // Present it as `ticket` in `peer.announce`. Valid once.
   string ticket = 1;
   // The WebSocket signalling URL browsers connect to.
   string signal_url = 2;
-  // The AI SDK realtime socket of the same listener; empty when the runtime
-  // serves none.
-  string realtime_url = 3;
   // When the ticket stops being accepted (Unix milliseconds).
   uint64 expires_at_ms = 4;
   // The runtime id of the session the member will join.

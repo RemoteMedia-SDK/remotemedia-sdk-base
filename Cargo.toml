@@ -402,7 +402,6 @@ members = [
     "crates/transports/grpc",
     "crates/transports/http",
     "crates/transports/telephony",
-    "crates/transports/realtime",
     "crates/services/webrtc-server",
     "crates/services/grpc-server",
     "crates/services/http-server",

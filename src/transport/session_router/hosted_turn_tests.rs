@@ -1674,19 +1674,24 @@ async fn client_instructions_set_by_rpc_ride_on_that_members_spoken_turns() {
     assert_eq!(request["client_instructions"], "Answer in Norwegian.");
     rig.until_listening().await;
 
-    // Another member's turn carries none; a typed frame's own wins.
+    // Another member's turn carries none.
     rig.transcript("bob", "hi").await;
     let request = host.answer(&["Hi."]).await;
     assert!(request.get("client_instructions").is_none());
     rig.until_listening().await;
-    rig.send(
-        RuntimeData::Json(json!({ "v": 1, "type": "text", "text": "hi", "client_instructions": "Be brief." })),
-        member("alice", None),
-    )
-    .await;
-    let request = host.answer(&["Hi."]).await;
-    assert_eq!(request["client_instructions"], "Be brief.");
-    rig.until_listening().await;
+    // Instructions a browser writes into its own text frame are not taken:
+    // alice's admission does not let her browser set them. What the realtime
+    // events node set for her (above) still applies; bob gets none.
+    for (who, expected) in [("alice", Some("Answer in Norwegian.")), ("bob", None)] {
+        rig.send(
+            RuntimeData::Json(json!({ "v": 1, "type": "text", "text": "hi", "client_instructions": "Be brief." })),
+            member(who, None),
+        )
+        .await;
+        let request = host.answer(&["Hi."]).await;
+        assert_eq!(request.get("client_instructions").and_then(Value::as_str), expected, "{who}");
+        rig.until_listening().await;
+    }
 
     // Cleared.
     rig.rpc("set_client_instructions", Some(json!({ "member": "alice", "instructions": null })))

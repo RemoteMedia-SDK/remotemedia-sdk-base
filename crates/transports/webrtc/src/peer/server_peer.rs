@@ -443,15 +443,9 @@ pub struct SharedPipelineSession {
     observer_copies: remotemedia_types::CopyContext,
     output_targets: Arc<RwLock<HashMap<String, PeerOutputTarget>>>,
     close_when_empty: bool,
-    /// Members attached by another transport of this listener (the realtime
-    /// socket): they keep the session open like a peer does.
-    external_members: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Peers admitted for the AI SDK realtime hook over WebRTC, named before
     /// they attach ([`Self::set_realtime_hook_peer`]).
     realtime_hook_peers: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Every audio flush asked of the session, for those members' transport:
-    /// `None` is the session-wide flush, `Some` a targeted one.
-    flushes: broadcast::Sender<Option<FlushTarget>>,
 }
 
 impl SharedPipelineSession {
@@ -470,9 +464,7 @@ impl SharedPipelineSession {
             observer_copies,
             output_targets: Arc::new(RwLock::new(HashMap::new())),
             close_when_empty,
-            external_members: std::sync::Mutex::new(std::collections::HashSet::new()),
             realtime_hook_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
-            flushes: broadcast::channel(32).0,
         });
 
         shared.spawn_output_drainers(receivers);
@@ -481,10 +473,8 @@ impl SharedPipelineSession {
             let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<()>(4);
             ctrl.install_flush_audio_hook(flush_tx).await;
             let output_targets = Arc::clone(&shared.output_targets);
-            let flushes = shared.flushes.clone();
             tokio::spawn(async move {
                 while flush_rx.recv().await.is_some() {
-                    let _ = flushes.send(None);
                     let targets: Vec<PeerOutputTarget> =
                         output_targets.read().await.values().cloned().collect();
                     let mut dropped = 0usize;
@@ -507,10 +497,8 @@ impl SharedPipelineSession {
             ctrl.install_flush_audio_for_hook(flush_tx);
             let output_targets = Arc::clone(&shared.output_targets);
             let session_id = shared.session_id().to_string();
-            let flushes = shared.flushes.clone();
             tokio::spawn(async move {
                 while let Some(target) = flush_rx.recv().await {
-                    let _ = flushes.send(Some(target.clone()));
                     let targets: Vec<PeerOutputTarget> = output_targets
                         .read()
                         .await
@@ -557,46 +545,10 @@ impl SharedPipelineSession {
         self.core.is_active().await
     }
 
-    /// The session's outputs, for a transport that delivers them itself
-    /// (the realtime socket). Addressing (`participant.to`) is the
-    /// subscriber's to apply.
+    /// The session's outputs, for a host that delivers them itself.
+    /// Addressing (`participant.to`) is the subscriber's to apply.
     pub fn subscribe_outputs(&self) -> SharedPipelineOutputReceivers {
         self.core.subscribe_outputs()
-    }
-
-    /// The audio flushes asked of this session: `None` for the session-wide
-    /// flush, `Some` for a targeted one. Peers' tracks are flushed here; a
-    /// transport with its own send queue subscribes.
-    pub fn subscribe_flushes(&self) -> broadcast::Receiver<Option<FlushTarget>> {
-        self.flushes.subscribe()
-    }
-
-    /// A member served by another transport joined: the session stays open
-    /// for it as for a peer.
-    pub fn attach_member(&self, member: &str) {
-        self.external_members
-            .lock()
-            .expect("external members lock")
-            .insert(member.to_string());
-    }
-
-    /// The member attached with [`Self::attach_member`] left. Closes the
-    /// session when it was the last one and the session closes when empty.
-    pub async fn detach_member(&self, member: &str) {
-        let none_left = {
-            let mut members = self.external_members.lock().expect("external members lock");
-            members.remove(member);
-            members.is_empty()
-        };
-        if self.close_when_empty && none_left && self.output_targets.read().await.is_empty() {
-            if let Err(e) = self.close().await {
-                warn!(
-                    "Error closing shared pipeline session {} after last member left: {}",
-                    self.session_id(),
-                    e
-                );
-            }
-        }
     }
 
     /// Say, before [`Self::attach_peer`], whether `peer_id` was admitted for
@@ -640,13 +592,7 @@ impl SharedPipelineSession {
         let should_close = {
             let mut targets = self.output_targets.write().await;
             targets.remove(peer_id);
-            self.close_when_empty
-                && targets.is_empty()
-                && self
-                    .external_members
-                    .lock()
-                    .expect("external members lock")
-                    .is_empty()
+            self.close_when_empty && targets.is_empty()
         };
 
         if should_close {

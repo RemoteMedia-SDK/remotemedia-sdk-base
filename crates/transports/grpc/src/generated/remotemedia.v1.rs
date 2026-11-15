@@ -5174,17 +5174,12 @@ pub struct AdmitMemberRequest {
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AdmitMemberResponse {
-    /// Present it as `ticket` in `peer.announce`, or as the realtime socket's
-    /// token. Valid once.
+    /// Present it as `ticket` in `peer.announce`. Valid once.
     #[prost(string, tag = "1")]
     pub ticket: ::prost::alloc::string::String,
     /// The WebSocket signalling URL browsers connect to.
     #[prost(string, tag = "2")]
     pub signal_url: ::prost::alloc::string::String,
-    /// The AI SDK realtime socket of the same listener; empty when the runtime
-    /// serves none.
-    #[prost(string, tag = "3")]
-    pub realtime_url: ::prost::alloc::string::String,
     /// When the ticket stops being accepted (Unix milliseconds).
     #[prost(uint64, tag = "4")]
     pub expires_at_ms: u64,

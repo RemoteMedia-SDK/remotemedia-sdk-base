@@ -335,37 +335,6 @@ impl Inner {
             })?;
         let session_id = core.session_id().to_string();
         let control = self.state.runner.control_bus().get(&session_id);
-        // Members on the realtime socket are not signalling peers: their
-        // joining and leaving is read from the session's media events.
-        if let Some(control) = &control {
-            let mut media = control.subscribe_media();
-            let weak = Arc::downgrade(self);
-            tokio::spawn(async move {
-                use remotemedia_core::transport::turn_audio::MediaEvent;
-                use tokio::sync::broadcast::error::RecvError;
-                loop {
-                    let event = match media.recv().await {
-                        Ok(data) => MediaEvent::from_runtime(&data),
-                        Err(RecvError::Lagged(_)) => continue,
-                        Err(RecvError::Closed) => break,
-                    };
-                    let Some(inner) = weak.upgrade() else { break };
-                    match event {
-                        Some(MediaEvent::MediaReady {
-                            member, transport, ..
-                        }) if transport == "realtime" => {
-                            inner.member_connected(&member);
-                        }
-                        Some(MediaEvent::MediaLost {
-                            member, transport, ..
-                        }) if transport == "realtime" => {
-                            inner.member_disconnected(&member, None);
-                        }
-                        _ => {}
-                    }
-                }
-            });
-        }
         // The host owns the session: it does not close when its last
         // member leaves (the reaper ends it after the empty timeout).
         let room = SharedRoomSession::new(core, control, false)
@@ -449,7 +418,7 @@ impl Inner {
         }
     }
 
-    /// A member's `peer.announce` (or realtime socket) was accepted.
+    /// A member's `peer.announce` was accepted.
     fn member_connected(&self, peer_id: &str) {
         let Some(record) = self
             .tickets

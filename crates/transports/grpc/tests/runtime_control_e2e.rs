@@ -49,7 +49,6 @@ impl ControlHost for TestHost {
         Ok(AdmitMemberResponse {
             ticket: format!("ticket-for-{}", request.member.unwrap_or_default().id),
             signal_url: "ws://127.0.0.1:1/ws".into(),
-            realtime_url: "ws://127.0.0.1:1/realtime".into(),
             expires_at_ms: 1_000 * u64::from(request.ttl_secs),
             session_id: format!("session-{}", request.session_key),
         })
