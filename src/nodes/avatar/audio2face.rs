@@ -140,10 +140,50 @@ impl Audio2FaceNode {
     }
 }
 
+/// A video generator (lip sync; openspec: add-generator-cancellation). Each
+/// chunk is computed inside its call. Queued audio belongs to the cancelled
+/// reply, so by default a cancel drops it, and the mouth closes: a silent
+/// weights snapshot is published so the avatar does not hold the last shape.
+#[async_trait::async_trait]
+impl remotemedia_traits::Cancellable for Audio2FaceNode {
+    fn cancel_strategy(&self) -> remotemedia_traits::CancelStrategy {
+        remotemedia_traits::CancelStrategy::OnCancel
+    }
+
+    fn default_disposition(
+        &self,
+        cancel: &remotemedia_traits::CancelContext,
+    ) -> remotemedia_traits::Disposition {
+        remotemedia_traits::Disposition {
+            pending_input: remotemedia_traits::Retention::Discard,
+            ..cancel.reason.default_disposition()
+        }
+    }
+
+    async fn on_cancel(
+        &self,
+        _call: &remotemedia_traits::rpc::CallContext,
+        _cancellation: &remotemedia_traits::Cancellation,
+    ) {
+        self.weights_out.publish(
+            AvatarWeights {
+                mouth_open: 0.0,
+                blendshapes: Vec::new(),
+            },
+            Self::now_us(),
+        );
+    }
+}
+impl remotemedia_traits::VideoGenerator for Audio2FaceNode {}
+
 #[async_trait::async_trait]
 impl StreamingNode for Audio2FaceNode {
     fn node_type(&self) -> &str {
         "Audio2FaceNode"
+    }
+
+    fn generator(&self) -> Option<remotemedia_traits::GeneratorRole<'_>> {
+        remotemedia_traits::GeneratorRole::video(self)
     }
 
     fn node_id(&self) -> &str {
@@ -276,6 +316,10 @@ impl StreamingNodeFactory for Audio2FaceNodeFactory {
             NodeSchema::new("Audio2FaceNode")
                 .description("Reactive lipsync producer — maps audio to blendshape weights")
                 .category("avatar")
+                .generator(
+                    remotemedia_traits::GeneratedModality::Video,
+                    remotemedia_traits::CancelStrategy::OnCancel,
+                )
                 .accepts([RuntimeDataType::Audio])
                 .produces([RuntimeDataType::Json]),
         )
@@ -399,5 +443,21 @@ mod tests {
         let snap = typed_input.snapshot().expect("populated");
         assert_eq!(snap.pts_us, 7_777);
         assert!(snap.value.mouth_open > 0.0);
+
+        // A cancel closes the mouth (openspec: add-generator-cancellation),
+        // and the reply's queued audio is dropped by default.
+        let role = node.generator().expect("a generator");
+        let interrupt = remotemedia_traits::CancelContext::new(remotemedia_traits::CancelReason::BargeIn);
+        assert_eq!(
+            role.cancellable().default_disposition(&interrupt).pending_input,
+            remotemedia_traits::Retention::Discard
+        );
+        role.cancellable()
+            .on_cancel(
+                &remotemedia_traits::rpc::CallContext::default(),
+                &remotemedia_traits::Cancellation::new(remotemedia_traits::CancelReason::BargeIn),
+            )
+            .await;
+        assert_eq!(typed_input.snapshot().expect("populated").value.mouth_open, 0.0);
     }
 }

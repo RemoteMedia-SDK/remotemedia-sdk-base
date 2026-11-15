@@ -167,10 +167,25 @@ impl IdleAnimationNode {
     }
 }
 
+/// A video generator (openspec: add-generator-cancellation). Each pose is
+/// computed inside its tick, and idle animation is meant to keep running
+/// through a cancelled turn: nothing to stop.
+#[async_trait::async_trait]
+impl remotemedia_traits::Cancellable for IdleAnimationNode {
+    fn cancel_strategy(&self) -> remotemedia_traits::CancelStrategy {
+        remotemedia_traits::CancelStrategy::DropStopsWork
+    }
+}
+impl remotemedia_traits::VideoGenerator for IdleAnimationNode {}
+
 #[async_trait::async_trait]
 impl StreamingNode for IdleAnimationNode {
     fn node_type(&self) -> &str {
         "IdleAnimationNode"
+    }
+
+    fn generator(&self) -> Option<remotemedia_traits::GeneratorRole<'_>> {
+        remotemedia_traits::GeneratorRole::video(self)
     }
 
     fn node_id(&self) -> &str {
@@ -306,6 +321,10 @@ impl StreamingNodeFactory for IdleAnimationNodeFactory {
             NodeSchema::new("IdleAnimationNode")
                 .description("Source-wall idle animation generator — emits breathing/blinking idle pose envelopes")
                 .category("avatar")
+                .generator(
+                    remotemedia_traits::GeneratedModality::Video,
+                    remotemedia_traits::CancelStrategy::DropStopsWork,
+                )
                 .accepts([])
                 .produces([RuntimeDataType::Json]),
         )

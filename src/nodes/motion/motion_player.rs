@@ -122,10 +122,25 @@ impl MotionPlayerNode {
     }
 }
 
+/// A video generator (motion; openspec: add-generator-cancellation). The
+/// playback paces itself with awaited sleeps inside the call, so dropping
+/// the call stops it.
+#[async_trait]
+impl remotemedia_traits::Cancellable for MotionPlayerNode {
+    fn cancel_strategy(&self) -> remotemedia_traits::CancelStrategy {
+        remotemedia_traits::CancelStrategy::DropStopsWork
+    }
+}
+impl remotemedia_traits::VideoGenerator for MotionPlayerNode {}
+
 #[async_trait]
 impl AsyncStreamingNode for MotionPlayerNode {
     fn node_type(&self) -> &str {
         "MotionPlayerNode"
+    }
+
+    fn generator(&self) -> Option<remotemedia_traits::GeneratorRole<'_>> {
+        remotemedia_traits::GeneratorRole::video(self)
     }
 
     async fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {

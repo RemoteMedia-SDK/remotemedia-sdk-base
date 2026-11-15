@@ -113,10 +113,44 @@ impl SyntheticLipSyncNode {
     }
 }
 
+/// A video generator (lip sync; openspec: add-generator-cancellation). Each
+/// chunk's frame is computed inside its call. A cancel restarts the frame
+/// clock for the next turn, as a barge does, and drops the cancelled reply's
+/// queued audio by default.
+#[async_trait]
+impl remotemedia_traits::Cancellable for SyntheticLipSyncNode {
+    fn cancel_strategy(&self) -> remotemedia_traits::CancelStrategy {
+        remotemedia_traits::CancelStrategy::OnCancel
+    }
+
+    fn default_disposition(
+        &self,
+        cancel: &remotemedia_traits::CancelContext,
+    ) -> remotemedia_traits::Disposition {
+        remotemedia_traits::Disposition {
+            pending_input: remotemedia_traits::Retention::Discard,
+            ..cancel.reason.default_disposition()
+        }
+    }
+
+    async fn on_cancel(
+        &self,
+        _call: &remotemedia_traits::rpc::CallContext,
+        _cancellation: &remotemedia_traits::Cancellation,
+    ) {
+        self.reset_clock();
+    }
+}
+impl remotemedia_traits::VideoGenerator for SyntheticLipSyncNode {}
+
 #[async_trait]
 impl AsyncStreamingNode for SyntheticLipSyncNode {
     fn node_type(&self) -> &str {
         "SyntheticLipSyncNode"
+    }
+
+    fn generator(&self) -> Option<remotemedia_traits::GeneratorRole<'_>> {
+        remotemedia_traits::GeneratorRole::video(self)
     }
 
     async fn process(&self, _data: RuntimeData) -> Result<RuntimeData> {
@@ -309,6 +343,26 @@ mod tests {
             .unwrap()
             .pts_ms;
         assert_eq!(pts, 100, "barge should restart the cumulative-ms clock");
+    }
+
+    /// The generic cancel (openspec: add-generator-cancellation) restarts the
+    /// clock as a barge does.
+    #[tokio::test]
+    async fn on_cancel_resets_clock() {
+        let node = SyntheticLipSyncNode::with_default();
+        let _ = drive(&node, audio_chunk(vec![0.1; 1600], 16_000)).await;
+        let role = node.generator().expect("a generator");
+        role.cancellable()
+            .on_cancel(
+                &remotemedia_traits::rpc::CallContext::default(),
+                &remotemedia_traits::Cancellation::new(remotemedia_traits::CancelReason::BargeIn),
+            )
+            .await;
+        let outs = drive(&node, audio_chunk(vec![0.1; 1600], 16_000)).await;
+        let pts = BlendshapeFrame::from_json(outs[0].as_json().unwrap())
+            .unwrap()
+            .pts_ms;
+        assert_eq!(pts, 100);
     }
 
     /// Non-barge control messages return `Ok(false)` (unhandled) so

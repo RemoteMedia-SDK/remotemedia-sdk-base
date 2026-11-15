@@ -102,14 +102,7 @@ fn transforms_are_unaffected() {
 /// Built-in node types in a generative category that do not declare a
 /// generator role yet. Each is a migration in tasks.md section 3; this list
 /// may only shrink. A node that declares its role must leave it.
-const NOT_YET_MIGRATED: &[&str] = &[
-    // tasks 3.5.1: tick-driven avatar/motion renderers drop the cancelled
-    // turn's queued output on cancel.
-    "AvatarNode",
-    "IdleAnimationNode",
-    "Audio2FaceNode",
-    "MotionPlayerNode",
-];
+const NOT_YET_MIGRATED: &[&str] = &[];
 
 /// Node types in a generative category that were reviewed and are
 /// transforms, not generators.
@@ -118,6 +111,10 @@ const TRANSFORMS: &[&str] = &[
     "RenderReadyGateNode",
     // Observes avatar intents on the bus.
     "AvatarIntentTapNode",
+    // Map one affect input (V/A/D, hidden-state projections) to one
+    // blendshape frame, sub-millisecond, nothing queued or running.
+    "VadToFaceNode",
+    "ActivationFaceNode",
 ];
 
 /// The audit (tasks 2.8): every built-in node in a generative category

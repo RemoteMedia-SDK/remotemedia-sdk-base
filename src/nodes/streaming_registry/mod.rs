@@ -649,6 +649,10 @@ impl StreamingNodeFactory for SyntheticLipSyncNodeFactory {
                      Audio2Face bundle is unavailable.",
                 )
                 .category("avatar")
+                .generator(
+                    remotemedia_traits::GeneratedModality::Video,
+                    remotemedia_traits::CancelStrategy::OnCancel,
+                )
                 .accepts([RuntimeDataType::Audio])
                 .produces([RuntimeDataType::Json])
                 .capabilities(NodeCapabilitiesSchema {
@@ -787,6 +791,10 @@ impl StreamingNodeFactory for MotionPlayerNodeFactory {
             NodeSchema::new("MotionPlayerNode")
                 .description("Replays pre-baked skeletal poses from a JSONL file into the pipeline")
                 .category("avatar")
+                .generator(
+                    remotemedia_traits::GeneratedModality::Video,
+                    remotemedia_traits::CancelStrategy::DropStopsWork,
+                )
                 .accepts([])
                 .produces([RuntimeDataType::Json]),
         )
