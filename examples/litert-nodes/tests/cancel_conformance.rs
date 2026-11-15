@@ -60,3 +60,39 @@ async fn a_cancelled_gemma_reply_does_not_hold_up_the_next() {
         eprintln!("after a {:?} cancel, first text in {next:?}", cancellation.disposition);
     }
 }
+
+/// Kokoro: a cancelled utterance stops before its next slice, so the next
+/// one starts on time. Needs `REMOTEMEDIA_KOKORO_LITERTLM` (and
+/// `REMOTEMEDIA_LITERT_LIB` where the LiteRT library is not found by default).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_kokoro_utterance_does_not_hold_up_the_next() {
+    let Ok(model) = std::env::var("REMOTEMEDIA_KOKORO_LITERTLM") else {
+        eprintln!("skipped: set REMOTEMEDIA_KOKORO_LITERTLM");
+        return;
+    };
+    let mut params = json!({ "model_path": model, "accelerator": "cpu", "chunk_ms": 200 });
+    if let Ok(lib) = std::env::var("REMOTEMEDIA_LITERT_LIB") {
+        params["runtime_lib"] = lib.into();
+    }
+    let (config, chunk) = remotemedia_litert_nodes::tts_node::config_from_params(&params).unwrap();
+    let node = Arc::new(remotemedia_litert_nodes::tts_node::KokoroTtsNode::start(config, chunk).unwrap());
+    // Many sentences: synthesis spans many slices, so a run-to-the-end
+    // regression would hold up the next call by seconds.
+    let text = "The ocean covers most of the planet and holds most of its water. ".repeat(12);
+    let report = assert_generator_cancels(
+        node,
+        move || RuntimeData::Text(text.clone()),
+        ConformanceOptions {
+            first_output_timeout: Duration::from_secs(60),
+            next_call_slack: Duration::from_millis(1500),
+            counts: |data| matches!(data, RuntimeData::Audio { .. }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    eprintln!("baseline first audio: {:?}", report.baseline);
+    for (cancellation, next) in &report.cancelled {
+        eprintln!("after a {:?} cancel, first audio in {next:?}", cancellation.disposition);
+    }
+}
