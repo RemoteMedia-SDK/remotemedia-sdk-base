@@ -632,15 +632,21 @@ pub fn barge_in_disposition(
     }
 }
 
-/// A `barge_in` envelope that states what the cancel does with data. Barge
-/// producers say what they mean: a VAD interrupt keeps the user's audio
-/// (`Disposition::INTERRUPT`), a retraction discards it.
-pub fn barge_in_envelope(disposition: Option<remotemedia_traits::DispositionOverride>) -> RuntimeData {
-    let payload = match disposition {
+/// What to publish to a node's `barge_in` port (the bus wraps it in the aux
+/// envelope). Producers state only what they mean beyond a plain interrupt:
+/// with `None`, the node's own default applies (an LLM keeps its cut-off
+/// reply and the queued speech, a TTS node drops its queued text); a turn
+/// that is dropped discards pending input; a retraction aborts.
+pub fn barge_in_payload(disposition: Option<remotemedia_traits::DispositionOverride>) -> RuntimeData {
+    RuntimeData::Json(match disposition {
         Some(d) if !d.is_empty() => serde_json::json!({ "disposition": d }),
         _ => serde_json::json!({}),
-    };
-    wrap_aux_port(BARGE_IN_PORT, RuntimeData::Json(payload))
+    })
+}
+
+/// A whole `barge_in` envelope: [`barge_in_payload`] on the barge port.
+pub fn barge_in_envelope(disposition: Option<remotemedia_traits::DispositionOverride>) -> RuntimeData {
+    wrap_aux_port(BARGE_IN_PORT, barge_in_payload(disposition))
 }
 
 /// Runtime execution state for a single node, controlled via the bus.

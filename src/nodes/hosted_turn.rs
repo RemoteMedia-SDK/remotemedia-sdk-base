@@ -2157,6 +2157,20 @@ impl Actor {
     /// nothing more of it is sent, and everyone's queued audio of it is
     /// flushed. It settles as interrupted once the senders have reported.
     async fn cancel(&mut self, why: &str) {
+        // The turn is dropped: its queued speech downstream goes with it.
+        self.cancel_with(
+            why,
+            remotemedia_traits::DispositionOverride {
+                pending_input: Some(remotemedia_traits::Retention::Discard),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// [`Self::cancel`], telling the speech nodes downstream what the cancel
+    /// does with their data (openspec: add-generator-cancellation).
+    async fn cancel_with(&mut self, why: &str, disposition: remotemedia_traits::DispositionOverride) {
         let wait = Duration::from_millis(self.config().flush_wait_ms);
         let Some(turn) = self.current.as_mut() else { return };
         if turn.cancelled.is_some() {
@@ -2184,7 +2198,8 @@ impl Actor {
         // the `MemberFlushNode` there publishes it.)
         for node in self.downstream() {
             let address = ControlAddress::node_in(&node).with_port(BARGE_IN_PORT);
-            if let Err(error) = self.control.publish(&address, RuntimeData::Text("barge".into())).await {
+            let payload = crate::transport::session_control::barge_in_payload(Some(disposition));
+            if let Err(error) = self.control.publish(&address, payload).await {
                 tracing::debug!(%node, %error, "barge not delivered downstream");
             }
         }
@@ -2211,7 +2226,13 @@ impl Actor {
         });
         if in_flight {
             // Cancels the host's call, flushes the turn's audio, stops TTS.
-            self.cancel("its utterance was retracted").await;
+            // A retraction voids the turn: downstream discards both what it
+            // generated and what is queued.
+            self.cancel_with(
+                "its utterance was retracted",
+                remotemedia_traits::Disposition::ABORT.into(),
+            )
+            .await;
             let Some(turn) = self.current.take() else { return };
             self.ui_retracted(&turn.id, &turn.member, turn.ui_to.as_deref(), true).await;
             self.forget(&turn.transcript, "");

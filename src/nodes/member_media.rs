@@ -408,9 +408,17 @@ impl AsyncStreamingNode for MemberFlushNode {
         // The speech nodes stop first: the sender's report of the flush then
         // tells the turn node that both happened.
         if request.barge {
+            // The turn node dropped the turn: its queued speech goes with it
+            // (openspec: add-generator-cancellation).
+            let payload = crate::transport::session_control::barge_in_payload(Some(
+                remotemedia_traits::DispositionOverride {
+                    pending_input: Some(remotemedia_traits::Retention::Discard),
+                    ..Default::default()
+                },
+            ));
             for node in &self.config.speech_nodes {
                 let address = ControlAddress::node_in(node).with_port(BARGE_IN_PORT);
-                if let Err(error) = ctx.control.publish(&address, RuntimeData::Text("barge".into())).await {
+                if let Err(error) = ctx.control.publish(&address, payload.clone()).await {
                     tracing::debug!(node = %self.node_id, target = %node, %error, "barge not delivered");
                 }
             }
