@@ -55,6 +55,48 @@ pub struct PythonStreamingNode {
 }
 
 impl PythonStreamingNode {
+    /// Send this call's cancellation to the Python worker when the router
+    /// fires the call's token, before it drops the call's future (openspec:
+    /// add-generator-cancellation). The frame carries the explicit choices,
+    /// so a Python generator re-resolves them with its own default.
+    fn forward_cancel(
+        &self,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+        session: Option<String>,
+    ) -> Option<remotemedia_traits::CancelRegistration> {
+        #[cfg(feature = "multiprocess")]
+        {
+            let session = session.or_else(|| self.session_id.clone())?;
+            let node_id = self.node_id.clone();
+            let call = crate::nodes::NodeRuntimeContext::of(ctx).map(|c| c.call_cancel().clone());
+            let runtime = tokio::runtime::Handle::try_current().ok();
+            Some(ctx.cancel_token().on_cancel(move |cancellation| {
+                let request = match &call {
+                    Some(call) => call.forwarded(cancellation),
+                    None => remotemedia_traits::CancelRequest::exact(*cancellation),
+                };
+                let frame = RuntimeData::Text(cancel_call_frame(&request));
+                use crate::python::multiprocess::MultiprocessExecutor;
+                if let Err(error) =
+                    MultiprocessExecutor::try_send_out_of_band(&session, &node_id, frame.clone())
+                {
+                    tracing::debug!(%error, node_id, "cancel frame queued asynchronously");
+                    if let Some(runtime) = &runtime {
+                        runtime.spawn(async move {
+                            let _ = MultiprocessExecutor::send_out_of_band(&session, &node_id, frame)
+                                .await;
+                        });
+                    }
+                }
+            }))
+        }
+        #[cfg(not(feature = "multiprocess"))]
+        {
+            let _ = (ctx, session);
+            None
+        }
+    }
+
     /// Create a new Python streaming node
     pub fn new(node_id: String, node_type: &str, params: &Value) -> Result<Self, Error> {
         // Extract session_id from params if present (spec 002)
@@ -339,6 +381,22 @@ impl PythonStreamingNode {
     }
 }
 
+/// Reserved aux port of the cancel frame a Python worker receives for the
+/// call in flight (openspec: add-generator-cancellation).
+pub(crate) const CANCEL_CALL_PORT: &str = "__cancel_call__";
+
+/// Text JSON aux frame cancelling the call in flight in a Python worker:
+/// `{"__aux_port__":"__cancel_call__","payload":<CancelRequest>}`. The worker
+/// handles it out of band, fires the call's token with the request
+/// re-resolved by the node's own default, and runs the node's `cancel()`.
+pub(crate) fn cancel_call_frame(request: &remotemedia_traits::CancelRequest) -> String {
+    serde_json::json!({
+        "__aux_port__": CANCEL_CALL_PORT,
+        "payload": request,
+    })
+    .to_string()
+}
+
 /// Text JSON aux frame carrying one endpoint-call reply chunk to a Python
 /// node: `{"__aux_port__":"__call_reply__","payload":{"corr_id",
 /// "args":[<CallReplyEnvelope>],"kwargs":{}}}` (typed-RPC ff request shape).
@@ -548,6 +606,9 @@ impl AsyncStreamingNode for PythonStreamingNode {
     {
         let copies = Self::legacy_copies(ctx)?;
         let session = (!ctx.session_id().is_empty()).then(|| ctx.session_id().to_owned());
+        // The worker hears this call's cancel out of band (openspec:
+        // add-generator-cancellation); held for the call.
+        let _cancel = self.forward_cancel(ctx, session.clone());
         // A node that starts its worker on its first input still gets the
         // instance's emitter; the input's sender travels with the input.
         let host = crate::nodes::NodeRuntimeContext::of(ctx);
@@ -617,6 +678,49 @@ pub(crate) fn single_named_input(
         .into_values()
         .next()
         .ok_or_else(|| Error::Execution("No input data provided".into()))
+}
+
+#[cfg(test)]
+mod cancel_frame_tests {
+    use super::*;
+
+    /// The frame the Python worker parses (openspec: add-generator-cancellation).
+    #[test]
+    fn the_cancel_frame_carries_the_request_on_the_reserved_port() {
+        let request = remotemedia_traits::CancelRequest {
+            cancellation: remotemedia_traits::Cancellation::new(
+                remotemedia_traits::CancelReason::BargeIn,
+            ),
+            explicit: remotemedia_traits::DispositionOverride {
+                pending_input: Some(remotemedia_traits::Retention::Discard),
+                ..Default::default()
+            },
+            elapsed_ms: Some(120),
+        };
+        let frame: serde_json::Value =
+            serde_json::from_str(&cancel_call_frame(&request)).unwrap();
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "__aux_port__": "__cancel_call__",
+                "payload": {
+                    "cancellation": {
+                        "reason": "barge_in",
+                        "disposition": {"partial_output": "retain", "pending_input": "retain"},
+                    },
+                    "explicit": {"pending_input": "discard"},
+                    "elapsed_ms": 120,
+                },
+            })
+        );
+        assert_eq!(
+            crate::transport::session_control::aux_port_of(&RuntimeData::Text(
+                cancel_call_frame(&request)
+            ))
+            .as_deref(),
+            Some(CANCEL_CALL_PORT)
+        );
+    }
 }
 
 #[cfg(test)]

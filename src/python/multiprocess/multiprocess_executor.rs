@@ -1086,6 +1086,36 @@ impl MultiprocessExecutor {
             .map_err(|e| Error::Execution(format!("Failed to send to IPC thread: {e}")))
     }
 
+    /// [`Self::send_out_of_band`] without waiting, for a call's cancel
+    /// callback, which runs before the call's future is dropped (openspec:
+    /// add-generator-cancellation). Fails instead of waiting when the
+    /// session table is being written or the IPC queue is full; the caller
+    /// then sends asynchronously.
+    pub fn try_send_out_of_band(
+        session_id: &str,
+        node_id: &str,
+        data: crate::data::RuntimeData,
+    ) -> Result<()> {
+        let bytes = Self::to_ipc_runtime_data(&data, session_id)?;
+        let tx = {
+            let global_sessions = global_sessions();
+            let sessions = global_sessions
+                .try_read()
+                .map_err(|_| Error::Execution("session table busy".into()))?;
+            sessions
+                .get(session_id)
+                .and_then(|s| s.get(node_id))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Execution(format!(
+                        "IPC thread not found for node {node_id} in session {session_id}"
+                    ))
+                })?
+        };
+        tx.try_send(IpcCommand::SendDataNoAck { bytes })
+            .map_err(|e| Error::Execution(format!("IPC queue busy: {e}")))
+    }
+
     /// Send data to a node's IPC thread without waiting for response (fire-and-forget)
     /// This is used for routing data between nodes in the pipeline
     #[cfg(feature = "multiprocess")]
