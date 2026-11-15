@@ -52,6 +52,13 @@ pub struct PythonStreamingNode {
     emitter: std::sync::Mutex<Option<crate::nodes::Emitter>>,
     /// `@self_driven` of the Python class, learned at initialization.
     declared_self_driven: std::sync::OnceLock<bool>,
+    /// The Python class's generator role and default dispositions (its
+    /// `META:` handshake), learned at initialization (openspec:
+    /// add-generator-cancellation).
+    declared_generator: std::sync::OnceLock<(
+        remotemedia_traits::GeneratorDeclaration,
+        Option<remotemedia_traits::DefaultDispositions>,
+    )>,
 }
 
 impl PythonStreamingNode {
@@ -125,6 +132,7 @@ impl PythonStreamingNode {
             control: Mutex::new(None),
             emitter: std::sync::Mutex::new(None),
             declared_self_driven: std::sync::OnceLock::new(),
+            declared_generator: std::sync::OnceLock::new(),
         })
     }
 
@@ -153,6 +161,7 @@ impl PythonStreamingNode {
             control: Mutex::new(None),
             emitter: std::sync::Mutex::new(None),
             declared_self_driven: std::sync::OnceLock::new(),
+            declared_generator: std::sync::OnceLock::new(),
         })
     }
 
@@ -178,6 +187,7 @@ impl PythonStreamingNode {
             control: Mutex::new(None),
             emitter: std::sync::Mutex::new(None),
             declared_self_driven: std::sync::OnceLock::new(),
+            declared_generator: std::sync::OnceLock::new(),
         })
     }
 
@@ -274,6 +284,13 @@ impl PythonStreamingNode {
                 .and_then(|mp| mp.declared_self_driven())
             {
                 let _ = self.declared_self_driven.set(self_driven);
+            }
+            if let Some(generator) = py_executor
+                .as_any_mut()
+                .downcast_mut::<crate::python::multiprocess::MultiprocessExecutor>()
+                .map(|mp| mp.declared_generator())
+            {
+                let _ = self.declared_generator.set(generator);
             }
 
             *executor_guard = Some(py_executor);
@@ -429,6 +446,27 @@ impl AsyncStreamingNode for PythonStreamingNode {
     /// The Python class's `@self_driven`, once initialized.
     fn self_driven(&self) -> Option<bool> {
         self.declared_self_driven.get().copied()
+    }
+
+    /// The Python class's generator role, once initialized.
+    fn generator_declaration(&self) -> remotemedia_traits::GeneratorDeclaration {
+        self.declared_generator
+            .get()
+            .map(|(generator, _)| *generator)
+            .unwrap_or_default()
+    }
+
+    /// The Python class's declared default, once initialized; the reason's
+    /// default before.
+    fn default_disposition(
+        &self,
+        cancel: &remotemedia_traits::CancelContext,
+    ) -> remotemedia_traits::Disposition {
+        self.declared_generator
+            .get()
+            .and_then(|(_, defaults)| defaults.as_ref())
+            .and_then(|defaults| defaults.get(&cancel.reason).copied())
+            .unwrap_or_else(|| cancel.reason.default_disposition())
     }
 
     fn rpc_methods(&self) -> Vec<remotemedia_traits::rpc::RpcMethod> {
