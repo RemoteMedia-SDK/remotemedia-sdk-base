@@ -203,9 +203,9 @@ pub fn config_from_params(params: &Value) -> Result<AssistantConfig, String> {
 
 struct Job {
     prompt: String,
-    /// The prompt for a conversation started over since the last reply (room
-    /// agent): it carries the recent lines that conversation never saw.
-    fresh_prompt: Option<String>,
+    /// The prompt for a conversation started over since the last reply: it
+    /// carries the recent lines that conversation never saw.
+    fresh_prompt: String,
     pieces: futures_channel::mpsc::UnboundedSender<Piece>,
 }
 
@@ -366,10 +366,7 @@ fn model_thread(config: AssistantConfig, jobs: mpsc::Receiver<Job>, ready: mpsc:
         let Some(current) = conversation.as_mut() else {
             continue;
         };
-        let prompt = match &job.fresh_prompt {
-            Some(prompt) if fresh => prompt,
-            _ => &job.prompt,
-        };
+        let prompt = if fresh { &job.fresh_prompt } else { &job.prompt };
         let rx = match current.send(prompt, config.max_reply_tokens) {
             Ok(rx) => rx,
             Err(e) => {
@@ -378,8 +375,10 @@ fn model_thread(config: AssistantConfig, jobs: mpsc::Receiver<Job>, ready: mpsc:
             }
         };
         fresh = false;
-        // Forward until the reply ends, then take the next job. A room agent
-        // drops its end of `pieces` when the room stops the reply.
+        // Forward until the reply ends, then take the next job. The other
+        // end of `pieces` is gone when nobody wants the rest: the room
+        // stopped the reply, or the runtime dropped the call (a barge, a
+        // cancelled or closed session).
         let mut stopped = false;
         for piece in rx {
             let end = matches!(piece, Piece::Done | Piece::Error(_));
@@ -387,7 +386,7 @@ fn model_thread(config: AssistantConfig, jobs: mpsc::Receiver<Job>, ready: mpsc:
             if end {
                 break;
             }
-            if sent.is_err() && config.publish_room {
+            if sent.is_err() {
                 stopped = true;
                 break;
             }
@@ -586,7 +585,7 @@ impl GemmaAssistantNode {
         let (prompt, fresh_prompt, reply) = {
             let mut room = self.room.lock().unwrap();
             room.replies += 1;
-            let fresh_prompt = as_agent.then(|| reply_prompt(&room.recent, speaker, said));
+            let fresh_prompt = reply_prompt(&room.recent, speaker, said);
             let lines: Vec<String> = room.pending.drain(..).collect();
             (
                 reply_prompt(&lines, speaker, said),
