@@ -20,8 +20,10 @@
 //! |---|---|---|
 //! | default | in | Text (a transcript), a browser frame `{ "v": 1, "type": "text" \| "interrupt" }`, or the retraction of the member's last utterance |
 //! | `vad` | in | The VAD node's speech start / stop events |
+//! | `media` | in | Member media events relayed by a `MemberMediaRelayNode` |
 //! | default | out | Reply text chunks, tagged with the turn id, chunk index and audience |
 //! | `ui` | out | Frames of the D6 wire contract |
+//! | `flush` | out | Flushes for a `MemberFlushNode`, while the members' media is in another process |
 //!
 //! The session router does not tell a node which connection an input came
 //! from, so the two inputs are told apart by shape: a JSON object with
@@ -30,6 +32,27 @@
 //! published to `<node>.in.vad`. A `ui` output is an `__aux_port__: "ui"`
 //! envelope; the router delivers its payload to the connections that read
 //! `from_port: "ui"` and to no other (see `Successor::port`).
+//!
+//! A member's browser frames reach the node's default input whichever
+//! process the node runs in, so two frames of the realtime hook
+//! (`{ "v": 1, "rt": <event> }`) are read here too: `response-cancel` has the
+//! effect of the typed RPC `interrupt` for that member, and the
+//! `instructions` of a `session-update` are that member's client
+//! instructions when its admission allows them. `RealtimeEventsNode` makes
+//! the same two calls over the session control; both arriving is the same as
+//! one.
+//!
+//! # Members' media in another process
+//!
+//! What the members heard (`audio_released`), whether they can hear
+//! (`media_ready`, `media_lost`), the flush of their queued audio and the
+//! `barge_in` to the speech nodes belong to the session control of the
+//! process that holds their connections. The node uses its own session
+//! control while that has any member media. While it has none and a
+//! `MemberMediaRelayNode` sends the events over a connection, the node uses
+//! those (the same handling, the same settlement), and each flush is also
+//! emitted on the `flush` output for a `MemberFlushNode`, which carries it
+//! out where the members are. See `member_media`.
 //!
 //! # Retracted utterances
 //!
@@ -100,6 +123,11 @@ pub const HOSTED_TURN_NODE: &str = "HostedTurnNode";
 pub const UI_PORT: &str = "ui";
 /// The node's VAD input port.
 pub const VAD_PORT: &str = "vad";
+/// The node's input port for relayed member media events.
+pub const MEDIA_PORT: &str = "media";
+/// The node's third output port: flushes for the process that holds the
+/// members' connections.
+pub const FLUSH_PORT: &str = "flush";
 /// `participant.*` prefix of a member's admission metadata.
 const METADATA_PREFIX: &str = "participant.metadata.";
 /// Sentinel some chat nodes append to a reply; never spoken.
@@ -491,6 +519,8 @@ enum Cmd {
         heard: Option<Value>,
         reply: oneshot::Sender<Value>,
     },
+    /// A member media event a `MemberMediaRelayNode` sent over a connection.
+    RelayedMedia(MediaEvent),
 }
 
 fn vad_flag(value: &Value, key: &str) -> Option<bool> {
@@ -520,6 +550,9 @@ fn frame_cmd(value: &Value, member: &Member) -> Option<Option<Cmd>> {
     if value.get("v").and_then(Value::as_u64) != Some(1) {
         return None;
     }
+    if let Some(event) = crate::nodes::realtime_events::rt_frame_event(value) {
+        return Some(rt_cmd(event, member));
+    }
     match value.get("type").and_then(Value::as_str)? {
         "text" => {
             let text = value.get("text").and_then(Value::as_str).unwrap_or_default().trim();
@@ -544,6 +577,48 @@ fn frame_cmd(value: &Value, member: &Member) -> Option<Option<Cmd>> {
     }
 }
 
+/// The command a realtime event of a member's browser (the `rt` of a frame
+/// `{ "v": 1, "rt": <event> }`, design D10) stands for at the turn node.
+/// `RealtimeEventsNode` reads the same frames and makes the same two calls
+/// by typed RPC (`interrupt`, `set_client_instructions`) where the session
+/// control reaches this node; here they arrive with the frame itself, on any
+/// runner. Both arriving has the effect of one.
+fn rt_cmd(event: &Value, member: &Member) -> Option<Cmd> {
+    if member.id.is_empty() {
+        // Only a member's own data channel speaks for it.
+        return None;
+    }
+    match event.get("type").and_then(Value::as_str)? {
+        // The member stops hearing the turn, protected or not: the typed
+        // RPC `interrupt { member }`.
+        "response-cancel" => Some(Cmd::Interrupt {
+            member: Some(member.id.clone()),
+            force: true,
+            reply: None,
+        }),
+        // The session-configuration policy: instructions count only when the
+        // member's admission lets its browser set them. Empty or not a
+        // string: the member's instructions are forgotten.
+        "session-update" => {
+            let instructions = event.get("config")?.as_object()?.get("instructions")?;
+            member.may_set_instructions().then(|| Cmd::ClientInstructions {
+                member: member.id.clone(),
+                instructions: instructions
+                    .as_str()
+                    .filter(|text| !text.trim().is_empty())
+                    .map(str::to_string),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The relayed media event of a frame, when it is one.
+fn relayed_cmd(value: &Value, member: &Member) -> Option<Option<Cmd>> {
+    use crate::nodes::member_media::{is_relay_frame, relayed_event};
+    is_relay_frame(value).then(|| relayed_event(value, member.origin.as_deref()).map(Cmd::RelayedMedia))
+}
+
 /// What an input on the node's stream inputs stands for.
 fn classify(data: &RuntimeData, member: &Member) -> Option<Cmd> {
     match data {
@@ -556,8 +631,12 @@ fn classify(data: &RuntimeData, member: &Member) -> Option<Cmd> {
                         .map(|_| Cmd::SpeechStart {
                             member: member.clone(),
                         }),
+                    MEDIA_PORT => relayed_cmd(payload, member).flatten(),
                     _ => None,
                 };
+            }
+            if let Some(cmd) = relayed_cmd(value, member) {
+                return cmd;
             }
             if let Some(cmd) = frame_cmd(value, member) {
                 return cmd;
@@ -573,6 +652,9 @@ fn classify(data: &RuntimeData, member: &Member) -> Option<Cmd> {
             }
             if body.starts_with('{') {
                 if let Ok(value) = serde_json::from_str::<Value>(body) {
+                    if let Some(cmd) = relayed_cmd(&value, member) {
+                        return cmd;
+                    }
                     if let Some(cmd) = frame_cmd(&value, member) {
                         return cmd;
                     }
@@ -1207,6 +1289,12 @@ struct Actor {
     settled: HashMap<String, Settled>,
     /// Turns of earlier instances closed by the host's `settle_turn`.
     settled_elsewhere: VecDeque<String>,
+    /// This process's session control has had member media: its events are
+    /// the ones the node uses, and relayed ones are ignored from then on.
+    local_media: bool,
+    /// Members a `MemberMediaRelayNode` said are media-ready, while the
+    /// node's own session control has no member media.
+    remote_ready: HashSet<String>,
 }
 
 impl Actor {
@@ -1230,6 +1318,8 @@ impl Actor {
             client_instructions: HashMap::new(),
             settled: HashMap::new(),
             settled_elsewhere: VecDeque::new(),
+            local_media: false,
+            remote_ready: HashSet::new(),
         }
     }
 
@@ -1242,6 +1332,7 @@ impl Actor {
         let mut joins = Some(self.control.subscribe_members());
         // Members that became ready before the node ran.
         for member in self.control.media_ready_members() {
+            self.local_media();
             self.media_ready(&member);
         }
         loop {
@@ -1263,7 +1354,13 @@ impl Actor {
             };
             match event {
                 Event::Cmd(cmd) => self.on_cmd(cmd).await,
-                Event::Media(data) => self.on_media(&data),
+                Event::Media(data) => {
+                    if let Some(event) = MediaEvent::from_runtime(&data) {
+                        self.local_media = true;
+                        self.remote_ready.clear();
+                        self.on_media(event);
+                    }
+                }
                 Event::Member(data) => self.on_member(&data).await,
                 Event::Reply(item) => self.on_reply(item).await,
                 Event::Tick => self.on_tick().await,
@@ -1433,9 +1530,57 @@ impl Actor {
         }
     }
 
+    /// Whether this process's session control has (or had) member media.
+    /// From the first time it does, relayed media events are not used.
+    fn local_media(&mut self) -> bool {
+        if !self.local_media && !self.control.media_ready_members().is_empty() {
+            self.local_media = true;
+            self.remote_ready.clear();
+        }
+        self.local_media
+    }
+
+    /// The members' media is in another process: a relay told this node of
+    /// it, and its own session control has none.
+    fn media_is_remote(&self) -> bool {
+        !self.local_media && !self.remote_ready.is_empty() && self.control.media_ready_members().is_empty()
+    }
+
+    /// Whether the member can hear output now, by this process's session
+    /// control or by the relay.
+    fn is_media_ready(&self, member: &str) -> bool {
+        self.control.is_media_ready(member) || self.remote_ready.contains(member)
+    }
+
     /// Whether the member's transport says what it released.
     fn reports(&self, member: &str) -> bool {
-        self.reporters.contains(member) || self.control.is_media_ready(member)
+        self.reporters.contains(member) || self.is_media_ready(member)
+    }
+
+    /// Whether a connection reads the node's `flush` output.
+    fn flush_is_read(&self) -> bool {
+        self.control.descriptor().is_some_and(|descriptor| {
+            descriptor.edges.iter().any(|edge| {
+                edge.from == self.shared.node_id && edge.from_port.as_deref() == Some(FLUSH_PORT)
+            })
+        })
+    }
+
+    /// Drop the queued audio of a turn for some members (see
+    /// `SessionControl::request_flush_audio_for`). `barge`: the turn is
+    /// cancelled, so the speech nodes stop too. While the members' media is
+    /// in another process, the request also goes out on the `flush` output,
+    /// to the `MemberFlushNode` that runs there.
+    async fn flush_audio(&self, target: FlushTarget, barge: bool) {
+        if self.media_is_remote() && self.flush_is_read() {
+            let request = crate::nodes::member_media::FlushRequest::new(&target, barge);
+            let frame = RuntimeData::Json(json!({
+                crate::transport::session_control::AUX_PORT_ENVELOPE_KEY: FLUSH_PORT,
+                "payload": serde_json::to_value(&request).unwrap_or_default(),
+            }));
+            self.emit(frame, None).await;
+        }
+        self.control.request_flush_audio_for(target);
     }
 
     /// The members of a turn's audience, by id.
@@ -1544,6 +1689,23 @@ impl Actor {
                 let outcome = self.settle_elsewhere(turn_id, spoken, member, to, open, heard).await;
                 let _ = reply.send(outcome);
             }
+            Cmd::RelayedMedia(event) => {
+                // With member media in this process the node already has
+                // the event from its own session control.
+                if self.local_media() {
+                    return;
+                }
+                match &event {
+                    MediaEvent::MediaReady { member, .. } => {
+                        self.remote_ready.insert(member.clone());
+                    }
+                    MediaEvent::MediaLost { member, .. } => {
+                        self.remote_ready.remove(member);
+                    }
+                    MediaEvent::AudioReleased(_) => {}
+                }
+                self.on_media(event);
+            }
         }
     }
 
@@ -1618,9 +1780,9 @@ impl Actor {
 
     fn can_hear(&self, to: &[String]) -> bool {
         if to.is_empty() {
-            !self.control.media_ready_members().is_empty()
+            !self.control.media_ready_members().is_empty() || !self.remote_ready.is_empty()
         } else {
-            to.iter().all(|member| self.control.is_media_ready(member))
+            to.iter().all(|member| self.is_media_ready(member))
         }
     }
 
@@ -1663,10 +1825,11 @@ impl Actor {
         }
     }
 
-    fn on_media(&mut self, data: &RuntimeData) {
-        match MediaEvent::from_runtime(data) {
-            Some(MediaEvent::MediaReady { member, .. }) => self.media_ready(&member),
-            Some(MediaEvent::MediaLost { member, .. }) => {
+    /// A member media event, from this process's session control or relayed.
+    fn on_media(&mut self, event: MediaEvent) {
+        match event {
+            MediaEvent::MediaReady { member, .. } => self.media_ready(&member),
+            MediaEvent::MediaLost { member, .. } => {
                 self.ready_told.remove(&member);
                 if let Some(turn) = self.current.as_mut() {
                     if let Some(listener) = turn.listeners.get_mut(&member) {
@@ -1674,8 +1837,7 @@ impl Actor {
                     }
                 }
             }
-            Some(MediaEvent::AudioReleased(report)) => self.released(report),
-            None => {}
+            MediaEvent::AudioReleased(report) => self.released(report),
         }
     }
 
@@ -1979,11 +2141,12 @@ impl Actor {
             deadline: Instant::now() + if reports { wait } else { Duration::ZERO },
             notified: false,
         });
-        self.control.request_flush_audio_for(FlushTarget {
+        let target = FlushTarget {
             members: vec![member.to_string()],
             turn_id: turn.id.clone(),
             drop_rest: true,
-        });
+        };
+        self.flush_audio(target, false).await;
         let turn = self.current.as_ref().expect("current turn");
         if self.listening(turn).is_empty() {
             self.cancel("its last listener stopped hearing it").await;
@@ -2010,12 +2173,15 @@ impl Actor {
             Audience::All => Vec::new(),
         };
         let turn_id = turn.id.clone();
-        self.control.request_flush_audio_for(FlushTarget {
+        let target = FlushTarget {
             members,
             turn_id,
             drop_rest: true,
-        });
-        // TTS stops what it is synthesizing for the turn.
+        };
+        self.flush_audio(target, true).await;
+        // TTS stops what it is synthesizing for the turn. (With the members'
+        // media in another process this reaches no speech node from here:
+        // the `MemberFlushNode` there publishes it.)
         for node in self.downstream() {
             let address = ControlAddress::node_in(&node).with_port(BARGE_IN_PORT);
             if let Err(error) = self.control.publish(&address, RuntimeData::Text("barge".into())).await {
@@ -2429,16 +2595,26 @@ impl Actor {
         self.ui(json!({ "type": "text-delta", "id": format!("{id}:text"), "delta": utterance.text }))
             .await;
 
-        for node in self.downstream() {
-            let request = SpeechRequest {
-                node: node.clone(),
-                text: utterance.text.clone(),
-                to: utterance.to.clone(),
-                turn_id: Some(id.clone()),
-                wait_for_media: true,
-            };
-            if let Err(error) = self.control.speak(request).await {
-                tracing::warn!(%node, %error, "speech not sent to TTS");
+        if self.media_is_remote() {
+            // The speech nodes and the members are in another process, and
+            // this one's session control would wait for a `media_ready` it
+            // never gets. The listeners are ready (`can_hear`): the text
+            // goes down the speech connection like a reply's, with the tag
+            // and the address `SessionControl::speak` gives it.
+            let origin = out_origin(&Member::default(), Some(&utterance.to), Some((&id, 0)));
+            self.emit(RuntimeData::Text(utterance.text.clone()), origin).await;
+        } else {
+            for node in self.downstream() {
+                let request = SpeechRequest {
+                    node: node.clone(),
+                    text: utterance.text.clone(),
+                    to: utterance.to.clone(),
+                    turn_id: Some(id.clone()),
+                    wait_for_media: true,
+                };
+                if let Err(error) = self.control.speak(request).await {
+                    tracing::warn!(%node, %error, "speech not sent to TTS");
+                }
             }
         }
         if let Some(turn) = self.current.as_mut() {
@@ -2606,11 +2782,17 @@ impl StreamingNodeFactory for HostedTurnNodeFactory {
     }
 
     fn input_port_kinds(&self) -> HashMap<String, PortKind> {
-        HashMap::from([(VAD_PORT.to_string(), PortKind::Stream)])
+        HashMap::from([
+            (VAD_PORT.to_string(), PortKind::Stream),
+            (MEDIA_PORT.to_string(), PortKind::Stream),
+        ])
     }
 
     fn output_port_kinds(&self) -> HashMap<String, PortKind> {
-        HashMap::from([(UI_PORT.to_string(), PortKind::Stream)])
+        HashMap::from([
+            (UI_PORT.to_string(), PortKind::Stream),
+            (FLUSH_PORT.to_string(), PortKind::Stream),
+        ])
     }
 
     fn schema(&self) -> Option<NodeSchema> {
@@ -2621,7 +2803,10 @@ impl StreamingNodeFactory for HostedTurnNodeFactory {
                      forwards the reply's text as it arrives. Keeps the conversation unless \
                      the host does, applies the barge-in policy, and emits UI message frames \
                      on its `ui` output. Inputs: a transcript or typed text (default port), \
-                     VAD events (`vad` port).",
+                     VAD events (`vad` port), member media events relayed by a \
+                     `MemberMediaRelayNode` (`media` port). While the members' media is in \
+                     another process, its flushes also go out on `flush`, for a \
+                     `MemberFlushNode`.",
                 )
                 .category("conversation")
                 .accepts([RuntimeDataType::Text, RuntimeDataType::Json])

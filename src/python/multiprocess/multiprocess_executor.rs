@@ -766,6 +766,12 @@ pub struct MultiprocessExecutor {
     /// Optional control bus handle for forwarding progress events from
     /// Python nodes during initialization. Set via `set_control()`.
     control: Arc<std::sync::Mutex<Option<Arc<crate::transport::session_control::SessionControl>>>>,
+
+    /// Shared by every clone: when the last one is dropped, the sessions this
+    /// executor still has give up their IPC threads and iceoryx2 services.
+    /// A streaming session closes by dropping its nodes, without `cleanup()`.
+    #[cfg(feature = "multiprocess")]
+    _ipc_release: Arc<ipc_release::ReleaseOnDrop>,
 }
 
 impl MultiprocessExecutor {
@@ -1230,12 +1236,18 @@ impl MultiprocessExecutor {
             None
         };
 
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
         let executor = Self {
             process_manager: Arc::new(ProcessManager::new(config.clone())),
+            #[cfg(feature = "multiprocess")]
+            _ipc_release: Arc::new(ipc_release::ReleaseOnDrop {
+                sessions: sessions.clone(),
+                registry: channel_registry.clone(),
+            }),
             channel_registry,
             #[cfg(feature = "multiprocess")]
             health_monitor: health_monitor.clone(),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions,
             config,
             current_context: None,
             declared_instance_scope: None,
@@ -2082,19 +2094,29 @@ sys.stdout.flush()
 
         if let Some(mut session) = sessions_guard.remove(session_id) {
             session.status = SessionStatus::Terminating;
+            let ipc = ipc_release::SessionIpc::take(&mut session);
 
             // Terminate all processes in the session; detach from shared workers
+            let mut failure = None;
             for (node_id, process) in session.node_processes.drain() {
                 if let Some(lease) = session.shared_lanes.remove(&node_id) {
                     lease.detach().await;
                     continue;
                 }
-                process_manager
+                if let Err(error) = process_manager
                     .terminate_process(process, std::time::Duration::from_secs(5))
-                    .await?;
+                    .await
+                {
+                    failure.get_or_insert(error);
+                }
             }
 
-            // Channels will be cleaned up when processes exit
+            // The session's IPC threads and services go whether or not every
+            // process could be terminated.
+            ipc.release_in_background(ChannelRegistry::global());
+            if let Some(error) = failure {
+                return Err(error);
+            }
         }
 
         Ok(())
@@ -2877,33 +2899,10 @@ sys.stdout.flush()
         if let Some(mut session) = sessions.remove(session_id) {
             session.status = SessionStatus::Terminating;
 
-            // Shutdown IPC threads first
+            // The IPC threads and channels; released below, once the
+            // processes have been asked to stop and have exited.
             #[cfg(feature = "multiprocess")]
-            {
-                for (node_id, mut ipc_thread) in session.ipc_threads.drain() {
-                    tracing::debug!("Shutting down IPC thread for node: {}", node_id);
-
-                    // Send shutdown command
-                    let _ = ipc_thread.command_tx.send(IpcCommand::Shutdown).await;
-
-                    // Wait for thread to exit (with timeout)
-                    if let Some(handle) = ipc_thread.thread_handle.take() {
-                        std::thread::spawn(move || {
-                            let _ = handle.join();
-                        });
-                    }
-                }
-
-                // Remove session from global sessions storage
-                let global_sessions = global_sessions();
-                let mut global_sessions_guard = global_sessions.write().await;
-                global_sessions_guard.remove(session_id);
-                tracing::debug!(
-                    "Removed session {} from global sessions storage",
-                    session_id
-                );
-                drop(global_sessions_guard);
-            }
+            let ipc = ipc_release::SessionIpc::take(&mut session);
 
             // Cleanup Docker containers before terminating processes
             #[cfg(feature = "docker")]
@@ -2952,37 +2951,32 @@ sys.stdout.flush()
             // Then terminate processes
             #[cfg(feature = "multiprocess")]
             {
+                let mut failure = None;
                 for (node_id, process) in session.node_processes.drain() {
                     // A shared worker keeps running for its other sessions.
                     if let Some(lease) = session.shared_lanes.remove(&node_id) {
                         lease.detach().await;
                         continue;
                     }
-                    self.process_manager
+                    if let Err(error) = self
+                        .process_manager
                         .terminate_process(process, std::time::Duration::from_secs(5))
-                        .await?;
+                        .await
+                    {
+                        failure.get_or_insert(error);
+                    }
                 }
 
-                // CRITICAL: Drain and cleanup channels to prevent stale messages
-                // This ensures no old inputs persist in iceoryx2 shared memory
-                for (channel_name, channel) in session.channels.drain() {
-                    // Drain any pending messages first
-                    if let Err(e) = self.channel_registry.drain_channel(&channel_name).await {
-                        tracing::warn!(
-                            "Failed to drain channel {} during session cleanup: {}",
-                            channel_name,
-                            e
-                        );
-                    }
-
-                    // Then destroy the channel (removes service and cleans up shared memory)
-                    if let Err(e) = self.channel_registry.destroy_channel(channel).await {
-                        tracing::warn!(
-                            "Failed to destroy channel {} during session cleanup: {}",
-                            channel_name,
-                            e
-                        );
-                    }
+                // Stop the IPC threads and remove the session's iceoryx2
+                // services (see `ipc_release`), whether or not every process
+                // could be terminated. Nothing of the session is left for a
+                // later one to read.
+                let registry = self.channel_registry.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || ipc.release(&registry)).await {
+                    tracing::error!("Releasing the IPC channels of session {session_id} failed: {error}");
+                }
+                if let Some(error) = failure {
+                    return Err(error);
                 }
             }
 
@@ -2992,6 +2986,33 @@ sys.stdout.flush()
                 "Session {} not found",
                 session_id
             )))
+        }
+    }
+
+    /// Create a channel and record it in its session, which releases it when
+    /// the session ends.
+    #[cfg(feature = "multiprocess")]
+    async fn create_session_channel(
+        &self,
+        session_id: &str,
+        name: &str,
+        capacity: usize,
+        backpressure: bool,
+    ) -> Result<ChannelHandle> {
+        let channel = self
+            .channel_registry
+            .create_channel(name, capacity, backpressure)
+            .await?;
+        match self.sessions.write().await.get_mut(session_id) {
+            Some(session) => {
+                session.channels.insert(name.to_string(), channel.clone());
+                Ok(channel)
+            }
+            None => {
+                // The session ended meanwhile: nothing would release this.
+                let _ = self.channel_registry.destroy_channel(channel).await;
+                Err(Error::Execution(format!("Session {session_id} not found")))
+            }
         }
     }
 
@@ -3161,9 +3182,12 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             let output_channel_name = format!("{}_{}_output", session_id, ctx.node_id);
             let control_channel_name = format!("control/{}_{}", session_id, ctx.node_id);
 
+            // Each channel is recorded in the session as soon as it exists,
+            // so that the session's end releases it even when a later step
+            // of this initialization fails.
             let input_channel = self
-                .channel_registry
-                .create_channel(
+                .create_session_channel(
+                    &session_id,
                     &input_channel_name,
                     self.config.channel_capacity,
                     self.config.enable_backpressure,
@@ -3171,8 +3195,8 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 .await?;
 
             let output_channel = self
-                .channel_registry
-                .create_channel(
+                .create_session_channel(
+                    &session_id,
                     &output_channel_name,
                     self.config.channel_capacity,
                     self.config.enable_backpressure,
@@ -3181,13 +3205,13 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
 
             // Create control channel BEFORE spawning process to avoid race condition
             // Python will open this channel to send READY signal
-            self.channel_registry
-                .create_channel(
-                    &control_channel_name,
-                    10,    // Small capacity for control messages
-                    false, // No backpressure for control
-                )
-                .await?;
+            self.create_session_channel(
+                &session_id,
+                &control_channel_name,
+                10,    // Small capacity for control messages
+                false, // No backpressure for control
+            )
+            .await?;
 
             // Wake events, so neither side polls: the host signals the input
             // event after publishing an input, and the node signals the output
@@ -4149,6 +4173,10 @@ except Exception as e:
     }
 }
 
+#[cfg(feature = "multiprocess")]
+#[path = "ipc_release.rs"]
+mod ipc_release;
+
 #[cfg(all(test, feature = "multiprocess"))]
 #[path = "legacy_ipc_tests.rs"]
 mod legacy_ipc_tests;
@@ -4156,3 +4184,7 @@ mod legacy_ipc_tests;
 #[cfg(all(test, feature = "multiprocess"))]
 #[path = "shared_workers_tests.rs"]
 mod shared_workers_tests;
+
+#[cfg(all(test, feature = "multiprocess"))]
+#[path = "ipc_release_tests.rs"]
+mod ipc_release_tests;

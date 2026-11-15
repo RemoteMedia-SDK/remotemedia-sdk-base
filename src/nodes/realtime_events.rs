@@ -659,11 +659,12 @@ impl Core {
         let first = turn.responses[response - 1].min(end);
         listen.settled |= settled;
         if end > first && listen.released.unwrap_or(0) < end {
-            // Text of this response is still being spoken to the member. A
-            // turn node on the member's runner settles once the audio was
-            // released, and the last report is on its way here; one on
-            // another runner sees no reports and settles at once, while this
-            // node, which is with the member, follows them.
+            // Text of this response is still being spoken to the member. The
+            // turn node settles once the audio was released (on another
+            // runner it has the reports from a `MemberMediaRelayNode`), and
+            // the last report is on its way here; a turn node that gets no
+            // reports settles at once, while this node, which is with the
+            // member, follows them.
             listen.pending_end = true;
             if settled {
                 listen.watched_ms = Some(listen.released_ms);

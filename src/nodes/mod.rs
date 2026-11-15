@@ -191,6 +191,9 @@ pub use conversation_flow::{
 pub mod hosted_turn;
 pub use hosted_turn::{HostedTurnConfig, HostedTurnNode, HostedTurnNodeFactory};
 pub mod realtime_events;
+/// A turn node's link to the members' media when it runs in another process than their connections.
+pub mod member_media;
+pub use member_media::{MemberFlushNode, MemberFlushNodeFactory, MemberMediaRelayNode, MemberMediaRelayNodeFactory};
 /// Passes on only the listed kinds of data; heads the audio and text paths of a voice pipeline.
 pub mod media_kind_filter;
 /// Test stand-in for a TTS node (a tone per text chunk); not speech synthesis.
