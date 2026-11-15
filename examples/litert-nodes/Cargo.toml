@@ -50,6 +50,10 @@ memmap2 = "0.9"
 regex = "1"
 matrixmultiply = { version = "0.3", features = ["threading"] }
 
+[dev-dependencies]
+# Runs the plugin SDK's generator conformance check on real models.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
 [build-dependencies]
 cc = "1"
 cmake = "0.1"
