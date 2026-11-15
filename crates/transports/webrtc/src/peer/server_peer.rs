@@ -82,6 +82,10 @@ struct PerTrackDispatcher {
     track_registry: Arc<TrackRegistry<AudioTrack, VideoTrack>>,
     data_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
     peer_id: String,
+    /// The peer was admitted for the AI SDK realtime hook over WebRTC
+    /// (`rm.realtime` with `transport: "webrtc"`): its data channel carries
+    /// the hook's `{ v: 1, rt }` frames and no D6 UI frames (design D13).
+    realtime_hook: bool,
     /// Total video frames dropped across all streams for this peer due to a
     /// full per-stream shard. Incremented on `try_send` Full; sampled by the
     /// rate-limited drop log so we don't spam when the encoder is steadily
@@ -110,9 +114,11 @@ impl PerTrackDispatcher {
         data_channel: Arc<RwLock<Option<Arc<RTCDataChannel>>>>,
         peer_id: String,
         copies: remotemedia_types::CopyContext,
+        realtime_hook: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             copies,
+            realtime_hook,
             audio_txs: TokioMutex::new(HashMap::new()),
             video_txs: TokioMutex::new(HashMap::new()),
             track_registry,
@@ -227,6 +233,11 @@ impl PerTrackDispatcher {
                 if let Err(e) = Self::send_data_channel(&self.data_channel, &transport_data, &self.copies).await {
                     error!("data channel send failed (peer {}): {}", self.peer_id, e);
                 }
+            }
+            RuntimeData::Json(value)
+                if self.realtime_hook && remotemedia_core::nodes::realtime_events::is_ui_frame(value) =>
+            {
+                trace!("UI frame not sent to realtime-hook peer {}", self.peer_id);
             }
             RuntimeData::Json(_) | RuntimeData::Text(_) => {
                 if let Err(e) =
@@ -435,6 +446,9 @@ pub struct SharedPipelineSession {
     /// Members attached by another transport of this listener (the realtime
     /// socket): they keep the session open like a peer does.
     external_members: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Peers admitted for the AI SDK realtime hook over WebRTC, named before
+    /// they attach ([`Self::set_realtime_hook_peer`]).
+    realtime_hook_peers: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Every audio flush asked of the session, for those members' transport:
     /// `None` is the session-wide flush, `Some` a targeted one.
     flushes: broadcast::Sender<Option<FlushTarget>>,
@@ -457,6 +471,7 @@ impl SharedPipelineSession {
             output_targets: Arc::new(RwLock::new(HashMap::new())),
             close_when_empty,
             external_members: std::sync::Mutex::new(std::collections::HashSet::new()),
+            realtime_hook_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             flushes: broadcast::channel(32).0,
         });
 
@@ -584,6 +599,18 @@ impl SharedPipelineSession {
         }
     }
 
+    /// Say, before [`Self::attach_peer`], whether `peer_id` was admitted for
+    /// the AI SDK realtime hook over WebRTC. Such a peer's data channel
+    /// carries no D6 UI frames (design D13).
+    pub fn set_realtime_hook_peer(&self, peer_id: &str, realtime_hook: bool) {
+        let mut peers = self.realtime_hook_peers.lock().expect("realtime hook peers lock");
+        if realtime_hook {
+            peers.insert(peer_id.to_string());
+        } else {
+            peers.remove(peer_id);
+        }
+    }
+
     pub async fn attach_peer(
         &self,
         peer_id: String,
@@ -592,7 +619,13 @@ impl SharedPipelineSession {
         #[cfg(feature = "ws-signaling")] event_tx: Option<mpsc::Sender<WebRtcEventBridge>>,
     ) {
         let copies = self.core.transport_copy_context().await;
-        let dispatcher = PerTrackDispatcher::new(track_registry, data_channel, peer_id.clone(), copies);
+        let realtime_hook = self
+            .realtime_hook_peers
+            .lock()
+            .expect("realtime hook peers lock")
+            .contains(&peer_id);
+        let dispatcher =
+            PerTrackDispatcher::new(track_registry, data_channel, peer_id.clone(), copies, realtime_hook);
         self.output_targets.write().await.insert(
             peer_id,
             PeerOutputTarget {
@@ -1625,6 +1658,13 @@ impl ServerPeer {
             debug!("Input forwarder task ended for peer {}", peer_id_for_input);
         });
 
+        let realtime_hook = self
+            .participant_metadata
+            .read()
+            .expect("participant metadata lock")
+            .get(remotemedia_core::nodes::realtime_events::ADMISSION_FIELD)
+            .is_some_and(|admission| remotemedia_core::nodes::realtime_events::admission_is_webrtc(admission));
+        shared_session.set_realtime_hook_peer(&peer_id, realtime_hook);
         shared_session
             .attach_peer(
                 peer_id.clone(),
