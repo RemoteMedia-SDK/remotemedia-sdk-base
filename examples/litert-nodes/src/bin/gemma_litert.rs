@@ -6,7 +6,8 @@
 
 use std::time::Instant;
 
-use remotemedia_litert_nodes::lm::{Engine, LmConfig, Piece, Sentences};
+use remotemedia_litert_nodes::lm::{Engine, LmConfig, Piece};
+use remotemedia_room_agent::Sentences;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -49,7 +50,7 @@ fn main() {
         println!("> {prompt}");
         let start = Instant::now();
         let rx = conversation.send(&prompt, 256).unwrap();
-        let mut sentences = Sentences::default();
+        let mut sentences = Sentences::spoken().first_clause(0);
         let mut first = None;
         let mut pieces = 0;
         loop {
@@ -57,7 +58,7 @@ fn main() {
                 Ok(Piece::Text(t)) => {
                     pieces += 1;
                     first.get_or_insert_with(|| start.elapsed().as_secs_f64() * 1000.0);
-                    for s in sentences.push(&t) {
+                    for s in sentences.push(&t).unwrap_or_default() {
                         println!("  [{:>5.0} ms] {s}", start.elapsed().as_secs_f64() * 1000.0);
                     }
                 }

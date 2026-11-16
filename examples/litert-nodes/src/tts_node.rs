@@ -39,7 +39,7 @@ use serde_json::Value;
 
 use crate::kokoro::tokens::SAMPLE_RATE;
 use crate::kokoro::{Kokoro, KokoroConfig};
-use crate::node::expand;
+use remotemedia_plugin_sdk::params::expand_env as expand;
 
 pub const NODE_TYPE: &str = "KokoroTtsNode";
 
@@ -230,7 +230,7 @@ impl KokoroTtsNode {
             RuntimeData::Json(value) => value["reply"].as_str().unwrap_or(""),
             _ => "",
         };
-        let trace = crate::stage_trace::Stage::new(
+        let trace = remotemedia_room_agent::trace::Stage::new(
             "tts",
             reply,
             serde_json::json!({"characters":text.chars().count()}),

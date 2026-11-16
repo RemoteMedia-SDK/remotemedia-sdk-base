@@ -33,6 +33,8 @@ use remotemedia_plugin_sdk::{
 };
 use serde_json::Value;
 
+use remotemedia_plugin_sdk::params::expand_env as expand;
+
 use crate::mel::to_mono_16k;
 use crate::whisper::{MaskMode, Transcript, Whisper, WhisperConfig};
 
@@ -47,28 +49,6 @@ struct Job {
 /// reentrant); turns queue for it.
 pub struct WhisperLiteRtNode {
     jobs: std::sync::Mutex<mpsc::Sender<Job>>,
-}
-
-/// `${NAME}` → the variable's value.
-pub fn expand(value: &str) -> String {
-    let mut out = String::new();
-    let mut rest = value;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        match rest[start + 2..].find('}') {
-            Some(end) => {
-                let name = &rest[start + 2..start + 2 + end];
-                out.push_str(&std::env::var(name).unwrap_or_default());
-                rest = &rest[start + 3 + end..];
-            }
-            None => {
-                out.push_str(&rest[start..]);
-                rest = "";
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 pub fn config_from_params(params: &Value) -> Result<WhisperConfig, String> {

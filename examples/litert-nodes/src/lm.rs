@@ -200,6 +200,33 @@ impl LmConfig {
             cache_dir: None,
         }
     }
+
+    /// Reads `model_path` (required), `runtime_lib`, `backend`, `cache_dir`,
+    /// `threads` and `max_tokens`. String values are taken as they are:
+    /// expand `${VAR}` first. `node` names the node in the error.
+    pub fn from_params(params: &serde_json::Value, node: &str) -> Result<Self, String> {
+        let s = |key: &str| {
+            params[key]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let model_path =
+            s("model_path").ok_or_else(|| format!("{node} needs params.model_path"))?;
+        let mut lm = LmConfig::new(model_path);
+        lm.runtime_lib = s("runtime_lib");
+        if let Some(b) = s("backend") {
+            lm.backend = b;
+        }
+        lm.cache_dir = s("cache_dir");
+        if let Some(t) = params["threads"].as_i64() {
+            lm.threads = t as i32;
+        }
+        if let Some(t) = params["max_tokens"].as_i64() {
+            lm.max_tokens = t as i32;
+        }
+        Ok(lm)
+    }
 }
 
 pub struct Engine {
@@ -467,103 +494,9 @@ impl Drop for Conversation {
     }
 }
 
-/// Splits streamed text into sentences as they complete: a sentence ends at
-/// `.`, `!`, `?` (or `:`/`;` once it is long) followed by whitespace, or at a
-/// newline.
-#[derive(Default)]
-pub struct Sentences {
-    pending: String,
-    /// Let the first piece end at a comma once it is this long (0: never).
-    first_clause: usize,
-    emitted: bool,
-}
-
-impl Sentences {
-    /// A splitter whose first piece may end at a comma (after 24
-    /// characters), so speech can start before the first sentence is done.
-    pub fn first_clause() -> Self {
-        Self {
-            first_clause: 24,
-            ..Self::default()
-        }
-    }
-
-    pub fn push(&mut self, text: &str) -> Vec<String> {
-        self.pending.push_str(text);
-        let mut out = Vec::new();
-        loop {
-            let bytes = self.pending.as_bytes();
-            let mut cut = None;
-            for i in 0..bytes.len() {
-                let c = bytes[i];
-                let next_space = bytes.get(i + 1).map_or(false, |b| b.is_ascii_whitespace());
-                let long = i > 60;
-                let early_clause = !self.emitted && self.first_clause > 0 && i >= self.first_clause;
-                if c == b'\n'
-                    || (matches!(c, b'.' | b'!' | b'?') && next_space)
-                    || (long && matches!(c, b':' | b';') && next_space)
-                    || (early_clause && c == b',' && next_space)
-                {
-                    // Not after a single capital ("Mr.", "U.S.") or a digit ("3.").
-                    if c == b'.' && i >= 1 {
-                        let before = &self.pending[..i];
-                        let word = before
-                            .rsplit(|ch: char| ch.is_whitespace())
-                            .next()
-                            .unwrap_or("");
-                        if word.len() <= 2
-                            && word.chars().next().map_or(false, |ch| ch.is_uppercase())
-                        {
-                            continue;
-                        }
-                    }
-                    cut = Some(i + 1);
-                    break;
-                }
-            }
-            let Some(at) = cut else { break };
-            let sentence = self.pending[..at].trim().to_string();
-            self.pending = self.pending[at..].to_string();
-            if !sentence.is_empty() {
-                self.emitted = true;
-                out.push(sentence);
-            }
-        }
-        out
-    }
-
-    /// What is left at the end of the reply.
-    pub fn finish(&mut self) -> Option<String> {
-        let rest = std::mem::take(&mut self.pending).trim().to_string();
-        (!rest.is_empty()).then_some(rest)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sentences_split_as_they_complete() {
-        let mut s = Sentences::default();
-        assert!(s.push("Hello there").is_empty());
-        assert_eq!(s.push(". How are"), vec!["Hello there."]);
-        assert_eq!(s.push(" you? Dr. Smith said 3.5 is"), vec!["How are you?"]);
-        assert!(s.push(" fine").is_empty());
-        assert_eq!(s.finish().as_deref(), Some("Dr. Smith said 3.5 is fine"));
-    }
-
-    #[test]
-    fn first_piece_may_end_at_a_comma() {
-        let mut s = Sentences::first_clause();
-        assert_eq!(
-            s.push("The tallest mountain on Earth, by height above sea level, is Everest. "),
-            vec![
-                "The tallest mountain on Earth,",
-                "by height above sea level, is Everest."
-            ]
-        );
-    }
 
     #[test]
     fn chunk_text_reads_messages() {

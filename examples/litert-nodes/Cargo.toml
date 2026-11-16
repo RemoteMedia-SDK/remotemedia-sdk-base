@@ -39,6 +39,8 @@ kokoro = []
 [dependencies]
 # Same plugin SDK checkout as the host runner, so the plugin ABI matches.
 remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk" }
+# Room behavior shared with other room agents (link, history, replies).
+remotemedia-room-agent = { path = "../../../remotemedia-plugin-sdk/crates/room-agent" }
 abi_stable = "0.11"
 async-trait = "0.1"
 serde_json = "1"

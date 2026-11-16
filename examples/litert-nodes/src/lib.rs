@@ -17,7 +17,6 @@
 //! `whisper-litert`, `gemma-litert` and `kokoro-litert` commands.
 
 pub mod assistant;
-pub mod assistant_room;
 pub mod backend;
 pub mod bilstm;
 pub mod compiled;
@@ -28,7 +27,6 @@ pub mod litert;
 pub mod lm;
 pub mod mel;
 pub mod node;
-pub mod stage_trace;
 pub mod tokenizer;
 #[cfg(feature = "kokoro")]
 pub mod tts_node;

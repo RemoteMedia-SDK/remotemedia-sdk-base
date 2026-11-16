@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use remotemedia_litert_nodes::assistant::{config_from_params, GemmaAssistantNode};
+use remotemedia_litert_nodes::assistant::{config_from_params, start};
 use remotemedia_plugin_sdk::testing::{assert_generator_cancels, ConformanceOptions};
 use remotemedia_plugin_sdk::types::RuntimeData;
 use serde_json::json;
@@ -42,7 +42,7 @@ async fn a_cancelled_gemma_reply_does_not_hold_up_the_next() {
         "respond": "all",
     }))
     .unwrap();
-    let node = Arc::new(GemmaAssistantNode::start(config).unwrap());
+    let node = Arc::new(start(config).unwrap());
     let report = assert_generator_cancels(
         node,
         || RuntimeData::Text("Tell me a long story about the ocean, in many sentences.".into()),
