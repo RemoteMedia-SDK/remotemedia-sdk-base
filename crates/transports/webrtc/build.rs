@@ -2,12 +2,11 @@
 //
 // The protobuf bindings in `src/generated/` (used by the `grpc-signaling`
 // feature) are committed. A normal build uses them as they are: it does not
-// build protoc (protobuf-src), does not run it, and writes nothing into
-// `src/`. It only hashes the `.proto` files and warns when they no longer
+// parse the .proto files and writes nothing into `src/`. It only hashes the `.proto` files and warns when they no longer
 // match `src/generated/protos.stamp`.
 //
 // Code generation sits behind the `regen-protos` feature, which pulls in
-// protobuf-src (builds protoc from source; needs CMake and a C++ compiler)
+// protox (a pure-Rust .proto compiler: no protoc, CMake or C++ toolchain)
 // and tonic-prost-build. From the sdk-base workspace root:
 //
 //   Check that the committed bindings match the .proto files (writes
@@ -49,11 +48,16 @@ fn main() {
             &out_dir,
             PROTOS,
             |fresh_dir| {
-                // Vendored protoc, so the output does not depend on a system install.
-                std::env::set_var("PROTOC", protobuf_src::protoc());
+                // protox parses the .proto files in pure Rust, so the output
+                // does not depend on a protoc install or a C++ toolchain.
+                let fds = protox::compile(PROTOS, ["../../../proto/"])
+                    .unwrap_or_else(|e| panic!("Failed to parse protos: {e:?}"));
                 // Bulk payload fields are `bytes::Bytes`, so decoded frames
                 // keep the received buffer instead of copying it into a Vec.
                 tonic_prost_build::configure()
+                    // `compile_protos` adds this to every type; `compile_fds`
+                    // does not, so add it here to keep the output identical.
+                    .type_attribute(".", "#[allow(clippy::all)]")
                     .build_server(true)
                     .build_client(true)
                     .bytes(".remotemedia.v1.AudioBuffer.samples")
@@ -65,7 +69,7 @@ fn main() {
                     .bytes(".remotemedia.v1.webrtc.RuntimeDataFrame.data_buffer")
                     .bytes(".remotemedia.v1.webrtc.ChunkFrame.data")
                     .out_dir(fresh_dir)
-                    .compile_protos(PROTOS, &["../../../proto/"])
+                    .compile_fds(fds)
                     .unwrap_or_else(|e| panic!("Failed to compile protos: {}", e));
             },
         );
