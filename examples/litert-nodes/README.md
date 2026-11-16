@@ -180,6 +180,12 @@ needs CMake, Ninja and a C++ compiler (MSVC on Windows; the NDK's clang for
 Android, with `ANDROID_NDK_HOME` set). The first build downloads Abseil
 20260526.0 into `cpp/third_party/` (or set `ABSEIL_SOURCE_DIR`).
 
+The default `plugin` feature exports this library's node factories. Rust consumers
+embedding its engine and assistant helpers in another plugin should depend on
+this crate with `default-features = false`, so only the consumer's plugin entry
+point is exported. A standalone LiteRT plugin without Kokoro can be built with
+`--no-default-features --features plugin`.
+
 ```bash
 cargo build --release                                     # this host
 cargo build --release --target aarch64-linux-android      # Android (NDK clang as linker)

@@ -9,41 +9,41 @@ use std::time::{Duration, Instant};
 const NODE_TYPE: &str = "AssistantRoom";
 
 /// Lines kept for context between replies.
-pub(crate) const MAX_PENDING: usize = 24;
+pub const MAX_PENDING: usize = 24;
 /// Words that do not make a line a question ("hey Pixel", "ok Pixel").
 const FILLER: &[&str] = &[
     "hey", "hi", "hello", "ok", "okay", "so", "um", "uh", "yo", "excuse", "me",
 ];
 
 #[derive(Default)]
-pub(crate) struct Room {
+pub struct Room {
     /// "name: line" since the last reply.
-    pub(crate) pending: VecDeque<String>,
+    pub pending: VecDeque<String>,
     /// The last lines, replies included.
-    pub(crate) recent: VecDeque<String>,
-    pub(crate) replies: u64,
-    pub(crate) attributed: VecDeque<Value>,
+    pub recent: VecDeque<String>,
+    pub replies: u64,
+    pub attributed: VecDeque<Value>,
     /// Speakers who named the assistant without a question yet: when, and
     /// what they said.
-    pub(crate) waiting: HashMap<String, (Instant, String)>,
+    pub waiting: HashMap<String, (Instant, String)>,
     /// The reply the room last said to stop.
-    pub(crate) stopped: Option<String>,
+    pub stopped: Option<String>,
 }
 
 /// What a reply has generated so far. Dropped before the reply ended (the
 /// runtime cancelled the call on a barge), it leaves that text in the room's
 /// recent lines, marked, for the conversation that is started next — unless
 /// the cancel's disposition discards partial output.
-pub(crate) struct Partial<'a> {
-    pub(crate) room: &'a std::sync::Mutex<Room>,
-    pub(crate) name: &'a str,
-    pub(crate) text: String,
-    pub(crate) ended: bool,
-    pub(crate) cancel: CancelToken,
+pub struct Partial<'a> {
+    pub room: &'a std::sync::Mutex<Room>,
+    pub name: &'a str,
+    pub text: String,
+    pub ended: bool,
+    pub cancel: CancelToken,
 }
 
 /// How a reply that was cut off is kept in the context.
-pub(crate) fn cut_off_line(name: &str, text: &str) -> Option<String> {
+pub fn cut_off_line(name: &str, text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| format!("{name}: {text} [interrupted before finishing]"))
 }
@@ -78,13 +78,7 @@ impl Drop for Partial<'_> {
 
 impl Room {
     /// Structured history for RAG; never infer author roles from generated text.
-    pub(crate) fn note_attributed(
-        &mut self,
-        author: &str,
-        text: &str,
-        agent: bool,
-        interrupted: bool,
-    ) {
+    pub fn note_attributed(&mut self, author: &str, text: &str, agent: bool, interrupted: bool) {
         self.note(format!("{author}: {text}"));
         self.attributed.push_back(
             json!({"author": author.chars().take(256).collect::<String>(),
@@ -97,7 +91,7 @@ impl Room {
     }
 
     /// Adds a "name: line" to the context.
-    pub(crate) fn note(&mut self, line: String) {
+    pub fn note(&mut self, line: String) {
         for lines in [&mut self.pending, &mut self.recent] {
             lines.push_back(line.clone());
             while lines.len() > MAX_PENDING {
@@ -109,7 +103,7 @@ impl Room {
     /// A person's live line. Returns what they said to the assistant, if the
     /// line is for it: the line itself, or the line after their bare name
     /// within `follow_up`.
-    pub(crate) fn hear(
+    pub fn hear(
         &mut self,
         speaker: &str,
         text: &str,
@@ -137,13 +131,7 @@ impl Room {
     /// A person's history line: context, and the speaker is waiting for
     /// their question from `now` if the line is only the name, and not
     /// waiting after any other line.
-    pub(crate) fn recall(
-        &mut self,
-        speaker: &str,
-        text: &str,
-        addressed: &Addressed,
-        now: Instant,
-    ) {
+    pub fn recall(&mut self, speaker: &str, text: &str, addressed: &Addressed, now: Instant) {
         self.note_attributed(speaker, text, false, false);
         if matches!(addressed, Addressed::NameOnly) {
             self.waiting
@@ -155,7 +143,7 @@ impl Room {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) enum Addressed {
+pub enum Addressed {
     No,
     /// Only the name: wait for the question.
     NameOnly,
@@ -164,7 +152,7 @@ pub(crate) enum Addressed {
 
 /// `participant.name` when the client set one, else the peer id without the
 /// page's `-xxxx` suffix.
-pub(crate) fn speaker_name(ctx: &dyn NodeRuntimeContextRead) -> String {
+pub fn speaker_name(ctx: &dyn NodeRuntimeContextRead) -> String {
     let Some(origin) = ctx.origin() else {
         return "Someone".into();
     };
@@ -186,7 +174,7 @@ pub(crate) fn speaker_name(ctx: &dyn NodeRuntimeContextRead) -> String {
 
 /// A room agent's name for the author of a frame: the display name the room
 /// gave, else as `speaker_name`.
-pub(crate) fn room_speaker_name(ctx: &dyn NodeRuntimeContextRead) -> String {
+pub fn room_speaker_name(ctx: &dyn NodeRuntimeContextRead) -> String {
     ctx.origin()
         .and_then(|origin| {
             origin
@@ -200,7 +188,7 @@ pub(crate) fn room_speaker_name(ctx: &dyn NodeRuntimeContextRead) -> String {
 
 /// What a room agent reads from a participant link.
 #[derive(Debug, PartialEq)]
-pub(crate) enum RoomFrame {
+pub enum RoomFrame {
     /// A room-log line; `agent` is its `author_kind`.
     Line {
         text: String,
@@ -215,7 +203,7 @@ pub(crate) enum RoomFrame {
 
 /// The frame in `data`, if it is one the assistant acts on. A `floor`
 /// refusal for `floor_busy` is not: its text is still posted.
-pub(crate) fn room_frame(data: &RuntimeData) -> Option<RoomFrame> {
+pub fn room_frame(data: &RuntimeData) -> Option<RoomFrame> {
     let v = match data {
         RuntimeData::Json(v) => v,
         _ => {
@@ -249,12 +237,12 @@ pub(crate) fn room_frame(data: &RuntimeData) -> Option<RoomFrame> {
 }
 
 /// A room agent's publications.
-pub(crate) fn presence_listening(to: &str) -> Value {
+pub fn presence_listening(to: &str) -> Value {
     json!({ "kind": "presence", "state": "listening", "to": to })
 }
 
 /// `line` is the `seq` of the line the reply answers.
-pub(crate) fn presence_thinking(reply: &str, to: &str, line: Option<u64>) -> Value {
+pub fn presence_thinking(reply: &str, to: &str, line: Option<u64>) -> Value {
     let mut presence = json!({ "kind": "presence", "state": "thinking", "reply": reply, "to": to });
     if let Some(seq) = line {
         presence["line"] = json!(seq);
@@ -262,18 +250,18 @@ pub(crate) fn presence_thinking(reply: &str, to: &str, line: Option<u64>) -> Val
     presence
 }
 
-pub(crate) fn presence_idle(reply: &str) -> Value {
+pub fn presence_idle(reply: &str) -> Value {
     json!({ "kind": "presence", "state": "idle", "reply": reply })
 }
 
 /// One sentence of a reply: the room posts `text`, text-to-speech speaks
 /// `say`.
-pub(crate) fn sentence_line(sentence: &str, reply: &str) -> Value {
+pub fn sentence_line(sentence: &str, reply: &str) -> Value {
     json!({ "kind": "text", "text": sentence, "say": sentence, "reply": reply })
 }
 
 /// Whether `text` names the assistant, and with more than the name.
-pub(crate) fn addressed(wake_words: &[String], respond_all: bool, text: &str) -> Addressed {
+pub fn addressed(wake_words: &[String], respond_all: bool, text: &str) -> Addressed {
     if respond_all {
         return Addressed::Yes;
     }
@@ -298,7 +286,7 @@ pub(crate) fn addressed(wake_words: &[String], respond_all: bool, text: &str) ->
 }
 
 /// The words a line says: a transcript (Text) or a typed message.
-pub(crate) fn line_text(data: &RuntimeData) -> Option<String> {
+pub fn line_text(data: &RuntimeData) -> Option<String> {
     match data {
         RuntimeData::Text(t) => Some(t.trim().to_string()),
         RuntimeData::Json(v) if v["kind"] == "text" => {
