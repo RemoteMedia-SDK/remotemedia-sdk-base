@@ -51,7 +51,7 @@ enum Out {
 struct Job {
     text: String,
     out: futures_channel::mpsc::UnboundedSender<Out>,
-    /// The call's cancellation: synthesis stops before the next slice.
+    /// The call's cancellation: synthesis stops between model invocations.
     cancel: CancelToken,
 }
 
@@ -64,7 +64,8 @@ pub struct KokoroTtsNode {
 
 pub fn config_from_params(params: &Value) -> Result<(KokoroConfig, usize), String> {
     let s = |key: &str| params[key].as_str().map(expand).filter(|v| !v.is_empty());
-    let mut config = KokoroConfig::new(s("model_path").ok_or("KokoroTtsNode needs params.model_path")?);
+    let mut config =
+        KokoroConfig::new(s("model_path").ok_or("KokoroTtsNode needs params.model_path")?);
     config.runtime_lib = s("runtime_lib");
     if let Some(a) = s("accelerator") {
         config.vocoder_accelerator = a;
@@ -155,7 +156,7 @@ fn text_of(data: &RuntimeData) -> Option<String> {
 }
 
 /// An audio generator (openspec: add-generator-cancellation). Synthesis runs
-/// on its own thread, which stops before the next slice once the call's token
+/// on its own thread, which stops between model invocations once the call's token
 /// fires. Its queued text belongs to the reply that was cancelled, so by
 /// default an interrupt discards it.
 #[async_trait]
@@ -213,14 +214,29 @@ impl AsyncStreamingNode for KokoroTtsNode {
 }
 
 impl KokoroTtsNode {
-    async fn speak<F>(&self, data: RuntimeData, cancel: CancelToken, mut callback: F) -> Result<usize, Error>
+    async fn speak<F>(
+        &self,
+        data: RuntimeData,
+        cancel: CancelToken,
+        mut callback: F,
+    ) -> Result<usize, Error>
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
         let Some(text) = text_of(&data) else {
             return Ok(0);
         };
+        let reply = match &data {
+            RuntimeData::Json(value) => value["reply"].as_str().unwrap_or(""),
+            _ => "",
+        };
+        let trace = crate::stage_trace::Stage::new(
+            "tts",
+            reply,
+            serde_json::json!({"characters":text.chars().count()}),
+        );
         let _turn = self.turn.lock().await;
+        trace.mark("admitted", serde_json::json!({}));
         let (tx, mut rx) = futures_channel::mpsc::unbounded();
         self.jobs
             .lock()
@@ -228,7 +244,7 @@ impl KokoroTtsNode {
             .send(Job {
                 text: text.clone(),
                 out: tx,
-                cancel,
+                cancel: cancel.clone(),
             })
             .map_err(|_| Error::Execution("the Kokoro thread is gone".into()))?;
         let start = Instant::now();
@@ -236,11 +252,24 @@ impl KokoroTtsNode {
         let mut samples = 0usize;
         let mut frames = 0;
         while let Some(out) = rx.next().await {
+            if cancel.is_cancelled() {
+                trace.finish(serde_json::json!({"outcome":"cancelled","samples":samples}));
+                return Ok(frames);
+            }
             match out {
                 Out::Audio(pcm) => {
+                    if first.is_none() {
+                        trace.mark(
+                            "first_audio",
+                            serde_json::json!({"sample_rate":SAMPLE_RATE}),
+                        );
+                    }
                     first.get_or_insert_with(|| start.elapsed().as_secs_f64() * 1000.0);
-                    samples += pcm.len();
                     for chunk in pcm.chunks(self.chunk) {
+                        if cancel.is_cancelled() {
+                            trace.finish(serde_json::json!({"outcome":"cancelled","samples":samples}));
+                            return Ok(frames);
+                        }
                         callback(RuntimeData::Audio {
                             samples: chunk.to_vec().into(),
                             sample_rate: SAMPLE_RATE,
@@ -250,10 +279,14 @@ impl KokoroTtsNode {
                             arrival_ts_us: None,
                             metadata: None,
                         })?;
+                        samples += chunk.len();
                         frames += 1;
                     }
                 }
                 Out::Done(Ok(timing)) => {
+                    trace.finish(serde_json::json!({"outcome":"complete","samples":samples,
+                        "sample_rate":SAMPLE_RATE,"generation_first_audio_ms":first,
+                        "generation_total_ms":start.elapsed().as_secs_f64() * 1000.0}));
                     eprintln!(
                         "[{NODE_TYPE}] {:.2} s of speech, first audio {:.0} ms, all {:.0} ms ({timing}): {text:?}",
                         samples as f64 / SAMPLE_RATE as f64,
@@ -271,6 +304,49 @@ impl KokoroTtsNode {
 
 #[derive(Default)]
 pub struct KokoroTtsFactory;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remotemedia_plugin_sdk::traits::{CancelReason, CancelSource, Cancellation};
+
+    #[tokio::test]
+    async fn cancellation_discards_remaining_pcm_chunks_without_affecting_next_call() {
+        // Explicit PCM worker fixture: tests publication, not model cancellation.
+        let (jobs, incoming) = mpsc::channel::<Job>();
+        let worker = std::thread::spawn(move || {
+            for job in incoming.into_iter().take(2) {
+                let _ = job.out.unbounded_send(Out::Audio(vec![0.25; 12]));
+                let _ = job.out.unbounded_send(Out::Done(Ok("fixture".into())));
+            }
+        });
+        let node = KokoroTtsNode {
+            jobs: Mutex::new(jobs),
+            chunk: 4,
+            turn: futures_util::lock::Mutex::new(()),
+        };
+        let cancel = CancelSource::new();
+        let mut published = 0;
+        let first = node
+            .speak(RuntimeData::Text("first".into()), cancel.token(), |_| {
+                published += 1;
+                cancel.cancel(Cancellation::new(CancelReason::BargeIn));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!((first, published), (1, 1));
+        let next = node
+            .speak(RuntimeData::Text("next".into()), CancelToken::never(), |_| {
+                published += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!((next, published), (3, 4));
+        worker.join().unwrap();
+    }
+}
 
 impl FfiNodeFactory for KokoroTtsFactory {
     fn node_type(&self) -> RString {

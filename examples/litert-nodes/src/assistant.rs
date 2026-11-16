@@ -90,7 +90,6 @@
 //!   `say`;
 //! * `{"kind": "presence", "state": "idle", "reply"}`: the reply has ended.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -111,13 +110,12 @@ use remotemedia_plugin_sdk::{
 };
 use serde_json::{json, Value};
 
+use crate::assistant_room::*;
 use crate::lm::{Engine, LmConfig, Piece, Sentences};
 use crate::node::expand;
 
 pub const NODE_TYPE: &str = "GemmaAssistantNode";
 
-/// Lines kept for context between replies.
-const MAX_PENDING: usize = 24;
 /// Tokens left free before the conversation is started over.
 const CONTEXT_HEADROOM: usize = 800;
 
@@ -137,9 +135,6 @@ pub struct AssistantConfig {
     /// room agent).
     pub sentences_as_text: bool,
 }
-
-/// Words that do not make a line a question ("hey Pixel", "ok Pixel").
-const FILLER: &[&str] = &["hey", "hi", "hello", "ok", "okay", "so", "um", "uh", "yo", "excuse", "me"];
 
 fn default_system(name: &str) -> String {
     format!(
@@ -187,7 +182,9 @@ pub fn config_from_params(params: &Value) -> Result<AssistantConfig, String> {
     };
     let sentences_as_text = match s("sentences").as_deref() {
         None | Some("json") => false,
-        Some("text") if publish_room => return Err("sentences: text does not apply to a room agent (publish: room)".into()),
+        Some("text") if publish_room => {
+            return Err("sentences: text does not apply to a room agent (publish: room)".into())
+        }
         Some("text") => true,
         Some(other) => return Err(format!("sentences must be json or text, not {other:?}")),
     };
@@ -219,120 +216,6 @@ struct Job {
 /// waits for the next piece.
 const CANCEL_POLL: Duration = Duration::from_millis(20);
 
-#[derive(Default)]
-struct Room {
-    /// "name: line" since the last reply.
-    pending: VecDeque<String>,
-    /// The last lines, replies included.
-    recent: VecDeque<String>,
-    replies: u64,
-    /// Speakers who named the assistant without a question yet: when, and
-    /// what they said.
-    waiting: HashMap<String, (Instant, String)>,
-    /// The reply the room last said to stop.
-    stopped: Option<String>,
-}
-
-/// What a reply has generated so far. Dropped before the reply ended (the
-/// runtime cancelled the call on a barge), it leaves that text in the room's
-/// recent lines, marked, for the conversation that is started next — unless
-/// the cancel's disposition discards partial output.
-struct Partial<'a> {
-    room: &'a std::sync::Mutex<Room>,
-    name: &'a str,
-    text: String,
-    ended: bool,
-    cancel: CancelToken,
-}
-
-/// How a reply that was cut off is kept in the context.
-fn cut_off_line(name: &str, text: &str) -> Option<String> {
-    let text = text.trim();
-    (!text.is_empty()).then(|| format!("{name}: {text} [interrupted before finishing]"))
-}
-
-impl Drop for Partial<'_> {
-    fn drop(&mut self) {
-        if self.ended {
-            return;
-        }
-        if self
-            .cancel
-            .cancellation()
-            .is_some_and(|c| c.disposition.partial_output == Retention::Discard)
-        {
-            eprintln!("[{NODE_TYPE}] reply cut off; rolled back (the cancel discards it)");
-            return;
-        }
-        if let (Some(line), Ok(mut room)) = (cut_off_line(self.name, &self.text), self.room.lock()) {
-            eprintln!(
-                "[{NODE_TYPE}] reply cut off after {} characters; kept in the context, marked",
-                self.text.trim().chars().count()
-            );
-            room.note(line);
-        }
-    }
-}
-
-impl Room {
-    /// Adds a "name: line" to the context.
-    fn note(&mut self, line: String) {
-        for lines in [&mut self.pending, &mut self.recent] {
-            lines.push_back(line.clone());
-            while lines.len() > MAX_PENDING {
-                lines.pop_front();
-            }
-        }
-    }
-
-    /// A person's live line. Returns what they said to the assistant, if the
-    /// line is for it: the line itself, or the line after their bare name
-    /// within `follow_up`.
-    fn hear(
-        &mut self,
-        speaker: &str,
-        text: &str,
-        addressed: &Addressed,
-        follow_up: Duration,
-        now: Instant,
-    ) -> Option<String> {
-        self.note(format!("{speaker}: {text}"));
-        let follow_up = self
-            .waiting
-            .remove(speaker)
-            .filter(|(at, _)| now.duration_since(*at) <= follow_up)
-            .map(|(_, name)| format!("{name} {text}"));
-        match addressed {
-            Addressed::Yes => Some(text.to_string()),
-            Addressed::NameOnly => {
-                self.waiting.insert(speaker.to_string(), (now, text.to_string()));
-                None
-            }
-            Addressed::No => follow_up,
-        }
-    }
-
-    /// A person's history line: context, and the speaker is waiting for
-    /// their question from `now` if the line is only the name, and not
-    /// waiting after any other line.
-    fn recall(&mut self, speaker: &str, text: &str, addressed: &Addressed, now: Instant) {
-        self.note(format!("{speaker}: {text}"));
-        if matches!(addressed, Addressed::NameOnly) {
-            self.waiting.insert(speaker.to_string(), (now, text.to_string()));
-        } else {
-            self.waiting.remove(speaker);
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum Addressed {
-    No,
-    /// Only the name: wait for the question.
-    NameOnly,
-    Yes,
-}
-
 pub struct GemmaAssistantNode {
     config: AssistantConfig,
     jobs: Mutex<mpsc::Sender<Job>>,
@@ -345,7 +228,11 @@ pub struct GemmaAssistantNode {
 
 /// The model thread: one engine and conversation; replies stream back as
 /// pieces.
-fn model_thread(config: AssistantConfig, jobs: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<String, String>>) {
+fn model_thread(
+    config: AssistantConfig,
+    jobs: mpsc::Receiver<Job>,
+    ready: mpsc::Sender<Result<String, String>>,
+) {
     let engine = match Engine::load(&config.lm) {
         Ok(e) => e,
         Err(e) => {
@@ -386,7 +273,11 @@ fn model_thread(config: AssistantConfig, jobs: mpsc::Receiver<Job>, ready: mpsc:
         let Some(current) = conversation.as_mut() else {
             continue;
         };
-        let prompt = if fresh { &job.fresh_prompt } else { &job.prompt };
+        let prompt = if fresh {
+            &job.fresh_prompt
+        } else {
+            &job.prompt
+        };
         let rx = match current.send(prompt, config.max_reply_tokens) {
             Ok(rx) => rx,
             Err(e) => {
@@ -432,133 +323,12 @@ fn model_thread(config: AssistantConfig, jobs: mpsc::Receiver<Job>, ready: mpsc:
     }
 }
 
-/// `participant.name` when the client set one, else the peer id without the
-/// page's `-xxxx` suffix.
-fn speaker_name(ctx: &dyn NodeRuntimeContextRead) -> String {
-    let Some(origin) = ctx.origin() else {
-        return "Someone".into();
-    };
-    if let Some(name) = origin.fields().get("participant.name").filter(|n| !n.is_empty()) {
-        return name.clone();
-    }
-    let id = origin.id();
-    match id.rsplit_once('-') {
-        Some((name, tag)) if tag.len() == 4 && tag.chars().all(|c| c.is_ascii_hexdigit()) => name.to_string(),
-        _ => id.to_string(),
-    }
-}
-
-/// A room agent's name for the author of a frame: the display name the room
-/// gave, else as `speaker_name`.
-fn room_speaker_name(ctx: &dyn NodeRuntimeContextRead) -> String {
-    ctx.origin()
-        .and_then(|origin| {
-            origin
-                .fields()
-                .get("participant.display_name")
-                .filter(|n| !n.is_empty())
-                .cloned()
-        })
-        .unwrap_or_else(|| speaker_name(ctx))
-}
-
-/// What a room agent reads from a participant link.
-#[derive(Debug, PartialEq)]
-enum RoomFrame {
-    /// A room-log line; `agent` is its `author_kind`.
-    Line {
-        text: String,
-        seq: Option<u64>,
-        history: bool,
-        agent: bool,
-    },
-    HistoryEnd,
-    /// The room no longer wants this reply.
-    Stop(String),
-}
-
-/// The frame in `data`, if it is one the assistant acts on. A `floor`
-/// refusal for `floor_busy` is not: its text is still posted.
-fn room_frame(data: &RuntimeData) -> Option<RoomFrame> {
-    let v = match data {
-        RuntimeData::Json(v) => v,
-        _ => {
-            return line_text(data).map(|text| RoomFrame::Line {
-                text,
-                seq: None,
-                history: false,
-                agent: false,
-            })
-        }
-    };
-    let stop = || v["reply"].as_str().map(|id| RoomFrame::Stop(id.to_string()));
-    match v["kind"].as_str()? {
-        "text" | "voice" => {
-            let text = v["text"].as_str()?.trim();
-            (!text.is_empty()).then(|| RoomFrame::Line {
-                text: text.to_string(),
-                seq: v["seq"].as_u64(),
-                history: v["history"] == true,
-                agent: v["author_kind"] == "agent",
-            })
-        }
-        "history_end" => Some(RoomFrame::HistoryEnd),
-        "reply_interrupted" => stop(),
-        _ => None,
-    }
-}
-
-/// A room agent's publications.
-fn presence_listening(to: &str) -> Value {
-    json!({ "kind": "presence", "state": "listening", "to": to })
-}
-
-/// `line` is the `seq` of the line the reply answers.
-fn presence_thinking(reply: &str, to: &str, line: Option<u64>) -> Value {
-    let mut presence = json!({ "kind": "presence", "state": "thinking", "reply": reply, "to": to });
-    if let Some(seq) = line {
-        presence["line"] = json!(seq);
-    }
-    presence
-}
-
-fn presence_idle(reply: &str) -> Value {
-    json!({ "kind": "presence", "state": "idle", "reply": reply })
-}
-
-/// One sentence of a reply: the room posts `text`, text-to-speech speaks
-/// `say`.
-fn sentence_line(sentence: &str, reply: &str) -> Value {
-    json!({ "kind": "text", "text": sentence, "say": sentence, "reply": reply })
-}
-
-/// Whether `text` names the assistant, and with more than the name.
-fn addressed(wake_words: &[String], respond_all: bool, text: &str) -> Addressed {
-    if respond_all {
-        return Addressed::Yes;
-    }
-    let words: Vec<String> = text
-        .split(|c: char| !c.is_alphanumeric() && c != '\'')
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect();
-    let is_wake = |w: &String| wake_words.iter().any(|wake| wake == w);
-    if !words.iter().any(is_wake) {
-        return Addressed::No;
-    }
-    let rest = words
-        .iter()
-        .filter(|w| !is_wake(w) && !FILLER.contains(&w.as_str()))
-        .count();
-    if rest <= 1 {
-        Addressed::NameOnly
-    } else {
-        Addressed::Yes
-    }
-}
-
 /// The prompt for a reply to `speaker`, after `lines` of the room.
-fn reply_prompt<'a>(lines: impl IntoIterator<Item = &'a String>, speaker: &str, said: &str) -> String {
+fn reply_prompt<'a>(
+    lines: impl IntoIterator<Item = &'a String>,
+    speaker: &str,
+    said: &str,
+) -> String {
     let lines: Vec<&str> = lines.into_iter().map(String::as_str).collect();
     format!(
         "What was said in the room:\n{}\n\n{speaker} said to you: \"{said}\"\nReply to {speaker}.",
@@ -602,7 +372,10 @@ impl GemmaAssistantNode {
     /// display name or id is `name`, in any case.
     fn is_self(&self, ctx: &dyn NodeRuntimeContextRead, speaker: &str) -> bool {
         let name = self.config.name.to_lowercase();
-        speaker.to_lowercase() == name || ctx.origin().is_some_and(|origin| origin.id().to_lowercase() == name)
+        speaker.to_lowercase() == name
+            || ctx
+                .origin()
+                .is_some_and(|origin| origin.id().to_lowercase() == name)
     }
 
     /// Replies to what `speaker` said; `line` is the `seq` of that line in
@@ -663,23 +436,24 @@ impl GemmaAssistantNode {
             cancel,
         };
         let mut outputs = 1;
-        let mut say = |sentence: String, outputs: &mut usize, callback: &mut F| -> Result<(), Error> {
-            eprintln!(
-                "[{NODE_TYPE}] reply {reply} +{:.0} ms: {sentence}",
-                start.elapsed().as_secs_f64() * 1000.0
-            );
-            *outputs += 1;
-            if self.config.sentences_as_text {
-                return callback(RuntimeData::Text(sentence));
-            }
-            callback(RuntimeData::Json(if as_agent {
-                sentence_line(&sentence, &reply)
-            } else {
-                json!({
-                    "kind": "assistant", "say": sentence, "reply": reply, "to": speaker,
-                })
-            }))
-        };
+        let mut say =
+            |sentence: String, outputs: &mut usize, callback: &mut F| -> Result<(), Error> {
+                eprintln!(
+                    "[{NODE_TYPE}] reply {reply} +{:.0} ms: {sentence}",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+                *outputs += 1;
+                if self.config.sentences_as_text {
+                    return callback(RuntimeData::Text(sentence));
+                }
+                callback(RuntimeData::Json(if as_agent {
+                    sentence_line(&sentence, &reply)
+                } else {
+                    json!({
+                        "kind": "assistant", "say": sentence, "reply": reply, "to": speaker,
+                    })
+                }))
+            };
         let mut stopped = false;
         while let Some(piece) = rx.next().await {
             // The room stopped this reply: publish nothing more of it.
@@ -743,16 +517,6 @@ impl GemmaAssistantNode {
     }
 }
 
-/// The words a line says: a transcript (Text) or a typed message.
-fn line_text(data: &RuntimeData) -> Option<String> {
-    match data {
-        RuntimeData::Text(t) => Some(t.trim().to_string()),
-        RuntimeData::Json(v) if v["kind"] == "text" => v["text"].as_str().map(|t| t.trim().to_string()),
-        _ => None,
-    }
-    .filter(|t| !t.is_empty())
-}
-
 #[async_trait]
 impl AsyncStreamingNode for GemmaAssistantNode {
     fn node_type(&self) -> &str {
@@ -764,7 +528,9 @@ impl AsyncStreamingNode for GemmaAssistantNode {
     }
 
     async fn process(&self, _data: RuntimeData) -> Result<RuntimeData, Error> {
-        Err(Error::InvalidData(format!("{NODE_TYPE} streams its replies")))
+        Err(Error::InvalidData(format!(
+            "{NODE_TYPE} streams its replies"
+        )))
     }
 
     async fn process_streaming<F>(
@@ -819,11 +585,19 @@ impl AsyncStreamingNode for GemmaAssistantNode {
             (text, None, false, false)
         };
         let mut callback = callback;
-        let speaker = if as_agent { room_speaker_name(ctx) } else { speaker_name(ctx) };
+        let speaker = if as_agent {
+            room_speaker_name(ctx)
+        } else {
+            speaker_name(ctx)
+        };
         if by_agent {
             // An agent's line is context: its own under its name, another's
             // under that agent's.
-            let author = if self.is_self(ctx, &speaker) { &self.config.name } else { &speaker };
+            let author = if self.is_self(ctx, &speaker) {
+                &self.config.name
+            } else {
+                &speaker
+            };
             self.room.lock().unwrap().note(format!("{author}: {text}"));
             return Ok(0);
         }
@@ -835,11 +609,13 @@ impl AsyncStreamingNode for GemmaAssistantNode {
                 .recall(&speaker, &text, &addressed, Instant::now());
             return Ok(0);
         }
-        let said = self
-            .room
-            .lock()
-            .unwrap()
-            .hear(&speaker, &text, &addressed, self.config.follow_up, Instant::now());
+        let said = self.room.lock().unwrap().hear(
+            &speaker,
+            &text,
+            &addressed,
+            self.config.follow_up,
+            Instant::now(),
+        );
         let Some(said) = said else {
             if matches!(addressed, Addressed::NameOnly) {
                 // Shown on the page while it waits for the question.
@@ -913,7 +689,10 @@ mod tests {
 
     #[test]
     fn typed_and_spoken_lines() {
-        assert_eq!(line_text(&RuntimeData::Text(" hi ".into())).as_deref(), Some("hi"));
+        assert_eq!(
+            line_text(&RuntimeData::Text(" hi ".into())).as_deref(),
+            Some("hi")
+        );
         assert_eq!(
             line_text(&RuntimeData::Json(json!({"kind": "text", "text": "yo"}))).as_deref(),
             Some("yo")
@@ -952,7 +731,8 @@ mod tests {
 
     #[test]
     fn publish_param() {
-        let config = |publish: Value| config_from_params(&json!({"model_path": "m", "publish": publish}));
+        let config =
+            |publish: Value| config_from_params(&json!({"model_path": "m", "publish": publish}));
         assert!(!config(Value::Null).unwrap().publish_room);
         assert!(config(json!("room")).unwrap().publish_room);
         assert!(config(json!("elsewhere")).is_err());
@@ -969,20 +749,39 @@ mod tests {
             line("hey pixel", Some(4), false, false)
         );
         assert_eq!(
-            frame(json!({"kind": "voice", "text": "yo", "seq": 1, "history": true, "author_kind": "agent"})),
+            frame(
+                json!({"kind": "voice", "text": "yo", "seq": 1, "history": true, "author_kind": "agent"})
+            ),
             line("yo", Some(1), true, true)
         );
-        assert_eq!(frame(json!({"kind": "text", "text": "hi"})), line("hi", None, false, false));
+        assert_eq!(
+            frame(json!({"kind": "text", "text": "hi"})),
+            line("hi", None, false, false)
+        );
         assert_eq!(
             room_frame(&RuntimeData::Text(" hi ".into())),
             line("hi", None, false, false)
         );
         assert_eq!(frame(json!({"kind": "text", "text": "  "})), None);
-        assert_eq!(frame(json!({"kind": "history_end", "seq": 4})), Some(RoomFrame::HistoryEnd));
+        assert_eq!(
+            frame(json!({"kind": "history_end", "seq": 4})),
+            Some(RoomFrame::HistoryEnd)
+        );
     }
 
-    fn partial<'a>(room: &'a std::sync::Mutex<Room>, text: &str, ended: bool, cancel: CancelToken) -> Partial<'a> {
-        Partial { room, name: "Pixel", text: text.into(), ended, cancel }
+    fn partial<'a>(
+        room: &'a std::sync::Mutex<Room>,
+        text: &str,
+        ended: bool,
+        cancel: CancelToken,
+    ) -> Partial<'a> {
+        Partial {
+            room,
+            name: "Pixel",
+            text: text.into(),
+            ended,
+            cancel,
+        }
     }
 
     #[test]
@@ -1007,8 +806,16 @@ mod tests {
         for (disposition, kept) in [(Disposition::INTERRUPT, 1), (Disposition::ABORT, 0)] {
             let room = std::sync::Mutex::new(Room::default());
             let source = CancelSource::new();
-            source.cancel(Cancellation::with_disposition(CancelReason::BargeIn, disposition));
-            drop(partial(&room, "The largest ocean is", false, source.token()));
+            source.cancel(Cancellation::with_disposition(
+                CancelReason::BargeIn,
+                disposition,
+            ));
+            drop(partial(
+                &room,
+                "The largest ocean is",
+                false,
+                source.token(),
+            ));
             assert_eq!(room.lock().unwrap().recent.len(), kept, "{disposition:?}");
         }
     }
@@ -1022,15 +829,26 @@ mod tests {
         );
         // Text of a reply refused for a busy floor is still posted.
         assert_eq!(
-            frame(json!({"kind": "floor", "event": "refused", "reason": "floor_busy", "reply": "a1-2"})),
+            frame(
+                json!({"kind": "floor", "event": "refused", "reason": "floor_busy", "reply": "a1-2"})
+            ),
             None
         );
         for event in ["granted", "waiting", "not_held"] {
-            assert_eq!(frame(json!({"kind": "floor", "event": event, "reply": "a1-2"})), None);
+            assert_eq!(
+                frame(json!({"kind": "floor", "event": event, "reply": "a1-2"})),
+                None
+            );
         }
         assert_eq!(frame(json!({"kind": "turn", "state": "start"})), None);
-        assert_eq!(frame(json!({"kind": "presence", "state": "thinking", "reply": "b-1"})), None);
-        assert_eq!(frame(json!({"kind": "refused", "what": "text", "reason": "rate"})), None);
+        assert_eq!(
+            frame(json!({"kind": "presence", "state": "thinking", "reply": "b-1"})),
+            None
+        );
+        assert_eq!(
+            frame(json!({"kind": "refused", "what": "text", "reason": "rate"})),
+            None
+        );
     }
 
     fn named(text: &str) -> Addressed {
@@ -1042,7 +860,10 @@ mod tests {
         assert_eq!(named("Hey Pixel"), Addressed::NameOnly);
         assert_eq!(named("Pixel, what time is it?"), Addressed::Yes);
         assert_eq!(named("what time is it?"), Addressed::No);
-        assert_eq!(addressed(&["pixel".to_string()], true, "anything"), Addressed::Yes);
+        assert_eq!(
+            addressed(&["pixel".to_string()], true, "anything"),
+            Addressed::Yes
+        );
     }
 
     const FOLLOW_UP: Duration = Duration::from_secs(8);
@@ -1065,11 +886,20 @@ mod tests {
         // Someone else's line is not the question.
         assert_eq!(hear(&mut room, "ben", "lunch?", t0), None);
         assert_eq!(
-            hear(&mut room, "ana", "what time is it?", t0 + Duration::from_secs(3)).as_deref(),
+            hear(
+                &mut room,
+                "ana",
+                "what time is it?",
+                t0 + Duration::from_secs(3)
+            )
+            .as_deref(),
             Some("Hey Pixel what time is it?")
         );
         // The wait is used up.
-        assert_eq!(hear(&mut room, "ana", "and then?", t0 + Duration::from_secs(4)), None);
+        assert_eq!(
+            hear(&mut room, "ana", "and then?", t0 + Duration::from_secs(4)),
+            None
+        );
         assert_eq!(room.pending.len(), 4);
     }
 
@@ -1087,7 +917,12 @@ mod tests {
         assert_eq!(room.waiting.len(), 1);
         assert_eq!(
             room.pending,
-            ["ben: Hey Pixel", "ana: Hey Pixel", "ben: never mind", "cy: Pixel, what time is it?"]
+            [
+                "ben: Hey Pixel",
+                "ana: Hey Pixel",
+                "ben: never mind",
+                "cy: Pixel, what time is it?"
+            ]
         );
 
         let later = t0 + Duration::from_secs(2);

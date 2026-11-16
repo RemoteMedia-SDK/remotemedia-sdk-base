@@ -27,6 +27,14 @@ required-features = ["kokoro"]
 name = "gemma-litert"
 path = "src/bin/gemma_litert.rs"
 
+[[bin]]
+name = "rag-assistant-check"
+path = "src/bin/rag_assistant_check.rs"
+
+[[bin]]
+name = "gemma-rag-worker"
+path = "src/bin/gemma_rag_worker.rs"
+
 [features]
 default = ["kokoro"]
 # Kokoro text-to-speech: compiles LiteRT-LM's English phonemizer (C++) with
@@ -39,6 +47,10 @@ remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin
 abi_stable = "0.11"
 async-trait = "0.1"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "time", "net", "sync", "macros"] }
+uuid = { version = "1", features = ["v4"] }
 # LiteRT is loaded at run time (liblitert_lm.so on Android, litert-lm.dll on
 # Windows), so the plugin builds without it.
 libloading = "0.8"

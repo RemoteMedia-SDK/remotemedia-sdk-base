@@ -18,10 +18,9 @@ use std::time::Instant;
 
 use crate::backend::Backend;
 use crate::compiled::{accelerators, CompiledBackend, ModelSource};
-use crate::litert::TfLiteBackend;
 use crate::container::{Container, TFLITE_MODEL};
+use crate::litert::TfLiteBackend;
 use tokens::Join;
-
 
 const VOICE_TOKENS: usize = 510;
 const VOICE_DIM: usize = 256;
@@ -84,7 +83,7 @@ pub struct Timing {
     pub vocoder_ms: f64,
     pub slices: usize,
     pub tokens: usize,
-    /// Stopped before its last slice (`synthesize_until`).
+    /// Stopped before all requested speech was emitted (`synthesize_until`).
     pub stopped: bool,
 }
 
@@ -154,7 +153,12 @@ impl Kokoro {
                 Some(path) => ModelSource::File(path.clone()),
                 None => borrowed(section("tf_lite_vocoder")?),
             };
-            Box::new(TfLiteBackend::load_source(lib, source, config.threads, &[SIGNATURE])?)
+            Box::new(TfLiteBackend::load_source(
+                lib,
+                source,
+                config.threads,
+                &[SIGNATURE],
+            )?)
         } else {
             let source = match &config.vocoder_path {
                 Some(path) => ModelSource::File(path.clone()),
@@ -242,8 +246,9 @@ impl Kokoro {
         self.synthesize_until(text, sink, || false)
     }
 
-    /// [`Self::synthesize`] that stops before the next slice once `stop`
-    /// says so (a cancelled call). A slice in progress runs to its end.
+    /// [`Self::synthesize`] that checks `stop` between model invocations and
+    /// before emitting audio. An invocation already running completes; its
+    /// cancelled output is discarded without starting the remaining stages.
     pub fn synthesize_until(
         &mut self,
         text: &str,
@@ -251,6 +256,10 @@ impl Kokoro {
         stop: impl Fn() -> bool,
     ) -> Result<Timing, String> {
         let mut timing = Timing::default();
+        if stop() {
+            timing.stopped = true;
+            return Ok(timing);
+        }
         let start = Instant::now();
         let ipa = self.phonemize(text)?;
         let (ids, _dropped) = tokens::phoneme_ids(&ipa);
@@ -267,7 +276,16 @@ impl Kokoro {
                 timing.stopped = true;
                 break;
             }
-            let pcm = self.run_slice(&slice.ids, slice.before, slice.after, &mut timing)?;
+            let Some(pcm) =
+                self.run_slice(&slice.ids, slice.before, slice.after, &mut timing, &stop)?
+            else {
+                timing.stopped = true;
+                break;
+            };
+            if stop() {
+                timing.stopped = true;
+                break;
+            }
             timing.slices += 1;
             sink(pcm);
         }
@@ -280,7 +298,8 @@ impl Kokoro {
         before: Join,
         after: Join,
         timing: &mut Timing,
-    ) -> Result<Vec<f32>, String> {
+        stop: &impl Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, String> {
         let start = Instant::now();
         let n = ids.len().min(self.capacity);
         let style = &self.voice[(n - 1).min(VOICE_TOKENS - 1) * VOICE_DIM..][..VOICE_DIM];
@@ -291,6 +310,10 @@ impl Kokoro {
         a.write_bytes(&sig, "speaker_style", bytes_of(prosody_style))?;
         a.write_bytes(&sig, "phoneme_length", bytes_of(&[n as i64]))?;
         a.invoke(&sig)?;
+        if stop() {
+            timing.acoustic_ms += ms(start);
+            return Ok(None);
+        }
         let sig = sig.as_str();
         let a = &mut self.acoustic;
         let mut raw = Vec::new();
@@ -349,7 +372,11 @@ impl Kokoro {
             for c in 0..FEATURE_DIM {
                 cropped.extend_from_slice(&features[c * row..c * row + width * 4]);
             }
-            (cropped, pitch[..2 * width * 4].to_vec(), energy[..2 * width * 4].to_vec())
+            (
+                cropped,
+                pitch[..2 * width * 4].to_vec(),
+                energy[..2 * width * 4].to_vec(),
+            )
         };
         let v = &mut self.vocoder;
         v.write_bytes(sig, "acoustic_features", &features)?;
@@ -361,7 +388,15 @@ impl Kokoro {
         } else {
             v.write_bytes(sig, "speech_frame_length", bytes_of(&[frames as i32]))?;
         }
+        if stop() {
+            timing.vocoder_ms += ms(start);
+            return Ok(None);
+        }
         v.invoke(sig)?;
+        if stop() {
+            timing.vocoder_ms += ms(start);
+            return Ok(None);
+        }
         v.read_bytes(sig, "magnitude_spectrogram", &mut raw)?;
         let magnitude = f32s(&raw);
         v.read_bytes(sig, "phase_spectrogram", &mut raw)?;
@@ -370,7 +405,7 @@ impl Kokoro {
         pcm.resize(frames.min(width) * AUDIO_HOP, 0.0);
         tokens::trim_join_silence(&mut pcm, before, after);
         timing.vocoder_ms += ms(start);
-        Ok(pcm)
+        Ok(Some(pcm))
     }
 }
 
@@ -435,4 +470,3 @@ pub fn upsample_2x(pcm: &[f32]) -> Vec<f32> {
     }
     out
 }
-
