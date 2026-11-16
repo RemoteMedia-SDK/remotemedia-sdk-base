@@ -18,8 +18,9 @@ env:
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
   # Cargo.toml [patch]es plugin-sdk crates to ../remotemedia-plugin-sdk.
-  # plugin-sdk chore/iceoryx2-0.10 (iceoryx2 0.10, zero-copy, InstanceScope).
-  PLUGIN_SDK_REV: 401eabd10033999737b1f7d11164f00f2417da64
+  # plugin-sdk feat/generator-cancellation (ABI 0.11, cancel contract);
+  # RemoteMedia-SDK/remotemedia-plugin-sdk#18. Move to its merge commit on main.
+  PLUGIN_SDK_REV: 0e8cc5e2916c4292a8cb7edfcf87ac2358b9ba7b
 
 jobs:
   check:
