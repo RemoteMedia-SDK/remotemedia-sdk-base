@@ -36,6 +36,7 @@ fn owned_frame(budget: &BufferBudget, value: u8) -> AudioFrame {
         data: bytes::Bytes::from_owner(owner),
         sample_count: 960,
         duration: Duration::from_millis(20),
+        ..Default::default()
     }
 }
 

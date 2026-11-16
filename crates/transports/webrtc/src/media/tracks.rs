@@ -10,7 +10,8 @@ use super::audio_packetizer::AudioPcmPacketizer;
 use super::audio_packetizer::PcmFixtureExt;
 use remotemedia_types::{CopyContext, SharedBuffer};
 use super::audio::{AudioEncoder, AudioEncoderConfig};
-use super::audio_sender::{AudioSender, MediaClockPublisher};
+use super::audio_sender::{AudioSender, MediaClockPublisher, ReleaseReporter};
+use remotemedia_core::transport::turn_audio::{DroppedTurns, TurnSegments, TurnTag};
 use super::video::{VideoFormat, VideoFrame};
 use crate::{Error, Result};
 use parking_lot::RwLock;
@@ -105,6 +106,20 @@ mod audio_owner_tests;
 #[path = "audio_shutdown_tests.rs"]
 mod audio_shutdown_tests;
 
+#[cfg(test)]
+#[path = "turn_release_tests.rs"]
+pub(crate) mod turn_release_tests;
+
+/// Turn bookkeeping of an [`AudioTrack`]. Locked briefly, never across an
+/// await; `segments` changes only while the packetizer lock is held.
+#[derive(Default)]
+struct TurnState {
+    /// Tags of the PCM waiting in the packetizer.
+    segments: TurnSegments,
+    /// Turns this track refuses (`flush_turn` with `drop_rest`).
+    dropped: DroppedTurns,
+}
+
 #[cfg(all(test, not(feature = "video")))]
 #[tokio::test]
 async fn video_copy_disabled_backend_keeps_explicit_error_without_materialization() {
@@ -159,6 +174,10 @@ pub struct AudioTrack {
     /// Serializes PCM assembly, encoding, and enqueue across concurrent callers.
     packetizer: tokio::sync::Mutex<AudioPcmPacketizer>,
 
+    /// Which turn and text chunk the queued PCM belongs to, and the turns
+    /// this track refuses (openspec: add-ai-sdk-voice-library).
+    turns: parking_lot::Mutex<TurnState>,
+
     /// RTP timestamp (in sample units). Sync parking_lot — only
     /// `u32` reads/writes; no guard ever lives across an await.
     timestamp: Arc<RwLock<u32>>,
@@ -193,6 +212,7 @@ impl AudioTrack {
             packetizer: tokio::sync::Mutex::new(AudioPcmPacketizer::new(
                 (config.sample_rate as usize * 20) / 1000 * config.channels as usize,
             )),
+            turns: Default::default(),
             timestamp: Arc::new(RwLock::new(0)),
         })
     }
@@ -225,7 +245,29 @@ impl AudioTrack {
     pub async fn send_audio_with_context(
         &self, samples: SharedBuffer<f32>, sample_rate: u32, copies: &CopyContext,
     ) -> Result<()> {
+        self.send_audio_tagged(samples, sample_rate, copies, None).await
+    }
+
+    /// [`Self::send_audio_with_context`] for audio of a turn. The tag (turn
+    /// id and text chunk) survives re-framing into 20 ms codec frames: each
+    /// queued frame carries the tag of its first sample, so the sender can
+    /// report what it released per turn and flush one turn only. Audio of a
+    /// turn this track refuses ([`Self::flush_turn`] with `drop_rest`) is
+    /// dropped here.
+    pub async fn send_audio_tagged(
+        &self,
+        samples: SharedBuffer<f32>,
+        sample_rate: u32,
+        copies: &CopyContext,
+        tag: Option<TurnTag>,
+    ) -> Result<()> {
         use tracing::{info, trace};
+
+        if let Some(tag) = &tag {
+            if self.turns.lock().dropped.contains(&tag.turn_id) {
+                return Ok(());
+            }
+        }
 
         // Phase B2: encoder / decoder / sender / timestamp locks
         // swapped from `tokio::sync::RwLock` to `parking_lot::RwLock`.
@@ -279,20 +321,37 @@ impl AudioTrack {
 
         if let Some(replacement) = replacement {
             // End the previous format once, before replacing its encoder.
-            while let Some((pcm, _real)) = packetizer.finish()? {
+            while let Some((pcm, real)) = packetizer.finish()? {
+                let frame_tag = self.turns.lock().segments.take(real);
                 let encoded = self.encoder.write().encode(&pcm)?;
-                sender.enqueue_frame(encoded, (pcm.len() / channels) as u32, frame_duration).await?;
+                sender
+                    .enqueue_frame_tagged(encoded, (pcm.len() / channels) as u32, frame_duration, frame_tag)
+                    .await?;
             }
             *self.encoder.write() = replacement;
             *packetizer = AudioPcmPacketizer::new(frame_size);
+            self.turns.lock().segments.clear();
             info!("Sample rate changed from {} to {} Hz, recreating encoder", old_rate, sample_rate);
         }
 
         let mut frames_enqueued = 0;
+        let appended = samples.len();
         packetizer.append(samples, copies)?;
+        self.turns.lock().segments.push(tag.as_ref(), appended);
         while let Some(pcm) = packetizer.next_frame()? {
+            let frame_tag = {
+                let mut turns = self.turns.lock();
+                let frame_tag = turns.segments.take(pcm.len());
+                // Refused while this call was queueing: drop the rest.
+                if frame_tag.as_ref().is_some_and(|tag| turns.dropped.contains(&tag.turn_id)) {
+                    continue;
+                }
+                frame_tag
+            };
             let encoded = self.encoder.write().encode(&pcm)?;
-            sender.enqueue_frame(encoded, (pcm.len() / channels) as u32, frame_duration).await?;
+            sender
+                .enqueue_frame_tagged(encoded, (pcm.len() / channels) as u32, frame_duration, frame_tag)
+                .await?;
             frames_enqueued += 1;
         }
 
@@ -307,14 +366,31 @@ impl AudioTrack {
 
     /// Encode the final partial frame once at an explicit speech boundary.
     pub async fn finish_audio(&self) -> Result<()> {
+        self.finish_audio_tagged(None).await
+    }
+
+    /// [`Self::finish_audio`] at the end of a turn's text chunk (a
+    /// `speech_end` carrying the chunk's tag). After the final partial frame
+    /// an end mark is queued: once the sender reaches it, the tagged chunk
+    /// (untagged: the chunk being sent) is reported as wholly released.
+    pub async fn finish_audio_tagged(&self, tag: Option<TurnTag>) -> Result<()> {
         let mut packetizer = self.packetizer.lock().await;
-        while let Some((pcm, _real)) = packetizer.finish()? {
-            let sender_guard = self.sender.read().await;
-            let sender = sender_guard.as_ref().ok_or_else(||
-                Error::MediaTrackError("AudioSender not initialized".to_string()))?;
+        let sender_guard = self.sender.read().await;
+        let sender = sender_guard.as_ref().ok_or_else(||
+            Error::MediaTrackError("AudioSender not initialized".to_string()))?;
+        while let Some((pcm, real)) = packetizer.finish()? {
+            let frame_tag = self.turns.lock().segments.take(real);
             let encoded = self.encoder.write().encode(&pcm)?;
             let channels = self.encoder.read().config.channels as usize;
-            sender.enqueue_frame(encoded, (pcm.len() / channels) as u32, Duration::from_millis(20)).await?;
+            sender
+                .enqueue_frame_tagged(encoded, (pcm.len() / channels) as u32, Duration::from_millis(20), frame_tag)
+                .await?;
+        }
+        let refused = tag
+            .as_ref()
+            .is_some_and(|tag| self.turns.lock().dropped.contains(&tag.turn_id));
+        if !refused {
+            sender.enqueue_end_mark(tag).await?;
         }
         Ok(())
     }
@@ -372,10 +448,58 @@ impl AudioTrack {
     pub async fn flush_send_buffer(&self) -> usize {
         let mut packetizer = self.packetizer.lock().await;
         packetizer.clear();
+        self.turns.lock().segments.clear();
         if let Some(sender) = self.sender.read().await.as_ref() {
             sender.flush_buffer()
         } else {
             0
+        }
+    }
+
+    /// Targeted flush: drop only the queued audio of `turn_id`. Frames of
+    /// other turns (a later turn queued behind it) and untagged audio stay
+    /// queued. With `drop_rest`, this track also refuses the turn's later
+    /// audio; turn ids are unique within a session, so it stays refused.
+    /// Without it, only what the sender holds now is dropped, and audio of
+    /// the turn still upstream of the track plays when it arrives.
+    ///
+    /// The sender reports the turn once afterwards (`audio_released` with
+    /// `flushed`). Returns the number of frames dropped.
+    pub async fn flush_turn(&self, turn_id: &str, drop_rest: bool) -> usize {
+        if drop_rest {
+            self.turns.lock().dropped.drop_turn(turn_id);
+        }
+        let sender = self.sender.read().await.clone();
+        // First the queue, so a producer blocked on a full queue moves on.
+        let mut dropped = sender.as_ref().map_or(0, |sender| sender.flush_turn(turn_id, false));
+        {
+            let mut packetizer = self.packetizer.lock().await;
+            let mut turns = self.turns.lock();
+            // Less than one frame waits here between calls. A remainder
+            // shared with another turn is left: at most 20 ms.
+            if turns.segments.only_turn(turn_id) {
+                packetizer.clear();
+                turns.segments.clear();
+            }
+        }
+        // Then whatever that producer queued meanwhile, and the report.
+        dropped += sender.as_ref().map_or(0, |sender| sender.flush_turn(turn_id, true));
+        dropped
+    }
+
+    /// Queued frames of `turn_id`; with `None`, of no turn.
+    pub async fn queued_frames_for_turn(&self, turn_id: Option<&str>) -> usize {
+        self.sender
+            .read()
+            .await
+            .as_ref()
+            .map_or(0, |sender| sender.queued_frames_for_turn(turn_id))
+    }
+
+    /// Attach the `audio_released` reporter of this track's sender.
+    pub async fn set_release_reporter(&self, reporter: ReleaseReporter) {
+        if let Some(sender) = self.sender.read().await.as_ref() {
+            sender.set_release_reporter(reporter);
         }
     }
 

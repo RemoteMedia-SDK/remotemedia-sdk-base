@@ -275,6 +275,11 @@ pub(crate) fn cleanup_dead_nodes(config: &iceoryx2::config::Config) -> (u64, u64
     use iceoryx2::node::NodeState;
     use iceoryx2::prelude::CallbackProgression;
 
+    // One sweep at a time in this process: sessions that end together would
+    // otherwise remove the same dead node concurrently.
+    static SWEEPING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _sweeping = SWEEPING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let (mut cleanups, mut failed_cleanups) = (0u64, 0u64);
     let listed = iceoryx2::node::Node::<ipc::Service>::list(config, |state| {
         if let NodeState::Dead(dead_node) = state {

@@ -30,6 +30,7 @@ const PROTOS: &[&str] = &[
     "../../../proto/webrtc_signaling.proto",
     "../../../proto/control.proto",
     "../../../proto/deployment.proto",
+    "../../../proto/runtime_control.proto",
 ];
 
 fn main() {

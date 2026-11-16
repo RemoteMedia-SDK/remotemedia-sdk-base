@@ -376,7 +376,7 @@ pub struct ProcessManager {
 
 /// How long a dropped manager's workers get to stop on their own
 /// (`REMOTEMEDIA_PY_STOP_GRACE_MS`, default 2000; `0` kills them at once).
-fn stop_grace() -> Duration {
+pub(super) fn stop_grace() -> Duration {
     let millis = std::env::var("REMOTEMEDIA_PY_STOP_GRACE_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -399,7 +399,7 @@ impl ProcessHandle {
     }
 
     /// Whether the worker process has exited; None while its handle is busy.
-    fn exited_now(&self) -> Option<bool> {
+    pub(super) fn exited_now(&self) -> Option<bool> {
         let mut guard = self.inner.try_lock().ok()?;
         Some(match guard.as_mut() {
             Some(child) => !matches!(child.try_wait(), Ok(None)),

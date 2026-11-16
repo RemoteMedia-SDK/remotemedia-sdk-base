@@ -5119,3 +5119,1085 @@ pub mod bundle_deployment_service_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+/// A member of a session, as it was admitted.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MemberInfo {
+    /// The member's identity (`participant.id`).
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Display name (`participant.display_name`); empty = none.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// Each entry travels as `participant.metadata.<key>`.
+    #[prost(map = "string, string", tag = "3")]
+    pub metadata: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+}
+/// One control grant of a ticket (Entry's grant shape).
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MemberGrant {
+    /// "tap" | "publish" | "rpc" | "intercept" | "node_state".
+    #[prost(string, tag = "1")]
+    pub op: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub node: ::prost::alloc::string::String,
+    /// `tap` only: just the output produced from the member's own input.
+    #[prost(bool, tag = "3")]
+    pub own: bool,
+    /// `rpc` only: the methods the member may call.
+    #[prost(string, repeated, tag = "4")]
+    pub methods: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AdmitMemberRequest {
+    /// Name of a pipeline the runtime serves (its manifest's `metadata.name`).
+    #[prost(string, tag = "1")]
+    pub pipeline: ::prost::alloc::string::String,
+    /// The application's session key: members admitted with the same key share
+    /// one session.
+    #[prost(string, tag = "2")]
+    pub session_key: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub member: ::core::option::Option<MemberInfo>,
+    /// Lifetime of the ticket in seconds (at least 1).
+    #[prost(uint32, tag = "4")]
+    pub ttl_secs: u32,
+    /// Empty: media and the pipeline data channel only, no control channel.
+    #[prost(message, repeated, tag = "5")]
+    pub grants: ::prost::alloc::vec::Vec<MemberGrant>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AdmitMemberResponse {
+    /// Present it as `ticket` in `peer.announce`. Valid once.
+    #[prost(string, tag = "1")]
+    pub ticket: ::prost::alloc::string::String,
+    /// The WebSocket signalling URL browsers connect to.
+    #[prost(string, tag = "2")]
+    pub signal_url: ::prost::alloc::string::String,
+    /// When the ticket stops being accepted (Unix milliseconds).
+    #[prost(uint64, tag = "4")]
+    pub expires_at_ms: u64,
+    /// The runtime id of the session the member will join.
+    #[prost(string, tag = "5")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetSessionRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetSessionResponse {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub pipeline: ::prost::alloc::string::String,
+    /// The application's session key.
+    #[prost(string, tag = "3")]
+    pub session_key: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListMembersRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListMembersResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub members: ::prost::alloc::vec::Vec<MemberInfo>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveMemberRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub member_id: ::prost::alloc::string::String,
+}
+/// `removed` is false when the member was not connected to that session.
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveMemberResponse {
+    #[prost(bool, tag = "1")]
+    pub removed: bool,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EndSessionRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// Reported to watchers as the reason the session ended (default "ended").
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// `ended` is false when the session is not live.
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EndSessionResponse {
+    #[prost(bool, tag = "1")]
+    pub ended: bool,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchMembersRequest {}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MemberChange {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub member: ::core::option::Option<MemberInfo>,
+    /// `left` only: "disconnected" | "replaced" | "removed" | "session_ended".
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchMembersReady {}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MemberEvent {
+    #[prost(oneof = "member_event::Event", tags = "1, 2, 3")]
+    pub event: ::core::option::Option<member_event::Event>,
+}
+/// Nested message and enum types in `MemberEvent`.
+pub mod member_event {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        /// The stream is open: members that join from now on are reported.
+        #[prost(message, tag = "1")]
+        Ready(super::WatchMembersReady),
+        #[prost(message, tag = "2")]
+        Joined(super::MemberChange),
+        #[prost(message, tag = "3")]
+        Left(super::MemberChange),
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RunPipelineRequest {
+    /// The pipeline manifest as JSON.
+    #[prost(string, tag = "1")]
+    pub manifest_json: ::prost::alloc::string::String,
+    /// Fed to the pipeline in order; the input then ends.
+    #[prost(message, repeated, tag = "2")]
+    pub inputs: ::prost::alloc::vec::Vec<DataBuffer>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RunPipelineOutput {
+    #[prost(message, optional, tag = "1")]
+    pub data: ::core::option::Option<DataBuffer>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ManagedLlmRequest {
+    /// The model id (the name of a preset the runtime's host configured).
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ManagedLlmResponse {
+    /// OpenAI-compatible base URL (`<http://127.0.0.1:<port>/v1`>): a loopback
+    /// address on the runtime's host.
+    #[prost(string, tag = "1")]
+    pub base_url: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub api_key: ::prost::alloc::string::String,
+    /// The model id to send in requests.
+    #[prost(string, tag = "3")]
+    pub model: ::prost::alloc::string::String,
+}
+/// Generated client implementations.
+pub mod runtime_control_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    #[derive(Debug, Clone)]
+    pub struct RuntimeControlClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl RuntimeControlClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
+    impl<T> RuntimeControlClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> RuntimeControlClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            RuntimeControlClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// Admit one member to the session of `(pipeline, session_key)`, starting
+        /// the session if it is not running. Returns a single-use ticket.
+        pub async fn admit_member(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AdmitMemberRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AdmitMemberResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.RuntimeControl/AdmitMember",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("remotemedia.v1.RuntimeControl", "AdmitMember"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// The application's key of a session started by `AdmitMember`. NOT_FOUND
+        /// for any other session. Answers once a session start in progress has
+        /// finished, so it can be called as soon as `WatchSessions` reports the id.
+        pub async fn get_session(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetSessionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.RuntimeControl/GetSession",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("remotemedia.v1.RuntimeControl", "GetSession"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// The connected members of a session, as they were admitted.
+        pub async fn list_members(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListMembersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListMembersResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.RuntimeControl/ListMembers",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("remotemedia.v1.RuntimeControl", "ListMembers"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Disconnect a member and forget its unused tickets for the session.
+        pub async fn remove_member(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RemoveMemberRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RemoveMemberResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.RuntimeControl/RemoveMember",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("remotemedia.v1.RuntimeControl", "RemoveMember"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// End a session: members are disconnected, unused tickets are forgotten.
+        pub async fn end_session(
+            &mut self,
+            request: impl tonic::IntoRequest<super::EndSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::EndSessionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.RuntimeControl/EndSession",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("remotemedia.v1.RuntimeControl", "EndSession"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Members joining and leaving sessions started by `AdmitMember`, from the
+        /// moment the stream opens (`ListMembers` gives the members already there).
+        /// The first message is always `ready`.
+        pub async fn watch_members(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchMembersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::MemberEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.RuntimeControl/WatchMembers",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("remotemedia.v1.RuntimeControl", "WatchMembers"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        /// Run a manifest on `inputs` in a session of its own and stream every
+        /// output of its sinks; the stream ends when the pipeline has drained.
+        /// Cancelling the call ends the run.
+        pub async fn run_pipeline(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RunPipelineRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::RunPipelineOutput>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.RuntimeControl/RunPipeline",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("remotemedia.v1.RuntimeControl", "RunPipeline"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        /// The runtime's managed OpenAI-compatible LLM server for a model, started
+        /// on demand. The address is a loopback address on the runtime's host.
+        pub async fn managed_llm(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ManagedLlmRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ManagedLlmResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.RuntimeControl/ManagedLlm",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("remotemedia.v1.RuntimeControl", "ManagedLlm"));
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod runtime_control_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with RuntimeControlServer.
+    #[async_trait]
+    pub trait RuntimeControl: std::marker::Send + std::marker::Sync + 'static {
+        /// Admit one member to the session of `(pipeline, session_key)`, starting
+        /// the session if it is not running. Returns a single-use ticket.
+        async fn admit_member(
+            &self,
+            request: tonic::Request<super::AdmitMemberRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::AdmitMemberResponse>,
+            tonic::Status,
+        >;
+        /// The application's key of a session started by `AdmitMember`. NOT_FOUND
+        /// for any other session. Answers once a session start in progress has
+        /// finished, so it can be called as soon as `WatchSessions` reports the id.
+        async fn get_session(
+            &self,
+            request: tonic::Request<super::GetSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetSessionResponse>,
+            tonic::Status,
+        >;
+        /// The connected members of a session, as they were admitted.
+        async fn list_members(
+            &self,
+            request: tonic::Request<super::ListMembersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListMembersResponse>,
+            tonic::Status,
+        >;
+        /// Disconnect a member and forget its unused tickets for the session.
+        async fn remove_member(
+            &self,
+            request: tonic::Request<super::RemoveMemberRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RemoveMemberResponse>,
+            tonic::Status,
+        >;
+        /// End a session: members are disconnected, unused tickets are forgotten.
+        async fn end_session(
+            &self,
+            request: tonic::Request<super::EndSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::EndSessionResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the WatchMembers method.
+        type WatchMembersStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::MemberEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Members joining and leaving sessions started by `AdmitMember`, from the
+        /// moment the stream opens (`ListMembers` gives the members already there).
+        /// The first message is always `ready`.
+        async fn watch_members(
+            &self,
+            request: tonic::Request<super::WatchMembersRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::WatchMembersStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the RunPipeline method.
+        type RunPipelineStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::RunPipelineOutput, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Run a manifest on `inputs` in a session of its own and stream every
+        /// output of its sinks; the stream ends when the pipeline has drained.
+        /// Cancelling the call ends the run.
+        async fn run_pipeline(
+            &self,
+            request: tonic::Request<super::RunPipelineRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::RunPipelineStream>,
+            tonic::Status,
+        >;
+        /// The runtime's managed OpenAI-compatible LLM server for a model, started
+        /// on demand. The address is a loopback address on the runtime's host.
+        async fn managed_llm(
+            &self,
+            request: tonic::Request<super::ManagedLlmRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ManagedLlmResponse>,
+            tonic::Status,
+        >;
+    }
+    #[derive(Debug)]
+    pub struct RuntimeControlServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> RuntimeControlServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for RuntimeControlServer<T>
+    where
+        T: RuntimeControl,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/remotemedia.v1.RuntimeControl/AdmitMember" => {
+                    #[allow(non_camel_case_types)]
+                    struct AdmitMemberSvc<T: RuntimeControl>(pub Arc<T>);
+                    impl<
+                        T: RuntimeControl,
+                    > tonic::server::UnaryService<super::AdmitMemberRequest>
+                    for AdmitMemberSvc<T> {
+                        type Response = super::AdmitMemberResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AdmitMemberRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RuntimeControl>::admit_member(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AdmitMemberSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.RuntimeControl/GetSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetSessionSvc<T: RuntimeControl>(pub Arc<T>);
+                    impl<
+                        T: RuntimeControl,
+                    > tonic::server::UnaryService<super::GetSessionRequest>
+                    for GetSessionSvc<T> {
+                        type Response = super::GetSessionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RuntimeControl>::get_session(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.RuntimeControl/ListMembers" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListMembersSvc<T: RuntimeControl>(pub Arc<T>);
+                    impl<
+                        T: RuntimeControl,
+                    > tonic::server::UnaryService<super::ListMembersRequest>
+                    for ListMembersSvc<T> {
+                        type Response = super::ListMembersResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListMembersRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RuntimeControl>::list_members(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListMembersSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.RuntimeControl/RemoveMember" => {
+                    #[allow(non_camel_case_types)]
+                    struct RemoveMemberSvc<T: RuntimeControl>(pub Arc<T>);
+                    impl<
+                        T: RuntimeControl,
+                    > tonic::server::UnaryService<super::RemoveMemberRequest>
+                    for RemoveMemberSvc<T> {
+                        type Response = super::RemoveMemberResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RemoveMemberRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RuntimeControl>::remove_member(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RemoveMemberSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.RuntimeControl/EndSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct EndSessionSvc<T: RuntimeControl>(pub Arc<T>);
+                    impl<
+                        T: RuntimeControl,
+                    > tonic::server::UnaryService<super::EndSessionRequest>
+                    for EndSessionSvc<T> {
+                        type Response = super::EndSessionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::EndSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RuntimeControl>::end_session(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = EndSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.RuntimeControl/WatchMembers" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchMembersSvc<T: RuntimeControl>(pub Arc<T>);
+                    impl<
+                        T: RuntimeControl,
+                    > tonic::server::ServerStreamingService<super::WatchMembersRequest>
+                    for WatchMembersSvc<T> {
+                        type Response = super::MemberEvent;
+                        type ResponseStream = T::WatchMembersStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WatchMembersRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RuntimeControl>::watch_members(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchMembersSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.RuntimeControl/RunPipeline" => {
+                    #[allow(non_camel_case_types)]
+                    struct RunPipelineSvc<T: RuntimeControl>(pub Arc<T>);
+                    impl<
+                        T: RuntimeControl,
+                    > tonic::server::ServerStreamingService<super::RunPipelineRequest>
+                    for RunPipelineSvc<T> {
+                        type Response = super::RunPipelineOutput;
+                        type ResponseStream = T::RunPipelineStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RunPipelineRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RuntimeControl>::run_pipeline(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RunPipelineSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/remotemedia.v1.RuntimeControl/ManagedLlm" => {
+                    #[allow(non_camel_case_types)]
+                    struct ManagedLlmSvc<T: RuntimeControl>(pub Arc<T>);
+                    impl<
+                        T: RuntimeControl,
+                    > tonic::server::UnaryService<super::ManagedLlmRequest>
+                    for ManagedLlmSvc<T> {
+                        type Response = super::ManagedLlmResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ManagedLlmRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RuntimeControl>::managed_llm(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ManagedLlmSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for RuntimeControlServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "remotemedia.v1.RuntimeControl";
+    impl<T> tonic::server::NamedService for RuntimeControlServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}

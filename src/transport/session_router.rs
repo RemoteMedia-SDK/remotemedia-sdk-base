@@ -49,6 +49,8 @@ use input_queue::InputQueue;
 #[cfg(test)]
 mod children_tests;
 #[cfg(test)]
+mod hosted_turn_tests;
+#[cfg(test)]
 mod routing_identity_tests;
 #[cfg(test)]
 mod source_completion_tests;
@@ -169,6 +171,11 @@ impl ClientOutputRouter {
 
     /// Route one piece of sink output to the channel for its kind.
     ///
+    /// A TTS node's end mark (`{ "kind": "speech_end" }`) travels with the
+    /// audio: on the data channel it would overtake audio that is waiting
+    /// for a paced sender, and the sender would report a text chunk as
+    /// wholly released while its audio was still queued.
+    ///
     /// Awaits when that kind's channel is full — backpressure is per-kind,
     /// so a stalled video consumer no longer holds back audio. Legacy Vec audio
     /// is promoted first, so later consumer clones share the samples. The
@@ -182,6 +189,8 @@ impl ClientOutputRouter {
         output.data = output.data.into_shared();
         match &output.data {
             RuntimeData::Audio { .. } => self.audio_tx.send(output).await,
+            // In order with the audio it ends.
+            data if is_audio_end_mark(data) => self.audio_tx.send(output).await,
             RuntimeData::Video { .. } => self.video_tx.send(output).await,
             _ => self.data_tx.send(output).await,
         }
@@ -196,10 +205,17 @@ impl ClientOutputRouter {
         output.data = output.data.into_shared();
         match &output.data {
             RuntimeData::Audio { .. } => self.audio_tx.try_send(output),
+            data if is_audio_end_mark(data) => self.audio_tx.try_send(output),
             RuntimeData::Video { .. } => self.video_tx.try_send(output),
             _ => self.data_tx.try_send(output),
         }
     }
+}
+
+/// A TTS node's end mark: `{ "kind": "speech_end" }`, the last output of a
+/// text chunk's audio.
+fn is_audio_end_mark(data: &RuntimeData) -> bool {
+    matches!(data, RuntimeData::Json(value) if value.get("kind").and_then(|kind| kind.as_str()) == Some("speech_end"))
 }
 
 /// Read the input-channel capacity from the environment, falling back to
@@ -622,6 +638,24 @@ impl SelfDrivenLive {
 struct Successor {
     tx: InputQueue,
     edge: Option<usize>,
+    /// The producer's named stream output port this connection reads
+    /// (`from_port`), when the producer's factory declares that port as
+    /// [`PortKind::Stream`](crate::nodes::ports::PortKind). Such a successor
+    /// receives only the outputs the node emitted on that port (an
+    /// `__aux_port__` envelope naming it), unwrapped; every other successor
+    /// receives only the node's other outputs. `None` for every connection
+    /// of a node that declares no named stream output.
+    port: Option<Arc<str>>,
+}
+
+/// The payload of an output a node emitted on a named stream port.
+fn port_payload(data: &RuntimeData) -> RuntimeData {
+    match data {
+        RuntimeData::Json(value) => {
+            RuntimeData::Json(value.get("payload").cloned().unwrap_or(serde_json::Value::Null))
+        }
+        other => other.clone(),
+    }
 }
 
 /// Everything a node's tasks need to update telemetry.
@@ -1841,12 +1875,27 @@ impl SessionRouter {
                 continue;
             }
             if let Some(tx) = input_txs.get(&conn.to) {
+                // A connection from a declared named stream output carries
+                // only that port's outputs (e.g. `HostedTurnNode`'s `ui`).
+                let port = conn.from_port.as_deref().and_then(|port| {
+                    let declared = self
+                        .graph
+                        .nodes
+                        .get(&conn.from)
+                        .and_then(|node| self.registry.get_factory(&node.node_type))
+                        .is_some_and(|factory| {
+                            factory.output_port_kinds().get(port).copied()
+                                == Some(crate::nodes::ports::PortKind::Stream)
+                        });
+                    declared.then(|| Arc::<str>::from(port))
+                });
                 stream_successors
                     .entry(conn.from.clone())
                     .or_default()
                     .push(Successor {
                         tx: tx.clone(),
                         edge: (conn_idx < self.telemetry.edge_count()).then_some(conn_idx),
+                        port,
                     });
             }
         }
@@ -2188,6 +2237,7 @@ impl SessionRouter {
         let fan_tel = tel.clone();
         let mut fan_shutdown = shutdown.clone();
         let fan_envelope_calls = envelope_calls.clone();
+        let has_port_successors = successor_txs.iter().any(|succ| succ.port.is_some());
         let fan_task = async move {
             let forward = async move {
                 let tel = fan_tel;
@@ -2229,10 +2279,28 @@ impl SessionRouter {
                         None
                     };
 
+                    // An output on a named stream port goes, unwrapped, to
+                    // the connections that read that port and to no other.
+                    let ported = if has_port_successors {
+                        aux_port_of(&kept).and_then(|port| {
+                            successor_txs
+                                .iter()
+                                .any(|succ| succ.port.as_deref() == Some(port.as_str()))
+                                .then(|| (port, port_payload(&kept)))
+                        })
+                    } else {
+                        None
+                    };
+
                     // Fan out to successors first. Bounded `send` awaits on
                     // full, providing real backpressure all the way back to
                     // the node's callback (via `fan_tx` filling up).
                     for succ in &successor_txs {
+                        let kept = match (&ported, succ.port.as_deref()) {
+                            (None, None) => &kept,
+                            (Some((port, payload)), Some(reads)) if port == reads => payload,
+                            _ => continue,
+                        };
                         if let Some(desc) = kept_desc.as_deref() {
                             tracing::info!(
                                 session_id = %fan_session_id,
@@ -3149,6 +3217,9 @@ impl SessionRouter {
             if let Some(id) = packet.metadata.get(crate::transport::data::participant::ID) {
                 self.roster.leave(id);
                 let _ = lifecycle.send(ParticipantEvent::Left(id.clone()));
+                if let Some(control) = &self.control {
+                    control.publish_member_left(id);
+                }
             }
             return;
         }
@@ -3160,6 +3231,9 @@ impl SessionRouter {
                 crate::transport::origin::Origin::from_metadata(&packet.metadata).map(Arc::new)
             {
                 if self.roster.note(&origin) {
+                    if let Some(control) = &self.control {
+                        control.publish_member_joined(&origin);
+                    }
                     let _ = lifecycle.send(ParticipantEvent::Joined(origin));
                 }
             }
@@ -3172,9 +3246,18 @@ impl SessionRouter {
 
         // Who sent this frame; carried next to the payload through the graph.
         let origin = crate::transport::origin::Origin::from_metadata(&packet.metadata).map(Arc::new);
-        if let Some(origin) = &origin {
+        // Agent speech (a turn-tagged frame, e.g. `SessionControl::speak`) is
+        // attributed to the member it is for but is not that member's input:
+        // it neither joins the member nor replaces its identity.
+        let agent_speech = packet
+            .metadata
+            .contains_key(crate::transport::turn_audio::keys::TURN_ID);
+        if let Some(origin) = origin.as_ref().filter(|_| !agent_speech) {
             // A participant's first input is also how it joins.
             if self.roster.note(origin) {
+                if let Some(control) = &self.control {
+                    control.publish_member_joined(origin);
+                }
                 let _ = lifecycle.send(ParticipantEvent::Joined(origin.clone()));
             }
         }

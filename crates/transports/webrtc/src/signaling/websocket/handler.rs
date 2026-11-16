@@ -64,6 +64,48 @@ pub trait PeerAdmission: Send + Sync {
     fn admit(&self, ticket: Option<&str>) -> Result<AdmittedPeer, String>;
 }
 
+/// The handshake of a connection to a mounted [`SocketRoute`].
+#[derive(Debug, Clone)]
+pub struct SocketRequest {
+    /// The request path, without the query.
+    pub path: String,
+    pub query: Option<String>,
+    /// The subprotocols the client offered (`Sec-WebSocket-Protocol`), in order.
+    pub protocols: Vec<String>,
+}
+
+/// The connection, once its handshake has completed.
+pub type RouteSocket = tokio_tungstenite::WebSocketStream<TcpStream>;
+
+/// A [`SocketRoute`] accepted a handshake.
+pub struct SocketAccept {
+    /// The subprotocol answered in `Sec-WebSocket-Protocol`; it must be one
+    /// the client offered.
+    pub protocol: Option<String>,
+    /// Runs the connection after the handshake, to its end.
+    pub serve: Box<dyn FnOnce(RouteSocket) -> futures_util::future::BoxFuture<'static, ()> + Send>,
+}
+
+/// A [`SocketRoute`] refused a handshake: the HTTP status and body answered.
+#[derive(Debug, Clone)]
+pub struct SocketRefusal {
+    pub status: u16,
+    pub reason: String,
+}
+
+/// Another WebSocket endpoint served on the signaling listener, at its own
+/// path ([`SharedState::mount`]). A connection to that path never reaches
+/// the JSON-RPC signaling handler.
+pub trait SocketRoute: Send + Sync {
+    /// Decide a handshake. Called before the upgrade is answered, so a
+    /// refusal is an HTTP error and the socket never opens.
+    fn accept(
+        &self,
+        state: &Arc<SharedState>,
+        request: &SocketRequest,
+    ) -> Result<SocketAccept, SocketRefusal>;
+}
+
 /// Peer connection info for WebSocket clients
 pub struct WsPeerConnection {
     pub peer_id: String,
@@ -103,6 +145,8 @@ pub struct SharedState {
     pub hosted_rooms: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Who may join, when the host admits peers.
     admission: std::sync::RwLock<Option<Arc<dyn PeerAdmission>>>,
+    /// Other WebSocket endpoints of this listener, by path.
+    routes: std::sync::RwLock<HashMap<String, Arc<dyn SocketRoute>>>,
 }
 
 impl SharedState {
@@ -132,7 +176,29 @@ impl SharedState {
             rooms: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             hosted_rooms: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             admission: std::sync::RwLock::new(None),
+            routes: std::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Serve `route` at `path` on this listener.
+    /// Replaces a route mounted at that path before.
+    pub fn mount(&self, path: &str, route: Arc<dyn SocketRoute>) {
+        self.routes
+            .write()
+            .expect("routes lock")
+            .insert(path.to_string(), route);
+        info!("Mounted WebSocket route at {}", path);
+    }
+
+    fn route(&self, path: &str) -> Option<Arc<dyn SocketRoute>> {
+        self.routes.read().expect("routes lock").get(path).cloned()
+    }
+
+    /// Admit the holder of `ticket` through the server's admission, exactly
+    /// as `peer.announce` does: a single-use ticket is consumed. `None` when
+    /// the server has no admission.
+    pub fn admit(&self, ticket: Option<&str>) -> Option<Result<AdmittedPeer, String>> {
+        self.admission().map(|admission| admission.admit(ticket))
     }
 
     /// Admit peers only through `admission`: a `peer.announce` needs a ticket
@@ -256,14 +322,71 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
 
     // The handshake's `?room=<key>` picks the room this connection joins.
     let mut requested_room: Option<String> = None;
-    let ws_stream = accept_hdr_async(
+    // A connection to a mounted path belongs to its route, not to signaling.
+    let mut routed: Option<SocketAccept> = None;
+    let mut refused = false;
+    let accepted = accept_hdr_async(
         stream,
-        |request: &HandshakeRequest, response: HandshakeResponse| {
+        |request: &HandshakeRequest, mut response: HandshakeResponse| {
+            if let Some(route) = state.route(request.uri().path()) {
+                let socket_request = SocketRequest {
+                    path: request.uri().path().to_string(),
+                    query: request.uri().query().map(str::to_string),
+                    protocols: request
+                        .headers()
+                        .get_all("sec-websocket-protocol")
+                        .iter()
+                        .filter_map(|value| value.to_str().ok())
+                        .flat_map(|value| value.split(','))
+                        .map(|protocol| protocol.trim().to_string())
+                        .filter(|protocol| !protocol.is_empty())
+                        .collect(),
+                };
+                return match route.accept(&state, &socket_request) {
+                    Ok(accept) => {
+                        if let Some(value) = accept
+                            .protocol
+                            .as_deref()
+                            .and_then(|protocol| protocol.parse().ok())
+                        {
+                            response.headers_mut().insert("sec-websocket-protocol", value);
+                        }
+                        routed = Some(accept);
+                        Ok(response)
+                    }
+                    Err(refusal) => {
+                        refused = true;
+                        warn!(
+                            "WebSocket route {} refused {}: {}",
+                            socket_request.path, addr, refusal.reason
+                        );
+                        let mut error =
+                            tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
+                                Some(refusal.reason),
+                            );
+                        *error.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::from_u16(
+                            refusal.status,
+                        )
+                        .unwrap_or(tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN);
+                        Err(error)
+                    }
+                };
+            }
             requested_room = request.uri().query().and_then(room_from_query);
             Ok(response)
         },
     )
-    .await?;
+    .await;
+    let ws_stream = match accepted {
+        Ok(ws_stream) => ws_stream,
+        // The route answered the handshake with its refusal.
+        Err(_) if refused => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if let Some(accept) = routed {
+        (accept.serve)(ws_stream).await;
+        return Ok(());
+    }
     let connection_room = state.room_for_connection(requested_room.as_deref());
 
     let (ws_tx, ws_rx) = ws_stream.split();
@@ -837,13 +960,20 @@ async fn handle_offer(
         };
 
         // Handle offer and get SDP answer: in a room, join its shared session.
-        let (peer_room, peer_control, peer_name) = state
+        let (peer_room, peer_control, peer_name, peer_metadata) = state
             .peers
             .read()
             .await
             .get(&from_peer_id)
-            .map(|peer| (peer.room.clone(), peer.control.clone(), peer.display_name.clone()))
-            .unwrap_or_else(|| (state.room_key().map(str::to_string), None, None));
+            .map(|peer| {
+                (
+                    peer.room.clone(),
+                    peer.control.clone(),
+                    peer.display_name.clone(),
+                    peer.metadata.clone(),
+                )
+            })
+            .unwrap_or_else(|| (state.room_key().map(str::to_string), None, None, HashMap::new()));
         // An admitted peer's control channel is bound to its own session and
         // its access; without anything granted there is no channel.
         if let Some(access) = peer_control {
@@ -857,6 +987,11 @@ async fn handle_offer(
                 ControlChannelPolicy::Refused
             });
             server_peer.set_display_name(peer_name);
+            // What the admission said about the member travels with its
+            // input as `participant.metadata.<key>` (for example its role),
+            // so a node can tell members apart by something the browser
+            // cannot claim.
+            server_peer.set_participant_metadata(admitted_participant_metadata(&peer_metadata));
         }
         let answered = match peer_room.as_deref() {
             Some(key) => match state.room(key).await {
@@ -1403,6 +1538,26 @@ async fn broadcast_peer_left(state: &Arc<SharedState>, peer_id: &str, room: Opti
     for peer in peers.values().filter(|peer| peer.room.as_deref() == room) {
         let _ = peer.tx.send(msg.clone()).await;
     }
+}
+
+/// An admitted peer's metadata as frame attribution: every scalar entry
+/// becomes `participant.metadata.<key>`. `display_name` is left out (it is
+/// `participant.display_name` already), as are nulls, arrays and objects.
+pub(crate) fn admitted_participant_metadata(
+    metadata: &HashMap<String, Value>,
+) -> HashMap<String, String> {
+    metadata
+        .iter()
+        .filter(|(key, _)| key.as_str() != "display_name")
+        .filter_map(|(key, value)| {
+            let value = match value {
+                Value::String(text) => text.clone(),
+                Value::Bool(_) | Value::Number(_) => value.to_string(),
+                _ => return None,
+            };
+            Some((format!("participant.metadata.{key}"), value))
+        })
+        .collect()
 }
 
 /// The `room` parameter of a handshake query string (`a=1&room=standup`).

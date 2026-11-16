@@ -72,6 +72,9 @@ use crate::transport::endpoint::{
     EndpointRegistry, EndpointSpec,
 };
 use crate::transport::session_router::DataPacket;
+use crate::transport::turn_audio::{
+    AudioReleased, FlushTarget, MediaEvent, SpeechAccepted, SpeechRequest, MEDIA_PORT, SPEAK_PORT,
+};
 use crate::Result;
 use dashmap::DashMap;
 use remotemedia_traits::call::{
@@ -671,6 +674,9 @@ pub struct SessionControl {
     /// queue (gRPC, etc.) — callers should treat its absence as a
     /// no-op.
     flush_audio_tx: RwLock<Option<mpsc::Sender<()>>>,
+    /// Member readiness, targeted-flush hooks and speech waiting for
+    /// `media_ready` (openspec: add-ai-sdk-voice-library).
+    media: super::turn_audio::MediaState,
     /// Capability transient channel, addressed by `<medium>:<stream_id>`
     /// (e.g. `"video:default"`, `"audio:default"`).
     ///
@@ -853,6 +859,7 @@ impl SessionControl {
             close_tx,
             node_states: DashMap::new(),
             flush_audio_tx: RwLock::new(None),
+            media: Default::default(),
             capabilities: DashMap::new(),
             media_clocks: DashMap::new(),
             system_retained: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
@@ -1019,6 +1026,241 @@ impl SessionControl {
             Some(tx) => tx.try_send(()).is_ok(),
             None => false,
         }
+    }
+
+    // ─── Media readiness, release reports, targeted flush, speech ──────────
+    // (openspec: add-ai-sdk-voice-library, group 2; see `turn_audio`)
+
+    /// Install a targeted-flush hook. Each transport serving members of this
+    /// session installs one; a request goes to all of them.
+    pub fn install_flush_audio_for_hook(&self, tx: mpsc::Sender<FlushTarget>) {
+        let mut hooks = self.media.flush_hooks.write();
+        hooks.retain(|hook| !hook.is_closed());
+        hooks.push(tx);
+    }
+
+    /// Ask the transports to drop the queued audio of one turn for some
+    /// members: only frames tagged with `target.turn_id`, only for
+    /// `target.members` (empty: every member). Other turns and other members
+    /// are untouched. With `drop_rest`, those members' outputs also refuse
+    /// the turn's later frames. [`Self::request_flush_audio`] is unchanged
+    /// and still means everyone and every turn.
+    ///
+    /// Fire-and-forget: `true` if a transport accepted the request, `false`
+    /// if none installed a hook. Never blocks.
+    pub fn request_flush_audio_for(&self, target: FlushTarget) -> bool {
+        let hooks = self.media.flush_hooks.read().clone();
+        let mut accepted = false;
+        for hook in hooks {
+            accepted |= hook.try_send(target.clone()).is_ok();
+        }
+        accepted
+    }
+
+    /// Subscribe to the session's media events (`__media__.out`):
+    /// `media_ready`, `media_lost` and `audio_released`
+    /// ([`super::turn_audio::MediaEvent`]).
+    pub fn subscribe_media(&self) -> broadcast::Receiver<RuntimeData> {
+        self.tap_sender(MEDIA_PORT, None).subscribe()
+    }
+
+    /// A member can hear output: its WebRTC peer is connected with its
+    /// outbound audio track bound, or its call was answered. `connection`
+    /// identifies the member's connection. Publishes `media_ready` once per
+    /// connection: again only after [`Self::publish_media_lost`], or when the
+    /// member comes back on another connection. Speech waiting for the member
+    /// is then sent. `true` if the event was published.
+    pub fn publish_media_ready(
+        self: &Arc<Self>,
+        member: &str,
+        transport: &str,
+        connection: &str,
+    ) -> bool {
+        {
+            let mut ready = self.media.ready.write();
+            if ready.get(member).is_some_and(|current| current == connection) {
+                return false;
+            }
+            ready.insert(member.to_string(), connection.to_string());
+        }
+        let event = MediaEvent::MediaReady {
+            member: member.to_string(),
+            transport: transport.to_string(),
+            ts_ms: super::turn_audio::now_ms(),
+        };
+        self.publish_tap(MEDIA_PORT, None, event.to_runtime());
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let this = Arc::clone(self);
+            runtime.spawn(async move { this.drain_pending_speech().await });
+        }
+        true
+    }
+
+    /// The member's connection ended. Ignored when the member has since
+    /// become ready on another connection. `true` if `media_lost` was
+    /// published.
+    pub fn publish_media_lost(&self, member: &str, transport: &str, connection: &str) -> bool {
+        {
+            let mut ready = self.media.ready.write();
+            if ready.get(member).is_none_or(|current| current != connection) {
+                return false;
+            }
+            ready.remove(member);
+        }
+        let event = MediaEvent::MediaLost {
+            member: member.to_string(),
+            transport: transport.to_string(),
+            ts_ms: super::turn_audio::now_ms(),
+        };
+        self.publish_tap(MEDIA_PORT, None, event.to_runtime());
+        true
+    }
+
+    /// Whether `media_ready` holds for the member now.
+    pub fn is_media_ready(&self, member: &str) -> bool {
+        self.media.ready.read().contains_key(member)
+    }
+
+    /// The members that are media-ready now. A subscriber that attached
+    /// after a `media_ready` event reads this to catch up.
+    pub fn media_ready_members(&self) -> Vec<String> {
+        self.media.ready.read().keys().cloned().collect()
+    }
+
+    /// Subscribe to member joins and leaves (`__members__.out`,
+    /// [`super::turn_audio::MemberEvent`]). A subscriber that attached late
+    /// learns the current members from the inputs it sees.
+    pub fn subscribe_members(&self) -> broadcast::Receiver<RuntimeData> {
+        self.tap_sender(super::turn_audio::MEMBERS_PORT, None).subscribe()
+    }
+
+    /// The router saw a member join (its first input, or an explicit join).
+    pub fn publish_member_joined(&self, origin: &super::origin::Origin) {
+        let event = super::turn_audio::MemberEvent::MemberJoined {
+            member: origin.id().to_string(),
+            fields: origin.fields().clone(),
+            ts_ms: super::turn_audio::now_ms(),
+        };
+        self.publish_tap(super::turn_audio::MEMBERS_PORT, None, event.to_runtime());
+    }
+
+    /// The router saw a member leave.
+    pub fn publish_member_left(&self, member: &str) {
+        let event = super::turn_audio::MemberEvent::MemberLeft {
+            member: member.to_string(),
+            ts_ms: super::turn_audio::now_ms(),
+        };
+        self.publish_tap(super::turn_audio::MEMBERS_PORT, None, event.to_runtime());
+    }
+
+    /// Publish an `audio_released` report from a transport's audio sender.
+    pub fn publish_audio_released(&self, report: AudioReleased) {
+        self.publish_tap(MEDIA_PORT, None, MediaEvent::AudioReleased(report).to_runtime());
+    }
+
+    /// Speak `request.text` through the TTS node `request.node`: the text
+    /// enters that node's input tagged with a turn id (generated when not
+    /// given) and addressed to `request.to`, so the audio is delivered,
+    /// reported (`audio_released`) and flushable like a turn's. Unless
+    /// `wait_for_media` is false, the text is held until its listeners are
+    /// media-ready, in order with other waiting speech.
+    ///
+    /// Also reachable from any control client as a publish to
+    /// `<node>.in.__speak__` with the request as JSON (`node` then comes
+    /// from the address) or a bare text.
+    pub async fn speak(&self, mut request: SpeechRequest) -> Result<SpeechAccepted> {
+        if request.node.is_empty() {
+            return Err(crate::Error::Execution("speech needs a TTS node id".into()));
+        }
+        let turn_id = match request.turn_id.clone().filter(|id| !id.is_empty()) {
+            Some(turn_id) => turn_id,
+            None => format!(
+                "speak-{}",
+                self.media.speech_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        };
+        request.turn_id = Some(turn_id.clone());
+        let queued = {
+            let mut pending = self.media.pending_speech.lock();
+            // Speech already waiting goes first.
+            if request.wait_for_media && (!pending.is_empty() || !self.media.can_hear(&request)) {
+                if pending.len() >= super::turn_audio::MAX_PENDING_SPEECH {
+                    return Err(crate::Error::Execution(format!(
+                        "session {}: too much speech is waiting for media_ready",
+                        self.session_id
+                    )));
+                }
+                pending.push_back(request.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if queued {
+            // The listeners may have become ready while it was queued.
+            self.drain_pending_speech().await;
+            let still = self
+                .media
+                .pending_speech
+                .lock()
+                .iter()
+                .any(|pending| pending.turn_id == request.turn_id);
+            return Ok(SpeechAccepted { turn_id, queued: still });
+        }
+        self.send_speech(&request).await?;
+        Ok(SpeechAccepted { turn_id, queued: false })
+    }
+
+    /// Send waiting speech whose listeners are ready, oldest first. Speech
+    /// behind a request that still waits keeps waiting, so order holds.
+    async fn drain_pending_speech(&self) {
+        let _serial = self.media.drain.lock().await;
+        loop {
+            let next = {
+                let mut pending = self.media.pending_speech.lock();
+                match pending.front() {
+                    Some(request) if self.media.can_hear(request) => pending.pop_front(),
+                    _ => None,
+                }
+            };
+            let Some(request) = next else { break };
+            if let Err(error) = self.send_speech(&request).await {
+                tracing::warn!(
+                    "session {}: queued speech for {:?} not sent: {error}",
+                    self.session_id,
+                    request.to
+                );
+            }
+        }
+    }
+
+    async fn send_speech(&self, request: &SpeechRequest) -> Result<()> {
+        use super::data::participant;
+        let turn_id = request.turn_id.as_deref().unwrap_or_default();
+        // Attributed to the member spoken to (or to the agent when it is for
+        // everyone): the router carries these fields to the TTS audio.
+        let mut metadata = HashMap::from([
+            (
+                participant::ID.to_string(),
+                request
+                    .to
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| participant::role::AGENT.to_string()),
+            ),
+            (participant::ROLE.to_string(), participant::role::AGENT.to_string()),
+        ]);
+        if !request.to.is_empty() {
+            metadata.insert(participant::TO.to_string(), request.to.join(","));
+        }
+        super::turn_audio::TurnTag::new(turn_id, 0).write_to(&mut metadata);
+        self.publish_inner(
+            &ControlAddress::node_in(&request.node),
+            RuntimeData::Text(request.text.clone()),
+            None,
+            metadata,
+        )
+        .await
     }
 
     /// Set a node's runtime execution state.
@@ -1576,6 +1818,29 @@ impl SessionControl {
             return Err(crate::Error::Execution(
                 "publish requires Direction::In".into(),
             ));
+        }
+        // `<tts>.in.__speak__`: speech through that node (see `speak`).
+        if addr.port.as_deref() == Some(SPEAK_PORT) {
+            let mut request: SpeechRequest = match &data {
+                RuntimeData::Json(payload) => serde_json::from_value(payload.clone())
+                    .map_err(|e| crate::Error::Execution(format!("invalid speech request: {e}")))?,
+                RuntimeData::Text(text) => SpeechRequest {
+                    node: String::new(),
+                    text: text.clone(),
+                    to: Vec::new(),
+                    turn_id: None,
+                    wait_for_media: true,
+                },
+                other => {
+                    return Err(crate::Error::Execution(format!(
+                        "a speech request is JSON or text, not {}",
+                        other.data_type()
+                    )))
+                }
+            };
+            request.node = addr.node_id.clone();
+            // Boxed: `speak` publishes the text through this function.
+            return Box::pin(self.speak(request)).await.map(|_| ());
         }
         // RPC-shaped publishes to a client-hosted endpoint become endpoint
         // calls (host-only delivery, presence, deadlines). Unhosted ids keep
@@ -2484,6 +2749,10 @@ pub fn global_bus() -> Option<Arc<SessionControlBus>> {
 // ────────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "session_media_tests.rs"]
+mod media_tests;
 
 #[cfg(test)]
 #[path = "session_control_input_tests.rs"]

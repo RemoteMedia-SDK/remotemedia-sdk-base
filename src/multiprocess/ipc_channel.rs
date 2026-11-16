@@ -419,6 +419,19 @@ impl ChannelRegistry {
             .map_err(|e| Error::IpcError(format!("Failed to create wake listener: {:?}", e)))
     }
 
+    /// Whether this registry still holds `name`: a channel's service or
+    /// handle, or the wake event service called `name`.
+    #[cfg(feature = "multiprocess")]
+    pub async fn holds(&self, name: &str) -> bool {
+        let wake_event = match name.strip_suffix("_event") {
+            Some(channel) => self.wake_events.read().await.contains_key(channel),
+            None => false,
+        };
+        wake_event
+            || self.services.read().await.contains_key(name)
+            || self.channels.read().await.contains_key(name)
+    }
+
     /// Destroy a channel and cleanup resources
     ///
     /// This method:
@@ -449,6 +462,16 @@ impl ChannelRegistry {
             channel_name
         );
         Ok(())
+    }
+
+    /// Drop this registry's handles to a channel: its service, its wake
+    /// event and its handle. [`ChannelRegistry::destroy_channel`] for a
+    /// thread that runs no async tasks; it panics on one that does.
+    #[cfg(feature = "multiprocess")]
+    pub fn release_channel_blocking(&self, channel_name: &str) {
+        drop(self.services.blocking_write().remove(channel_name));
+        drop(self.wake_events.blocking_write().remove(channel_name));
+        self.channels.blocking_write().remove(channel_name);
     }
 
     /// Discard a new subscriber's pending samples without decoding payloads.

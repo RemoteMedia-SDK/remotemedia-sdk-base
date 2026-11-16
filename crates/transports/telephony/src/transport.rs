@@ -18,6 +18,8 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use ipnet::IpNet;
 use remotemedia_core::manifest::Manifest;
+use remotemedia_core::transport::session_control::SessionControl;
+use remotemedia_core::transport::turn_audio::FlushTarget;
 use remotemedia_core::transport::{
     data::participant, Participant, ParticipantSessionHandle, PipelineExecutor, PipelineTransport,
     SharedPipelineOutputReceivers, StreamSession, TransportData,
@@ -28,6 +30,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::net::UdpSocket;
+use tokio::sync::broadcast;
 use tracing::warn;
 
 /// SIP/RTP telephony transport.
@@ -42,6 +45,13 @@ pub struct TelephonyTransport {
     rtp_ports: RtpPortAllocator,
     metrics: Arc<Mutex<CallMetrics>>,
     rate_limits: DashMap<IpAddr, PeerRateState>,
+    /// Answered calls by Call-ID: the session's control and the caller leg,
+    /// to publish `media_ready` at the caller's ACK and `media_lost` when
+    /// the call ends.
+    answered: DashMap<String, (Arc<SessionControl>, String)>,
+    /// Session-wide flush requests (`SessionControl::request_flush_audio`)
+    /// by pipeline session id, fanned out to the session's calls.
+    session_flushes: Arc<DashMap<String, broadcast::Sender<()>>>,
 }
 
 /// Per-peer rate-limit state.
@@ -128,7 +138,23 @@ pub struct AcceptedCall {
     pub call_id: String,
     /// RemoteMedia call leg identifier for caller media.
     pub leg_id: String,
-    _rtp_port: RtpPortLease,
+    /// The pipeline session's control bus, when it has one. `media_ready`
+    /// for `leg_id` is published on it when the caller's ACK reaches
+    /// [`TelephonyTransport::handle_sip_datagram_from`] (or, in the media
+    /// loop, at the caller's first RTP packet); the RTP send loop publishes
+    /// the call's `audio_released` reports on it
+    /// (`crate::media_loop::CallAudioSender`).
+    pub session_control: Option<Arc<SessionControl>>,
+    /// The session's targeted flush requests. The RTP send loop applies each
+    /// to its outbound media (`RtpOutboundMediaSession::apply_flush` with
+    /// `leg_id`).
+    pub flush_requests: Option<tokio::sync::mpsc::Receiver<FlushTarget>>,
+    /// The session-wide flush requests (`SessionControl::request_flush_audio`,
+    /// everyone and every turn). The RTP send loop drops everything it has
+    /// queued at each.
+    pub session_flushes: Option<broadcast::Receiver<()>>,
+    /// Keeps the RTP port allocated; hold it while the call runs.
+    pub(crate) rtp_port: RtpPortLease,
 }
 
 struct PreparedInboundCall {
@@ -159,6 +185,8 @@ impl TelephonyTransport {
             rtp_ports,
             metrics: Arc::new(Mutex::new(CallMetrics::default())),
             rate_limits: DashMap::new(),
+            answered: DashMap::new(),
+            session_flushes: Arc::new(DashMap::new()),
         })
     }
 
@@ -291,14 +319,59 @@ impl TelephonyTransport {
                             metrics.record_call_completed();
                         }
                     }
+                    // The caller can no longer hear output.
+                    if let Some((_, (control, leg_id))) = self.answered.remove(call_id) {
+                        control.publish_media_lost(&leg_id, "telephony", call_id);
+                    }
                 }
                 Ok(Some(SipTransactionResponse {
                     status_code: 200,
                     bytes: build_response(&request, 200, "OK", "", None).into_bytes(),
                 }))
             }
-            SipMethod::Ack => Ok(None),
+            SipMethod::Ack => {
+                // The caller confirmed the answer: it can hear output
+                // (openspec: add-ai-sdk-voice-library, task 2.1). Once per
+                // call; a retransmitted ACK publishes nothing.
+                if let Some(call_id) = request.call_id() {
+                    if let Some(answered) = self.answered.get(call_id) {
+                        let (control, leg_id) = answered.value();
+                        control.publish_media_ready(leg_id, "telephony", call_id);
+                    }
+                }
+                Ok(None)
+            }
         }
+    }
+
+    /// The session-wide flush requests of `control`'s session. The first
+    /// call of a session installs the session's flush hook; every call of
+    /// the session then receives each request.
+    async fn subscribe_session_flushes(
+        &self,
+        control: &Arc<SessionControl>,
+    ) -> broadcast::Receiver<()> {
+        let session_id = control.session_id().to_string();
+        let (flushes, hook) = match self.session_flushes.entry(session_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => return entry.get().subscribe(),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let (flushes, _) = broadcast::channel(8);
+                entry.insert(flushes.clone());
+                (flushes, tokio::sync::mpsc::channel::<()>(4))
+            }
+        };
+        let receiver = flushes.subscribe();
+        let (hook_tx, mut hook_rx) = hook;
+        control.install_flush_audio_hook(hook_tx).await;
+        let sessions = Arc::clone(&self.session_flushes);
+        tokio::spawn(async move {
+            while hook_rx.recv().await.is_some() {
+                let _ = flushes.send(());
+            }
+            // The session ended, or another transport took its hook.
+            sessions.remove_if(&session_id, |_, current| current.same_channel(&flushes));
+        });
+        receiver
     }
 
     fn ensure_peer_allowed_result(&self, peer: SocketAddr) -> PeerAccess {
@@ -562,7 +635,27 @@ impl TelephonyTransport {
             )
             .await
             .map_err(|e| Error::Pipeline(e.to_string()))?;
+        // The 200 OK is built, not yet confirmed: `media_ready` for the
+        // caller leg is published at its ACK (`handle_sip_datagram_inner`).
+        // A caller who dials again is a new Call-ID and is announced again.
+        let session_control = self.executor.control_bus().get(stream.session_id());
+        let flush_requests = session_control.as_ref().map(|control| {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            control.install_flush_audio_for_hook(tx);
+            self.answered.insert(
+                prepared.call_id.clone(),
+                (Arc::clone(control), prepared.leg_id.clone()),
+            );
+            rx
+        });
+        let session_flushes = match &session_control {
+            Some(control) => Some(self.subscribe_session_flushes(control).await),
+            None => None,
+        };
         Ok(AcceptedCall {
+            session_control,
+            flush_requests,
+            session_flushes,
             copies,
             response: prepared.response,
             stream,
@@ -573,7 +666,7 @@ impl TelephonyTransport {
             codec_map: prepared.codec_map,
             call_id: prepared.call_id,
             leg_id: prepared.leg_id,
-            _rtp_port: prepared.rtp_port,
+            rtp_port: prepared.rtp_port,
         })
     }
 
@@ -624,6 +717,9 @@ impl TelephonyTransport {
                     self.sessions
                         .transition(&call_id, CallSessionState::Terminated)?;
                 }
+            }
+            if let Some((_, (control, leg_id))) = self.answered.remove(&call_id) {
+                control.publish_media_lost(&leg_id, "telephony", &call_id);
             }
         }
         Ok(())
@@ -1185,6 +1281,57 @@ a=ptime:20\r\n",
         assert!(accepted.codec_map.get(0).is_some());
         assert_eq!(accepted.call_id, "call-stream");
         assert_eq!(accepted.leg_id, "call-stream:caller");
+
+        // `media_ready` for the caller leg at its ACK, not at the 200 OK;
+        // once, on the session bus; `media_lost` when the call ends.
+        let control = accepted.session_control.clone().expect("session control");
+        assert!(
+            !control.is_media_ready("call-stream:caller"),
+            "the 200 OK is not confirmed yet"
+        );
+        let ack = b"ACK sip:bot@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK1a\r\n\
+From: <sip:a@example.com>;tag=1\r\n\
+To: <sip:bot@example.com>\r\n\
+Call-ID: call-stream\r\n\
+CSeq: 1 ACK\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut ready = control.subscribe_media();
+        assert!(transport.handle_sip_datagram(ack).unwrap().is_none());
+        assert!(control.is_media_ready("call-stream:caller"));
+        assert!(matches!(
+            remotemedia_core::transport::MediaEvent::from_runtime(&ready.try_recv().unwrap()),
+            Some(remotemedia_core::transport::MediaEvent::MediaReady { ref member, ref transport, .. })
+                if member == "call-stream:caller" && transport == "telephony"
+        ));
+        // A retransmitted ACK announces nothing.
+        transport.handle_sip_datagram(ack).unwrap();
+        assert!(ready.try_recv().is_err());
+        assert!(accepted.session_flushes.is_some());
+        assert!(
+            !control.publish_media_ready("call-stream:caller", "telephony", "call-stream"),
+            "already announced for this call"
+        );
+        assert!(accepted.flush_requests.is_some());
+        let mut events = control.subscribe_media();
+        transport
+            .handle_sip_datagram(
+                b"BYE sip:bot@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK2\r\n\
+From: <sip:a@example.com>;tag=1\r\n\
+To: <sip:bot@example.com>\r\n\
+Call-ID: call-stream\r\n\
+CSeq: 2 BYE\r\n\
+Content-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        assert!(!control.is_media_ready("call-stream:caller"));
+        let event = remotemedia_core::transport::MediaEvent::from_runtime(&events.try_recv().unwrap());
+        assert!(matches!(
+            event,
+            Some(remotemedia_core::transport::MediaEvent::MediaLost { ref member, ref transport, .. })
+                if member == "call-stream:caller" && transport == "telephony"
+        ));
     }
 
     #[tokio::test]
@@ -1248,6 +1395,28 @@ a=ptime:20\r\n",
         assert_eq!(first.stream.session_id(), second.stream.session_id());
         assert_eq!(first.leg_id, "call-shared-1:caller");
         assert_eq!(second.leg_id, "call-shared-2:caller");
+
+        // Both calls of the session receive its flush requests: the
+        // session-wide one (one hook per session, fanned out) and the
+        // targeted one (one hook per call).
+        let control = first.session_control.clone().expect("session control");
+        assert!(control.request_flush_audio().await);
+        for call in [&mut first, &mut second] {
+            let flushes = call.session_flushes.as_mut().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), flushes.recv())
+                .await
+                .expect("the session-wide flush")
+                .unwrap();
+        }
+        assert!(control.request_flush_audio_for(FlushTarget {
+            members: vec!["call-shared-2:caller".into()],
+            turn_id: "t".into(),
+            drop_rest: true,
+        }));
+        for call in [&mut first, &mut second] {
+            let target = call.flush_requests.as_mut().unwrap().try_recv().unwrap();
+            assert_eq!(target.turn_id, "t");
+        }
 
         first.stream.close().await.unwrap();
         assert!(second.stream.is_active());
