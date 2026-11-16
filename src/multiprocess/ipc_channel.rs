@@ -108,8 +108,14 @@ impl ChannelRegistry {
                     // Set log level first
                     set_log_level(LogLevel::Info);
 
-                    // Create iceoryx2 node directly here, not via a mutable method
-                    match NodeBuilder::new().create::<ipc::Service>() {
+                    // Create iceoryx2 node directly here, not via a mutable method.
+                    // With iceoryx2's own dead-node sweeps off: this node opens
+                    // every session's services, and concurrent sweeps from
+                    // several hosts fatal-panic on Windows (see iox_hygiene).
+                    match NodeBuilder::new()
+                        .config(&super::iox_hygiene::node_config_without_dead_node_sweeps())
+                        .create::<ipc::Service>()
+                    {
                         Ok(node) => {
                             tracing::info!("Global iceoryx2 node created successfully");
                             Arc::new(Self {
@@ -285,6 +291,7 @@ impl ChannelRegistry {
 
         // Create iceoryx2 node
         let node = NodeBuilder::new()
+            .config(&super::iox_hygiene::node_config_without_dead_node_sweeps())
             .create::<ipc::Service>()
             .map_err(|e| Error::IpcError(format!("Failed to create iceoryx2 node: {:?}", e)))?;
 
