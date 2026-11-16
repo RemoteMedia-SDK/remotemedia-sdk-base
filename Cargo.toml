@@ -144,6 +144,9 @@ nokhwa = { version = "0.10", optional = true, features = ["input-native"] }
 # IPC for multiprocess
 iceoryx2 = { version = "0.10.0", optional = true }
 iceoryx2-log = { version = "0.10.0", optional = true }
+# The Windows temp directory iceoryx2 keeps its shared-memory state files in
+# (multiprocess::iox_hygiene).
+iceoryx2-pal-configuration = { version = "0.10.0", optional = true }
 
 # Note: Python wrapper nodes are in a separate crate (remotemedia-nodes-python).
 # Users should add that crate as a dependency to get Python nodes.
@@ -194,7 +197,7 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 # JobObjects/Threading/ToolHelp/Security: Python node workers live in a
 # kill-on-close job, so they never outlive the host (process_manager.rs).
-windows = { version = "0.52", features = ["Win32_System_ProcessStatus", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security"] }
+windows = { version = "0.52", features = ["Win32_System_ProcessStatus", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security", "Win32_System_Memory"] }
 
 # Error handling
 anyhow = "1.0.100"
@@ -276,7 +279,7 @@ harness = false
 
 [features]
 default = []
-multiprocess = ["iceoryx2", "iceoryx2-log"]
+multiprocess = ["iceoryx2", "iceoryx2-log", "iceoryx2-pal-configuration"]
 # Typed mapped native workers. Independent of the explicit legacy iceoryx2 codec.
 native-worker = ["dep:remotemedia-plugin-sdk", "remotemedia-plugin-sdk/native-worker"]
 linux-worker-supervisor = ["native-worker", "remotemedia-plugin-sdk/linux-worker-supervisor"]

@@ -224,29 +224,17 @@ pub(super) type NativePublisher = iceoryx2::port::publisher::Publisher<ipc::Serv
 pub(super) type NativeSubscriber = iceoryx2::port::subscriber::Subscriber<ipc::Service, [u8], ()>;
 
 /// iceoryx2 config for nodes opened by native compatibility workers and their
-/// host IPC threads, with dead-node sweeps off.
-///
-/// By default every iceoryx2 node scans all nodes on the machine and removes
-/// the ones it judges dead, when it is created, when it is dropped and when it
-/// opens a service. On
-/// Windows that liveness check emulates F_GETLK by briefly taking an exclusive
-/// lock, so processes checking the same node at once can judge a live node dead
-/// and iceoryx2 fatal-panics ("the Node is still alive"); every sweep also
-/// rescans all stale node directories, slowing startup. The host sweeps once,
-/// per process, before its first spawn, instead ([`sweep_dead_nodes_once`]).
-/// Returns a copy; the process-wide global config is unchanged.
+/// host IPC threads, with iceoryx2's own dead-node sweeps off. See
+/// [`super::iox_hygiene`]. Returns a copy; the process-wide global config is
+/// unchanged.
 pub(super) fn node_config_without_dead_node_sweeps() -> iceoryx2::config::Config {
-    let mut config = iceoryx2::config::Config::global_config().clone();
-    config.global.node.cleanup_dead_nodes_on_creation = false;
-    config.global.node.cleanup_dead_nodes_on_destruction = false;
-    config.global.service.cleanup_dead_nodes_on_open = false;
-    config
+    super::iox_hygiene::node_config_without_dead_node_sweeps()
 }
 
 /// Host-side replacement for the per-node sweeps: remove dead iceoryx2 nodes
 /// once per process, before the first worker spawn. Concurrent first spawns
-/// wait for that single sweep. A sweep per spawn would rescan, serially, every
-/// node directory that iceoryx2 cannot delete on Windows.
+/// wait for that single sweep. Later sweeps run when a session ends with
+/// services a dead worker left behind (`ipc_release`).
 pub(super) fn sweep_dead_nodes_once() {
     static SWEEP: std::sync::Once = std::sync::Once::new();
     SWEEP.call_once(sweep_dead_nodes);
@@ -265,35 +253,10 @@ fn sweep_dead_nodes() {
 }
 
 /// Remove the stale resources of every dead iceoryx2 node, without creating a
-/// node. Returns `(removed, failed)`. A node another process is already
-/// cleaning, or one this process may not remove, counts as failed and is left
-/// for a later sweep.
-///
-/// iceoryx2 0.10 only offers this sweep as a method on a live node; this is
-/// the same loop over the public node list.
+/// node. Returns `(removed, failed)`. One sweep at a time on the machine, and
+/// it never panics: see [`super::iox_hygiene::cleanup_dead_nodes`].
 pub(crate) fn cleanup_dead_nodes(config: &iceoryx2::config::Config) -> (u64, u64) {
-    use iceoryx2::node::NodeState;
-    use iceoryx2::prelude::CallbackProgression;
-
-    // One sweep at a time in this process: sessions that end together would
-    // otherwise remove the same dead node concurrently.
-    static SWEEPING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _sweeping = SWEEPING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let (mut cleanups, mut failed_cleanups) = (0u64, 0u64);
-    let listed = iceoryx2::node::Node::<ipc::Service>::list(config, |state| {
-        if let NodeState::Dead(dead_node) = state {
-            match dead_node.blocking_remove_stale_resources(std::time::Duration::ZERO) {
-                Ok(_) => cleanups += 1,
-                Err(_) => failed_cleanups += 1,
-            }
-        }
-        CallbackProgression::Continue
-    });
-    if let Err(error) = listed {
-        tracing::debug!("iceoryx2: could not list nodes for the dead-node sweep: {error:?}");
-    }
-    (cleanups, failed_cleanups)
+    super::iox_hygiene::cleanup_dead_nodes(config)
 }
 
 pub(super) fn open_channels(

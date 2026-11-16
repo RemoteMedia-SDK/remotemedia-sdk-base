@@ -226,6 +226,52 @@ async fn explicit_cleanup_releases_every_service() {
     assert_eq!(registered(&session).await, 0);
 }
 
+/// A worker killed mid-session runs no cleanup of its own: its iceoryx2 node
+/// stays registered as a dead node in every service it had open, with its
+/// ports and shared memory. Ending the session must remove all of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn killed_worker_leaves_no_dead_node_behind() {
+    use iceoryx2::node::{NodeState, NodeView};
+    use iceoryx2::prelude::CallbackProgression;
+    let Some(client) = enabled() else { return };
+    let session = session_id("kill");
+    let executor = start(&client, &session).await;
+    let worker = executor.sessions.read().await[&session].node_processes[NODE].clone();
+    worker.kill().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while worker.exited_now() != Some(true) {
+        assert!(Instant::now() < deadline, "the killed worker did not exit");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(executor);
+    let left = left_after(&session, Duration::from_secs(20)).await;
+    assert!(
+        left.is_empty(),
+        "a killed worker's session left services behind: {left:?}"
+    );
+    assert_eq!(registered(&session).await, 0);
+    let mut workers_nodes = Vec::new();
+    iceoryx2::node::Node::<ipc::Service>::list(
+        iceoryx2::config::Config::global_config(),
+        |state| {
+            let (kind, details) = match &state {
+                NodeState::Alive(view) => ("alive", view.details().clone()),
+                NodeState::Dead(view) => ("dead", view.details().clone()),
+                _ => return CallbackProgression::Continue,
+            };
+            if details.is_some_and(|d| d.process_id().value() as u32 == worker.id) {
+                workers_nodes.push(kind);
+            }
+            CallbackProgression::Continue
+        },
+    )
+    .unwrap();
+    assert!(
+        workers_nodes.is_empty(),
+        "the killed worker's node is still registered: {workers_nodes:?}"
+    );
+}
+
 /// The worker exits before READY: initialization fails after the channels
 /// were created.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
