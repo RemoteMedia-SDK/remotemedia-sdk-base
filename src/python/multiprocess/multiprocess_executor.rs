@@ -734,6 +734,11 @@ pub struct MultiprocessExecutor {
     /// `SCOPE:` control message, else the source probe.
     declared_instance_scope: Option<crate::nodes::InstanceScope>,
 
+    /// The node class's generator role and default dispositions, from the
+    /// worker's `META:` control message (openspec: add-generator-cancellation).
+    declared_generator: remotemedia_traits::GeneratorDeclaration,
+    declared_dispositions: Option<remotemedia_traits::DefaultDispositions>,
+
     /// `@self_driven` as the worker reported it before READY.
     declared_self_driven: Option<bool>,
 
@@ -1086,6 +1091,36 @@ impl MultiprocessExecutor {
             .map_err(|e| Error::Execution(format!("Failed to send to IPC thread: {e}")))
     }
 
+    /// [`Self::send_out_of_band`] without waiting, for a call's cancel
+    /// callback, which runs before the call's future is dropped (openspec:
+    /// add-generator-cancellation). Fails instead of waiting when the
+    /// session table is being written or the IPC queue is full; the caller
+    /// then sends asynchronously.
+    pub fn try_send_out_of_band(
+        session_id: &str,
+        node_id: &str,
+        data: crate::data::RuntimeData,
+    ) -> Result<()> {
+        let bytes = Self::to_ipc_runtime_data(&data, session_id)?;
+        let tx = {
+            let global_sessions = global_sessions();
+            let sessions = global_sessions
+                .try_read()
+                .map_err(|_| Error::Execution("session table busy".into()))?;
+            sessions
+                .get(session_id)
+                .and_then(|s| s.get(node_id))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::Execution(format!(
+                        "IPC thread not found for node {node_id} in session {session_id}"
+                    ))
+                })?
+        };
+        tx.try_send(IpcCommand::SendDataNoAck { bytes })
+            .map_err(|e| Error::Execution(format!("IPC queue busy: {e}")))
+    }
+
     /// Send data to a node's IPC thread without waiting for response (fire-and-forget)
     /// This is used for routing data between nodes in the pipeline
     #[cfg(feature = "multiprocess")]
@@ -1251,6 +1286,8 @@ impl MultiprocessExecutor {
             config,
             current_context: None,
             declared_instance_scope: None,
+            declared_generator: Default::default(),
+            declared_dispositions: None,
             declared_self_driven: None,
             emitter: Default::default(),
             wire_turns: Default::default(),
@@ -1366,6 +1403,17 @@ impl MultiprocessExecutor {
     /// known once [`NodeExecutor::initialize`] returned.
     pub fn declared_instance_scope(&self) -> Option<crate::nodes::InstanceScope> {
         self.declared_instance_scope
+    }
+
+    /// The generator role the worker declared (`META:`), and its default
+    /// dispositions (openspec: add-generator-cancellation).
+    pub fn declared_generator(
+        &self,
+    ) -> (
+        remotemedia_traits::GeneratorDeclaration,
+        Option<remotemedia_traits::DefaultDispositions>,
+    ) {
+        (self.declared_generator, self.declared_dispositions.clone())
     }
 
     /// Whether the Python class is `@self_driven`, once the worker is ready.
@@ -2338,7 +2386,7 @@ sys.stdout.flush()
         session_id: &str,
         node_id: &str,
         timeout: std::time::Duration,
-    ) -> Result<(bool, Option<crate::nodes::InstanceScope>, bool, bool, bool)> {
+    ) -> Result<(bool, Option<crate::nodes::InstanceScope>, bool, bool, bool, Option<Vec<u8>>)> {
         let start = std::time::Instant::now();
         let control_channel_name = format!("control/{}_{}", session_id, node_id);
 
@@ -2365,7 +2413,14 @@ sys.stdout.flush()
 
         // Control channel was already created in initialize() before spawning Python
         // Now poll for the READY signal - need direct iceoryx2 subscriber (not RuntimeData wrapper)
-        type Readiness = (bool, Option<crate::nodes::InstanceScope>, bool, bool, bool);
+        type Readiness = (
+            bool,
+            Option<crate::nodes::InstanceScope>,
+            bool,
+            bool,
+            bool,
+            Option<Vec<u8>>,
+        );
         let ready = tokio::task::spawn_blocking(move || -> Result<Readiness> {
             let handle = tokio::runtime::Handle::current();
             // `@instance_scope` as the worker reports it before READY.
@@ -2376,6 +2431,8 @@ sys.stdout.flush()
             let mut self_driven = false;
             // The worker's node has a body that waits for the start signal.
             let mut awaits_start = false;
+            // The generator role (META:{json}), openspec: add-generator-cancellation.
+            let mut meta: Option<Vec<u8>> = None;
 
             // Create raw subscriber for control channel (bypasses RuntimeData deserialization)
             let subscriber = handle.block_on(registry.create_raw_subscriber(&channel_name))?;
@@ -2391,7 +2448,7 @@ sys.stdout.flush()
                         node_id_clone,
                         poll_count
                     );
-                    return Ok((false, scope, turns, self_driven, awaits_start));
+                    return Ok((false, scope, turns, self_driven, awaits_start, meta));
                 }
 
                 poll_count += 1;
@@ -2445,7 +2502,9 @@ sys.stdout.flush()
                         // Check if it's the READY signal
                         if bytes == b"READY" {
                             tracing::debug!("Node {} signaled READY via iceoryx2", node_id_clone);
-                            return Ok((true, scope, turns, self_driven, awaits_start));
+                            return Ok((true, scope, turns, self_driven, awaits_start, meta));
+                        } else if let Some(declared) = bytes.strip_prefix(b"META:") {
+                            meta = Some(declared.to_vec());
                         } else if bytes == b"START:1" {
                             awaits_start = true;
                         } else if bytes == b"TURNS:1" {
@@ -3689,13 +3748,33 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             // Python creates its input subscriber BEFORE sending READY, so when we receive
             // READY signal, Python is fully prepared to receive data
             // Wait for READY signal with configured timeout (allows time for heavy model loading)
-            let (ready, reported_scope, worker_tags_turns, worker_self_driven, worker_awaits_start) = self
+            let (ready, reported_scope, worker_tags_turns, worker_self_driven, worker_awaits_start, worker_meta) = self
                 .wait_for_ready_signal_ipc(
                     &session_id,
                     &ctx.node_id,
                     std::time::Duration::from_secs(self.config.init_timeout_secs),
                 )
                 .await?;
+            if let Some(meta) = worker_meta {
+                #[derive(serde::Deserialize)]
+                struct WorkerMeta {
+                    #[serde(flatten)]
+                    generator: remotemedia_traits::GeneratorDeclaration,
+                    #[serde(default)]
+                    default_dispositions: Option<remotemedia_traits::DefaultDispositions>,
+                }
+                match serde_json::from_slice::<WorkerMeta>(&meta) {
+                    Ok(meta) => {
+                        self.declared_generator = meta.generator;
+                        self.declared_dispositions = meta.default_dispositions;
+                    }
+                    Err(error) => tracing::warn!(
+                        node_id = %ctx.node_id,
+                        %error,
+                        "unreadable META declaration from the Python node"
+                    ),
+                }
+            }
             if let Some(reported) = reported_scope {
                 if let Some(probed) = self.declared_instance_scope.filter(|p| *p != reported) {
                     tracing::warn!(
@@ -4188,3 +4267,7 @@ mod shared_workers_tests;
 #[cfg(all(test, feature = "multiprocess"))]
 #[path = "ipc_release_tests.rs"]
 mod ipc_release_tests;
+
+#[cfg(all(test, feature = "multiprocess"))]
+#[path = "cancel_worker_tests.rs"]
+mod cancel_worker_tests;

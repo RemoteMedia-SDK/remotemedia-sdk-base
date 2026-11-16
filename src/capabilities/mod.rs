@@ -68,9 +68,9 @@ pub mod hints;
 
 // Re-export main types for convenience
 pub use constraints::{
-    AudioConstraints, AudioSampleFormat, ConstraintValue, FileConstraints, JsonConstraints,
-    MediaCapabilities, MediaConstraints, PixelFormat, TensorConstraints, TensorDataType,
-    TextConstraints, VideoConstraints,
+    AudioConstraints, AudioSampleFormat, ConstraintValue, FileConstraints, ImageConstraints,
+    ImageEncoding, JsonConstraints, MediaCapabilities, MediaConstraints, MediaType, PixelFormat,
+    TensorConstraints, TensorDataType, TextConstraints, VideoConstraints,
 };
 
 pub use validation::{CapabilityMismatch, CapabilityValidationResult};

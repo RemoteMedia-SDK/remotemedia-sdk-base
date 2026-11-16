@@ -180,6 +180,31 @@ pub struct StreamingNodeRegistry {
     /// plugins). Types absent here are built-in, or Python when the factory
     /// says so.
     implementations: HashMap<String, crate::telemetry::NodeImplementation>,
+    /// Node types refused at registration, with why (openspec:
+    /// add-generator-cancellation: a generator without a cancel strategy).
+    refused: HashMap<String, String>,
+}
+
+/// Whether a factory's generator declaration is admissible. A generator
+/// whose declared outputs lack its generated media type is admitted with a
+/// warning (an animation node generates video and emits JSON frames).
+fn admit(factory: &dyn StreamingNodeFactory) -> Result<(), String> {
+    let params = Value::Object(Default::default());
+    let declaration = factory.generator_declaration(&params);
+    declaration
+        .validate(factory.node_type())
+        .map_err(|error| error.to_string())?;
+    if let Some(capabilities) = factory.media_capabilities(&params) {
+        if !declaration.outputs_agree(&capabilities) {
+            tracing::warn!(
+                node_type = factory.node_type(),
+                generates = declaration.generates.map(|m| m.as_str()),
+                outputs = ?capabilities.outputs.values().map(|c| c.media_type()).collect::<Vec<_>>(),
+                "a generator's declared outputs do not include what it generates"
+            );
+        }
+    }
+    Ok(())
 }
 
 impl StreamingNodeRegistry {
@@ -190,15 +215,21 @@ impl StreamingNodeRegistry {
             #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
             session_workers: HashMap::new(),
             implementations: HashMap::new(),
+            refused: HashMap::new(),
         }
     }
 
-    /// Register a streaming node factory
+    /// Register a streaming node factory. A factory that declares a
+    /// generator role without a cancel strategy is refused: it is not
+    /// registered, and creating its node type reports why.
     pub fn register(&mut self, factory: Arc<dyn StreamingNodeFactory>) {
         let node_type = factory.node_type().to_string();
         #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
         self.session_workers.remove(&node_type);
         self.implementations.remove(&node_type);
+        if !self.admitted(&node_type, factory.as_ref()) {
+            return;
+        }
         self.factories.insert(node_type, factory);
     }
 
@@ -212,9 +243,33 @@ impl StreamingNodeRegistry {
         let node_type = factory.node_type().to_string();
         #[cfg(all(feature = "native-worker", any(windows, target_os = "linux")))]
         self.session_workers.remove(&node_type);
+        if !self.admitted(&node_type, factory.as_ref()) {
+            self.implementations.remove(&node_type);
+            return;
+        }
         self.implementations
             .insert(node_type.clone(), implementation);
         self.factories.insert(node_type, factory);
+    }
+
+    fn admitted(&mut self, node_type: &str, factory: &dyn StreamingNodeFactory) -> bool {
+        match admit(factory) {
+            Ok(()) => {
+                self.refused.remove(node_type);
+                true
+            }
+            Err(reason) => {
+                tracing::error!(node_type, %reason, "node factory refused");
+                self.factories.remove(node_type);
+                self.refused.insert(node_type.to_string(), reason);
+                false
+            }
+        }
+    }
+
+    /// Why `node_type` was refused at registration, if it was.
+    pub fn refusal(&self, node_type: &str) -> Option<&str> {
+        self.refused.get(node_type).map(String::as_str)
     }
 
     /// Build identity of `node_type`: the registered one, else `python`
@@ -315,6 +370,9 @@ impl StreamingNodeRegistry {
         params: &Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
+        if let Some(reason) = self.refusal(node_type) {
+            return Err(Error::ConfigError(reason.to_string()));
+        }
         let factory = self.factories.get(node_type).ok_or_else(|| {
             Error::Execution(format!(
                 "No streaming node factory registered for type '{}'. Available types: {:?}",
@@ -323,7 +381,20 @@ impl StreamingNodeRegistry {
             ))
         })?;
 
-        factory.create(node_id, params, session_id)
+        // The generator role (openspec: add-generator-cancellation): the
+        // declaration for these parameters must be admissible, and the node
+        // created must declare what its factory did.
+        let declared = factory.generator_declaration(params);
+        declared
+            .validate(node_type)
+            .map_err(|error| Error::ConfigError(error.to_string()))?;
+        let node = factory.create(node_id, params, session_id)?;
+        let actual = node.generator_declaration();
+        actual
+            .validate(node_type)
+            .and_then(|()| declared.check_instance(node_type, actual))
+            .map_err(|error| Error::ConfigError(error.to_string()))?;
+        Ok(node)
     }
 
     /// Check if a node type is registered
@@ -477,6 +548,7 @@ mod runtime_context_default_tests {
     fn ctx_for(node_id: &str, session_id: &str) -> NodeRuntimeContext {
         NodeRuntimeContext {
             source_completion: None,
+            call_cancel: Default::default(),
             emitter: crate::nodes::Emitter::detached(String::new()),
             origin: None,
             materialization: remotemedia_types::CopyContext::legacy().clone(),

@@ -42,7 +42,7 @@ pub mod schema;
 pub mod streaming_node;
 pub mod streaming_registry;
 
-pub use runtime_context::{AnySessionState, NodeRuntimeContext, SnapshotPort};
+pub use runtime_context::{AnySessionState, CallCancel, NodeRuntimeContext, SnapshotPort};
 
 // Video codec support (spec 012)
 #[cfg(feature = "video")]
@@ -223,6 +223,8 @@ pub use audio_evidence::{AudioEvidenceConfig, AudioEvidenceNode, AudioEvidenceNo
 
 pub mod audio_resample_streaming;
 mod media_buffer_contract;
+#[cfg(test)]
+mod generator_admission_tests;
 pub use audio_resample_streaming::ResampleStreamingNode;
 
 pub mod audio_format_converter_streaming;

@@ -22,6 +22,17 @@ struct ActiveCall {
     method: String,
     caller_id: Option<u64>,
     abort: tokio::task::AbortHandle,
+    /// Fires the call's token before the call is aborted (openspec:
+    /// add-generator-cancellation).
+    cancel: remotemedia_traits::CancelSource,
+}
+
+impl ActiveCall {
+    fn cancel(self, reason: remotemedia_traits::CancelReason) {
+        self.cancel
+            .cancel(remotemedia_traits::Cancellation::new(reason));
+        self.abort.abort();
+    }
 }
 
 async fn caller_closed(caller: &mut Option<RpcCaller>) {
@@ -148,7 +159,9 @@ pub(super) async fn run(
                 let Some(id) = id else { continue };
                 if let Some(method) = method.strip_suffix(".__cancel__") {
                     if active.get(&id).is_some_and(|call| call.method == method && call.caller_id == caller_id) {
-                        if let Some(call) = active.remove(&id) { call.abort.abort(); }
+                        if let Some(call) = active.remove(&id) {
+                            call.cancel(remotemedia_traits::CancelReason::CallerCancelled);
+                        }
                     }
                     continue;
                 }
@@ -173,12 +186,22 @@ pub(super) async fn run(
                     }
                 };
                 let node = node.clone();
-                let ctx = ctx.clone();
+                // Each RPC call has its own cancellation token.
+                let (cancel, call_cancel) = crate::nodes::CallCancel::new();
+                let ctx = ctx.clone().with_call_cancel(call_cancel);
                 let methods = methods.clone();
+                let on_close = cancel.clone();
                 let handle = tasks.spawn(async move {
                     let result = tokio::select! {
                         biased;
-                        _ = caller_closed(&mut caller) => return,
+                        // The token fires inside the branch, before `select!`
+                        // drops the handler's future.
+                        _ = async {
+                            caller_closed(&mut caller).await;
+                            on_close.cancel(remotemedia_traits::Cancellation::new(
+                                remotemedia_traits::CancelReason::CallerCancelled,
+                            ));
+                        } => return,
                         result = std::panic::AssertUnwindSafe(dispatch(&*node, &ctx, request, &methods, &mut replies)).catch_unwind() => {
                             result.unwrap_or_else(|_| Err(Error::Execution("RPC handler panicked".into())))
                         }
@@ -187,9 +210,13 @@ pub(super) async fn run(
                         tracing::debug!(%error, "RPC delivery/handler failed");
                     }
                 });
-                active.insert(key, ActiveCall { method, caller_id, abort: handle });
+                active.insert(key, ActiveCall { method, caller_id, abort: handle, cancel });
             }
         }
+    }
+    // The session is closing: the calls still running hear it first.
+    for (_, call) in active.drain() {
+        call.cancel(remotemedia_traits::CancelReason::SessionClosed);
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
@@ -214,4 +241,71 @@ async fn dispatch(
         )));
     }
     node.call_rpc(request, ctx, replies).await
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    //! A cancelled RPC call's token fires before the call is aborted
+    //! (openspec: add-generator-cancellation).
+    use super::*;
+    use remotemedia_traits::{CancelReason, NodeRuntimeContextRead};
+
+    /// A streaming RPC that waits for its call's token and records why.
+    struct Waits(Arc<std::sync::Mutex<Option<CancelReason>>>);
+
+    #[async_trait::async_trait]
+    impl crate::nodes::AsyncStreamingNode for Waits {
+        fn node_type(&self) -> &str {
+            "Waits"
+        }
+        async fn process(&self, data: RuntimeData) -> Result<RuntimeData, Error> {
+            Ok(data)
+        }
+        fn rpc_methods(&self) -> Vec<RpcMethod> {
+            vec![RpcMethod::new("generate", RpcMode::Stream)]
+        }
+        async fn call_rpc(
+            &self,
+            _request: RpcRequest,
+            ctx: &dyn NodeRuntimeContextRead,
+            _replies: &mut RpcResponder,
+        ) -> Result<(), Error> {
+            let seen = self.0.clone();
+            // Registered before waiting: it runs when the token fires, which
+            // must happen before the abort drops this future.
+            ctx.cancel_token()
+                .on_cancel(move |c| *seen.lock().unwrap() = Some(c.reason))
+                .forget();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_cancel_fires_the_calls_token_before_the_abort() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let node: Arc<dyn StreamingNode> =
+            Arc::new(crate::nodes::AsyncNodeWrapper(Arc::new(Waits(seen.clone()))));
+        let ctx = NodeRuntimeContext::for_test("s", "n");
+        let (tx, rx) = mpsc::channel(4);
+        let (_stop, shutdown) = watch::channel(false);
+        let running = tokio::spawn(run(node, ctx, rx, None, shutdown));
+        let call = |method: &str| RpcInvocation {
+            method: method.into(),
+            data: RuntimeData::Json(serde_json::json!({ "corr_id": 7, "args": [], "kwargs": {} })),
+            caller: None,
+        };
+        tx.send(call("generate")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx.send(call("generate.__cancel__")).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while seen.lock().unwrap().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the token fired");
+        assert_eq!(*seen.lock().unwrap(), Some(CancelReason::CallerCancelled));
+        drop(tx);
+        let _ = running.await;
+    }
 }

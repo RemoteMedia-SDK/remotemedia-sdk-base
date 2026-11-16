@@ -315,6 +315,8 @@ impl StreamingNodeFactory for SourcePythonFactory {
             declared_instance_scope: handshake.instance_scope,
             declared_self_driven: handshake.self_driven,
             declared_background: handshake.background,
+            declared_generator: handshake.generator,
+            declared_dispositions: handshake.default_dispositions.clone(),
             body: Default::default(),
             _child: child,
             _env_lease: provisioning.venv.clone(),
@@ -360,6 +362,10 @@ struct SourcePythonNode {
     /// The worker's node has a `background()` that waits for the start
     /// signal: this node's body starts it and reports how it ended.
     declared_background: bool,
+    /// The worker's generator role and default dispositions (its `META:`
+    /// handshake message, openspec: add-generator-cancellation).
+    declared_generator: remotemedia_traits::GeneratorDeclaration,
+    declared_dispositions: Option<remotemedia_traits::DefaultDispositions>,
     /// How the worker's `background()` stands.
     body: tokio::sync::watch::Sender<BodyState>,
     /// The id the runner was started with (it names the runner's stop event).
@@ -420,6 +426,28 @@ async fn deliver_emitted(
 }
 
 impl SourcePythonNode {
+    /// Send this call's cancel to the worker, out of band, when the router
+    /// fires the call's token (openspec: add-generator-cancellation).
+    fn forward_cancel(&self, ctx: &dyn NodeRuntimeContextRead) -> remotemedia_traits::CancelRegistration {
+        let cmd_tx = self.cmd_tx.clone();
+        let session_id = self.session_id.clone();
+        let node_type = self.node_type.clone();
+        let call = crate::nodes::NodeRuntimeContext::of(ctx).map(|c| c.call_cancel().clone());
+        ctx.cancel_token().on_cancel(move |cancellation| {
+            let request = match &call {
+                Some(call) => call.forwarded(cancellation),
+                None => remotemedia_traits::CancelRequest::exact(*cancellation),
+            };
+            let frame = remotemedia_plugin_sdk::python_ipc::cancel_call_frame(&request);
+            let wire = WireRuntimeData::now_text(&frame, &session_id);
+            if let Err(error) = cmd_tx.try_send(IpcCommand::Send {
+                req_bytes: wire.to_bytes(),
+            }) {
+                tracing::warn!(node_type = %node_type, %error, "the cancel did not reach the worker");
+            }
+        })
+    }
+
     fn wire_copies(
         &self,
         ctx: &dyn NodeRuntimeContextRead,
@@ -457,6 +485,20 @@ impl StreamingNode for SourcePythonNode {
 
     fn self_driven(&self) -> Option<bool> {
         self.declared_self_driven.then_some(true)
+    }
+
+    fn generator_declaration(&self) -> remotemedia_traits::GeneratorDeclaration {
+        self.declared_generator
+    }
+
+    fn default_disposition(
+        &self,
+        cancel: &remotemedia_traits::CancelContext,
+    ) -> remotemedia_traits::Disposition {
+        self.declared_dispositions
+            .as_ref()
+            .and_then(|defaults| defaults.get(&cancel.reason).copied())
+            .unwrap_or_else(|| cancel.reason.default_disposition())
     }
 
     fn is_multi_input(&self) -> bool {
@@ -601,6 +643,7 @@ impl StreamingNode for SourcePythonNode {
     ) -> Result<usize, Error> {
         let copies = self.wire_copies(ctx)?;
         let req_bytes = encode_input(&data, &self.session_id, &copies)?;
+        let _cancel = self.forward_cancel(ctx);
         // Per-frame streaming: the IPC thread forwards each yield onto
         // `frame_rx` as it arrives, instead of accumulating into a Vec
         // and returning at EndOfInput. Capacity 32 is plenty for any

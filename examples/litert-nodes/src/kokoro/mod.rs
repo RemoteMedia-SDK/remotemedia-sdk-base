@@ -84,6 +84,8 @@ pub struct Timing {
     pub vocoder_ms: f64,
     pub slices: usize,
     pub tokens: usize,
+    /// Stopped before its last slice (`synthesize_until`).
+    pub stopped: bool,
 }
 
 pub struct Kokoro {
@@ -236,10 +238,17 @@ impl Kokoro {
     }
 
     /// Speech for `text`, one call of `sink` per slice (24 kHz mono).
-    pub fn synthesize(
+    pub fn synthesize(&mut self, text: &str, sink: impl FnMut(Vec<f32>)) -> Result<Timing, String> {
+        self.synthesize_until(text, sink, || false)
+    }
+
+    /// [`Self::synthesize`] that stops before the next slice once `stop`
+    /// says so (a cancelled call). A slice in progress runs to its end.
+    pub fn synthesize_until(
         &mut self,
         text: &str,
         mut sink: impl FnMut(Vec<f32>),
+        stop: impl Fn() -> bool,
     ) -> Result<Timing, String> {
         let mut timing = Timing::default();
         let start = Instant::now();
@@ -254,6 +263,10 @@ impl Kokoro {
             .min(self.frames / FRAMES_PER_TOKEN_BUDGET)
             .max(1);
         for slice in tokens::slice(&ids, capacity) {
+            if stop() {
+                timing.stopped = true;
+                break;
+            }
             let pcm = self.run_slice(&slice.ids, slice.before, slice.after, &mut timing)?;
             timing.slices += 1;
             sink(pcm);

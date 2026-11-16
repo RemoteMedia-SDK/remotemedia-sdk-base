@@ -239,10 +239,26 @@ impl AvatarNode {
     }
 }
 
+/// A video generator (openspec: add-generator-cancellation). It renders on
+/// its tick from the latest snapshots, each frame inside its tick, so there
+/// is nothing of a cancelled turn to stop: the turn's lip sync closes the
+/// mouth (`Audio2FaceNode`), and the avatar falls back to idle.
+#[async_trait::async_trait]
+impl remotemedia_traits::Cancellable for AvatarNode {
+    fn cancel_strategy(&self) -> remotemedia_traits::CancelStrategy {
+        remotemedia_traits::CancelStrategy::DropStopsWork
+    }
+}
+impl remotemedia_traits::VideoGenerator for AvatarNode {}
+
 #[async_trait::async_trait]
 impl StreamingNode for AvatarNode {
     fn node_type(&self) -> &str {
         "AvatarNode"
+    }
+
+    fn generator(&self) -> Option<remotemedia_traits::GeneratorRole<'_>> {
+        remotemedia_traits::GeneratorRole::video(self)
     }
 
     fn node_id(&self) -> &str {
@@ -346,6 +362,10 @@ impl StreamingNodeFactory for AvatarNodeFactory {
             NodeSchema::new("AvatarNode")
                 .description("Tick-driven avatar render node — reads blendshape weights and idle pose snapshots")
                 .category("avatar")
+                .generator(
+                    remotemedia_traits::GeneratedModality::Video,
+                    remotemedia_traits::CancelStrategy::DropStopsWork,
+                )
                 .accepts([RuntimeDataType::Json])
                 .produces([RuntimeDataType::Video]),
         )

@@ -326,6 +326,7 @@ impl OpenAIChatNode {
     ) -> ChatTurnContext {
         ChatTurnContext {
             cancel_gate,
+            cancel: None,
             node_id: self.node_id.clone(),
             control: None,
         }
@@ -365,10 +366,26 @@ impl OpenAIChatNode {
     }
 }
 
+/// A text generator (openspec: add-generator-cancellation). The reply streams
+/// over HTTP inside the call's future, so dropping the call closes the
+/// stream; the chat backend applies the disposition to history (a cut-off
+/// reply is kept, marked interrupted, when partial output is retained).
+#[async_trait::async_trait]
+impl remotemedia_traits::Cancellable for OpenAIChatNode {
+    fn cancel_strategy(&self) -> remotemedia_traits::CancelStrategy {
+        remotemedia_traits::CancelStrategy::DropStopsWork
+    }
+}
+impl remotemedia_traits::TextGenerator for OpenAIChatNode {}
+
 #[async_trait::async_trait]
 impl AsyncStreamingNode for OpenAIChatNode {
     fn node_type(&self) -> &str {
         "OpenAIChatNode"
+    }
+
+    fn generator(&self) -> Option<remotemedia_traits::GeneratorRole<'_>> {
+        remotemedia_traits::GeneratorRole::text(self)
     }
 
     fn supersede_on_new_input(&self) -> bool {
@@ -547,6 +564,7 @@ impl AsyncStreamingNode for OpenAIChatNode {
             .as_any()
             .downcast_ref::<crate::nodes::NodeRuntimeContext>();
         let mut turn = self.turn_context(runtime.map(|c| Arc::clone(&c.cancel_gate)));
+        turn.cancel = Some(ctx.cancel_token());
         if !ctx.node_id().is_empty() {
             turn.node_id = Some(ctx.node_id().to_string());
         }
@@ -595,6 +613,10 @@ impl crate::nodes::StreamingNodeFactory for OpenAIChatNodeFactory {
             NodeSchema::new("OpenAIChatNode")
                 .description("Streaming chat completion node for OpenAI-compatible APIs (OpenAI, Azure, vLLM, Ollama, etc.)")
                 .category("llm")
+                .generator(
+                    remotemedia_traits::GeneratedModality::Text,
+                    remotemedia_traits::CancelStrategy::DropStopsWork,
+                )
                 .accepts([RuntimeDataType::Text, RuntimeDataType::Json])
                 .produces([RuntimeDataType::Text])
                 .capabilities(NodeCapabilitiesSchema {

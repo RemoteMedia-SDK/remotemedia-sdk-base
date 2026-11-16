@@ -71,9 +71,35 @@ impl TestToneTtsNode {
     }
 }
 
+/// An audio generator (openspec: add-generator-cancellation). It renders a
+/// call's tone at once, without waiting on the clock, so nothing of a call
+/// outlives it: `DropStopsWork`. Like a TTS node, an interrupt drops its
+/// queued text, which belongs to the cancelled reply.
+#[async_trait::async_trait]
+impl remotemedia_traits::Cancellable for TestToneTtsNode {
+    fn cancel_strategy(&self) -> remotemedia_traits::CancelStrategy {
+        remotemedia_traits::CancelStrategy::DropStopsWork
+    }
+
+    fn default_disposition(
+        &self,
+        cancel: &remotemedia_traits::CancelContext,
+    ) -> remotemedia_traits::Disposition {
+        remotemedia_traits::Disposition {
+            pending_input: remotemedia_traits::Retention::Discard,
+            ..cancel.reason.default_disposition()
+        }
+    }
+}
+impl remotemedia_traits::AudioGenerator for TestToneTtsNode {}
+
 impl SyncStreamingNode for TestToneTtsNode {
     fn node_type(&self) -> &str {
         TEST_TONE_TTS_NODE
+    }
+
+    fn generator(&self) -> Option<remotemedia_traits::GeneratorRole<'_>> {
+        remotemedia_traits::GeneratorRole::audio(self)
     }
 
     fn process(&self, _data: RuntimeData) -> Result<RuntimeData, Error> {
@@ -158,6 +184,10 @@ impl StreamingNodeFactory for TestToneTtsNodeFactory {
                      `speech_end` mark.",
                 )
                 .category("testing")
+                .generator(
+                    remotemedia_traits::GeneratedModality::Audio,
+                    remotemedia_traits::CancelStrategy::DropStopsWork,
+                )
                 .accepts([RuntimeDataType::Text])
                 .produces([RuntimeDataType::Audio, RuntimeDataType::Json])
                 .config_schema_from::<TestToneTtsConfig>(),

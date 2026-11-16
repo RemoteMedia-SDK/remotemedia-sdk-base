@@ -102,7 +102,10 @@ use remotemedia_plugin_sdk::{
         std_types::{RErr, ROk, RResult, RString},
     },
     adapter::StreamingNodeFfiAdapter,
-    traits::{AsyncStreamingNode, NodeRuntimeContextRead},
+    traits::{
+        rpc::CallContext, AsyncStreamingNode, CancelStrategy, CancelToken, Cancellable,
+        Cancellation, GeneratorRole, NodeRuntimeContextRead, Retention, TextGenerator,
+    },
     types::{Error, RuntimeData},
     FfiNodeBox, FfiNodeFactory, FfiNode_TO,
 };
@@ -207,7 +210,14 @@ struct Job {
     /// carries the recent lines that conversation never saw.
     fresh_prompt: String,
     pieces: futures_channel::mpsc::UnboundedSender<Piece>,
+    /// The call's cancellation: the model thread stops the reply when it
+    /// fires, also before the first token.
+    cancel: CancelToken,
 }
+
+/// How often the model thread looks at a reply's cancellation while it
+/// waits for the next piece.
+const CANCEL_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Default)]
 struct Room {
@@ -225,12 +235,14 @@ struct Room {
 
 /// What a reply has generated so far. Dropped before the reply ended (the
 /// runtime cancelled the call on a barge), it leaves that text in the room's
-/// recent lines, marked, for the conversation that is started next.
+/// recent lines, marked, for the conversation that is started next — unless
+/// the cancel's disposition discards partial output.
 struct Partial<'a> {
     room: &'a std::sync::Mutex<Room>,
     name: &'a str,
     text: String,
     ended: bool,
+    cancel: CancelToken,
 }
 
 /// How a reply that was cut off is kept in the context.
@@ -242,6 +254,14 @@ fn cut_off_line(name: &str, text: &str) -> Option<String> {
 impl Drop for Partial<'_> {
     fn drop(&mut self) {
         if self.ended {
+            return;
+        }
+        if self
+            .cancel
+            .cancellation()
+            .is_some_and(|c| c.disposition.partial_output == Retention::Discard)
+        {
+            eprintln!("[{NODE_TYPE}] reply cut off; rolled back (the cancel discards it)");
             return;
         }
         if let (Some(line), Ok(mut room)) = (cut_off_line(self.name, &self.text), self.room.lock()) {
@@ -379,8 +399,19 @@ fn model_thread(config: AssistantConfig, jobs: mpsc::Receiver<Job>, ready: mpsc:
         // end of `pieces` is gone when nobody wants the rest: the room
         // stopped the reply, or the runtime dropped the call (a barge, a
         // cancelled or closed session).
+        // It also stops as soon as the call's token fires, without waiting
+        // for the next token (openspec: add-generator-cancellation).
         let mut stopped = false;
-        for piece in rx {
+        loop {
+            if job.cancel.is_cancelled() {
+                stopped = true;
+                break;
+            }
+            let piece = match rx.recv_timeout(CANCEL_POLL) {
+                Ok(piece) => piece,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             let end = matches!(piece, Piece::Done | Piece::Error(_));
             let sent = job.pieces.unbounded_send(piece);
             if end {
@@ -576,7 +607,14 @@ impl GemmaAssistantNode {
 
     /// Replies to what `speaker` said; `line` is the `seq` of that line in
     /// the room log, when it has one.
-    async fn reply<F>(&self, speaker: &str, said: &str, line: Option<u64>, mut callback: F) -> Result<usize, Error>
+    async fn reply<F>(
+        &self,
+        speaker: &str,
+        said: &str,
+        line: Option<u64>,
+        cancel: CancelToken,
+        mut callback: F,
+    ) -> Result<usize, Error>
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
@@ -603,6 +641,7 @@ impl GemmaAssistantNode {
                 prompt,
                 fresh_prompt,
                 pieces: tx,
+                cancel: cancel.clone(),
             })
             .map_err(|_| Error::Execution("the model thread is gone".into()))?;
         callback(RuntimeData::Json(if as_agent {
@@ -621,6 +660,7 @@ impl GemmaAssistantNode {
             name: &self.config.name,
             text: String::new(),
             ended: false,
+            cancel,
         };
         let mut outputs = 1;
         let mut say = |sentence: String, outputs: &mut usize, callback: &mut F| -> Result<(), Error> {
@@ -719,6 +759,10 @@ impl AsyncStreamingNode for GemmaAssistantNode {
         NODE_TYPE
     }
 
+    fn generator(&self) -> Option<GeneratorRole<'_>> {
+        GeneratorRole::text(self)
+    }
+
     async fn process(&self, _data: RuntimeData) -> Result<RuntimeData, Error> {
         Err(Error::InvalidData(format!("{NODE_TYPE} streams its replies")))
     }
@@ -811,9 +855,37 @@ impl AsyncStreamingNode for GemmaAssistantNode {
             }
             return Ok(0);
         };
-        self.reply(&speaker, &said, seq, callback).await
+        self.reply(&speaker, &said, seq, ctx.cancel_token(), callback)
+            .await
     }
 }
+
+/// A text generator (openspec: add-generator-cancellation). The model runs on
+/// its own thread, which watches the call's token and stops the reply
+/// (`Conversation::cancel`) as soon as it fires. A cut-off reply stays in the
+/// context, marked, unless the cancel discards partial output; a cancel that
+/// discards pending input also drops the lines heard since the last reply.
+#[async_trait]
+impl Cancellable for GemmaAssistantNode {
+    fn cancel_strategy(&self) -> CancelStrategy {
+        CancelStrategy::ObservesToken
+    }
+
+    async fn on_cancel(&self, _call: &CallContext, cancellation: &Cancellation) {
+        if cancellation.disposition.pending_input == Retention::Discard {
+            let dropped = {
+                let mut room = self.room.lock().unwrap();
+                let n = room.pending.len();
+                room.pending.clear();
+                n
+            };
+            if dropped > 0 {
+                eprintln!("[{NODE_TYPE}] cancel discards {dropped} pending lines");
+            }
+        }
+    }
+}
+impl TextGenerator for GemmaAssistantNode {}
 
 #[derive(Default)]
 pub struct GemmaAssistantFactory;
@@ -909,22 +981,36 @@ mod tests {
         assert_eq!(frame(json!({"kind": "history_end", "seq": 4})), Some(RoomFrame::HistoryEnd));
     }
 
+    fn partial<'a>(room: &'a std::sync::Mutex<Room>, text: &str, ended: bool, cancel: CancelToken) -> Partial<'a> {
+        Partial { room, name: "Pixel", text: text.into(), ended, cancel }
+    }
+
     #[test]
     fn a_reply_dropped_before_it_ended_stays_in_the_context_marked() {
         let room = std::sync::Mutex::new(Room::default());
-        let mut partial = Partial { room: &room, name: "Pixel", text: String::new(), ended: false };
-        partial.text.push_str(" The largest ocean is ");
-        drop(partial);
+        let mut cut = partial(&room, "", false, CancelToken::never());
+        cut.text.push_str(" The largest ocean is ");
+        drop(cut);
         assert_eq!(
             room.lock().unwrap().recent.back().map(String::as_str),
             Some("Pixel: The largest ocean is [interrupted before finishing]")
         );
         // A reply that ended, and one cut before any text, add nothing here.
-        let ended = Partial { room: &room, name: "Pixel", text: "done".into(), ended: true };
-        drop(ended);
-        let empty = Partial { room: &room, name: "Pixel", text: "  ".into(), ended: false };
-        drop(empty);
+        drop(partial(&room, "done", true, CancelToken::never()));
+        drop(partial(&room, "  ", false, CancelToken::never()));
         assert_eq!(room.lock().unwrap().recent.len(), 1);
+    }
+
+    #[test]
+    fn the_cancel_decides_whether_a_cut_off_reply_is_kept() {
+        use remotemedia_plugin_sdk::traits::{CancelReason, CancelSource, Disposition};
+        for (disposition, kept) in [(Disposition::INTERRUPT, 1), (Disposition::ABORT, 0)] {
+            let room = std::sync::Mutex::new(Room::default());
+            let source = CancelSource::new();
+            source.cancel(Cancellation::with_disposition(CancelReason::BargeIn, disposition));
+            drop(partial(&room, "The largest ocean is", false, source.token()));
+            assert_eq!(room.lock().unwrap().recent.len(), kept, "{disposition:?}");
+        }
     }
 
     #[test]

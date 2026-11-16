@@ -28,7 +28,10 @@ use remotemedia_plugin_sdk::{
         std_types::{RErr, ROk, RResult, RString},
     },
     adapter::StreamingNodeFfiAdapter,
-    traits::AsyncStreamingNode,
+    traits::{
+        AsyncStreamingNode, AudioGenerator, CancelContext, CancelStrategy, CancelToken,
+        Cancellable, Disposition, GeneratorRole, NodeRuntimeContextRead, Retention,
+    },
     types::{Error, RuntimeData},
     FfiNodeBox, FfiNodeFactory, FfiNode_TO,
 };
@@ -48,6 +51,8 @@ enum Out {
 struct Job {
     text: String,
     out: futures_channel::mpsc::UnboundedSender<Out>,
+    /// The call's cancellation: synthesis stops before the next slice.
+    cancel: CancelToken,
 }
 
 pub struct KokoroTtsNode {
@@ -96,15 +101,31 @@ impl KokoroTtsNode {
                     }
                 };
                 while let Ok(job) = jobs_rx.recv() {
+                    // Cancelled while it waited its turn: nothing to say.
+                    if job.cancel.is_cancelled() {
+                        let _ = job.out.unbounded_send(Out::Done(Ok("cancelled before it started".into())));
+                        continue;
+                    }
                     let out = job.out.clone();
+                    let cancel = job.cancel.clone();
                     let result = kokoro
-                        .synthesize(&job.text, |pcm| {
-                            let _ = out.unbounded_send(Out::Audio(pcm));
-                        })
+                        .synthesize_until(
+                            &job.text,
+                            |pcm| {
+                                let _ = out.unbounded_send(Out::Audio(pcm));
+                            },
+                            // Stop when the call is cancelled, or nobody
+                            // reads the audio any more.
+                            || cancel.is_cancelled() || out.is_closed(),
+                        )
                         .map(|t| {
                             format!(
-                                "phonemes {:.0} ms, acoustic {:.0} ms, vocoder {:.0} ms, {} slices",
-                                t.phonemize_ms, t.acoustic_ms, t.vocoder_ms, t.slices
+                                "phonemes {:.0} ms, acoustic {:.0} ms, vocoder {:.0} ms, {} slices{}",
+                                t.phonemize_ms,
+                                t.acoustic_ms,
+                                t.vocoder_ms,
+                                t.slices,
+                                if t.stopped { ", stopped" } else { "" }
                             )
                         });
                     let _ = job.out.unbounded_send(Out::Done(result));
@@ -133,10 +154,33 @@ fn text_of(data: &RuntimeData) -> Option<String> {
     .filter(|t| !t.is_empty())
 }
 
+/// An audio generator (openspec: add-generator-cancellation). Synthesis runs
+/// on its own thread, which stops before the next slice once the call's token
+/// fires. Its queued text belongs to the reply that was cancelled, so by
+/// default an interrupt discards it.
+#[async_trait]
+impl Cancellable for KokoroTtsNode {
+    fn cancel_strategy(&self) -> CancelStrategy {
+        CancelStrategy::ObservesToken
+    }
+
+    fn default_disposition(&self, cancel: &CancelContext) -> Disposition {
+        Disposition {
+            pending_input: Retention::Discard,
+            ..cancel.reason.default_disposition()
+        }
+    }
+}
+impl AudioGenerator for KokoroTtsNode {}
+
 #[async_trait]
 impl AsyncStreamingNode for KokoroTtsNode {
     fn node_type(&self) -> &str {
         NODE_TYPE
+    }
+
+    fn generator(&self) -> Option<GeneratorRole<'_>> {
+        GeneratorRole::audio(self)
     }
 
     async fn process(&self, _data: RuntimeData) -> Result<RuntimeData, Error> {
@@ -147,8 +191,29 @@ impl AsyncStreamingNode for KokoroTtsNode {
         &self,
         data: RuntimeData,
         _session_id: Option<String>,
-        mut callback: F,
+        callback: F,
     ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        self.speak(data, CancelToken::never(), callback).await
+    }
+
+    async fn process_streaming_with_ctx<F>(
+        &self,
+        data: RuntimeData,
+        ctx: &dyn NodeRuntimeContextRead,
+        callback: F,
+    ) -> Result<usize, Error>
+    where
+        F: FnMut(RuntimeData) -> Result<(), Error> + Send,
+    {
+        self.speak(data, ctx.cancel_token(), callback).await
+    }
+}
+
+impl KokoroTtsNode {
+    async fn speak<F>(&self, data: RuntimeData, cancel: CancelToken, mut callback: F) -> Result<usize, Error>
     where
         F: FnMut(RuntimeData) -> Result<(), Error> + Send,
     {
@@ -163,6 +228,7 @@ impl AsyncStreamingNode for KokoroTtsNode {
             .send(Job {
                 text: text.clone(),
                 out: tx,
+                cancel,
             })
             .map_err(|_| Error::Execution("the Kokoro thread is gone".into()))?;
         let start = Instant::now();

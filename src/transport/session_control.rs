@@ -595,6 +595,60 @@ pub fn wrap_aux_port(port: &str, data: RuntimeData) -> RuntimeData {
     }))
 }
 
+/// The aux envelope's `payload` object, if `data` is an aux envelope.
+fn aux_payload_of(data: &RuntimeData) -> Option<serde_json::Value> {
+    let envelope = match data {
+        RuntimeData::Json(v) => v.clone(),
+        RuntimeData::Text(s) => {
+            let body = crate::data::text_channel::split_text_str(s).1.trim_start();
+            if !body.starts_with('{') {
+                return None;
+            }
+            serde_json::from_str::<serde_json::Value>(body).ok()?
+        }
+        _ => return None,
+    };
+    envelope.get(AUX_PORT_ENVELOPE_KEY)?;
+    envelope.get("payload").cloned()
+}
+
+/// The disposition a `barge_in` envelope chooses (openspec:
+/// add-generator-cancellation): its payload's `disposition` field, e.g.
+/// `{"pending_input":"discard"}`. `None` when absent or not a barge.
+pub fn barge_in_disposition(
+    data: &RuntimeData,
+) -> Option<remotemedia_traits::DispositionOverride> {
+    if aux_port_of(data).as_deref() != Some(BARGE_IN_PORT) {
+        return None;
+    }
+    let payload = aux_payload_of(data)?;
+    let disposition = payload.get("disposition")?;
+    match serde_json::from_value(disposition.clone()) {
+        Ok(over) => Some(over),
+        Err(error) => {
+            tracing::warn!(%error, "barge_in: ignoring an invalid disposition");
+            None
+        }
+    }
+}
+
+/// What to publish to a node's `barge_in` port (the bus wraps it in the aux
+/// envelope). Producers state only what they mean beyond a plain interrupt:
+/// with `None`, the node's own default applies (an LLM keeps its cut-off
+/// reply and the queued speech, a TTS node drops its queued text); a turn
+/// that is dropped discards pending input; a retraction aborts.
+pub fn barge_in_payload(disposition: Option<remotemedia_traits::DispositionOverride>) -> RuntimeData {
+    RuntimeData::Json(match disposition {
+        Some(d) if !d.is_empty() => serde_json::json!({ "disposition": d }),
+        _ => serde_json::json!({}),
+    })
+}
+
+/// A whole `barge_in` envelope: [`barge_in_payload`] on the barge port.
+pub fn barge_in_envelope(disposition: Option<remotemedia_traits::DispositionOverride>) -> RuntimeData {
+    wrap_aux_port(BARGE_IN_PORT, barge_in_payload(disposition))
+}
+
 /// Runtime execution state for a single node, controlled via the bus.
 ///
 /// - `Enabled` (default): node runs normally.

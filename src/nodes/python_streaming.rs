@@ -52,9 +52,58 @@ pub struct PythonStreamingNode {
     emitter: std::sync::Mutex<Option<crate::nodes::Emitter>>,
     /// `@self_driven` of the Python class, learned at initialization.
     declared_self_driven: std::sync::OnceLock<bool>,
+    /// The Python class's generator role and default dispositions (its
+    /// `META:` handshake), learned at initialization (openspec:
+    /// add-generator-cancellation).
+    declared_generator: std::sync::OnceLock<(
+        remotemedia_traits::GeneratorDeclaration,
+        Option<remotemedia_traits::DefaultDispositions>,
+    )>,
 }
 
 impl PythonStreamingNode {
+    /// Send this call's cancellation to the Python worker when the router
+    /// fires the call's token, before it drops the call's future (openspec:
+    /// add-generator-cancellation). The frame carries the explicit choices,
+    /// so a Python generator re-resolves them with its own default.
+    fn forward_cancel(
+        &self,
+        ctx: &dyn crate::nodes::NodeRuntimeContextRead,
+        session: Option<String>,
+    ) -> Option<remotemedia_traits::CancelRegistration> {
+        #[cfg(feature = "multiprocess")]
+        {
+            let session = session.or_else(|| self.session_id.clone())?;
+            let node_id = self.node_id.clone();
+            let call = crate::nodes::NodeRuntimeContext::of(ctx).map(|c| c.call_cancel().clone());
+            let runtime = tokio::runtime::Handle::try_current().ok();
+            Some(ctx.cancel_token().on_cancel(move |cancellation| {
+                let request = match &call {
+                    Some(call) => call.forwarded(cancellation),
+                    None => remotemedia_traits::CancelRequest::exact(*cancellation),
+                };
+                let frame = RuntimeData::Text(cancel_call_frame(&request));
+                use crate::python::multiprocess::MultiprocessExecutor;
+                if let Err(error) =
+                    MultiprocessExecutor::try_send_out_of_band(&session, &node_id, frame.clone())
+                {
+                    tracing::debug!(%error, node_id, "cancel frame queued asynchronously");
+                    if let Some(runtime) = &runtime {
+                        runtime.spawn(async move {
+                            let _ = MultiprocessExecutor::send_out_of_band(&session, &node_id, frame)
+                                .await;
+                        });
+                    }
+                }
+            }))
+        }
+        #[cfg(not(feature = "multiprocess"))]
+        {
+            let _ = (ctx, session);
+            None
+        }
+    }
+
     /// Create a new Python streaming node
     pub fn new(node_id: String, node_type: &str, params: &Value) -> Result<Self, Error> {
         // Extract session_id from params if present (spec 002)
@@ -83,6 +132,7 @@ impl PythonStreamingNode {
             control: Mutex::new(None),
             emitter: std::sync::Mutex::new(None),
             declared_self_driven: std::sync::OnceLock::new(),
+            declared_generator: std::sync::OnceLock::new(),
         })
     }
 
@@ -111,6 +161,7 @@ impl PythonStreamingNode {
             control: Mutex::new(None),
             emitter: std::sync::Mutex::new(None),
             declared_self_driven: std::sync::OnceLock::new(),
+            declared_generator: std::sync::OnceLock::new(),
         })
     }
 
@@ -136,6 +187,7 @@ impl PythonStreamingNode {
             control: Mutex::new(None),
             emitter: std::sync::Mutex::new(None),
             declared_self_driven: std::sync::OnceLock::new(),
+            declared_generator: std::sync::OnceLock::new(),
         })
     }
 
@@ -232,6 +284,13 @@ impl PythonStreamingNode {
                 .and_then(|mp| mp.declared_self_driven())
             {
                 let _ = self.declared_self_driven.set(self_driven);
+            }
+            if let Some(generator) = py_executor
+                .as_any_mut()
+                .downcast_mut::<crate::python::multiprocess::MultiprocessExecutor>()
+                .map(|mp| mp.declared_generator())
+            {
+                let _ = self.declared_generator.set(generator);
             }
 
             *executor_guard = Some(py_executor);
@@ -339,6 +398,22 @@ impl PythonStreamingNode {
     }
 }
 
+/// Reserved aux port of the cancel frame a Python worker receives for the
+/// call in flight (openspec: add-generator-cancellation).
+pub(crate) const CANCEL_CALL_PORT: &str = "__cancel_call__";
+
+/// Text JSON aux frame cancelling the call in flight in a Python worker:
+/// `{"__aux_port__":"__cancel_call__","payload":<CancelRequest>}`. The worker
+/// handles it out of band, fires the call's token with the request
+/// re-resolved by the node's own default, and runs the node's `cancel()`.
+pub(crate) fn cancel_call_frame(request: &remotemedia_traits::CancelRequest) -> String {
+    serde_json::json!({
+        "__aux_port__": CANCEL_CALL_PORT,
+        "payload": request,
+    })
+    .to_string()
+}
+
 /// Text JSON aux frame carrying one endpoint-call reply chunk to a Python
 /// node: `{"__aux_port__":"__call_reply__","payload":{"corr_id",
 /// "args":[<CallReplyEnvelope>],"kwargs":{}}}` (typed-RPC ff request shape).
@@ -371,6 +446,27 @@ impl AsyncStreamingNode for PythonStreamingNode {
     /// The Python class's `@self_driven`, once initialized.
     fn self_driven(&self) -> Option<bool> {
         self.declared_self_driven.get().copied()
+    }
+
+    /// The Python class's generator role, once initialized.
+    fn generator_declaration(&self) -> remotemedia_traits::GeneratorDeclaration {
+        self.declared_generator
+            .get()
+            .map(|(generator, _)| *generator)
+            .unwrap_or_default()
+    }
+
+    /// The Python class's declared default, once initialized; the reason's
+    /// default before.
+    fn default_disposition(
+        &self,
+        cancel: &remotemedia_traits::CancelContext,
+    ) -> remotemedia_traits::Disposition {
+        self.declared_generator
+            .get()
+            .and_then(|(_, defaults)| defaults.as_ref())
+            .and_then(|defaults| defaults.get(&cancel.reason).copied())
+            .unwrap_or_else(|| cancel.reason.default_disposition())
     }
 
     fn rpc_methods(&self) -> Vec<remotemedia_traits::rpc::RpcMethod> {
@@ -548,6 +644,9 @@ impl AsyncStreamingNode for PythonStreamingNode {
     {
         let copies = Self::legacy_copies(ctx)?;
         let session = (!ctx.session_id().is_empty()).then(|| ctx.session_id().to_owned());
+        // The worker hears this call's cancel out of band (openspec:
+        // add-generator-cancellation); held for the call.
+        let _cancel = self.forward_cancel(ctx, session.clone());
         // A node that starts its worker on its first input still gets the
         // instance's emitter; the input's sender travels with the input.
         let host = crate::nodes::NodeRuntimeContext::of(ctx);
@@ -617,6 +716,49 @@ pub(crate) fn single_named_input(
         .into_values()
         .next()
         .ok_or_else(|| Error::Execution("No input data provided".into()))
+}
+
+#[cfg(test)]
+mod cancel_frame_tests {
+    use super::*;
+
+    /// The frame the Python worker parses (openspec: add-generator-cancellation).
+    #[test]
+    fn the_cancel_frame_carries_the_request_on_the_reserved_port() {
+        let request = remotemedia_traits::CancelRequest {
+            cancellation: remotemedia_traits::Cancellation::new(
+                remotemedia_traits::CancelReason::BargeIn,
+            ),
+            explicit: remotemedia_traits::DispositionOverride {
+                pending_input: Some(remotemedia_traits::Retention::Discard),
+                ..Default::default()
+            },
+            elapsed_ms: Some(120),
+        };
+        let frame: serde_json::Value =
+            serde_json::from_str(&cancel_call_frame(&request)).unwrap();
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "__aux_port__": "__cancel_call__",
+                "payload": {
+                    "cancellation": {
+                        "reason": "barge_in",
+                        "disposition": {"partial_output": "retain", "pending_input": "retain"},
+                    },
+                    "explicit": {"pending_input": "discard"},
+                    "elapsed_ms": 120,
+                },
+            })
+        );
+        assert_eq!(
+            crate::transport::session_control::aux_port_of(&RuntimeData::Text(
+                cancel_call_frame(&request)
+            ))
+            .as_deref(),
+            Some(CANCEL_CALL_PORT)
+        );
+    }
 }
 
 #[cfg(test)]

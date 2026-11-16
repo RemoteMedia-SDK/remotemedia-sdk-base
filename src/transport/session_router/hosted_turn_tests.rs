@@ -1377,6 +1377,27 @@ async fn scope_none_ignores_speech_but_not_the_hosts_interrupt() {
     assert_eq!(rig.rpc("interrupt", Some(json!({}))).await.unwrap(), json!({ "interrupted": false }));
 }
 
+/// The generic cancel (openspec: add-generator-cancellation): a cancelled
+/// call reaches the node's `on_cancel`, which stops the running turn as the
+/// host's interrupt does.
+#[tokio::test]
+async fn on_cancel_stops_the_running_turn() {
+    use remotemedia_traits::{CancelReason, Cancellation, GeneratedModality};
+    let mut rig = rig(json!({ "reply_to": "everyone", "barge_in": { "scope": "none" } })).await;
+    let mut host = rig.host();
+    let (call, _) = shared_turn(&mut rig, &mut host).await;
+    let role = crate::nodes::AsyncStreamingNode::generator(&*rig.node).expect("a generator");
+    assert_eq!(role.modality(), GeneratedModality::Text);
+    role.cancellable()
+        .on_cancel(
+            &remotemedia_traits::rpc::CallContext::default(),
+            &Cancellation::new(CancelReason::BargeIn),
+        )
+        .await;
+    host.cancelled(&call).await;
+    assert_eq!(host.settled().await["interrupted"], true);
+}
+
 #[tokio::test]
 async fn a_moderator_role_stops_the_room_and_others_only_themselves() {
     let policy = json!({ "scope": "everyone", "by": { "members": [], "roles": ["host"] }, "otherwise": "speaker" });
