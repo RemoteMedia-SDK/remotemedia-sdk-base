@@ -4267,3 +4267,7 @@ mod shared_workers_tests;
 #[cfg(all(test, feature = "multiprocess"))]
 #[path = "ipc_release_tests.rs"]
 mod ipc_release_tests;
+
+#[cfg(all(test, feature = "multiprocess"))]
+#[path = "cancel_worker_tests.rs"]
+mod cancel_worker_tests;
