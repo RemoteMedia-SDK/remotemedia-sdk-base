@@ -20,7 +20,7 @@ env:
   # Cargo.toml [patch]es plugin-sdk crates to ../remotemedia-plugin-sdk.
   # plugin-sdk feat/generator-cancellation (ABI 0.11, cancel contract);
   # RemoteMedia-SDK/remotemedia-plugin-sdk#18. Move to its merge commit on main.
-  PLUGIN_SDK_REV: 0e8cc5e2916c4292a8cb7edfcf87ac2358b9ba7b
+  PLUGIN_SDK_REV: 3fb3c44bf2cc96b7fd85cd9cdaa80c0f50a7fda8
 
 jobs:
   check:

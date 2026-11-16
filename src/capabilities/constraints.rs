@@ -11,8 +11,8 @@
 
 pub use remotemedia_traits::capabilities::{
     AudioConstraints, AudioSampleFormat, CapabilityPixelFormat, ConstraintValue, FileConstraints,
-    JsonConstraints, MediaCapabilities, MediaConstraints, PixelFormat, TensorConstraints,
-    TensorDataType, TextConstraints, VideoConstraints,
+    ImageConstraints, ImageEncoding, JsonConstraints, MediaCapabilities, MediaConstraints,
+    MediaType, PixelFormat, TensorConstraints, TensorDataType, TextConstraints, VideoConstraints,
 };
 
 #[cfg(test)]

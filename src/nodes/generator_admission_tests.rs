@@ -38,7 +38,9 @@ impl StreamingNodeFactory for Declares {
         _params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(Transform))))
+        Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(
+            Transform,
+        ))))
     }
     fn node_type(&self) -> &str {
         self.node_type
@@ -156,4 +158,102 @@ fn every_builtin_generator_declares_its_role() {
         migrated_but_listed.is_empty(),
         "remove these from NOT_YET_MIGRATED, they declare their role now: {migrated_but_listed:?}"
     );
+}
+
+/// A generator declared through `#[node(generates = ..., cancel = ...)]`:
+/// `generates` is caps DSL, so one attribute gives the role and the output
+/// capability. In its own module: the macro's output names `Result` with two
+/// parameters.
+mod declared_by_the_attribute {
+    use remotemedia_traits::{
+        AudioGenerator, CancelStrategy, Cancellable, GeneratedModality, ImageGenerator,
+    };
+
+    #[crate::node(
+        node_type = "MacroTts",
+        generates = "audio(sample_rate=24000, channels=1)",
+        cancel = "observes_token"
+    )]
+    pub struct MacroTtsNode {
+        #[config(default = 1)]
+        pub voice: u32,
+    }
+
+    impl MacroTtsNode {
+        async fn process_impl(
+            &self,
+            data: remotemedia_types::RuntimeData,
+        ) -> Result<remotemedia_types::RuntimeData, crate::Error> {
+            Ok(data)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Cancellable for MacroTtsNode {
+        fn cancel_strategy(&self) -> CancelStrategy {
+            CancelStrategy::ObservesToken
+        }
+    }
+    impl AudioGenerator for MacroTtsNode {}
+
+    #[crate::node(
+        node_type = "MacroPainter",
+        generates = "image(format=[png, jpeg])",
+        cancel = "drop_stops_work"
+    )]
+    pub struct MacroPainterNode {}
+
+    impl MacroPainterNode {
+        async fn process_impl(
+            &self,
+            data: remotemedia_types::RuntimeData,
+        ) -> Result<remotemedia_types::RuntimeData, crate::Error> {
+            Ok(data)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Cancellable for MacroPainterNode {
+        fn cancel_strategy(&self) -> CancelStrategy {
+            CancelStrategy::DropStopsWork
+        }
+    }
+    impl ImageGenerator for MacroPainterNode {}
+
+    #[test]
+    fn the_attribute_declares_role_and_output() {
+        use crate::capabilities::MediaConstraints;
+        use crate::nodes::AsyncStreamingNode;
+        use remotemedia_traits::schema::NodeConfigSchema;
+
+        let tts = MacroTtsNode::with_default();
+        let role = tts.generator().expect("a generator role");
+        assert_eq!(role.modality(), GeneratedModality::Audio);
+        assert_eq!(
+            role.cancellable().cancel_strategy(),
+            CancelStrategy::ObservesToken
+        );
+        assert_eq!(
+            MacroTtsNodeConfig::generator(),
+            Some((GeneratedModality::Audio, CancelStrategy::ObservesToken))
+        );
+        let caps = MacroTtsNode::media_capabilities_static();
+        let Some(MediaConstraints::Audio(audio)) = caps.default_output() else {
+            panic!("{caps:?}");
+        };
+        assert_eq!(
+            audio.sample_rate,
+            Some(crate::capabilities::ConstraintValue::Exact(24000))
+        );
+
+        let painter = MacroPainterNode::with_default();
+        assert_eq!(
+            painter.generator().map(|r| r.modality()),
+            Some(GeneratedModality::Image)
+        );
+        assert!(matches!(
+            MacroPainterNode::media_capabilities_static().default_output(),
+            Some(MediaConstraints::Image(_))
+        ));
+    }
 }

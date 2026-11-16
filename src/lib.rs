@@ -159,6 +159,82 @@ pub use error::{Error, Result};
 pub use serde_json;
 
 // Re-export attribute macros (always available since derive is default)
+/// Declares a node. A generator declares its role with `generates`, in the
+/// caps DSL of `output_caps`, and `cancel` (openspec:
+/// add-generator-cancellation):
+///
+/// ```
+/// use remotemedia_sdk_base::node;
+/// use remotemedia_traits::{AudioGenerator, CancelStrategy, Cancellable};
+///
+/// #[node(generates = "audio(sample_rate=24000)", cancel = "observes_token")]
+/// pub struct ToneNode {}
+///
+/// impl ToneNode {
+///     async fn process_impl(
+///         &self,
+///         data: remotemedia_types::RuntimeData,
+///     ) -> Result<remotemedia_types::RuntimeData, remotemedia_types::Error> {
+///         Ok(data)
+///     }
+/// }
+/// #[async_trait::async_trait]
+/// impl Cancellable for ToneNode {
+///     fn cancel_strategy(&self) -> CancelStrategy { CancelStrategy::ObservesToken }
+/// }
+/// impl AudioGenerator for ToneNode {}
+/// # fn main() {}
+/// ```
+///
+/// Only text, audio, video and image are generated media; `json` is not:
+///
+/// ```compile_fail
+/// use remotemedia_sdk_base::node;
+/// use remotemedia_traits::{AudioGenerator, CancelStrategy, Cancellable};
+///
+/// #[node(generates = "json", cancel = "observes_token")]
+/// pub struct ToneNode {}
+///
+/// impl ToneNode {
+///     async fn process_impl(
+///         &self,
+///         data: remotemedia_types::RuntimeData,
+///     ) -> Result<remotemedia_types::RuntimeData, remotemedia_types::Error> {
+///         Ok(data)
+///     }
+/// }
+/// #[async_trait::async_trait]
+/// impl Cancellable for ToneNode {
+///     fn cancel_strategy(&self) -> CancelStrategy { CancelStrategy::ObservesToken }
+/// }
+/// impl AudioGenerator for ToneNode {}
+/// # fn main() {}
+/// ```
+///
+/// and `cancel` names a `CancelStrategy`:
+///
+/// ```compile_fail
+/// use remotemedia_sdk_base::node;
+/// use remotemedia_traits::{AudioGenerator, CancelStrategy, Cancellable};
+///
+/// #[node(generates = "audio", cancel = "observes_tokens")]
+/// pub struct ToneNode {}
+///
+/// impl ToneNode {
+///     async fn process_impl(
+///         &self,
+///         data: remotemedia_types::RuntimeData,
+///     ) -> Result<remotemedia_types::RuntimeData, remotemedia_types::Error> {
+///         Ok(data)
+///     }
+/// }
+/// #[async_trait::async_trait]
+/// impl Cancellable for ToneNode {
+///     fn cancel_strategy(&self) -> CancelStrategy { CancelStrategy::ObservesToken }
+/// }
+/// impl AudioGenerator for ToneNode {}
+/// # fn main() {}
+/// ```
 pub use remotemedia_core_derive::node;
 pub use remotemedia_core_derive::node_config;
 

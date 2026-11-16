@@ -185,12 +185,26 @@ pub struct StreamingNodeRegistry {
     refused: HashMap<String, String>,
 }
 
-/// Whether a factory's generator declaration is admissible.
+/// Whether a factory's generator declaration is admissible. A generator
+/// whose declared outputs lack its generated media type is admitted with a
+/// warning (an animation node generates video and emits JSON frames).
 fn admit(factory: &dyn StreamingNodeFactory) -> Result<(), String> {
-    factory
-        .generator_declaration(&Value::Object(Default::default()))
+    let params = Value::Object(Default::default());
+    let declaration = factory.generator_declaration(&params);
+    declaration
         .validate(factory.node_type())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Some(capabilities) = factory.media_capabilities(&params) {
+        if !declaration.outputs_agree(&capabilities) {
+            tracing::warn!(
+                node_type = factory.node_type(),
+                generates = declaration.generates.map(|m| m.as_str()),
+                outputs = ?capabilities.outputs.values().map(|c| c.media_type()).collect::<Vec<_>>(),
+                "a generator's declared outputs do not include what it generates"
+            );
+        }
+    }
+    Ok(())
 }
 
 impl StreamingNodeRegistry {

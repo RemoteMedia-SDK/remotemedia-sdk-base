@@ -6,8 +6,8 @@
 use std::fmt;
 
 use super::constraints::{
-    AudioConstraints, ConstraintValue, FileConstraints, JsonConstraints, MediaCapabilities,
-    MediaConstraints, TensorConstraints, TextConstraints, VideoConstraints,
+    AudioConstraints, ConstraintValue, FileConstraints, ImageConstraints, JsonConstraints,
+    MediaCapabilities, MediaConstraints, TensorConstraints, TextConstraints, VideoConstraints,
 };
 
 // =============================================================================
@@ -284,6 +284,37 @@ fn check_video_compatible(
     mismatches
 }
 
+/// Check if image constraints are compatible.
+fn check_image_compatible(
+    source: &ImageConstraints,
+    target: &ImageConstraints,
+) -> Vec<(String, String, String)> {
+    let mut mismatches = Vec::new();
+    for (name, mismatch) in [
+        (
+            "width",
+            check_constraint_compatible("width", &source.width, &target.width),
+        ),
+        (
+            "height",
+            check_constraint_compatible("height", &source.height, &target.height),
+        ),
+        (
+            "format",
+            check_constraint_compatible("format", &source.format, &target.format),
+        ),
+        (
+            "pixel_format",
+            check_constraint_compatible("pixel_format", &source.pixel_format, &target.pixel_format),
+        ),
+    ] {
+        if let Some((src_val, tgt_val)) = mismatch {
+            mismatches.push((name.to_string(), src_val, tgt_val));
+        }
+    }
+    mismatches
+}
+
 /// Check if tensor constraints are compatible.
 fn check_tensor_compatible(
     source: &TensorConstraints,
@@ -426,6 +457,9 @@ pub fn validate_connection(
         }
         (MediaConstraints::Video(src), MediaConstraints::Video(tgt)) => {
             check_video_compatible(src, tgt)
+        }
+        (MediaConstraints::Image(src), MediaConstraints::Image(tgt)) => {
+            check_image_compatible(src, tgt)
         }
         (MediaConstraints::Tensor(src), MediaConstraints::Tensor(tgt)) => {
             check_tensor_compatible(src, tgt)
@@ -570,6 +604,40 @@ mod tests {
         );
 
         assert!(mismatches.is_empty());
+    }
+
+    #[test]
+    fn test_validate_connection_image() {
+        use super::super::constraints::ImageEncoding;
+        let png = |width| {
+            MediaConstraints::Image(ImageConstraints {
+                width: Some(ConstraintValue::Exact(width)),
+                format: Some(ConstraintValue::Exact(ImageEncoding::Png)),
+                ..Default::default()
+            })
+        };
+        let source = MediaCapabilities::with_output(png(512));
+        let accepts = MediaCapabilities::with_input(MediaConstraints::Image(ImageConstraints {
+            width: Some(ConstraintValue::Range {
+                min: 256,
+                max: 1024,
+            }),
+            format: Some(ConstraintValue::Set(vec![
+                ImageEncoding::Png,
+                ImageEncoding::Jpeg,
+            ])),
+            ..Default::default()
+        }));
+        let check = |target: &MediaCapabilities| {
+            validate_connection("painter", &source, "viewer", target, "default", "default")
+        };
+        assert!(check(&accepts).is_empty());
+        let mismatches = check(&MediaCapabilities::with_input(png(64)));
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0].constraint_name, "width");
+        // An image is not a video frame.
+        let video = MediaCapabilities::with_input(MediaConstraints::Video(Default::default()));
+        assert_eq!(check(&video)[0].constraint_name, "media_type");
     }
 
     #[test]
