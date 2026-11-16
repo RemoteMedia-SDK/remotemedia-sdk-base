@@ -188,14 +188,14 @@ cargo build --release --features full
 ## Protobuf bindings
 
 The generated protobuf/tonic code in `src/generated/` is committed. A normal
-build uses it as-is: no protoc, no `protobuf-src`, nothing written to `src/`.
+build uses it as-is: no .proto parsing, nothing written to `src/`.
 `src/generated/protos.stamp` records a hash of each `.proto` input; the build
 warns, and the `proto_stamp_tests` unit test fails, when a `.proto` file no
 longer matches it.
 
 After editing `proto/*.proto` (repo root), regenerate. The `regen-protos`
-feature builds protoc from source via `protobuf-src`, so it needs CMake and a
-C++ compiler:
+feature parses the `.proto` files with `protox` (pure Rust), so it needs no
+`protoc`, CMake or C++ compiler:
 
 ```bash
 # from the sdk-base workspace root
