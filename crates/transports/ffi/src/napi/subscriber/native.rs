@@ -65,7 +65,17 @@ impl NativeReceiver {
         if !channel_open.load(Ordering::Acquire) {
             return Err(Error::from_reason("Channel is closed"));
         }
+        // iceoryx2's own dead-node sweeps off: run concurrently by several processes
+        // they fatal-panic on Windows. The host sweeps, one process at a time
+        // (remotemedia-sdk-base multiprocess::iox_hygiene).
         let node = NodeBuilder::new()
+            .config(&{
+                let mut config = iceoryx2::config::Config::global_config().clone();
+                config.global.node.cleanup_dead_nodes_on_creation = false;
+                config.global.node.cleanup_dead_nodes_on_destruction = false;
+                config.global.service.cleanup_dead_nodes_on_open = false;
+                config
+            })
             .create::<ipc_threadsafe::Service>()
             .map_err(native_error)?;
         let service = node

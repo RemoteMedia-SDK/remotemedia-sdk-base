@@ -57,4 +57,6 @@ pub mod factory;
 #[cfg(feature = "multiprocess")]
 pub mod ipc_channel;
 #[cfg(feature = "multiprocess")]
+pub mod iox_hygiene;
+#[cfg(feature = "multiprocess")]
 pub mod runner;
