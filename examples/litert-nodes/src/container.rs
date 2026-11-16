@@ -122,7 +122,9 @@ impl<'a> Table<'a> {
             return Ok(Vec::new());
         };
         let n = u32_at(self.buf, p)? as usize;
-        (0..n).map(|k| Ok(u32_at(self.buf, p + 4 + 4 * k)? as i32)).collect()
+        (0..n)
+            .map(|k| Ok(u32_at(self.buf, p + 4 + 4 * k)? as i32))
+            .collect()
     }
 
     pub(crate) fn tables(&self, index: usize) -> Result<Vec<Table<'a>>, String> {

@@ -67,7 +67,10 @@ pub fn keep_fc_dims(model: &[u8]) -> Result<(Vec<u8>, usize), String> {
         .ok_or("model has no subgraph")?;
     let tensors = subgraph.tables(0)?;
     let ops = subgraph.tables(3)?;
-    let shapes: Vec<Vec<i32>> = tensors.iter().map(|t| t.i32s(0)).collect::<Result<_, _>>()?;
+    let shapes: Vec<Vec<i32>> = tensors
+        .iter()
+        .map(|t| t.i32s(0))
+        .collect::<Result<_, _>>()?;
     let mut consumers: std::collections::HashMap<i32, Vec<usize>> = Default::default();
     for (k, op) in ops.iter().enumerate() {
         for i in op.i32s(1)? {

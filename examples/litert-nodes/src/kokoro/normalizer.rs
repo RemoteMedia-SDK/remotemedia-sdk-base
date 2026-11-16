@@ -225,7 +225,8 @@ fn map_lookup(s: &str) -> Option<(&str, usize, usize)> {
     let body = &s[1..close];
     let colon = body.find(':')?;
     let b = body.as_bytes();
-    if colon == 0 || b.len() != colon + 3 || b[colon + 1] != b'\\' || !b[colon + 2].is_ascii_digit() {
+    if colon == 0 || b.len() != colon + 3 || b[colon + 1] != b'\\' || !b[colon + 2].is_ascii_digit()
+    {
         return None;
     }
     Some((&body[..colon], (b[colon + 2] - b'0') as usize, close + 1))

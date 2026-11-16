@@ -111,7 +111,16 @@ pub fn compute(
                 *dst = s * keep;
             }
         }
-        unidirectional(&reversed_in, bwd.0, bwd.1, bwd.2, &mut reversed_out, active, d, h);
+        unidirectional(
+            &reversed_in,
+            bwd.0,
+            bwd.1,
+            bwd.2,
+            &mut reversed_out,
+            active,
+            d,
+            h,
+        );
         for t in 0..t_steps {
             let keep = 1.0 - mask_b[t];
             let r = reverse_index(length, t, t_steps);
@@ -126,12 +135,21 @@ pub fn compute(
 
 /// Runs the op on nine input slices, checking their sizes against the
 /// shapes (`x_dims` = `[B, T, D]`, `hidden` = H).
-pub fn run(inputs: [&[u8]; INPUTS], out: &mut [u8], x_dims: [usize; 3], hidden: usize) -> Result<(), String> {
+pub fn run(
+    inputs: [&[u8]; INPUTS],
+    out: &mut [u8],
+    x_dims: [usize; 3],
+    hidden: usize,
+) -> Result<(), String> {
     let [batch, t_steps, d] = x_dims;
     let h = hidden;
     let f = |bytes: &[u8], n: usize, what: &str| -> Result<&[f32], String> {
         if bytes.len() < n * 4 || bytes.as_ptr() as usize % 4 != 0 {
-            return Err(format!("bidirectional_lstm: {what} is {} bytes, need {}", bytes.len(), n * 4));
+            return Err(format!(
+                "bidirectional_lstm: {what} is {} bytes, need {}",
+                bytes.len(),
+                n * 4
+            ));
         }
         Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n) })
     };
@@ -188,7 +206,18 @@ mod tests {
         let x = [1.0, 2.0, 99.0];
         let mask = [0.0, 0.0, 1.0];
         let mut out = [0f32; 6];
-        compute(&x, &[2], &mask, (&w.0, &w.1, &w.2), (&w.0, &w.1, &w.2), &mut out, b, t, d, h);
+        compute(
+            &x,
+            &[2],
+            &mask,
+            (&w.0, &w.1, &w.2),
+            (&w.0, &w.1, &w.2),
+            &mut out,
+            b,
+            t,
+            d,
+            h,
+        );
         assert_eq!(&out[4..], &[0.0, 0.0]);
         // Backward at t = 1 sees only x[1] (the first step of its scan).
         let mut first = [0f32];

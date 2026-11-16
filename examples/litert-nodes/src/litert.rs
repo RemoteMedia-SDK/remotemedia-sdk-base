@@ -78,12 +78,17 @@ unsafe extern "C" fn bilstm_invoke(context: Ptr, node: Ptr) -> i32 {
         return 1;
     }
     let dims = |t: Ptr| -> Vec<usize> {
-        (0..(f.num_dims)(t)).map(|i| (f.dim)(t, i) as usize).collect()
+        (0..(f.num_dims)(t))
+            .map(|i| (f.dim)(t, i) as usize)
+            .collect()
     };
     let tensors: Vec<Ptr> = (0..crate::bilstm::INPUTS as i32)
         .map(|i| (f.input)(context, node, i))
         .collect();
-    if tensors.iter().any(|t| t.is_null() || (f.data)(*t).is_null()) {
+    if tensors
+        .iter()
+        .any(|t| t.is_null() || (f.data)(*t).is_null())
+    {
         return 1;
     }
     let (x, w_hh) = (dims(tensors[0]), dims(tensors[4]));
@@ -233,7 +238,11 @@ impl Interpreter {
         let (model, owner, model_path) = match source {
             ModelSource::File(path) => {
                 let c = CString::new(path.as_str()).map_err(|e| e.to_string())?;
-                (unsafe { (api.model_create_from_file)(c.as_ptr()) }, None, path)
+                (
+                    unsafe { (api.model_create_from_file)(c.as_ptr()) },
+                    None,
+                    path,
+                )
             }
             ModelSource::Buffer { owner, ptr, len } => (
                 unsafe { (api.model_create)(ptr as *const c_void, len) },
@@ -410,8 +419,12 @@ impl Signature {
         unsafe {
             for (name, dims) in shapes {
                 let cname = CString::new(*name).map_err(|e| e.to_string())?;
-                let status =
-                    (self.api.runner_resize)(self.runner, cname.as_ptr(), dims.as_ptr(), dims.len() as i32);
+                let status = (self.api.runner_resize)(
+                    self.runner,
+                    cname.as_ptr(),
+                    dims.as_ptr(),
+                    dims.len() as i32,
+                );
                 if status != 0 {
                     return Err(format!("'{}' cannot resize '{name}' to {dims:?}", self.key));
                 }
@@ -453,7 +466,12 @@ impl TfLiteBackend {
         threads: i32,
         signatures: &[&str],
     ) -> Result<Self, String> {
-        Self::load_source(lib, ModelSource::File(model_path.to_string()), threads, signatures)
+        Self::load_source(
+            lib,
+            ModelSource::File(model_path.to_string()),
+            threads,
+            signatures,
+        )
     }
 
     pub fn load_source(
@@ -543,7 +561,12 @@ impl Backend for TfLiteBackend {
         )
     }
 
-    fn tensor_info(&self, signature: &str, name: &str, output: bool) -> Result<(usize, u32), String> {
+    fn tensor_info(
+        &self,
+        signature: &str,
+        name: &str,
+        output: bool,
+    ) -> Result<(usize, u32), String> {
         self.signatures
             .get(signature)
             .ok_or_else(|| format!("no signature '{signature}'"))?
@@ -568,7 +591,12 @@ impl Backend for TfLiteBackend {
         self.signature(signature)?.resize(shapes)
     }
 
-    fn read_bytes(&mut self, signature: &str, output: &str, out: &mut Vec<u8>) -> Result<(), String> {
+    fn read_bytes(
+        &mut self,
+        signature: &str,
+        output: &str,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
         let src = self.signature(signature)?.output_bytes(output)?;
         out.clear();
         out.extend_from_slice(src);

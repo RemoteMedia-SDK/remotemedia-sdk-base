@@ -18,7 +18,10 @@ fn main() {
             "--lib" => config.runtime_lib = Some(args.next().expect("--lib <path>")),
             "--cache" => config.cache_dir = Some(args.next().expect("--cache <dir>")),
             "--threads" => {
-                config.threads = args.next().and_then(|n| n.parse().ok()).expect("--threads N")
+                config.threads = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .expect("--threads N")
             }
             _ => positional.push(arg),
         }
@@ -38,7 +41,9 @@ fn main() {
     });
     println!("loaded: {}", engine.runtime);
     let mut conversation = engine
-        .conversation("You are a voice assistant in a group chat. Answer briefly, in plain spoken sentences.")
+        .conversation(
+            "You are a voice assistant in a group chat. Answer briefly, in plain spoken sentences.",
+        )
         .unwrap();
     for prompt in positional {
         println!("> {prompt}");
@@ -64,7 +69,10 @@ fn main() {
             }
         }
         if let Some(rest) = sentences.finish() {
-            println!("  [{:>5.0} ms] {rest}", start.elapsed().as_secs_f64() * 1000.0);
+            println!(
+                "  [{:>5.0} ms] {rest}",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
         }
         let total = start.elapsed().as_secs_f64();
         println!(

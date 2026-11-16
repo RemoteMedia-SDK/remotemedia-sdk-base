@@ -6,7 +6,8 @@ use std::ffi::{c_char, c_int, c_void, CStr};
 use std::sync::Arc;
 
 extern "C" {
-    fn rm_en_g2p_create(lexicon: *const c_char, len: usize, error: *mut *mut c_char) -> *mut c_void;
+    fn rm_en_g2p_create(lexicon: *const c_char, len: usize, error: *mut *mut c_char)
+        -> *mut c_void;
     fn rm_en_g2p_text_to_ipa(
         handle: *mut c_void,
         text: *const c_char,
@@ -37,8 +38,9 @@ impl EnglishG2p {
     /// `lexicon` borrows from `owner`, which the converter keeps alive.
     pub fn new(lexicon: &[u8], owner: Arc<dyn Send + Sync>) -> Result<Self, String> {
         let mut error: *mut c_char = std::ptr::null_mut();
-        let handle =
-            unsafe { rm_en_g2p_create(lexicon.as_ptr() as *const c_char, lexicon.len(), &mut error) };
+        let handle = unsafe {
+            rm_en_g2p_create(lexicon.as_ptr() as *const c_char, lexicon.len(), &mut error)
+        };
         if handle.is_null() {
             return Err(unsafe { take(error) });
         }

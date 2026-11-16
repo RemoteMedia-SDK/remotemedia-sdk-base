@@ -267,7 +267,9 @@ impl KokoroTtsNode {
                     first.get_or_insert_with(|| start.elapsed().as_secs_f64() * 1000.0);
                     for chunk in pcm.chunks(self.chunk) {
                         if cancel.is_cancelled() {
-                            trace.finish(serde_json::json!({"outcome":"cancelled","samples":samples}));
+                            trace.finish(
+                                serde_json::json!({"outcome":"cancelled","samples":samples}),
+                            );
                             return Ok(frames);
                         }
                         callback(RuntimeData::Audio {
@@ -337,10 +339,14 @@ mod tests {
             .unwrap();
         assert_eq!((first, published), (1, 1));
         let next = node
-            .speak(RuntimeData::Text("next".into()), CancelToken::never(), |_| {
-                published += 1;
-                Ok(())
-            })
+            .speak(
+                RuntimeData::Text("next".into()),
+                CancelToken::never(),
+                |_| {
+                    published += 1;
+                    Ok(())
+                },
+            )
             .await
             .unwrap();
         assert_eq!((next, published), (3, 4));

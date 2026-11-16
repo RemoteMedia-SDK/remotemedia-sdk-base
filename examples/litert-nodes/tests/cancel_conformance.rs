@@ -57,7 +57,10 @@ async fn a_cancelled_gemma_reply_does_not_hold_up_the_next() {
     .unwrap_or_else(|e| panic!("{e}"));
     eprintln!("baseline first text: {:?}", report.baseline);
     for (cancellation, next) in &report.cancelled {
-        eprintln!("after a {:?} cancel, first text in {next:?}", cancellation.disposition);
+        eprintln!(
+            "after a {:?} cancel, first text in {next:?}",
+            cancellation.disposition
+        );
     }
 }
 
@@ -75,7 +78,8 @@ async fn a_cancelled_kokoro_utterance_does_not_hold_up_the_next() {
         params["runtime_lib"] = lib.into();
     }
     let (config, chunk) = remotemedia_litert_nodes::tts_node::config_from_params(&params).unwrap();
-    let node = Arc::new(remotemedia_litert_nodes::tts_node::KokoroTtsNode::start(config, chunk).unwrap());
+    let node =
+        Arc::new(remotemedia_litert_nodes::tts_node::KokoroTtsNode::start(config, chunk).unwrap());
     // Many sentences: synthesis spans many slices, so a run-to-the-end
     // regression would hold up the next call by seconds.
     let text = "The ocean covers most of the planet and holds most of its water. ".repeat(12);
@@ -93,6 +97,9 @@ async fn a_cancelled_kokoro_utterance_does_not_hold_up_the_next() {
     .unwrap_or_else(|e| panic!("{e}"));
     eprintln!("baseline first audio: {:?}", report.baseline);
     for (cancellation, next) in &report.cancelled {
-        eprintln!("after a {:?} cancel, first audio in {next:?}", cancellation.disposition);
+        eprintln!(
+            "after a {:?} cancel, first audio in {next:?}",
+            cancellation.disposition
+        );
     }
 }

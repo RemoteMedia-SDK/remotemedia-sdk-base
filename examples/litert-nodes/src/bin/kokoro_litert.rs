@@ -21,9 +21,16 @@ fn main() {
             "--accel" => config.vocoder_accelerator = args.next().expect("--accel gpu|cpu"),
             "--lib" => config.runtime_lib = Some(args.next().expect("--lib <path>")),
             "--vocoder" => config.vocoder_path = Some(args.next().expect("--vocoder <tflite>")),
-            "--gpu-options" => config.gpu_options = Some(args.next().expect("--gpu-options <toml>")),
+            "--gpu-options" => {
+                config.gpu_options = Some(args.next().expect("--gpu-options <toml>"))
+            }
             "--language" => config.language = args.next().expect("--language en-us|en-gb"),
-            "--repeat" => repeat = args.next().and_then(|n| n.parse().ok()).expect("--repeat N"),
+            "--repeat" => {
+                repeat = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .expect("--repeat N")
+            }
             _ => positional.push(arg),
         }
     }
@@ -39,7 +46,11 @@ fn main() {
         eprintln!("load: {e}");
         std::process::exit(1)
     });
-    println!("loaded in {:.0} ms: {}", start.elapsed().as_secs_f64() * 1000.0, kokoro.runtime);
+    println!(
+        "loaded in {:.0} ms: {}",
+        start.elapsed().as_secs_f64() * 1000.0,
+        kokoro.runtime
+    );
     match kokoro.phonemize(text) {
         Ok(ipa) => println!("phonemes: {ipa}"),
         Err(e) => println!("phonemes: error {e}"),

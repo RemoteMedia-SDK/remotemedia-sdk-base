@@ -66,7 +66,11 @@ fn main() {
                 })
                 .collect();
             let mut joined = std::env::join_paths(std::iter::once(bin).chain(kept)).unwrap();
-            if let Some((_, tool_path)) = cl.env().iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")) {
+            if let Some((_, tool_path)) = cl
+                .env()
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            {
                 let mut p = tool_path.clone();
                 p.push(";");
                 p.push(&joined);
@@ -107,14 +111,11 @@ fn main() {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            let stem = name
-                .strip_suffix(".lib")
-                .map(str::to_string)
-                .or_else(|| {
-                    name.strip_prefix("lib")
-                        .and_then(|n| n.strip_suffix(".a"))
-                        .map(str::to_string)
-                })?;
+            let stem = name.strip_suffix(".lib").map(str::to_string).or_else(|| {
+                name.strip_prefix("lib")
+                    .and_then(|n| n.strip_suffix(".a"))
+                    .map(str::to_string)
+            })?;
             stem.starts_with("absl_").then_some(stem)
         })
         .collect();

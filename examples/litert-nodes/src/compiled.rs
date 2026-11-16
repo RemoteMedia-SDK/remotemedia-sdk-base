@@ -91,8 +91,14 @@ struct Api {
         unsafe extern "C" fn(H, *const c_char, i32, *const CustomOpKernel, *mut c_void) -> Status,
     >,
     buffer_tensor_type: unsafe extern "C" fn(H, *mut RankedTensorType) -> Status,
-    create_opaque_options:
-        Option<unsafe extern "C" fn(*const c_char, *mut c_void, unsafe extern "C" fn(*mut c_void), *mut H) -> Status>,
+    create_opaque_options: Option<
+        unsafe extern "C" fn(
+            *const c_char,
+            *mut c_void,
+            unsafe extern "C" fn(*mut c_void),
+            *mut H,
+        ) -> Status,
+    >,
     add_opaque_options: Option<unsafe extern "C" fn(H, H) -> Status>,
 }
 
@@ -113,7 +119,8 @@ struct Layout {
 #[repr(C)]
 pub struct CustomOpKernel {
     init: unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> Status,
-    output_layouts: unsafe extern "C" fn(*mut c_void, usize, *const Layout, usize, *mut Layout) -> Status,
+    output_layouts:
+        unsafe extern "C" fn(*mut c_void, usize, *const Layout, usize, *mut Layout) -> Status,
     run: unsafe extern "C" fn(*mut c_void, usize, *const H, usize, *mut H) -> Status,
     destroy: unsafe extern "C" fn(*mut c_void) -> Status,
 }
@@ -200,7 +207,8 @@ unsafe extern "C" fn bilstm_run(
     for &buffer in inputs {
         let mut size = 0usize;
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        if (fns.packed_size)(buffer, &mut size) != 0 || (fns.lock)(buffer, &mut ptr, LOCK_READ) != 0 {
+        if (fns.packed_size)(buffer, &mut size) != 0 || (fns.lock)(buffer, &mut ptr, LOCK_READ) != 0
+        {
             failed = true;
             break;
         }
@@ -211,7 +219,9 @@ unsafe extern "C" fn bilstm_run(
     if !failed {
         let mut size = 0usize;
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        if (fns.packed_size)(output, &mut size) == 0 && (fns.lock)(output, &mut ptr, LOCK_WRITE) == 0 {
+        if (fns.packed_size)(output, &mut size) == 0
+            && (fns.lock)(output, &mut ptr, LOCK_WRITE) == 0
+        {
             let out = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
             let ins: [&[u8]; crate::bilstm::INPUTS] = std::array::from_fn(|i| slices[i]);
             match crate::bilstm::run(ins, out, [x[0], x[1], x[2]], w_hh[1]) {
@@ -307,10 +317,7 @@ impl Api {
             run: sym!(lib, "LiteRtRunCompiledModel"),
             fully_accelerated: sym!(lib, "LiteRtCompiledModelIsFullyAccelerated"),
             non_cpu_fully_accelerated: sym!(lib, "LiteRtCompiledModelIsNonCpuFullyAccelerated"),
-            add_custom_op: lib
-                .get(b"LiteRtAddCustomOpKernelOption\0")
-                .ok()
-                .map(|s| *s),
+            add_custom_op: lib.get(b"LiteRtAddCustomOpKernelOption\0").ok().map(|s| *s),
             buffer_tensor_type: sym!(lib, "LiteRtGetTensorBufferTensorType"),
             create_opaque_options: lib.get(b"LiteRtCreateOpaqueOptions\0").ok().map(|s| *s),
             add_opaque_options: lib.get(b"LiteRtAddOpaqueOptions\0").ok().map(|s| *s),
@@ -410,7 +417,13 @@ impl CompiledBackend {
         hw: i32,
         accelerator_dir: Option<&str>,
     ) -> Result<Self, String> {
-        Self::load_source(lib, ModelSource::File(model_path.to_string()), hw, accelerator_dir, None)
+        Self::load_source(
+            lib,
+            ModelSource::File(model_path.to_string()),
+            hw,
+            accelerator_dir,
+            None,
+        )
     }
 
     /// `gpu_options`: the GPU accelerator's options as TOML (the payload of
@@ -498,14 +511,25 @@ impl CompiledBackend {
                 (api.set_accelerators)(this.options, hw),
                 "LiteRtSetOptionsHardwareAccelerators",
             )?;
-            if let (Some(toml), true) = (gpu_options.filter(|t| !t.trim().is_empty()), hw & HW_GPU != 0) {
-                let (Some(create), Some(add)) = (api.create_opaque_options, api.add_opaque_options) else {
+            if let (Some(toml), true) = (
+                gpu_options.filter(|t| !t.trim().is_empty()),
+                hw & HW_GPU != 0,
+            ) {
+                let (Some(create), Some(add)) = (api.create_opaque_options, api.add_opaque_options)
+                else {
                     return Err("this LiteRT library cannot take GPU options".into());
                 };
-                let payload = CString::new(toml.replace("\\n", "\n")).map_err(|e| e.to_string())?.into_raw();
+                let payload = CString::new(toml.replace("\\n", "\n"))
+                    .map_err(|e| e.to_string())?
+                    .into_raw();
                 let mut opaque: H = std::ptr::null_mut();
                 api.check(
-                    create(c"gpu_options".as_ptr(), payload as *mut c_void, free_c_string, &mut opaque),
+                    create(
+                        c"gpu_options".as_ptr(),
+                        payload as *mut c_void,
+                        free_c_string,
+                        &mut opaque,
+                    ),
                     "LiteRtCreateOpaqueOptions",
                 )?;
                 api.check(add(this.options, opaque), "LiteRtAddOpaqueOptions")?;
@@ -741,7 +765,12 @@ impl CompiledBackend {
     }
 
     /// A whole output's bytes, after `invoke`.
-    pub fn read_bytes(&self, signature: &str, output: &str, out: &mut Vec<u8>) -> Result<(), String> {
+    pub fn read_bytes(
+        &self,
+        signature: &str,
+        output: &str,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
         let t = self.tensor(signature, output, true)?;
         unsafe {
             let mut src: *mut c_void = std::ptr::null_mut();
@@ -825,7 +854,12 @@ impl Backend for CompiledBackend {
         self.description.clone()
     }
 
-    fn tensor_info(&self, signature: &str, name: &str, output: bool) -> Result<(usize, u32), String> {
+    fn tensor_info(
+        &self,
+        signature: &str,
+        name: &str,
+        output: bool,
+    ) -> Result<(usize, u32), String> {
         CompiledBackend::tensor_info(self, signature, name, output)
     }
 
@@ -833,7 +867,12 @@ impl Backend for CompiledBackend {
         CompiledBackend::write_bytes(self, signature, input, data)
     }
 
-    fn read_bytes(&mut self, signature: &str, output: &str, out: &mut Vec<u8>) -> Result<(), String> {
+    fn read_bytes(
+        &mut self,
+        signature: &str,
+        output: &str,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
         CompiledBackend::read_bytes(self, signature, output, out)
     }
 }
