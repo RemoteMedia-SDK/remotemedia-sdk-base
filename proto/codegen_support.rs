@@ -6,9 +6,9 @@
 // may only use `std`.
 //
 // The bindings in `<crate>/src/generated/` are committed, so a normal build
-// never runs protoc. Next to them sits `protos.stamp`: one FNV-1a hash per
+// never parses the .proto files. Next to them sits `protos.stamp`: one FNV-1a hash per
 // input `.proto` file, written whenever the bindings are regenerated. A
-// cheap stamp comparison (no protoc) detects a `.proto` edit that was not
+// cheap stamp comparison (no codegen) detects a `.proto` edit that was not
 // followed by a regeneration; the full check under the `regen-protos`
 // feature regenerates into `OUT_DIR` and compares byte for byte.
 //
@@ -229,8 +229,8 @@ mod proto_codegen {
         );
     }
 
-    /// `regen-protos` build path. `compile(out_dir)` runs protoc into
-    /// `out_dir`; the result is compared with `generated_dir`. With
+    /// `regen-protos` build path. `compile(out_dir)` generates the bindings
+    /// into `out_dir`; the result is compared with `generated_dir`. With
     /// `REMOTEMEDIA_REGEN_PROTOS=1` differences are written back, otherwise
     /// they fail the build.
     pub fn regen_build(
