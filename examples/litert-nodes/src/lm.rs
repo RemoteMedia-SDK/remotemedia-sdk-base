@@ -26,8 +26,13 @@ struct Api {
     source: String,
     last_error: unsafe extern "C" fn() -> *const c_char,
     set_min_log_level: unsafe extern "C" fn(c_int) -> Status,
-    settings_create:
-        unsafe extern "C" fn(*const c_char, *const c_char, *const c_char, *const c_char, *mut H) -> Status,
+    settings_create: unsafe extern "C" fn(
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *mut H,
+    ) -> Status,
     settings_delete: unsafe extern "C" fn(H),
     settings_max_tokens: unsafe extern "C" fn(H, c_int) -> Status,
     settings_threads: unsafe extern "C" fn(H, c_int) -> Status,
@@ -41,13 +46,30 @@ struct Api {
     conversation_delete: unsafe extern "C" fn(H),
     conversation_tokens: unsafe extern "C" fn(H, *mut usize) -> Status,
     conversation_cancel: unsafe extern "C" fn(H) -> Status,
-    send_stream: unsafe extern "C" fn(H, *const c_char, *const c_char, H, StreamCallback, *mut c_void) -> Status,
+    send_stream: unsafe extern "C" fn(
+        H,
+        *const c_char,
+        *const c_char,
+        H,
+        StreamCallback,
+        *mut c_void,
+    ) -> Status,
     args_create: unsafe extern "C" fn(*mut H) -> Status,
     args_delete: unsafe extern "C" fn(H),
     args_max_output: unsafe extern "C" fn(H, c_int) -> Status,
     chunk_text: unsafe extern "C" fn(*const c_void, *mut *const c_char) -> Status,
     chunk_final: unsafe extern "C" fn(*const c_void, *mut bool) -> Status,
     chunk_error: unsafe extern "C" fn(*const c_void, *mut *const c_char) -> Status,
+    prompt_tokens: Option<PromptTokensApi>,
+}
+
+/// Optional for legacy assistant behavior, required by the grounded assistant.
+struct PromptTokensApi {
+    tokenize: unsafe extern "C" fn(H, *const c_char, *mut H) -> Status,
+    count: unsafe extern "C" fn(H, *mut usize) -> Status,
+    delete: unsafe extern "C" fn(H),
+    preface: unsafe extern "C" fn(H, *mut *const c_char) -> Status,
+    message: unsafe extern "C" fn(H, *const c_char, *mut *const c_char) -> Status,
 }
 
 macro_rules! sym {
@@ -92,7 +114,26 @@ impl Api {
     }
 
     unsafe fn resolve(lib: Library, source: &str) -> Result<Self, String> {
+        let version: unsafe extern "C" fn(*mut c_int, *mut c_int, *mut c_int) -> Status =
+            sym!(lib, "litert_lm_get_api_version");
+        let (mut major, mut minor, mut patch) = (0, 0, 0);
+        if version(&mut major, &mut minor, &mut patch) != 0 || major != 1 {
+            return Err(format!(
+                "requires LiteRT-LM C API 1.x, got {major}.{minor}.{patch}"
+            ));
+        }
+        let prompt_tokens = (|| -> Result<PromptTokensApi, String> {
+            Ok(PromptTokensApi {
+                tokenize: sym!(lib, "litert_lm_engine_tokenize"),
+                count: sym!(lib, "litert_lm_tokenize_result_get_num_tokens"),
+                delete: sym!(lib, "litert_lm_tokenize_result_delete"),
+                preface: sym!(lib, "litert_lm_conversation_render_preface_to_string"),
+                message: sym!(lib, "litert_lm_conversation_render_message_to_string"),
+            })
+        })()
+        .ok();
         Ok(Self {
+            prompt_tokens,
             last_error: sym!(lib, "litert_lm_get_last_error_message"),
             set_min_log_level: sym!(lib, "litert_lm_set_min_log_level"),
             settings_create: sym!(lib, "litert_lm_engine_settings_create"),
@@ -112,7 +153,10 @@ impl Api {
             send_stream: sym!(lib, "litert_lm_conversation_send_message_stream"),
             args_create: sym!(lib, "litert_lm_conversation_optional_args_create"),
             args_delete: sym!(lib, "litert_lm_conversation_optional_args_delete"),
-            args_max_output: sym!(lib, "litert_lm_conversation_optional_args_set_max_output_tokens"),
+            args_max_output: sym!(
+                lib,
+                "litert_lm_conversation_optional_args_set_max_output_tokens"
+            ),
             chunk_text: sym!(lib, "litert_lm_stream_chunk_get_text"),
             chunk_final: sym!(lib, "litert_lm_stream_chunk_is_final"),
             chunk_error: sym!(lib, "litert_lm_stream_chunk_get_error"),
@@ -206,10 +250,9 @@ unsafe extern "C" fn on_chunk(data: *mut c_void, chunk: *const c_void) {
 fn chunk_text(raw: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(raw) {
         Ok(v) => match &v["content"] {
-            serde_json::Value::Array(parts) => parts
-                .iter()
-                .filter_map(|p| p["text"].as_str())
-                .collect(),
+            serde_json::Value::Array(parts) => {
+                parts.iter().filter_map(|p| p["text"].as_str()).collect()
+            }
             serde_json::Value::String(s) => s.clone(),
             _ => String::new(),
         },
@@ -252,7 +295,10 @@ impl Engine {
             if let Some(dir) = &config.cache_dir {
                 let _ = std::fs::create_dir_all(dir);
                 let dir = CString::new(dir.as_str()).map_err(|e| e.to_string())?;
-                api.check((api.settings_cache_dir)(settings, dir.as_ptr()), "cache dir")?;
+                api.check(
+                    (api.settings_cache_dir)(settings, dir.as_ptr()),
+                    "cache dir",
+                )?;
             }
             let start = Instant::now();
             api.check((api.engine_create)(settings, &mut this.engine), "engine")?;
@@ -311,9 +357,62 @@ pub struct Conversation {
 unsafe impl Send for Conversation {}
 
 impl Conversation {
+    /// Count the rendered preface and first user message with this engine's
+    /// actual tokenizer. Only valid on a fresh, idle conversation. Separate
+    /// counts conservatively retain the template boundary between prefill parts.
+    pub fn first_prompt_tokens(&mut self, engine: &Engine, text: &str) -> Result<usize, String> {
+        if self.state.is_some() || !Arc::ptr_eq(&self.api, &engine.api) {
+            return Err("prompt budgeting requires a fresh conversation from this engine".into());
+        }
+        let api = self
+            .api
+            .prompt_tokens
+            .as_ref()
+            .ok_or("runtime lacks template/tokenizer APIs for RAG budgeting")?;
+        let tokenize = |text: &str| -> Result<usize, String> {
+            let text = CString::new(text).map_err(|e| e.to_string())?;
+            let mut result = std::ptr::null_mut();
+            unsafe {
+                self.api.check(
+                    (api.tokenize)(engine.engine, text.as_ptr(), &mut result),
+                    "tokenize prompt",
+                )?;
+                if result.is_null() {
+                    return Err("tokenizer returned no result".into());
+                }
+                let mut count = 0;
+                let status = (api.count)(result, &mut count);
+                (api.delete)(result);
+                self.api.check(status, "count prompt tokens")?;
+                Ok(count)
+            }
+        };
+        let message = CString::new(
+            serde_json::json!({"role":"user", "content":[{"type":"text","text":text}]}).to_string(),
+        )
+        .map_err(|e| e.to_string())?;
+        unsafe {
+            let mut rendered = std::ptr::null();
+            self.api.check(
+                (api.preface)(self.handle, &mut rendered),
+                "render prompt preface",
+            )?;
+            let preface = tokenize(&c_string(rendered))?;
+            self.api.check(
+                (api.message)(self.handle, message.as_ptr(), &mut rendered),
+                "render prompt message",
+            )?;
+            Ok(preface.saturating_add(tokenize(&c_string(rendered))?))
+        }
+    }
+
     /// Sends a user message; the reply arrives as pieces on the returned
     /// channel, ending with `Piece::Done` (or `Piece::Error`).
-    pub fn send(&mut self, text: &str, max_output_tokens: i32) -> Result<mpsc::Receiver<Piece>, String> {
+    pub fn send(
+        &mut self,
+        text: &str,
+        max_output_tokens: i32,
+    ) -> Result<mpsc::Receiver<Piece>, String> {
         let (tx, rx) = mpsc::channel();
         let message = serde_json::json!({
             "role": "user",
@@ -408,8 +507,13 @@ impl Sentences {
                     // Not after a single capital ("Mr.", "U.S.") or a digit ("3.").
                     if c == b'.' && i >= 1 {
                         let before = &self.pending[..i];
-                        let word = before.rsplit(|ch: char| ch.is_whitespace()).next().unwrap_or("");
-                        if word.len() <= 2 && word.chars().next().map_or(false, |ch| ch.is_uppercase()) {
+                        let word = before
+                            .rsplit(|ch: char| ch.is_whitespace())
+                            .next()
+                            .unwrap_or("");
+                        if word.len() <= 2
+                            && word.chars().next().map_or(false, |ch| ch.is_uppercase())
+                        {
                             continue;
                         }
                     }
@@ -454,7 +558,10 @@ mod tests {
         let mut s = Sentences::first_clause();
         assert_eq!(
             s.push("The tallest mountain on Earth, by height above sea level, is Everest. "),
-            vec!["The tallest mountain on Earth,", "by height above sea level, is Everest."]
+            vec![
+                "The tallest mountain on Earth,",
+                "by height above sea level, is Everest."
+            ]
         );
     }
 

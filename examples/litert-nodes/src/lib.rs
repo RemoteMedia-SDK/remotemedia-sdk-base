@@ -17,6 +17,7 @@
 //! `whisper-litert`, `gemma-litert` and `kokoro-litert` commands.
 
 pub mod assistant;
+pub mod assistant_room;
 pub mod backend;
 pub mod bilstm;
 pub mod compiled;
@@ -27,6 +28,7 @@ pub mod litert;
 pub mod lm;
 pub mod mel;
 pub mod node;
+pub mod stage_trace;
 pub mod tokenizer;
 #[cfg(feature = "kokoro")]
 pub mod tts_node;
@@ -34,11 +36,14 @@ pub mod whisper;
 
 pub use whisper::{Transcript, Whisper, WhisperConfig};
 
-#[cfg(feature = "kokoro")]
+#[cfg(all(feature = "plugin", feature = "kokoro"))]
 remotemedia_plugin_sdk::plugin_export!(
     node::WhisperLiteRtFactory,
     assistant::GemmaAssistantFactory,
     tts_node::KokoroTtsFactory,
 );
-#[cfg(not(feature = "kokoro"))]
-remotemedia_plugin_sdk::plugin_export!(node::WhisperLiteRtFactory, assistant::GemmaAssistantFactory);
+#[cfg(all(feature = "plugin", not(feature = "kokoro")))]
+remotemedia_plugin_sdk::plugin_export!(
+    node::WhisperLiteRtFactory,
+    assistant::GemmaAssistantFactory,
+);

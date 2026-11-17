@@ -28,7 +28,10 @@ name = "gemma-litert"
 path = "src/bin/gemma_litert.rs"
 
 [features]
-default = ["kokoro"]
+default = ["kokoro", "plugin"]
+# Disable when used as a Rust library by another loadable plugin: a shared
+# library must export only its own plugin ABI entry point.
+plugin = []
 # Kokoro text-to-speech: compiles LiteRT-LM's English phonemizer (C++) with
 # Abseil, so the build needs CMake, Ninja and a C++ compiler.
 kokoro = []
@@ -39,6 +42,7 @@ remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin
 abi_stable = "0.11"
 async-trait = "0.1"
 serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
 # LiteRT is loaded at run time (liblitert_lm.so on Android, litert-lm.dll on
 # Windows), so the plugin builds without it.
 libloading = "0.8"
