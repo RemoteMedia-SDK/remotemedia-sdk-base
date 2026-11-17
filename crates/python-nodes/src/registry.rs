@@ -380,6 +380,28 @@ pub fn register_default_python_nodes() {
 
     // TTS nodes
     register_python_node(
+        PythonNodeConfig::new("SentenceEmbeddingNode")
+            .with_description(
+                "Sentence embeddings (sentence-transformers, pinned revision): a batch of                  texts in, one Json output of L2-normalized vectors out",
+            )
+            .with_category("embedding")
+            .accepts(["json", "text"])
+            .produces(["json"])
+            .with_config_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string", "default": "sentence-transformers/all-MiniLM-L6-v2"},
+                    "revision": {"type": "string", "pattern": "^[0-9a-f]{40}$",
+                                 "description": "the model's commit SHA"},
+                    "device": {"type": "string", "default": "cpu"},
+                    "cache_dir": {"type": ["string", "null"]},
+                    "max_batch": {"type": "integer", "minimum": 1, "default": 64}
+                },
+                "additionalProperties": true
+            })),
+    );
+
+    register_python_node(
         PythonNodeConfig::new("KokoroOnnxTTSNode")
             .with_multi_output(true)
             .with_description(

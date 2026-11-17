@@ -16,8 +16,9 @@ crate-type = ["cdylib"]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../", default-features = false, features = ["inprocess-python", "loadable"] }
 remotemedia-python-nodes = { path = "../../crates/python-nodes", default-features = false, features = ["inprocess"] }
 remotemedia-plugin-sdk = { path = "../../../remotemedia-plugin-sdk/crates/plugin-sdk", features = ["inprocess-python"] }
-remotemedia-litert-nodes = { path = "../../../remotemedia-litert-nodes", default-features = false, features = ["whisper"] }
-litert-lm-loadable-plugin = { path = "../../../litert-lm-loadable-plugin", default-features = false }
+# LiteRT nodes are not linked into this library: the app loads them as a
+# plugin (the litert-nodes repository, checked out beside this one; see
+# build-android.sh), so this cdylib exports only its own JNI surface.
 remotemedia-scaling-runner-protocol = { path = "../../../remotemedia-scaling/crates/runner_protocol" }
 tonic = { version = "0.14", features = ["transport"] }
 prost = "0.14"
