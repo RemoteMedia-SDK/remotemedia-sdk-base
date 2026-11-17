@@ -297,6 +297,25 @@ pub fn clear_registry() {
     PYTHON_NODE_REGISTRY.clear();
 }
 
+/// JSON schema of the shared `transcript_updates` param
+/// (`remotemedia_modality::stt::TranscriptStreamingConfig`). A node whose
+/// schema has this property can stream `delta` / `correction` / `final`
+/// transcript events, and tools find streaming-capable STT nodes by it.
+fn transcript_updates_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Streaming transcript events. off (default): one Text per utterance. stable: delta events for committed text, then final. full: also the tentative tail, with corrections.",
+        "properties": {
+            "mode": {"type": "string", "enum": ["off", "stable", "full"], "default": "off"},
+            "agreement_updates": {"type": "integer", "minimum": 1, "default": 2,
+                                  "description": "Consecutive hypotheses that must agree before a token commits"},
+            "trailing_guard_tokens": {"type": "integer", "minimum": 0, "default": 1,
+                                      "description": "Agreed tokens at the end kept revisable"}
+        },
+        "additionalProperties": false
+    })
+}
+
 /// Register the default set of Python nodes
 ///
 /// This registers the common Python nodes that ship with RemoteMedia.
@@ -324,13 +343,18 @@ pub fn register_default_python_nodes() {
 
     register_python_node(
         PythonNodeConfig::new("WhisperSTTNode")
+            // Multi-output: with transcript_updates on, one input yields a
+            // delta and a final.
+            .with_multi_output(true)
             .with_description(
                 "Minimal multiprocess-capable Whisper STT: audio in, plain-text \
-                 transcript out. For observability / hookpoints on audio pipelines.",
+                 transcript out, or the shared transcript events when \
+                 transcript_updates is on. For observability / hookpoints on \
+                 audio pipelines.",
             )
             .with_category("stt")
             .accepts(["audio"])
-            .produces(["text"])
+            .produces(["text", "json"])
             .with_config_schema(serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -339,7 +363,8 @@ pub fn register_default_python_nodes() {
                     "language": {"type": ["string", "null"], "default": "en"},
                     "device": {"type": ["string", "null"], "description": "cpu, cuda or mps; auto when omitted"},
                     "torch_dtype": {"type": "string", "default": "float32"},
-                    "chunk_length_s": {"type": "integer", "minimum": 1, "default": 30}
+                    "chunk_length_s": {"type": "integer", "minimum": 1, "default": 30},
+                    "transcript_updates": transcript_updates_schema()
                 },
                 "additionalProperties": true
             })),
@@ -347,13 +372,17 @@ pub fn register_default_python_nodes() {
 
     register_python_node(
         PythonNodeConfig::new("FasterWhisperSTTNode")
+            // Multi-output: with transcript_updates on, one input yields a
+            // delta and a final.
+            .with_multi_output(true)
             .with_description(
                 "Whisper STT on CTranslate2 (faster-whisper): one audio utterance in, \
-                 plain-text transcript out.",
+                 plain-text transcript out, or the shared transcript events with \
+                 segment timings when transcript_updates is on.",
             )
             .with_category("stt")
             .accepts(["audio"])
-            .produces(["text"])
+            .produces(["text", "json"])
             .with_config_schema(serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -372,7 +401,42 @@ pub fn register_default_python_nodes() {
                     "hotwords": {"type": ["string", "null"]},
                     "vad_filter": {"type": "boolean", "default": false},
                     "trailing_silence_secs": {"type": "number", "minimum": 0, "default": 0.0},
-                    "cpu_threads": {"type": "integer", "minimum": 0, "default": 0}
+                    "cpu_threads": {"type": "integer", "minimum": 0, "default": 0},
+                    "transcript_updates": transcript_updates_schema()
+                },
+                "additionalProperties": true
+            })),
+    );
+
+    register_python_node(
+        PythonNodeConfig::new("WhisperXSTTNode")
+            .with_multi_output(true)
+            .with_description(
+                "WhisperX STT (batched CTranslate2 Whisper + wav2vec2 word alignment): \
+                 one audio utterance in, plain-text transcript out, or the shared \
+                 transcript events with word timings when transcript_updates is on. \
+                 The managed venv installs WhisperX from the node's @python_requires.",
+            )
+            .with_category("stt")
+            .accepts(["audio"])
+            .produces(["text", "json"])
+            .with_config_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string", "default": "base.en",
+                              "description": "Whisper model name for WhisperX (base.en, small, large-v3-turbo, ...) or local path"},
+                    "language": {"type": ["string", "null"], "default": "en",
+                                 "description": "Language code; null lets Whisper detect it"},
+                    "device": {"type": "string", "enum": ["auto", "cuda", "cpu"], "default": "auto"},
+                    "device_index": {"type": "integer", "minimum": 0, "default": 0},
+                    "compute_type": {"type": "string", "default": "default",
+                                     "description": "CTranslate2 compute type; default is float16 on CUDA and int8 on CPU"},
+                    "batch_size": {"type": "integer", "minimum": 1, "default": 16},
+                    "beam_size": {"type": "integer", "minimum": 1, "default": 5},
+                    "vad_method": {"type": ["string", "null"], "description": "pyannote or silero; WhisperX's default when null"},
+                    "align": {"type": "boolean", "default": true,
+                              "description": "Align words with wav2vec2 for word-level timestamps"},
+                    "transcript_updates": transcript_updates_schema()
                 },
                 "additionalProperties": true
             })),
@@ -624,12 +688,24 @@ pub fn register_default_python_nodes() {
                 "Streaming ASR with EOU detection via Parakeet \
                  (nvidia/parakeet_realtime_eou_120m-v1). Accepts audio \
                  chunks, emits partial text + JSON {text, eou: true} on \
-                 end-of-utterance. Replaces VAD + Whisper in English-only \
-                 s2s pipelines. Requires CUDA GPU.",
+                 end-of-utterance. With transcript_updates on, emits the \
+                 shared delta / correction / final Json events instead (the \
+                 final also carries eou: true). Replaces VAD + Whisper in \
+                 English-only s2s pipelines. Requires CUDA GPU.",
             )
             .with_category("stt")
             .accepts(["audio"])
-            .produces(["text", "json"]),
+            .produces(["text", "json"])
+            .with_config_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "model_id": {"type": "string", "default": "nvidia/parakeet_realtime_eou_120m-v1"},
+                    "device": {"type": ["string", "null"], "description": "CUDA device, e.g. cuda:0; auto when omitted"},
+                    "chunk_size_ms": {"type": "integer", "minimum": 1, "default": 80},
+                    "transcript_updates": transcript_updates_schema()
+                },
+                "additionalProperties": true
+            })),
     );
 
     register_python_node(
