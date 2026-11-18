@@ -18,9 +18,10 @@ env:
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
   # Cargo.toml [patch]es plugin-sdk crates to ../remotemedia-plugin-sdk.
-  # plugin-sdk feat/generator-cancellation (ABI 0.11, cancel contract);
-  # RemoteMedia-SDK/remotemedia-plugin-sdk#18. Move to its merge commit on main.
-  PLUGIN_SDK_REV: 3fb3c44bf2cc96b7fd85cd9cdaa80c0f50a7fda8
+  # The same rev Cargo.toml pins: plugin-sdk feat/node-factory-provider
+  # (remotemedia_traits::provider); RemoteMedia-SDK/remotemedia-plugin-sdk#24.
+  # Move to its merge commit on main.
+  PLUGIN_SDK_REV: 48e41429bafec472f4063127eb27d214ab42e659
 
 jobs:
   check:
