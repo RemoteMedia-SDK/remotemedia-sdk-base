@@ -198,11 +198,12 @@ impl GrpcPipelineClient {
         })
     }
 
-    /// Resolve the single input node id for `data_inputs` routing.
+    /// The node id inputs are addressed to.
     ///
-    /// Prefers a node that has no incoming connection (a source/entry node).
-    /// Bails with [`Error::InvalidManifest`] when more than one candidate
-    /// is ambiguous so inputs are never silently misrouted.
+    /// A manifest with one source node (no incoming connection) names it. A
+    /// manifest with several names none (the empty id): the server then
+    /// delivers each input to every source that takes it, as a session does
+    /// for any other transport.
     fn input_node_id(manifest: &Manifest) -> Result<String> {
         let targets: std::collections::HashSet<&str> =
             manifest.connections.iter().map(|c| c.to.as_str()).collect();
@@ -220,10 +221,7 @@ impl GrpcPipelineClient {
                 .ok_or_else(|| Error::InvalidManifest("manifest has no nodes".to_string()))?
                 .id
                 .clone()),
-            _ => Err(Error::InvalidManifest(format!(
-                "ambiguous input node: several source nodes found ({})",
-                candidates.join(", ")
-            ))),
+            _ => Ok(String::new()),
         }
     }
 }
@@ -656,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn test_input_node_id_rejects_ambiguous() {
+    fn test_input_node_id_addresses_no_node_when_there_are_several_sources() {
         let manifest: Manifest = serde_json::from_str(
             r#"{ "version": "v1", "metadata": {}, "nodes": [
                 { "id": "a", "node_type": "Echo" },
@@ -664,6 +662,6 @@ mod tests {
             ], "connections": [] }"#,
         )
         .unwrap();
-        assert!(GrpcPipelineClient::input_node_id(&manifest).is_err());
+        assert_eq!(GrpcPipelineClient::input_node_id(&manifest).unwrap(), "");
     }
 }
