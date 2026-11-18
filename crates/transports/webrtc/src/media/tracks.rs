@@ -204,7 +204,7 @@ impl AudioTrack {
     /// * `track` - Underlying WebRTC track
     /// * `config` - Audio encoder configuration
     pub fn new(track: Arc<TrackLocalStaticSample>, config: AudioEncoderConfig) -> Result<Self> {
-        println!("[AUDIOTRACK] Creating new AudioTrack with ring buffer support!");
+        tracing::debug!("[AUDIOTRACK] Creating new AudioTrack with ring buffer support!");
         let encoder = Arc::new(RwLock::new(AudioEncoder::new(config.clone())?));
         let decoder = Arc::new(RwLock::new(super::audio::AudioDecoder::new(
             config.clone(),
@@ -212,9 +212,9 @@ impl AudioTrack {
 
         // Create audio sender with ring buffer
         // Large buffer allows TTS to generate audio in bursts without blocking
-        println!("[AUDIOTRACK] About to create AudioSender...");
+        tracing::debug!("[AUDIOTRACK] About to create AudioSender...");
         let sender = AudioSender::new(Arc::clone(&track), config.ring_buffer_capacity);
-        println!("[AUDIOTRACK] AudioSender created!");
+        tracing::debug!("[AUDIOTRACK] AudioSender created!");
 
         Ok(Self {
             track,
