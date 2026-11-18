@@ -41,6 +41,8 @@ export declare class NapiRuntimeData {
   getFileOffset(): number | null;
   getFileLength(): number | null;
   getFileStreamId(): string | null;
+  /** The stream an audio, video or file value belongs to; null otherwise. */
+  getStreamId(): string | null;
 }
 
 export declare class NapiOutputAllocator {
