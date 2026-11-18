@@ -262,6 +262,18 @@ impl SharedState {
         info!("Hosting room '{}'", key);
     }
 
+    /// The manifest of room `key`, when its host named it.
+    pub async fn room_manifest(
+        &self,
+        key: &str,
+    ) -> Option<Arc<remotemedia_core::manifest::Manifest>> {
+        self.rooms
+            .lock()
+            .await
+            .get(key)
+            .and_then(|room| room.manifest())
+    }
+
     /// Stop serving hosted room `key`. The key stays reserved, so later joins
     /// are refused rather than given a new session; the session itself is the
     /// host's to close. Returns the room's session.
@@ -866,7 +878,14 @@ async fn handle_announce(
 
     // The outputs this member will be sent, so the client can offer a
     // section for each (openspec: extend-ai-sdk-media-streaming, D1).
-    let media = crate::peer::scanner::session_media_plan(state.runner.as_ref(), &state.manifest)
+    // An admitted member's plan is its own pipeline's (a host may serve
+    // several pipelines), not the server's start manifest.
+    let plan_manifest = match admitted_room.as_deref() {
+        Some(key) => state.room_manifest(key).await,
+        None => None,
+    }
+    .unwrap_or_else(|| Arc::clone(&state.manifest));
+    let media = crate::peer::scanner::session_media_plan(state.runner.as_ref(), &plan_manifest)
         .await
         .to_signaling_json();
 
@@ -1029,6 +1048,10 @@ async fn handle_offer(
         }
         // `receive.video`: which video outputs this member asked for.
         server_peer.set_video_receive(crate::peer::server_peer::video_receive_from_params(
+            &request.params,
+        ));
+        // `receive.audio: "data"`: audio outputs on the data channel.
+        server_peer.set_audio_as_data(crate::peer::server_peer::audio_as_data_from_params(
             &request.params,
         ));
         let answered = match peer_room.as_deref() {

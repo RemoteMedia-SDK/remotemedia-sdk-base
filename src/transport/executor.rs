@@ -202,6 +202,8 @@ pub struct SessionHandle {
     output_data_rx: Option<mpsc::Receiver<TransportData>>,
     /// Shutdown signal sender
     shutdown_tx: mpsc::Sender<()>,
+    /// The router's drain request ([`Self::request_drain`]).
+    drain: Arc<tokio::sync::Notify>,
     /// Handle to the session router task
     task_handle: JoinHandle<Result<()>>,
     /// Starts the session's node instances; already started unless the
@@ -469,6 +471,16 @@ impl SessionHandle {
     pub fn signal_input_complete(&mut self) {
         self.input_tx = None;
         self.input_control.finish_input();
+    }
+
+    /// End the session's input for every sender at once, including
+    /// participant handles that are still held: input already accepted is
+    /// still routed, nothing new is, and the pipeline then drains and the
+    /// output receivers end, as when the last sender is dropped. For a
+    /// session whose members have all said their input is over (openspec
+    /// extend-ai-sdk-media-streaming, design D12).
+    pub fn request_drain(&self) {
+        self.drain.notify_one();
     }
 
     /// Clone-able, send-only handle onto this session's input.
@@ -1659,6 +1671,7 @@ impl PipelineExecutor {
                 None
             },
         )?;
+        let drain = router.drain_signal();
         router.set_output_allocator(output_allocator.clone());
         // Node outputs keep their own budgets; only external production uses
         // the shared ingress allocator returned to the session handle.
@@ -1803,6 +1816,7 @@ impl PipelineExecutor {
             output_video_rx: Some(video_rx),
             output_data_rx: Some(data_rx),
             shutdown_tx,
+            drain,
             task_handle,
             start,
             is_active: true,

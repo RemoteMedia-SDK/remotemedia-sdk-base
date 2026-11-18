@@ -32,6 +32,12 @@ package remotemedia.v1;
 import "common.proto";
 
 service RuntimeControl {
+  // Make a manifest admissible by name (`AdmitMember.pipeline`), after the
+  // checks the runtime applies to the manifest it started with. Registering
+  // the same name with the same manifest again changes nothing; with another
+  // manifest it is ALREADY_EXISTS. Pipeline input never crosses this service:
+  // members join the pipeline's own transport with a ticket.
+  rpc RegisterPipeline(RegisterPipelineRequest) returns (RegisterPipelineResponse);
   // Admit one member to the session of `(pipeline, session_key)`, starting
   // the session if it is not running. Returns a single-use ticket.
   rpc AdmitMember(AdmitMemberRequest) returns (AdmitMemberResponse);
@@ -52,7 +58,13 @@ service RuntimeControl {
   // Run a manifest on `inputs` in a session of its own and stream every
   // output of its sinks; the stream ends when the pipeline has drained.
   // Cancelling the call ends the run.
-  rpc RunPipeline(RunPipelineRequest) returns (stream RunPipelineOutput);
+  //
+  // Deprecated: it feeds pipeline input through the control address.
+  // Register the pipeline and join it as a member instead (openspec
+  // extend-ai-sdk-media-streaming, design D10).
+  rpc RunPipeline(RunPipelineRequest) returns (stream RunPipelineOutput) {
+    option deprecated = true;
+  }
   // The runtime's managed OpenAI-compatible LLM server for a model, started
   // on demand. The address is a loopback address on the runtime's host.
   rpc ManagedLlm(ManagedLlmRequest) returns (ManagedLlmResponse);
@@ -90,6 +102,22 @@ message AdmitMemberRequest {
   uint32 ttl_secs = 4;
   // Empty: media and the pipeline data channel only, no control channel.
   repeated MemberGrant grants = 5;
+  // End the session as soon as its last member leaves, instead of after the
+  // runtime's empty-session timeout (a provider call's private session).
+  bool end_on_leave = 6;
+}
+
+message RegisterPipelineRequest {
+  // The name members are admitted by. Becomes the manifest's
+  // `metadata.name`.
+  string name = 1;
+  // The pipeline manifest as JSON.
+  string manifest_json = 2;
+}
+
+message RegisterPipelineResponse {
+  // `false` when the same manifest was already registered under the name.
+  bool registered = 1;
 }
 
 message AdmitMemberResponse {

@@ -1196,35 +1196,6 @@ pub async fn serve_control_with_host_incoming(
 ) -> Result<(), tonic::transport::Error> {
     use crate::control_host::{RuntimeControlService, MAX_RUNTIME_CONTROL_REQUEST_BYTES};
     use crate::generated::runtime_control_server::RuntimeControlServer;
-    // Live sessions (`StreamPipeline`) on the same address and token, when
-    // the host has an executor for them.
-    let streaming = host.pipeline_executor().map(|executor| {
-        // The token is enforced here, before the call reaches the service.
-        let expected = token.clone();
-        let require_token = move |req: Request<()>| -> Result<Request<()>, Status> {
-            let Some(expected) = &expected else {
-                return Ok(req);
-            };
-            let got = req
-                .metadata()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
-            match got {
-                Some(t) if t == expected => Ok(req),
-                _ => Err(Status::unauthenticated("missing or invalid bearer token")),
-            }
-        };
-        // A core session (`control_stream`), not the data-plane
-        // `StreamingServiceImpl`, whose older router loses the audio of
-        // multi-output nodes (a VAD's pass-through).
-        let server = crate::generated::streaming_pipeline_service_server::StreamingPipelineServiceServer::new(
-            crate::control_stream::ControlStreamService::new(executor),
-        )
-        .max_decoding_message_size(MAX_RUNTIME_CONTROL_REQUEST_BYTES)
-        .max_encoding_message_size(MAX_RUNTIME_CONTROL_REQUEST_BYTES);
-        tonic::service::interceptor::InterceptedService::new(server, require_token)
-    });
     let mut control = ControlServiceImpl::new(bus);
     let mut runtime = RuntimeControlService::new(host);
     if let Some(t) = token {
@@ -1253,7 +1224,6 @@ pub async fn serve_control_with_host_incoming(
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .add_service(control)
         .add_service(runtime)
-        .add_optional_service(streaming)
         .serve_with_incoming(incoming)
         .await
 }

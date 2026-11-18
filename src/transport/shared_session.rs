@@ -12,7 +12,7 @@ use crate::transport::session_router::{ClientOutputReceivers, DEFAULT_ROUTER_OUT
 use crate::transport::StreamSession;
 use crate::transport::TransportData;
 use crate::{Error, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
@@ -102,6 +102,9 @@ pub struct SharedPipelineSession {
     video_tx: broadcast::Sender<TransportData>,
     data_tx: broadcast::Sender<TransportData>,
     closed: AtomicBool,
+    /// [`Self::request_drain`] was called: when every output has been
+    /// broadcast, a [`DRAINED_MARKER_KEY`] marker follows on each kind.
+    drain_requested: Arc<AtomicBool>,
 }
 
 /// StreamSession adapter for one participant joined to a shared pipeline.
@@ -176,6 +179,7 @@ impl SharedPipelineSession {
             video_tx,
             data_tx,
             closed: AtomicBool::new(false),
+            drain_requested: Arc::new(AtomicBool::new(false)),
         });
 
         shared.spawn_output_drainers(receivers);
@@ -229,6 +233,15 @@ impl SharedPipelineSession {
         !self.closed.load(Ordering::Acquire) && self.session_handle.lock().await.is_active()
     }
 
+    /// End the session's input for every participant and let the pipeline
+    /// drain (openspec extend-ai-sdk-media-streaming, design D12). Every
+    /// output still produced is broadcast; then each kind's subscribers
+    /// receive one marker frame ([`is_drained_marker`]) and nothing more.
+    pub async fn request_drain(&self) {
+        self.drain_requested.store(true, Ordering::Release);
+        self.session_handle.lock().await.request_drain();
+    }
+
     pub async fn close(&self) -> Result<()> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -243,14 +256,36 @@ impl SharedPipelineSession {
             data_rx,
         } = receivers;
 
-        Self::spawn_output_drainer(audio_rx, self.audio_tx.clone());
-        Self::spawn_output_drainer(video_rx, self.video_tx.clone());
-        Self::spawn_output_drainer(data_rx, self.data_tx.clone());
+        // The last drainer to see its kind end announces the drain on every
+        // kind, so a subscriber that counts the markers knows each kind has
+        // delivered everything before it.
+        let remaining = Arc::new(AtomicUsize::new(3));
+        let all = [
+            self.audio_tx.clone(),
+            self.video_tx.clone(),
+            self.data_tx.clone(),
+        ];
+        for (rx, tx) in [
+            (audio_rx, self.audio_tx.clone()),
+            (video_rx, self.video_tx.clone()),
+            (data_rx, self.data_tx.clone()),
+        ] {
+            Self::spawn_output_drainer(
+                rx,
+                tx,
+                Arc::clone(&remaining),
+                all.clone(),
+                Arc::clone(&self.drain_requested),
+            );
+        }
     }
 
     fn spawn_output_drainer(
         mut rx: mpsc::Receiver<TransportData>,
         tx: broadcast::Sender<TransportData>,
+        remaining: Arc<AtomicUsize>,
+        all: [broadcast::Sender<TransportData>; 3],
+        drain_requested: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
             while let Some(mut output) = rx.recv().await {
@@ -260,6 +295,34 @@ impl SharedPipelineSession {
                 output.data = output.data.into_shared();
                 let _ = tx.send(output);
             }
+            if remaining.fetch_sub(1, Ordering::AcqRel) == 1
+                && drain_requested.load(Ordering::Acquire)
+            {
+                for tx in all {
+                    let _ = tx.send(drained_marker());
+                }
+            }
         });
     }
+}
+
+/// Metadata key of the frame a drained shared session broadcasts once on each
+/// output kind after its last output ([`SharedPipelineSession::request_drain`]).
+pub const DRAINED_MARKER_KEY: &str = "remotemedia.drained";
+
+/// The event a member receives when its session has drained.
+pub const DRAINED_EVENT_TYPE: &str = "remotemedia.drained";
+
+/// The marker frame: `{"type":"remotemedia.drained"}`, tagged with
+/// [`DRAINED_MARKER_KEY`].
+pub fn drained_marker() -> TransportData {
+    TransportData::new(RuntimeData::Json(
+        serde_json::json!({ "type": DRAINED_EVENT_TYPE }),
+    ))
+    .with_metadata(DRAINED_MARKER_KEY.to_string(), "1".to_string())
+}
+
+/// Whether `data` is the drain marker of [`drained_marker`].
+pub fn is_drained_marker(data: &TransportData) -> bool {
+    data.metadata.contains_key(DRAINED_MARKER_KEY)
 }

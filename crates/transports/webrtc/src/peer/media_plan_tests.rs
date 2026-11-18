@@ -93,7 +93,11 @@ async fn client_offer(video_sections: usize) -> String {
     offer.sdp
 }
 
-async fn answer(server: &WebRtcPeer, planned: &[PlannedSender], offer: String) -> Vec<AnsweredMedia> {
+async fn answer(
+    server: &WebRtcPeer,
+    planned: &[PlannedSender],
+    offer: String,
+) -> Vec<AnsweredMedia> {
     let pc = server.peer_connection();
     pc.set_remote_description(RTCSessionDescription::offer(offer).unwrap())
         .await
@@ -144,7 +148,10 @@ fn receive_list_orders_the_requested_outputs_first() {
     let ids = |specs: Vec<VideoStreamSpec>| -> Vec<String> {
         specs.into_iter().map(|s| s.stream_id).collect()
     };
-    assert_eq!(ids(order_video_outputs(&planned, None)), ["avatar", "screen"]);
+    assert_eq!(
+        ids(order_video_outputs(&planned, None)),
+        ["avatar", "screen"]
+    );
     assert_eq!(
         ids(order_video_outputs(&planned, Some(&["screen".to_string()]))),
         ["screen", "avatar"]
@@ -157,7 +164,10 @@ fn receive_list_orders_the_requested_outputs_first() {
         video_receive_from_params(&serde_json::json!({ "receive": { "video": false } })),
         Some(vec![])
     );
-    assert_eq!(video_receive_from_params(&serde_json::json!({ "sdp": "v=0" })), None);
+    assert_eq!(
+        video_receive_from_params(&serde_json::json!({ "sdp": "v=0" })),
+        None
+    );
     assert_eq!(
         video_receive_from_params(&serde_json::json!({ "receive": { "video": true } })),
         None
@@ -285,7 +295,15 @@ async fn after_picture_loss_the_next_frame_is_a_keyframe() {
         stream_id: None,
         arrival_ts_us: None,
     };
-    let keyframe = |data: &RuntimeData| matches!(data, RuntimeData::Video { is_keyframe: true, .. });
+    let keyframe = |data: &RuntimeData| {
+        matches!(
+            data,
+            RuntimeData::Video {
+                is_keyframe: true,
+                ..
+            }
+        )
+    };
     let encoded_size = |data: &RuntimeData| match data {
         RuntimeData::Video { pixel_data, .. } => pixel_data.len(),
         _ => 0,
@@ -297,7 +315,10 @@ async fn after_picture_loss_the_next_frame_is_a_keyframe() {
         let out = encoder.encode_frame(frame(n)).await.unwrap();
         sizes.push((keyframe(&out), encoded_size(&out)));
     }
-    let later_keyframes = sizes[1..].iter().filter(|(k, size)| *k && *size > 0).count();
+    let later_keyframes = sizes[1..]
+        .iter()
+        .filter(|(k, size)| *k && *size > 0)
+        .count();
     // A keyframe is requested (RTCP PLI); the next frame is one.
     encoder.request_keyframe();
     let out = encoder.encode_frame(frame(6)).await.unwrap();

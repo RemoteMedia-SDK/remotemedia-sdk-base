@@ -566,8 +566,17 @@ mod tests {
         }
         fn schema(&self) -> Option<remotemedia_core::nodes::schema::NodeSchema> {
             use remotemedia_core::nodes::schema::{NodeSchema, RuntimeDataType};
-            let all = [RuntimeDataType::Audio, RuntimeDataType::Video, RuntimeDataType::Text, RuntimeDataType::Json];
-            Some(NodeSchema::new("PassThroughLike").accepts(all).produces(all))
+            let all = [
+                RuntimeDataType::Audio,
+                RuntimeDataType::Video,
+                RuntimeDataType::Text,
+                RuntimeDataType::Json,
+            ];
+            Some(
+                NodeSchema::new("PassThroughLike")
+                    .accepts(all)
+                    .produces(all),
+            )
         }
     }
 

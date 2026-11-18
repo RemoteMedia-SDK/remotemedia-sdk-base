@@ -448,6 +448,11 @@ pub struct SessionRouter {
     /// Shutdown signal sender (held externally)
     _shutdown_tx: mpsc::Sender<()>,
 
+    /// A drain request: refuse new input from every sender, deliver what was
+    /// already accepted, and end the session gracefully once the pipeline
+    /// has drained ([`SessionRouter::drain_signal`]).
+    drain: Arc<tokio::sync::Notify>,
+
     /// Capability resolution context (spec 025)
     /// Stores pending capability updates for downstream nodes
     resolution_ctx: Option<ResolutionContext>,
@@ -709,6 +714,11 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 impl SessionRouter {
+    /// The session's drain request ([`SessionHandle::request_drain`]).
+    pub fn drain_signal(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.drain)
+    }
+
     /// Create a new session router
     ///
     /// # Arguments
@@ -846,6 +856,7 @@ impl SessionRouter {
             input_tx: Some(input_tx.into()),
             shutdown_rx: std::sync::Mutex::new(Some(shutdown_rx)),
             _shutdown_tx: shutdown_tx,
+            drain: Arc::new(tokio::sync::Notify::new()),
             resolution_ctx: None,
             scheduler,
             drift_metrics: Arc::new(dashmap::DashMap::new()),
@@ -1735,6 +1746,8 @@ impl SessionRouter {
         // input channel. Each node's bounded input mpsc provides natural
         // backpressure back through `input_rx`.
         let mut sources_finished = false;
+        let drain = Arc::clone(&self.drain);
+        let mut drain_requested = false;
         // With self-driven nodes the end of client input does not end the
         // session: it ends when it is closed, or when client input has ended
         // (or no node takes any) and every self-driven instance has finished.
@@ -1766,6 +1779,19 @@ impl SessionRouter {
                     // No node takes client input. Refuse new ingress, but
                     // deliver packets already accepted (addressed to a node)
                     // before the last source finished.
+                    input_rx.close();
+                },
+
+                // A drain request (openspec extend-ai-sdk-media-streaming,
+                // D12): no sender may add input any more, but everything
+                // already accepted is still routed; the recv arm then sees
+                // the end of input and the pipeline drains.
+                _ = drain.notified(), if !drain_requested && !input_ended => {
+                    tracing::info!(
+                        "Session {}: drain requested, closing client input",
+                        self.session_id
+                    );
+                    drain_requested = true;
                     input_rx.close();
                 },
 

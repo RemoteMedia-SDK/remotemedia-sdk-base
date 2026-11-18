@@ -12,7 +12,36 @@ use tracing::info;
 use crate::channels::{DataChannelDecodeError, DataChannelMessage, DataChannelReassembler};
 use crate::generated::DataBuffer;
 
-pub(super) fn decode_pipeline_input(
+/// The control action a member sends when its input is over (openspec
+/// extend-ai-sdk-media-streaming, design D12).
+pub const END_OF_INPUT_ACTION: &str = "end_of_input";
+
+/// What one data-channel message is to the pipeline.
+pub(crate) enum PipelineIngress {
+    /// One input value.
+    Data(RuntimeData),
+    /// The member's input is over ([`END_OF_INPUT_ACTION`]).
+    EndOfInput,
+}
+
+/// Decode a data-channel message, telling the end of a member's input
+/// apart from data.
+pub(crate) fn decode_member_input(
+    wire: Bytes,
+    reassembler: &mut DataChannelReassembler,
+    copies: &CopyContext,
+) -> crate::Result<Option<PipelineIngress>> {
+    if let Ok(DataChannelMessage::Control { action, .. }) =
+        DataChannelMessage::decode_owned_with_context(wire.clone(), copies)
+    {
+        if action == END_OF_INPUT_ACTION {
+            return Ok(Some(PipelineIngress::EndOfInput));
+        }
+    }
+    Ok(decode_pipeline_input(wire, reassembler, copies)?.map(PipelineIngress::Data))
+}
+
+pub(crate) fn decode_pipeline_input(
     wire: Bytes,
     reassembler: &mut DataChannelReassembler,
     copies: &CopyContext,

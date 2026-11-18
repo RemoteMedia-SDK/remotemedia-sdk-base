@@ -4,6 +4,10 @@
 //! answers that name the operation, member events, and a one-shot pipeline
 //! run on a real `PipelineExecutor`.
 
+// `RunPipeline` is deprecated (it feeds pipeline input through the control
+// address); its behaviour is still covered here while it exists.
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +22,7 @@ use remotemedia_grpc::generated::runtime_control_client::RuntimeControlClient;
 use remotemedia_grpc::generated::{
     AdmitMemberRequest, AdmitMemberResponse, DataBuffer, EndSessionRequest, GetSessionRequest,
     ListMembersRequest, ListSessionsRequest, ManagedLlmRequest, MemberChange, MemberInfo,
-    RemoveMemberRequest, RunPipelineRequest, WatchMembersRequest,
+    RegisterPipelineRequest, RemoveMemberRequest, RunPipelineRequest, WatchMembersRequest,
 };
 use tokio::sync::broadcast;
 use tonic::transport::Channel;
@@ -75,8 +79,11 @@ impl ControlHost for TestHost {
             .await
     }
 
-    fn pipeline_executor(&self) -> Option<Arc<PipelineExecutor>> {
-        Some(self.executor.clone())
+    async fn register_pipeline(&self, name: &str, manifest_json: &str) -> Result<bool, Status> {
+        if manifest_json.trim().is_empty() {
+            return Err(Status::invalid_argument("no manifest"));
+        }
+        Ok(name != "voice")
     }
 }
 
@@ -148,6 +155,7 @@ fn admit(pipeline: &str) -> AdmitMemberRequest {
         member: Some(member("ada")),
         ttl_secs: 60,
         grants: vec![],
+        end_on_leave: false,
     }
 }
 
@@ -157,6 +165,16 @@ async fn a_host_that_does_nothing_answers_unimplemented_naming_each_operation() 
     let mut client = RuntimeControlClient::new(server.channel.clone());
 
     let cases: Vec<(&str, Status)> = vec![
+        (
+            "registering a pipeline",
+            client
+                .register_pipeline(RegisterPipelineRequest {
+                    name: "p".into(),
+                    manifest_json: "{}".into(),
+                })
+                .await
+                .unwrap_err(),
+        ),
         (
             "admitting a member",
             client.admit_member(admit("voice")).await.unwrap_err(),
@@ -495,128 +513,50 @@ async fn a_control_server_without_a_host_has_no_runtime_control_service() {
     assert_eq!(refused.code(), Code::Unimplemented);
 }
 
-// ── StreamPipeline on the control address (extend-ai-sdk-media-streaming, D10) ──
+#[tokio::test]
+async fn register_pipeline_reaches_the_host_and_needs_a_name() {
+    let server = serve(None, false).await;
+    let mut client = RuntimeControlClient::new(server.channel.clone());
+    let added = client
+        .register_pipeline(RegisterPipelineRequest {
+            name: "provider-0123456789abcdef".into(),
+            manifest_json: "{\"version\":\"v1\",\"nodes\":[]}".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(added.registered);
+    // The same name again: already there.
+    let again = client
+        .register_pipeline(RegisterPipelineRequest {
+            name: "voice".into(),
+            manifest_json: "{}".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!again.registered);
+    let refused = client
+        .register_pipeline(RegisterPipelineRequest {
+            name: "  ".into(),
+            manifest_json: "{}".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(refused.message().contains("name"), "{}", refused.message());
+}
 
-mod stream_pipeline {
-    use super::*;
-    use remotemedia_grpc::generated::stream_request::Request as StreamRequestKind;
-    use remotemedia_grpc::generated::stream_response::Response as StreamResponseKind;
+#[tokio::test]
+async fn the_control_address_serves_no_pipeline_input() {
+    // Pipeline input crosses the pipeline's own transport (design D10):
+    // `StreamPipeline` is not on the control address.
     use remotemedia_grpc::generated::streaming_pipeline_service_client::StreamingPipelineServiceClient;
-    use remotemedia_grpc::generated::{DataChunk, PipelineManifest, StreamInit, StreamRequest};
-
-    fn init(manifest: &serde_json::Value) -> StreamRequest {
-        StreamRequest {
-            request: Some(StreamRequestKind::Init(StreamInit {
-                manifest: Some(PipelineManifest {
-                    manifest_json: manifest.to_string().into_bytes(),
-                    ..Default::default()
-                }),
-                client_version: "test".into(),
-                ..Default::default()
-            })),
-        }
-    }
-
-    async fn next(
-        responses: &mut tonic::Streaming<remotemedia_grpc::generated::StreamResponse>,
-    ) -> remotemedia_grpc::generated::StreamResponse {
-        tokio::time::timeout(Duration::from_secs(20), responses.message())
-            .await
-            .expect("a response in time")
-            .unwrap()
-            .expect("the session is open")
-    }
-
-    fn chunk(node: &str, sequence: u64, data: RuntimeData) -> StreamRequest {
-        StreamRequest {
-            request: Some(StreamRequestKind::DataChunk(DataChunk {
-                node_id: node.into(),
-                buffer: Some(runtime_data_to_data_buffer(&data)),
-                sequence,
-                ..Default::default()
-            })),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_live_session_on_the_control_address_answers_each_input_as_it_is_sent() {
-        let server = serve(Some("s3cret"), false).await;
-        let mut client = StreamingPipelineServiceClient::new(server.channel.clone());
-        let manifest = serde_json::json!({
-            "version": "v1",
-            "metadata": { "name": "echo" },
-            "nodes": [{ "id": "pass", "node_type": "PassThrough", "params": {} }],
-            "connections": []
-        });
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.send(init(&manifest)).await.unwrap();
-        let mut responses = client
-            .stream_pipeline(with_token(tokio_stream::wrappers::ReceiverStream::new(rx), "s3cret"))
-            .await
-            .unwrap()
-            .into_inner();
-        // Progress results may come first; then the session is ready.
-        loop {
-            let response = next(&mut responses).await;
-            match response.response {
-                Some(StreamResponseKind::Ready(_)) => break,
-                Some(StreamResponseKind::Result(_)) => continue,
-                other => panic!("expected the session to be ready, got {other:?}"),
-            }
-        }
-
-        // Live: the second input is sent only after the first output came back.
-        for (sequence, text) in ["one", "two"].into_iter().enumerate() {
-            tx.send(chunk("pass", sequence as u64, RuntimeData::Text(text.into())))
-                .await
-                .unwrap();
-            let mut output = None;
-            while output.is_none() {
-                let response = next(&mut responses).await;
-                if let Some(StreamResponseKind::Result(result)) = response.response {
-                    // `_status` carries the runtime's progress text, not output.
-                    output = result
-                        .data_outputs
-                        .into_iter()
-                        .find(|(key, _)| key != "_status")
-                        .map(|(_, buffer)| buffer);
-                }
-            }
-            match data_buffer_to_runtime_data(&output.unwrap()).unwrap() {
-                RuntimeData::Text(t) => assert_eq!(t, text),
-                other => panic!("unexpected output {other:?}"),
-            }
-        }
-        drop(tx);
-    }
-
-    #[tokio::test]
-    async fn the_live_session_needs_the_bearer_token() {
-        let server = serve(Some("s3cret"), false).await;
-        let mut client = StreamingPipelineServiceClient::new(server.channel.clone());
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tx.send(init(&serde_json::json!({ "version": "v1", "metadata": { "name": "x" }, "nodes": [], "connections": [] })))
-            .await
-            .unwrap();
-        let status = match client
-            .stream_pipeline(Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
-            .await
-        {
-            Err(status) => status,
-            Ok(response) => response.into_inner().message().await.unwrap_err(),
-        };
-        assert_eq!(status.code(), Code::Unauthenticated, "{status:?}");
-    }
-
-    #[tokio::test]
-    async fn a_host_without_an_executor_does_not_serve_live_sessions() {
-        let server = serve(None, true).await;
-        let mut client = StreamingPipelineServiceClient::new(server.channel.clone());
-        let (_tx, rx) = tokio::sync::mpsc::channel::<StreamRequest>(1);
-        let status = client
-            .stream_pipeline(Request::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
-            .await
-            .unwrap_err();
-        assert_eq!(status.code(), Code::Unimplemented, "{status:?}");
-    }
+    let server = serve(None, false).await;
+    let mut client = StreamingPipelineServiceClient::new(server.channel.clone());
+    let refused = client
+        .stream_pipeline(tokio_stream::iter(Vec::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unimplemented);
 }

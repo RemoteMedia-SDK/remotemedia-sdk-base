@@ -33,12 +33,12 @@ use remotemedia_core::{
     },
 };
 use std::collections::HashMap;
-use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex, RwLock};
 use tracing::{debug, error, info, trace, warn};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 
 fn participant_metadata(
     peer_id: &str,
@@ -87,6 +87,11 @@ struct PerTrackDispatcher {
     /// (`rm.realtime` with `transport: "webrtc"`): its data channel carries
     /// the hook's `{ v: 1, rt }` frames and no D6 UI frames (design D13).
     realtime_hook: bool,
+    /// The member asked for audio as data (`receive.audio: "data"`): every
+    /// audio output goes to its data channel as a lossless `DataBuffer`,
+    /// sent inline, not to an RTP track (openspec
+    /// extend-ai-sdk-media-streaming, design D12).
+    audio_as_data: bool,
     /// Total video frames dropped across all streams for this peer due to a
     /// full per-stream shard. Incremented on `try_send` Full; sampled by the
     /// rate-limited drop log so we don't spam when the encoder is steadily
@@ -116,10 +121,12 @@ impl PerTrackDispatcher {
         peer_id: String,
         copies: remotemedia_types::CopyContext,
         realtime_hook: bool,
+        audio_as_data: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             copies,
             realtime_hook,
+            audio_as_data,
             audio_txs: TokioMutex::new(HashMap::new()),
             video_txs: TokioMutex::new(HashMap::new()),
             track_registry,
@@ -134,6 +141,17 @@ impl PerTrackDispatcher {
     /// shard is overwhelmed). Json/Text go inline through the data
     /// channel.
     async fn dispatch(self: &Arc<Self>, transport_data: TransportData) {
+        if self.audio_as_data && matches!(transport_data.data, RuntimeData::Audio { .. }) {
+            if let Err(e) =
+                Self::send_data_channel(&self.data_channel, &transport_data, &self.copies).await
+            {
+                error!(
+                    "data channel audio send failed (peer {}): {}",
+                    self.peer_id, e
+                );
+            }
+            return;
+        }
         let stream_id = extract_stream_id(&transport_data.data)
             .unwrap_or(DEFAULT_STREAM_ID)
             .to_string();
@@ -431,14 +449,17 @@ impl PerTrackDispatcher {
         };
         let encoded = crate::adapters::encode_transport_data_with_context(transport_data, copies)
             .map_err(|e| Error::Other(e.into()))?;
-        if let Err(e) = dc.send(&bytes::Bytes::from(encoded)).await {
-            return Err(Error::WebRtcError(format!(
-                "Data channel send failed: {}",
-                e
-            )));
-        }
-        Ok(())
+        send_framed(dc, bytes::Bytes::from(encoded)).await
     }
+}
+
+/// One message from a member's connection to its input forwarder.
+enum PeerInput {
+    /// A value for the session.
+    Data(TransportData),
+    /// The member's input is over (openspec extend-ai-sdk-media-streaming,
+    /// design D12).
+    EndOfInput,
 }
 
 #[derive(Clone)]
@@ -462,6 +483,16 @@ pub struct SharedPipelineSession {
     /// Peers admitted for the AI SDK realtime hook over WebRTC, named before
     /// they attach ([`Self::set_realtime_hook_peer`]).
     realtime_hook_peers: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Peers that receive audio as data ([`Self::set_audio_as_data_peer`]).
+    audio_as_data_peers: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// A member's end of input drains the session once every attached
+    /// member has ended its input ([`Self::set_drain_on_end_input`]).
+    drain_on_end_input: std::sync::atomic::AtomicBool,
+    /// Members whose input is over.
+    ended_inputs: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The manifest the session runs, when its host named it
+    /// ([`Self::set_manifest`]); the media plan of its members is read from it.
+    manifest: std::sync::RwLock<Option<Arc<Manifest>>>,
 }
 
 impl SharedPipelineSession {
@@ -481,6 +512,10 @@ impl SharedPipelineSession {
             output_targets: Arc::new(RwLock::new(HashMap::new())),
             close_when_empty,
             realtime_hook_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            audio_as_data_peers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            drain_on_end_input: std::sync::atomic::AtomicBool::new(false),
+            ended_inputs: std::sync::Mutex::new(std::collections::HashSet::new()),
+            manifest: std::sync::RwLock::new(None),
         });
 
         shared.spawn_output_drainers(receivers);
@@ -582,6 +617,69 @@ impl SharedPipelineSession {
         }
     }
 
+    /// Whether `peer_id` receives audio outputs on its data channel
+    /// (`receive.audio: "data"` in its offer). Call before it attaches.
+    pub fn set_audio_as_data_peer(&self, peer_id: &str, audio_as_data: bool) {
+        let mut peers = self
+            .audio_as_data_peers
+            .lock()
+            .expect("audio as data peers lock");
+        if audio_as_data {
+            peers.insert(peer_id.to_string());
+        } else {
+            peers.remove(peer_id);
+        }
+    }
+
+    /// Let members end the session's input: once every attached member has
+    /// sent its end of input, the session drains, every remaining output is
+    /// delivered, then a `remotemedia.drained` event (openspec
+    /// extend-ai-sdk-media-streaming, design D12). Off by default: a
+    /// person's input never ends.
+    pub fn set_drain_on_end_input(&self, drain: bool) {
+        self.drain_on_end_input
+            .store(drain, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Name the manifest this session runs, for its members' media plans.
+    pub fn set_manifest(&self, manifest: Arc<Manifest>) {
+        *self.manifest.write().expect("room manifest lock") = Some(manifest);
+    }
+
+    /// The manifest this session runs, when its host named it.
+    pub fn manifest(&self) -> Option<Arc<Manifest>> {
+        self.manifest.read().expect("room manifest lock").clone()
+    }
+
+    /// `peer_id` has no more input. Drains the session when it allows it and
+    /// every attached member's input is over; otherwise only noted.
+    pub async fn end_input(&self, peer_id: &str) {
+        if !self
+            .drain_on_end_input
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            debug!(
+                "end of input from peer {} ignored: session {} does not drain on it",
+                peer_id,
+                self.session_id()
+            );
+            return;
+        }
+        let all_ended = {
+            let targets = self.output_targets.read().await;
+            let mut ended = self.ended_inputs.lock().expect("ended inputs lock");
+            ended.insert(peer_id.to_string());
+            targets.keys().all(|peer| ended.contains(peer))
+        };
+        if all_ended {
+            info!(
+                "every member of session {} ended its input; draining",
+                self.session_id()
+            );
+            self.core.request_drain().await;
+        }
+    }
+
     pub async fn attach_peer(
         &self,
         peer_id: String,
@@ -595,12 +693,18 @@ impl SharedPipelineSession {
             .lock()
             .expect("realtime hook peers lock")
             .contains(&peer_id);
+        let audio_as_data = self
+            .audio_as_data_peers
+            .lock()
+            .expect("audio as data peers lock")
+            .contains(&peer_id);
         let dispatcher = PerTrackDispatcher::new(
             track_registry,
             data_channel,
             peer_id.clone(),
             copies,
             realtime_hook,
+            audio_as_data,
         );
         self.output_targets.write().await.insert(
             peer_id,
@@ -638,16 +742,20 @@ impl SharedPipelineSession {
 
     fn spawn_output_drainers(self: &Arc<Self>, receivers: SharedPipelineOutputReceivers) {
         let (audio_rx, video_rx, data_rx) = receivers.split();
+        // The core session sends one drain marker on each kind after its last
+        // output; the drainer that sees the third one tells the members.
+        let markers = Arc::new(std::sync::atomic::AtomicUsize::new(3));
 
-        self.spawn_output_drainer(audio_rx, "audio");
-        self.spawn_output_drainer(video_rx, "video");
-        self.spawn_output_drainer(data_rx, "data");
+        self.spawn_output_drainer(audio_rx, "audio", Arc::clone(&markers));
+        self.spawn_output_drainer(video_rx, "video", Arc::clone(&markers));
+        self.spawn_output_drainer(data_rx, "data", markers);
     }
 
     fn spawn_output_drainer(
         self: &Arc<Self>,
         mut rx: broadcast::Receiver<TransportData>,
         kind: &'static str,
+        markers: Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let output_targets = Arc::clone(&self.output_targets);
         let session_id = self.session_id().to_string();
@@ -660,6 +768,21 @@ impl SharedPipelineSession {
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
+                if remotemedia_core::transport::shared_session::is_drained_marker(&transport_data) {
+                    if markers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                        let targets: Vec<PeerOutputTarget> =
+                            output_targets.read().await.values().cloned().collect();
+                        info!(
+                            "session {} drained; telling {} member(s)",
+                            session_id,
+                            targets.len()
+                        );
+                        for target in targets {
+                            target.dispatcher.dispatch(transport_data.clone()).await;
+                        }
+                    }
+                    continue;
+                }
                 // Promote legacy Vec audio once before any per-peer clone.
                 transport_data.data = transport_data.data.into_shared();
                 let targets: Vec<PeerOutputTarget> =
@@ -782,6 +905,11 @@ pub struct ServerPeer {
     /// The video outputs the member asked to receive (`receive.video` of
     /// `peer.offer`), in its order. `None`: every planned video output.
     video_receive: Arc<std::sync::RwLock<Option<Vec<String>>>>,
+
+    /// The member asked for audio as data (`receive.audio: "data"` of
+    /// `peer.offer`): no audio track is negotiated, and audio outputs go to
+    /// its data channel.
+    audio_as_data: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ServerPeer {
@@ -813,6 +941,12 @@ impl ServerPeer {
     /// tracks are registered, so the requested outputs are registered first;
     /// an output that is not requested is never reported in the answer's
     /// `media` and never encoded. `None` receives every planned output.
+    /// `receive.audio` of `peer.offer`: `true` for `"data"`.
+    pub fn set_audio_as_data(&self, audio_as_data: bool) {
+        self.audio_as_data
+            .store(audio_as_data, std::sync::atomic::Ordering::Release);
+    }
+
     pub fn set_video_receive(&self, streams: Option<Vec<String>>) {
         *self.video_receive.write().expect("video receive lock") = streams;
     }
@@ -889,6 +1023,7 @@ impl ServerPeer {
             answered_media: Default::default(),
             video_outputs: Default::default(),
             video_receive: Default::default(),
+            audio_as_data: Default::default(),
         })
     }
 
@@ -941,6 +1076,7 @@ impl ServerPeer {
             answered_media: Default::default(),
             video_outputs: Default::default(),
             video_receive: Default::default(),
+            audio_as_data: Default::default(),
         })
     }
 
@@ -1115,8 +1251,11 @@ impl ServerPeer {
         // audio track. The pipeline emits Audio with stream_id: None and
         // extract_stream_id then resolves to DEFAULT_STREAM_ID. The same
         // plan is what `peer.announce` sends the client.
+        let plan_manifest = shared_session
+            .manifest()
+            .unwrap_or_else(|| Arc::clone(&self.manifest));
         let plan =
-            crate::peer::scanner::session_media_plan(self.executor.as_ref(), &self.manifest).await;
+            crate::peer::scanner::session_media_plan(self.executor.as_ref(), &plan_manifest).await;
         info!(
             "Media plan for peer {}: {} audio, {} video",
             self.peer_id,
@@ -1124,8 +1263,19 @@ impl ServerPeer {
             plan.video_outputs.len()
         );
 
-        let audio_specs = plan.audio_outputs.clone();
-        let video_receive = self.video_receive.read().expect("video receive lock").clone();
+        let audio_as_data = self
+            .audio_as_data
+            .load(std::sync::atomic::Ordering::Acquire);
+        let audio_specs = if audio_as_data {
+            Vec::new()
+        } else {
+            plan.audio_outputs.clone()
+        };
+        let video_receive = self
+            .video_receive
+            .read()
+            .expect("video receive lock")
+            .clone();
         let video_specs = order_video_outputs(&plan.video_outputs, video_receive.as_deref());
         // Each planned output's RTP sender, to read its `mid` once answered.
         let mut planned_senders: Vec<PlannedSender> = Vec::new();
@@ -1240,7 +1390,11 @@ impl ServerPeer {
                 spec.stream_id.clone(),
                 Arc::clone(&sender),
             ));
-            video_tracks.push((spec.stream_id.clone(), Arc::clone(&track), Arc::clone(&sender)));
+            video_tracks.push((
+                spec.stream_id.clone(),
+                Arc::clone(&track),
+                Arc::clone(&sender),
+            ));
             self.track_senders.write().await.push(sender);
             self.track_registry
                 .register_video_track(&spec.stream_id, track)
@@ -1344,7 +1498,7 @@ impl ServerPeer {
         );
 
         // Create channel for data channel messages to pipeline
-        let (dc_input_tx, mut dc_input_rx) = mpsc::channel::<TransportData>(32);
+        let (dc_input_tx, mut dc_input_rx) = mpsc::channel::<PeerInput>(32);
 
         // Clone dc_input_tx before moving into closures
         let dc_input_tx_for_dc = dc_input_tx.clone();
@@ -1493,14 +1647,22 @@ impl ServerPeer {
                             // Drop the reassembly lock before awaiting pipeline backpressure.
                             let decoded = {
                                 let mut pending = reassembler.lock().await;
-                                super::data_channel_ingress::decode_pipeline_input(
+                                super::data_channel_ingress::decode_member_input(
                                     msg.data,
                                     &mut pending,
                                     &copies,
                                 )
                             };
                             match decoded {
-                                Ok(Some(runtime_data)) => {
+                                // In order with the data before it: the
+                                // forwarder handles it after that data has
+                                // entered the session.
+                                Ok(Some(super::data_channel_ingress::PipelineIngress::EndOfInput)) => {
+                                    if let Err(e) = dc_input_tx.send(PeerInput::EndOfInput).await {
+                                        error!("Failed to forward end of input of peer {}: {}", peer_id, e);
+                                    }
+                                }
+                                Ok(Some(super::data_channel_ingress::PipelineIngress::Data(runtime_data))) => {
                                     let transport_data = remotemedia_core::transport::TransportData {
                                         data: runtime_data,
                                         sequence: None,
@@ -1510,7 +1672,7 @@ impl ServerPeer {
                                             participant::modality::CONTROL,
                                         ),
                                     };
-                                    if let Err(e) = dc_input_tx.send(transport_data).await {
+                                    if let Err(e) = dc_input_tx.send(PeerInput::Data(transport_data)).await {
                                         error!("Failed to forward data channel message to pipeline: {}", e);
                                     }
                                 }
@@ -1659,7 +1821,7 @@ impl ServerPeer {
                                         ),
                                     };
 
-                                    if let Err(e) = dc_input_tx.send(transport_data).await {
+                                    if let Err(e) = dc_input_tx.send(PeerInput::Data(transport_data)).await {
                                         debug!("Audio reception ended for peer {}: {}", peer_id, e);
                                         break;
                                     }
@@ -1716,8 +1878,18 @@ impl ServerPeer {
         let participant_session = shared_session.participant_handle(participant);
         let participant_for_leave = participant_session.clone();
         let peer_id_for_input = peer_id.clone();
+        let shared_session_for_input = Arc::clone(&shared_session);
         tokio::spawn(async move {
-            while let Some(transport_data) = dc_input_rx.recv().await {
+            while let Some(input) = dc_input_rx.recv().await {
+                let transport_data = match input {
+                    PeerInput::Data(transport_data) => transport_data,
+                    PeerInput::EndOfInput => {
+                        // Everything the member sent before it has entered
+                        // the session (each send above waits for it).
+                        shared_session_for_input.end_input(&peer_id_for_input).await;
+                        continue;
+                    }
+                };
                 trace!("Forwarding data for peer {} to session", peer_id_for_input);
                 if let Err(e) = participant_session.send(transport_data).await {
                     debug!(
@@ -1739,6 +1911,11 @@ impl ServerPeer {
                 remotemedia_core::nodes::realtime_events::admission_is_webrtc(admission)
             });
         shared_session.set_realtime_hook_peer(&peer_id, realtime_hook);
+        shared_session.set_audio_as_data_peer(
+            &peer_id,
+            self.audio_as_data
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
         shared_session
             .attach_peer(
                 peer_id.clone(),
@@ -1895,7 +2072,6 @@ impl Drop for ServerPeer {
     }
 }
 
-
 /// Video outputs in registration order: the requested ones first, in the
 /// order asked for, then the rest in plan order. Unknown ids are ignored.
 pub(crate) fn order_video_outputs(
@@ -1919,6 +2095,48 @@ pub(crate) fn order_video_outputs(
 
 /// `receive.video` of `peer.offer` params: a list of stream ids, or `false`
 /// for none. `true` or absent: every planned video output (`None`).
+/// `receive.audio` of `peer.offer`: `true` for `"data"` (audio outputs on
+/// the data channel, lossless), `false` for `"rtp"` or nothing.
+pub fn audio_as_data_from_params(params: &serde_json::Value) -> bool {
+    params
+        .get("receive")
+        .and_then(|r| r.get("audio"))
+        .and_then(|a| a.as_str())
+        == Some("data")
+}
+
+/// Largest message sent on a data channel in one piece; a larger frame is
+/// split into `DataChannelMessage` chunks that the receiver reassembles.
+pub const DATA_CHANNEL_FRAME_LIMIT: usize = 60 * 1024;
+
+/// Send one encoded frame, split into chunks above
+/// [`DATA_CHANNEL_FRAME_LIMIT`].
+pub(crate) async fn send_framed(dc: &Arc<RTCDataChannel>, frame: bytes::Bytes) -> Result<()> {
+    if frame.len() <= DATA_CHANNEL_FRAME_LIMIT {
+        return dc
+            .send(&frame)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::WebRtcError(format!("Data channel send failed: {}", e)));
+    }
+    let message_id = uuid::Uuid::new_v4().simple().to_string();
+    // Leave room for the envelope around each chunk.
+    let splitter = crate::channels::DataChannelSplitter::with_max_chunk_size(
+        "frame",
+        message_id,
+        DATA_CHANNEL_FRAME_LIMIT - 1024,
+    );
+    for chunk in splitter.split_owned(frame)? {
+        let encoded = crate::channels::DataChannelMessage::chunk(chunk)
+            .encode()
+            .map_err(|e| Error::Other(e.into()))?;
+        dc.send(&bytes::Bytes::from(encoded))
+            .await
+            .map_err(|e| Error::WebRtcError(format!("Data channel send failed: {}", e)))?;
+    }
+    Ok(())
+}
+
 pub fn video_receive_from_params(params: &serde_json::Value) -> Option<Vec<String>> {
     match params.get("receive").and_then(|r| r.get("video")) {
         Some(serde_json::Value::Bool(false)) => Some(Vec::new()),
@@ -1947,7 +2165,11 @@ pub(crate) async fn answered_outputs(
     for t in &transceivers {
         let sender = t.sender().await;
         let current = t.current_direction();
-        let direction = if current == Dir::Unspecified { t.direction() } else { current };
+        let direction = if current == Dir::Unspecified {
+            t.direction()
+        } else {
+            current
+        };
         by_sender.push((sender, t.mid().map(|m| m.to_string()), direction));
     }
     let mut out = Vec::new();
@@ -1980,7 +2202,10 @@ pub(crate) fn spawn_picture_loss_reader(
     tokio::spawn(async move {
         while let Ok((packets, _)) = sender.read_rtcp().await {
             if packets.iter().any(|p| is_picture_loss(p.as_ref())) {
-                debug!("Picture loss on video stream '{}'; forcing a keyframe", stream_id);
+                debug!(
+                    "Picture loss on video stream '{}'; forcing a keyframe",
+                    stream_id
+                );
                 track.request_keyframe();
             }
         }
