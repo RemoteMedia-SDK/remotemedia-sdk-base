@@ -50,6 +50,10 @@ CI selects these packages together to unify features as a real host does. This d
 - Native worker or Python changes: validate the execution mode actually changed, including process startup, output draining, failure and cleanup. A test using another mode is not equivalent coverage.
 - Hardware, model, network and credential-dependent tests need their prerequisites. State what ran, what was skipped and why; do not equate unit tests with live transport or device validation.
 
+## Committing progress
+
+Commit development progress while implementing a task or an OpenSpec change; do not leave the whole result uncommitted until the end. Commit on the working feature branch, not the default branch, at each verified checkpoint: a completed task or coherent group of tasks that builds and passes its focused checks. Include the matching `tasks.md` checkbox updates in the same commit, and name the change ID and task numbers in the message when an OpenSpec change applies. Stage only the files the task touched; leave unrelated or pre-existing changes out. If partial or failing work must be saved, mark it as work in progress in the message and keep its tasks unchecked.
+
 ## Specifications
 
 Inspect the local `openspec/changes/` and any related SDK proposal before feature, protocol or architecture changes. Cross-repository changes should name the owning repositories and their validation tasks. When the SDK checkout is available, use [its OpenSpec workflow](../remotemedia-sdk/openspec/AGENTS.md); run OpenSpec commands from the repository containing the change. Existing approval remains valid for the approved scope. Documentation corrections and fixes restoring intended behavior can proceed directly.
