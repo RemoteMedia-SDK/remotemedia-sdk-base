@@ -880,7 +880,8 @@ async fn handle_announce(
     // section for each (openspec: extend-ai-sdk-media-streaming, D1).
     // An admitted member's plan is its own pipeline's (a host may serve
     // several pipelines), not the server's start manifest.
-    let plan_manifest = match admitted_room.as_deref() {
+    // The same holds for a hosted room joined by `?room=`, without a ticket.
+    let plan_manifest = match connection_room {
         Some(key) => state.room_manifest(key).await,
         None => None,
     }

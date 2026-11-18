@@ -213,3 +213,77 @@ async fn a_member_that_declines_video_gets_none() {
     client.close().await.unwrap();
     server.shutdown().await;
 }
+
+/// A hosted room runs a pipeline the server itself was not given (the NAPI
+/// agent server is created with an empty manifest and pipelines are
+/// registered by name). Its members are announced that pipeline's plan and
+/// receive its video.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosted_room_announces_and_sends_its_own_pipelines_video() {
+    let executor = Arc::new(
+        PipelineExecutor::with_config(ExecutorConfig {
+            transport_materialization_policy: CopyPolicy::AllowCopies,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let config = Arc::new(WebRtcTransportConfig {
+        stun_servers: Vec::new(),
+        turn_servers: Vec::new(),
+        ..Default::default()
+    });
+    let server =
+        WebSocketSignalingServer::new(0, config, executor.clone(), Arc::new(Manifest::default()));
+    let state = server.state();
+    let core = executor
+        .get_or_create_shared_session("host:studio".to_string(), manifest())
+        .await
+        .unwrap();
+    let control = executor.control_bus().get(core.session_id());
+    let room = crate::peer::SharedPipelineSession::new(core, control, false)
+        .await
+        .unwrap();
+    room.set_manifest(manifest());
+    state.host_room("studio", room).await;
+    let handle = server.start().await.expect("server starts");
+    let url = format!("ws://127.0.0.1:{}/ws?room=studio", handle.local_addr().port());
+
+    let mut client = PeerClient::connect(&url, PeerClientOptions::default())
+        .await
+        .expect("joins");
+    assert_eq!(
+        client.media_plan().map(|plan| plan["video"].clone()),
+        Some(json!([{ "stream": "avatar", "width": 320, "height": 240, "framerate": 15 }]))
+    );
+    assert!(
+        client
+            .answered_media()
+            .iter()
+            .any(|s| s.kind == "video" && s.stream == "avatar"),
+        "{:?}",
+        client.answered_media()
+    );
+    until(&mut client, Duration::from_secs(20), "data channel", |e| {
+        matches!(e, PeerEvent::DataChannelOpen)
+    })
+    .await;
+    let mic = vec![0.2f32; AUDIO_SAMPLE_RATE as usize * 2];
+    client.send_audio(&mic, true).await.unwrap();
+    let mut size = None;
+    until(&mut client, Duration::from_secs(20), "video frames", |event| {
+        if let PeerEvent::VideoFrame {
+            stream, dimensions, ..
+        } = event
+        {
+            assert_eq!(stream.as_deref(), Some("avatar"));
+            if dimensions.is_some() {
+                size = *dimensions;
+            }
+        }
+        size.is_some()
+    })
+    .await;
+    assert_eq!(size, Some((320, 240)));
+    client.close().await.unwrap();
+    handle.shutdown().await;
+}
