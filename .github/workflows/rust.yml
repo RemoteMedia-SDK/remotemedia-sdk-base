@@ -21,7 +21,7 @@ env:
   # The same rev Cargo.toml pins: plugin-sdk feat/node-factory-provider
   # (remotemedia_traits::provider); RemoteMedia-SDK/remotemedia-plugin-sdk#24.
   # Move to its merge commit on main.
-  PLUGIN_SDK_REV: 48e41429bafec472f4063127eb27d214ab42e659
+  PLUGIN_SDK_REV: 3be71019c3ebf9bd6dc932e3cd1faf64bdb78f41
 
 jobs:
   check:

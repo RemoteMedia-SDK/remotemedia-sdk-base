@@ -41,8 +41,8 @@ pyo3 = { version = "0.28", features = ["abi3-py311", "auto-initialize"], default
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"], optional = true }
 numpy = { version = "0.28", optional = true }
 remotemedia-python-buffers = { path = "../../../../remotemedia-plugin-sdk/crates/python-buffers", optional = true }
-remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "48e41429bafec472f4063127eb27d214ab42e659" }
-remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "48e41429bafec472f4063127eb27d214ab42e659" }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "3be71019c3ebf9bd6dc932e3cd1faf64bdb78f41" }
+remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "3be71019c3ebf9bd6dc932e3cd1faf64bdb78f41" }
 
 # Node.js FFI (optional - enabled with napi feature)
 napi = { version = "2", features = ["napi6", "async", "tokio_rt"], optional = true }
