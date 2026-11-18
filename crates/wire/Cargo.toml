@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 bytes = { workspace = true }
 prost = { workspace = true }
-remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "e8fc165eea4064717b6fb23de5f1a18d925533d4" }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "3be71019c3ebf9bd6dc932e3cd1faf64bdb78f41" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
