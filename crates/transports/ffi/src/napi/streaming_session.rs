@@ -520,7 +520,10 @@ pub async fn create_shared_streaming_session(
         .get_or_create_shared_session(shared_session_key, Arc::new(manifest))
         .await
         .map_err(|e| Error::from_reason(format!("create shared session failed: {}", e)))?;
-    let mut who = Participant::new(participant.id, participant.role.unwrap_or_else(|| "user".to_string()));
+    let mut who = Participant::new(
+        participant.id,
+        participant.role.unwrap_or_else(|| "user".to_string()),
+    );
     if let Some(track_id) = participant.track_id {
         who = who.with_track_id(track_id);
     }

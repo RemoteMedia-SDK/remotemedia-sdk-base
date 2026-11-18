@@ -234,7 +234,10 @@ impl SharedState {
     /// The room key when peers share one session, else `None` (one session
     /// per peer).
     pub fn room_key(&self) -> Option<&str> {
-        self.config.shared_session_key.as_deref().filter(|key| !key.is_empty())
+        self.config
+            .shared_session_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
     }
 
     /// The room a connection joins: the `?room=` it asked for, else the
@@ -277,15 +280,14 @@ impl SharedState {
     /// host's ([`Self::host_room`]). Any other room's session is created on
     /// first use and again after the previous one ended (it closes when its
     /// last peer leaves).
-    pub async fn room(
-        &self,
-        key: &str,
-    ) -> crate::Result<Arc<crate::peer::SharedPipelineSession>> {
+    pub async fn room(&self, key: &str) -> crate::Result<Arc<crate::peer::SharedPipelineSession>> {
         let mut rooms = self.rooms.lock().await;
         if self.is_hosted(key) {
             return match rooms.get(key) {
                 Some(room) if room.is_active().await => Ok(Arc::clone(room)),
-                _ => Err(crate::Error::InternalError(format!("Room '{key}' has ended"))),
+                _ => Err(crate::Error::InternalError(format!(
+                    "Room '{key}' has ended"
+                ))),
             };
         }
         if let Some(room) = rooms.get(key) {
@@ -297,10 +299,16 @@ impl SharedState {
             .runner
             .get_or_create_shared_session(format!("webrtc-room:{key}"), Arc::clone(&self.manifest))
             .await
-            .map_err(|e| crate::Error::InternalError(format!("Failed to create room session: {e}")))?;
+            .map_err(|e| {
+                crate::Error::InternalError(format!("Failed to create room session: {e}"))
+            })?;
         let control = self.runner.control_bus().get(core.session_id());
         let room = crate::peer::SharedPipelineSession::new(core, control, true).await?;
-        info!("Room '{}' runs on shared session {}", key, room.session_id());
+        info!(
+            "Room '{}' runs on shared session {}",
+            key,
+            room.session_id()
+        );
         rooms.insert(key.to_string(), Arc::clone(&room));
         Ok(room)
     }
@@ -349,7 +357,9 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
                             .as_deref()
                             .and_then(|protocol| protocol.parse().ok())
                         {
-                            response.headers_mut().insert("sec-websocket-protocol", value);
+                            response
+                                .headers_mut()
+                                .insert("sec-websocket-protocol", value);
                         }
                         routed = Some(accept);
                         Ok(response)
@@ -364,10 +374,11 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
                             tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
                                 Some(refusal.reason),
                             );
-                        *error.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::from_u16(
-                            refusal.status,
-                        )
-                        .unwrap_or(tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN);
+                        *error.status_mut() =
+                            tokio_tungstenite::tungstenite::http::StatusCode::from_u16(
+                                refusal.status,
+                            )
+                            .unwrap_or(tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN);
                         Err(error)
                     }
                 };
@@ -533,10 +544,13 @@ pub async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Ws
 }
 
 async fn send_parse_error(
-    tx: &mpsc::Sender<String>, error: serde_json::Error,
+    tx: &mpsc::Sender<String>,
+    error: serde_json::Error,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let error = JsonRpcError::new(
-        error_codes::PARSE_ERROR, format!("Failed to parse JSON: {error}"), json!(null),
+        error_codes::PARSE_ERROR,
+        format!("Failed to parse JSON: {error}"),
+        json!(null),
     );
     tx.send(error.to_json()?).await?;
     Ok(())
@@ -587,7 +601,9 @@ async fn handle_message(
             (Some(_), "peer.offer" | "peer.answer" | "peer.ice_candidate") => {
                 let to = serde_json::from_str::<Value>(request.params.get())
                     .ok()
-                    .and_then(|params| params.get("to").and_then(Value::as_str).map(str::to_string));
+                    .and_then(|params| {
+                        params.get("to").and_then(Value::as_str).map(str::to_string)
+                    });
                 // The server, or a peer of the same room.
                 let allowed = match to.as_deref() {
                     Some("remotemedia-server") => true,
@@ -604,7 +620,8 @@ async fn handle_message(
                     None => false,
                 };
                 (!allowed).then(|| {
-                    "an admitted peer signals only with the server and the peers of its room".to_string()
+                    "an admitted peer signals only with the server and the peers of its room"
+                        .to_string()
                 })
             }
             (Some(_), "peer.disconnect") => {
@@ -768,7 +785,10 @@ async fn handle_announce(
     if admitted.is_some() {
         let earlier = state.peers.write().await.remove(&params.peer_id);
         if let Some(earlier) = earlier {
-            info!("Peer {} reconnected; ending its earlier connection", params.peer_id);
+            info!(
+                "Peer {} reconnected; ending its earlier connection",
+                params.peer_id
+            );
             earlier.closed.notify_one();
             if let Some(server_peer) = state.server_peers.write().await.remove(&params.peer_id) {
                 if let Err(e) = server_peer.shutdown().await {
@@ -973,7 +993,14 @@ async fn handle_offer(
                     peer.metadata.clone(),
                 )
             })
-            .unwrap_or_else(|| (state.room_key().map(str::to_string), None, None, HashMap::new()));
+            .unwrap_or_else(|| {
+                (
+                    state.room_key().map(str::to_string),
+                    None,
+                    None,
+                    HashMap::new(),
+                )
+            });
         // An admitted peer's control channel is bound to its own session and
         // its access; without anything granted there is no channel.
         if let Some(access) = peer_control {
@@ -995,7 +1022,11 @@ async fn handle_offer(
         }
         let answered = match peer_room.as_deref() {
             Some(key) => match state.room(key).await {
-                Ok(room) => server_peer.handle_offer_with_shared_session(params.sdp, room).await,
+                Ok(room) => {
+                    server_peer
+                        .handle_offer_with_shared_session(params.sdp, room)
+                        .await
+                }
                 Err(e) => Err(e),
             },
             None => server_peer.handle_offer(params.sdp).await,

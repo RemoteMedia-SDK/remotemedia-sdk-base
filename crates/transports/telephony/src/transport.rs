@@ -1326,7 +1326,8 @@ Content-Length: 0\r\n\r\n",
             )
             .unwrap();
         assert!(!control.is_media_ready("call-stream:caller"));
-        let event = remotemedia_core::transport::MediaEvent::from_runtime(&events.try_recv().unwrap());
+        let event =
+            remotemedia_core::transport::MediaEvent::from_runtime(&events.try_recv().unwrap());
         assert!(matches!(
             event,
             Some(remotemedia_core::transport::MediaEvent::MediaLost { ref member, ref transport, .. })
@@ -1465,7 +1466,9 @@ a=ptime:20\r\n",
             .unwrap();
 
         assert_eq!(accepted.stream.session_id(), shared.session_id());
-        assert!(accepted.copies.same_authority(&shared.transport_copy_context().await));
+        assert!(accepted
+            .copies
+            .same_authority(&shared.transport_copy_context().await));
         accepted.stream.close().await.unwrap();
         assert!(shared.is_active().await);
         shared.close().await.unwrap();

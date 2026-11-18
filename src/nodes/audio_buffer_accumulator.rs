@@ -727,17 +727,27 @@ mod tests {
 
     type Pending = HashMap<String, Vec<(Vec<f32>, u32, u32, std::time::Instant)>>;
 
-    fn vad(node: &AudioBufferAccumulatorNode, states: &mut HashMap<String, BufferState>, start: bool) -> Vec<RuntimeData> {
+    fn vad(
+        node: &AudioBufferAccumulatorNode,
+        states: &mut HashMap<String, BufferState>,
+        start: bool,
+    ) -> Vec<RuntimeData> {
         let ev = serde_json::json!({ "is_speech_start": start, "is_speech_end": !start });
-        node.handle_vad_event(&ev, "s", states, &mut Pending::new()).unwrap()
+        node.handle_vad_event(&ev, "s", states, &mut Pending::new())
+            .unwrap()
     }
 
     /// Say one second of speech: start, audio, end. Returns the samples emitted.
-    fn utterance(node: &AudioBufferAccumulatorNode, states: &mut HashMap<String, BufferState>, level: f32) -> usize {
+    fn utterance(
+        node: &AudioBufferAccumulatorNode,
+        states: &mut HashMap<String, BufferState>,
+        level: f32,
+    ) -> usize {
         vad(node, states, true);
         let st = states.get_mut("s").unwrap();
         st.sample_rate = 16_000;
-        st.accumulated_samples.extend(std::iter::repeat(level).take(16_000));
+        st.accumulated_samples
+            .extend(std::iter::repeat(level).take(16_000));
         vad(node, states, false)
             .iter()
             .map(|d| match d {
@@ -765,14 +775,20 @@ mod tests {
                 message_type: ControlMessageType::CancelSpeculation { .. },
                 metadata,
                 ..
-            }] => metadata.get(RETRACT_UTTERANCE_KEY).and_then(|v| v.as_bool()) == Some(true),
+            }] => {
+                metadata
+                    .get(RETRACT_UTTERANCE_KEY)
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+            }
             other => panic!("expected one CancelSpeculation, got {other:?}"),
         };
         // The first speech start continues nothing.
         assert!(!retracts(vad(&node, &mut states, true)));
         let st = states.get_mut("s").unwrap();
         st.sample_rate = 16_000;
-        st.accumulated_samples.extend(std::iter::repeat(0.5).take(16_000));
+        st.accumulated_samples
+            .extend(std::iter::repeat(0.5).take(16_000));
         vad(&node, &mut states, false);
         // Speech again within the merge window: the utterance just emitted is taken back.
         assert!(retracts(vad(&node, &mut states, true)));
@@ -782,7 +798,8 @@ mod tests {
 
     #[test]
     fn merge_off_emits_each_utterance_once() {
-        let node = AudioBufferAccumulatorNode::new(None, None, Some(false)).with_continuation_merge_ms(0);
+        let node =
+            AudioBufferAccumulatorNode::new(None, None, Some(false)).with_continuation_merge_ms(0);
         let mut states = HashMap::new();
         for _ in 0..3 {
             assert_eq!(utterance(&node, &mut states, 0.5), 16_000);

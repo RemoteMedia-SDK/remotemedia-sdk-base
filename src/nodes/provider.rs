@@ -142,11 +142,16 @@ fn sdk_providers() -> &'static [SdkProvider] {
 ///
 /// Providers are yielded in priority order (highest first).
 pub fn iter_providers() -> impl Iterator<Item = &'static dyn NodeProvider> {
-    let mut providers: Vec<&'static dyn NodeProvider> = inventory::iter::<&'static dyn NodeProvider>
-        .into_iter()
-        .copied()
-        .chain(sdk_providers().iter().map(|provider| provider as &'static dyn NodeProvider))
-        .collect();
+    let mut providers: Vec<&'static dyn NodeProvider> =
+        inventory::iter::<&'static dyn NodeProvider>
+            .into_iter()
+            .copied()
+            .chain(
+                sdk_providers()
+                    .iter()
+                    .map(|provider| provider as &'static dyn NodeProvider),
+            )
+            .collect();
     providers.sort_by(|a, b| b.priority().cmp(&a.priority()));
     providers.into_iter()
 }
@@ -215,16 +220,25 @@ mod tests {
 
         let mut registry = StreamingNodeRegistry::new();
         provider.register(&mut registry);
-        assert!(registry.list_types().iter().any(|t| t == "SdkProviderTestNode"));
+        assert!(registry
+            .list_types()
+            .iter()
+            .any(|t| t == "SdkProviderTestNode"));
     }
 
     #[test]
     fn default_registries_register_sdk_provider_nodes() {
         let defaults = crate::nodes::streaming_registry::create_default_streaming_registry();
-        assert!(defaults.list_types().iter().any(|t| t == "SdkProviderTestNode"));
+        assert!(defaults
+            .list_types()
+            .iter()
+            .any(|t| t == "SdkProviderTestNode"));
 
         let built = StreamingNodeRegistry::builder().with_defaults().build();
-        assert!(built.list_types().iter().any(|t| t == "SdkProviderTestNode"));
+        assert!(built
+            .list_types()
+            .iter()
+            .any(|t| t == "SdkProviderTestNode"));
     }
 
     #[test]

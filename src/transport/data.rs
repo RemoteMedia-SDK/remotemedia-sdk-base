@@ -41,7 +41,10 @@ pub mod participant {
     }
 
     /// Whether an output with this metadata is delivered to `participant_id`.
-    pub fn is_for(metadata: &std::collections::HashMap<String, String>, participant_id: &str) -> bool {
+    pub fn is_for(
+        metadata: &std::collections::HashMap<String, String>,
+        participant_id: &str,
+    ) -> bool {
         match recipients(metadata) {
             None => true,
             Some(to) => to.contains(&participant_id),

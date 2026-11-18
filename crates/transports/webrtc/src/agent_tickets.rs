@@ -61,7 +61,10 @@ impl std::fmt::Display for TicketError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TicketError::Missing => {
-                write!(f, "a ticket is required: ask the application's backend to admit you")
+                write!(
+                    f,
+                    "a ticket is required: ask the application's backend to admit you"
+                )
             }
             TicketError::Unknown => write!(f, "the ticket is unknown or was already used"),
             TicketError::Expired => write!(f, "the ticket has expired"),
@@ -220,11 +223,16 @@ mod tests {
         store
             .issue("t-1".into(), admission("room", "user-17"), t0(), TTL)
             .unwrap();
-        let admitted = store.redeem(Some("t-1"), t0() + Duration::from_secs(1)).unwrap();
+        let admitted = store
+            .redeem(Some("t-1"), t0() + Duration::from_secs(1))
+            .unwrap();
         assert_eq!(admitted.member, "user-17");
         assert_eq!(admitted.room, "room");
         assert_eq!(admitted.name.as_deref(), Some("Ada"));
-        assert_eq!(admitted.metadata.get("role").map(String::as_str), Some("host"));
+        assert_eq!(
+            admitted.metadata.get("role").map(String::as_str),
+            Some("host")
+        );
         assert!(admitted.grants.is_empty(), "no grants unless asked for");
     }
 
@@ -245,7 +253,10 @@ mod tests {
             .issue("t-1".into(), admission("room", "user-17"), t0(), TTL)
             .unwrap();
         assert_eq!(expires, t0() + TTL);
-        assert_eq!(store.redeem(Some("t-1"), t0() + TTL), Err(TicketError::Expired));
+        assert_eq!(
+            store.redeem(Some("t-1"), t0() + TTL),
+            Err(TicketError::Expired)
+        );
         // Refused for expiry, it is still consumed.
         assert_eq!(store.redeem(Some("t-1"), t0()), Err(TicketError::Unknown));
     }
@@ -261,8 +272,12 @@ mod tests {
     #[test]
     fn two_members_of_one_room_have_their_own_tickets() {
         let store = TicketStore::new();
-        store.issue("a".into(), admission("room", "ada"), t0(), TTL).unwrap();
-        store.issue("b".into(), admission("room", "bob"), t0(), TTL).unwrap();
+        store
+            .issue("a".into(), admission("room", "ada"), t0(), TTL)
+            .unwrap();
+        store
+            .issue("b".into(), admission("room", "bob"), t0(), TTL)
+            .unwrap();
         assert_eq!(store.pending_for_room("room", t0()), 2);
         assert_eq!(store.redeem(Some("b"), t0()).unwrap().member, "bob");
         assert_eq!(store.redeem(Some("a"), t0()).unwrap().member, "ada");
@@ -272,10 +287,18 @@ mod tests {
     #[test]
     fn revoking_a_member_forgets_only_its_tickets() {
         let store = TicketStore::new();
-        store.issue("a1".into(), admission("room", "ada"), t0(), TTL).unwrap();
-        store.issue("a2".into(), admission("room", "ada"), t0(), TTL).unwrap();
-        store.issue("a3".into(), admission("other", "ada"), t0(), TTL).unwrap();
-        store.issue("b".into(), admission("room", "bob"), t0(), TTL).unwrap();
+        store
+            .issue("a1".into(), admission("room", "ada"), t0(), TTL)
+            .unwrap();
+        store
+            .issue("a2".into(), admission("room", "ada"), t0(), TTL)
+            .unwrap();
+        store
+            .issue("a3".into(), admission("other", "ada"), t0(), TTL)
+            .unwrap();
+        store
+            .issue("b".into(), admission("room", "bob"), t0(), TTL)
+            .unwrap();
         assert_eq!(store.revoke_member("room", "ada"), 2);
         assert_eq!(store.redeem(Some("a1"), t0()), Err(TicketError::Unknown));
         assert!(store.redeem(Some("a3"), t0()).is_ok());
@@ -285,9 +308,15 @@ mod tests {
     #[test]
     fn revoking_a_room_forgets_all_its_tickets() {
         let store = TicketStore::new();
-        store.issue("a".into(), admission("room", "ada"), t0(), TTL).unwrap();
-        store.issue("b".into(), admission("room", "bob"), t0(), TTL).unwrap();
-        store.issue("c".into(), admission("other", "cy"), t0(), TTL).unwrap();
+        store
+            .issue("a".into(), admission("room", "ada"), t0(), TTL)
+            .unwrap();
+        store
+            .issue("b".into(), admission("room", "bob"), t0(), TTL)
+            .unwrap();
+        store
+            .issue("c".into(), admission("other", "cy"), t0(), TTL)
+            .unwrap();
         assert_eq!(store.revoke_room("room"), 2);
         assert_eq!(store.pending_for_room("room", t0()), 0);
         assert_eq!(store.pending_for_room("other", t0()), 1);
@@ -296,10 +325,14 @@ mod tests {
     #[test]
     fn expired_tickets_do_not_count_and_are_forgotten_on_the_next_issue() {
         let store = TicketStore::new();
-        store.issue("old".into(), admission("room", "ada"), t0(), TTL).unwrap();
+        store
+            .issue("old".into(), admission("room", "ada"), t0(), TTL)
+            .unwrap();
         let later = t0() + TTL + Duration::from_secs(1);
         assert_eq!(store.pending_for_room("room", later), 0);
-        store.issue("new".into(), admission("room", "bob"), later, TTL).unwrap();
+        store
+            .issue("new".into(), admission("room", "bob"), later, TTL)
+            .unwrap();
         assert_eq!(store.pending.lock().unwrap().len(), 1);
     }
 

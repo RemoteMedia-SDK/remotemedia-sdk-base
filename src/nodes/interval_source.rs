@@ -25,8 +25,8 @@ use crate::data::RuntimeData;
 use crate::nodes::{
     AsyncNodeWrapper, AsyncStreamingNode, Emitter, StreamingNode, StreamingNodeFactory,
 };
-use remotemedia_traits::runtime_context::NodeRuntimeContextRead;
 use crate::Error;
+use remotemedia_traits::runtime_context::NodeRuntimeContextRead;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -96,8 +96,13 @@ impl AsyncStreamingNode for IntervalSourceNode {
             ticker.tick().await;
             let mut frame = self.payload.clone();
             frame.insert("tick".into(), tick.into());
-            frame.insert("elapsed_ms".into(), (started.elapsed().as_millis() as u64).into());
-            emitter.emit(RuntimeData::Json(Value::Object(frame))).await?;
+            frame.insert(
+                "elapsed_ms".into(),
+                (started.elapsed().as_millis() as u64).into(),
+            );
+            emitter
+                .emit(RuntimeData::Json(Value::Object(frame)))
+                .await?;
             tick += 1;
         }
         Ok(())
@@ -117,7 +122,9 @@ impl StreamingNodeFactory for IntervalSourceNodeFactory {
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        Ok(Box::new(AsyncNodeWrapper(Arc::new(IntervalSourceNode::new(params)?))))
+        Ok(Box::new(AsyncNodeWrapper(Arc::new(
+            IntervalSourceNode::new(params)?,
+        ))))
     }
 
     fn node_type(&self) -> &str {
@@ -129,7 +136,10 @@ impl StreamingNodeFactory for IntervalSourceNodeFactory {
     }
 
     /// A source declares its output: JSON ticks.
-    fn media_capabilities(&self, _params: &Value) -> Option<crate::capabilities::MediaCapabilities> {
+    fn media_capabilities(
+        &self,
+        _params: &Value,
+    ) -> Option<crate::capabilities::MediaCapabilities> {
         Some(crate::capabilities::MediaCapabilities::with_output(
             crate::capabilities::MediaConstraints::Json(Default::default()),
         ))
@@ -214,6 +224,9 @@ mod tests {
         }
         // The source finished, so the session drains and ends by itself.
         let end = tokio::time::timeout(Duration::from_secs(5), session.recv_output()).await;
-        assert!(matches!(end, Ok(Ok(None)) | Ok(Err(_))), "the session did not end");
+        assert!(
+            matches!(end, Ok(Ok(None)) | Ok(Err(_))),
+            "the session did not end"
+        );
     }
 }

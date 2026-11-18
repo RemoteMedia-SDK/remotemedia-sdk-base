@@ -255,8 +255,9 @@ impl BundleDeploymentService for BundleDeploymentServiceImpl {
             .service
             .active_manifest(token.as_bytes(), &request.deployment_name)
             .map_err(status)?;
-        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|error| Status::failed_precondition(format!("invalid deployed manifest: {error}")))?;
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            Status::failed_precondition(format!("invalid deployed manifest: {error}"))
+        })?;
         let output = self
             .executor
             .execute_unary(
@@ -264,7 +265,9 @@ impl BundleDeploymentService for BundleDeploymentServiceImpl {
                 TransportData::new(RuntimeData::Text(request.input_text)),
             )
             .await
-            .map_err(|error| Status::failed_precondition(format!("deployment smoke test failed: {error}")))?;
+            .map_err(|error| {
+                Status::failed_precondition(format!("deployment smoke test failed: {error}"))
+            })?;
         let RuntimeData::Text(output_text) = output.data else {
             return Err(Status::failed_precondition(
                 "deployment smoke test produced non-text output",

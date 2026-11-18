@@ -217,9 +217,19 @@ mod turn_tag_tests {
             wire.push(mode);
             wire.extend_from_slice(&(id.len() as u16).to_le_bytes());
             wire.extend_from_slice(id.as_bytes());
-            let (frame, turn) = split_output_turn(&SharedBytes::from(wire)).unwrap().unwrap();
-            assert_eq!(turn, OutputTurn { seq: 7, origin: expected });
-            assert!(matches!(from_python_wire(&frame).unwrap(), RuntimeData::Text(t) if t == "hello"));
+            let (frame, turn) = split_output_turn(&SharedBytes::from(wire))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                turn,
+                OutputTurn {
+                    seq: 7,
+                    origin: expected
+                }
+            );
+            assert!(
+                matches!(from_python_wire(&frame).unwrap(), RuntimeData::Text(t) if t == "hello")
+            );
         }
     }
 
@@ -234,7 +244,8 @@ mod turn_tag_tests {
     fn an_input_tag_follows_the_payload() {
         let untagged = text_frame("hello");
         let mut wire = untagged.clone();
-        let fields = std::collections::HashMap::from([("participant.id".to_string(), "bob".to_string())]);
+        let fields =
+            std::collections::HashMap::from([("participant.id".to_string(), "bob".to_string())]);
         append_input_turn(&mut wire, 3, Some(&fields)).unwrap();
         assert_eq!(payload_end(&wire), Some(untagged.len()));
         let tag = &wire[untagged.len()..];

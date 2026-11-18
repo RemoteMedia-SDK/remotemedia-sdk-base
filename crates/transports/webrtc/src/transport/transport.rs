@@ -69,7 +69,10 @@ impl WebRtcTransport {
 
     /// Construct with immutable session/caller authority. Queued media and
     /// receive callbacks retain this ledger; it cannot be rebound after startup.
-    pub fn new_with_copy_context(config: WebRtcTransportConfig, copies: CopyContext) -> Result<Self> {
+    pub fn new_with_copy_context(
+        config: WebRtcTransportConfig,
+        copies: CopyContext,
+    ) -> Result<Self> {
         // Validate configuration
         config.validate()?;
 
@@ -382,7 +385,9 @@ impl WebRtcTransport {
 
         // Send audio via track with default 24kHz sample rate (for backwards compatibility)
         // TODO: Add sample_rate parameter to this method
-        audio_track.send_audio_with_context(samples.into(), 24000, &self.copies).await?;
+        audio_track
+            .send_audio_with_context(samples.into(), 24000, &self.copies)
+            .await?;
 
         Ok(())
     }
@@ -419,7 +424,9 @@ impl WebRtcTransport {
         })?;
 
         // Send video via track
-        video_track.send_video_runtime_data_with_context(frame.as_runtime_data(), &self.copies).await?;
+        video_track
+            .send_video_runtime_data_with_context(frame.as_runtime_data(), &self.copies)
+            .await?;
 
         Ok(())
     }
@@ -606,13 +613,21 @@ impl WebRtcTransport {
 
         // Determine if this is audio or video and get the appropriate track
         match data {
-            RuntimeData::Audio { samples, sample_rate, .. } => {
+            RuntimeData::Audio {
+                samples,
+                sample_rate,
+                ..
+            } => {
                 let audio_track = peer.audio_track().await.ok_or_else(|| {
                     Error::MediaTrackError("No audio track configured for peer".to_string())
                 })?;
 
                 audio_track
-                    .send_audio_with_context(samples.clone().into_shared(), *sample_rate, &self.copies)
+                    .send_audio_with_context(
+                        samples.clone().into_shared(),
+                        *sample_rate,
+                        &self.copies,
+                    )
                     .await
             }
             RuntimeData::Video { .. } => {
@@ -620,7 +635,9 @@ impl WebRtcTransport {
                     Error::MediaTrackError("No video track configured for peer".to_string())
                 })?;
 
-                video_track.send_video_runtime_data_with_context(data.clone(), &self.copies).await
+                video_track
+                    .send_video_runtime_data_with_context(data.clone(), &self.copies)
+                    .await
             }
             _ => Err(Error::MediaTrackError(
                 "Unsupported RuntimeData type for peer-to-peer transmission".to_string(),
@@ -699,7 +716,8 @@ impl WebRtcTransport {
         debug!("Sending data channel message to peer: {}", peer_id);
 
         let peer = self.peer_manager.get_peer(peer_id).await?;
-        peer.send_data_channel_message_with_context(msg, &self.copies).await
+        peer.send_data_channel_message_with_context(msg, &self.copies)
+            .await
     }
 
     /// Broadcast a data channel message to all connected peers
@@ -806,7 +824,8 @@ impl WebRtcTransport {
                     Err(error) => warn!("Failed to decode peer message: {}", error),
                 }
             }
-        }).await
+        })
+        .await
     }
 
     /// Receive structured messages or typed decode/policy errors. Modern bulk
@@ -817,12 +836,22 @@ impl WebRtcTransport {
         handler: F,
     ) -> Result<()>
     where
-        F: Fn(std::result::Result<crate::channels::DataChannelMessage, crate::channels::DataChannelDecodeError>) -> Fut
-            + Send + Sync + 'static,
+        F: Fn(
+                std::result::Result<
+                    crate::channels::DataChannelMessage,
+                    crate::channels::DataChannelDecodeError,
+                >,
+            ) -> Fut
+            + Send
+            + Sync
+            + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.peer_manager.get_peer(peer_id).await?
-            .on_data_channel_message_with_context(self.copies.clone(), handler).await
+        self.peer_manager
+            .get_peer(peer_id)
+            .await?
+            .on_data_channel_message_with_context(self.copies.clone(), handler)
+            .await
     }
 
     /// Check if a peer has a data channel configured

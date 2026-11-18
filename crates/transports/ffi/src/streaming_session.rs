@@ -216,8 +216,14 @@ impl PyStreamingSession {
 
     /// Try to take the next output without waiting; see `recv_event`.
     fn try_recv_event(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        for (kind, rx) in [("audio", &self.audio_rx), ("video", &self.video_rx), ("data", &self.data_rx)] {
-            let Ok(mut guard) = rx.try_lock() else { continue };
+        for (kind, rx) in [
+            ("audio", &self.audio_rx),
+            ("video", &self.video_rx),
+            ("data", &self.data_rx),
+        ] {
+            let Ok(mut guard) = rx.try_lock() else {
+                continue;
+            };
             if let Some(Ok(out)) = guard.as_mut().map(|rx| rx.try_recv()) {
                 return pack_event(py, kind, out, &self.input_copies.session);
             }
@@ -442,7 +448,12 @@ fn try_recv_kind_sync(py: Python<'_>, rx: &RxSlot, copies: &CopyContext) -> PyRe
 }
 
 /// `{"kind", "data", "participant"}` for one output.
-fn pack_event(py: Python<'_>, kind: &str, out: TransportData, copies: &CopyContext) -> PyResult<Py<PyAny>> {
+fn pack_event(
+    py: Python<'_>,
+    kind: &str,
+    out: TransportData,
+    copies: &CopyContext,
+) -> PyResult<Py<PyAny>> {
     let event = pyo3::types::PyDict::new(py);
     event.set_item("kind", kind)?;
     event.set_item(

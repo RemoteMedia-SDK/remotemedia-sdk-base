@@ -562,7 +562,10 @@ mod tests {
         executor
             .register_factory(Arc::new(SyntheticFactory { base: base.clone() }))
             .await;
-        let mut session = executor.create_session(manifest(delivery, fps)).await.unwrap();
+        let mut session = executor
+            .create_session(manifest(delivery, fps))
+            .await
+            .unwrap();
         let base = base.lock().unwrap().expect("the device started");
         let deadline = tokio::time::Instant::now() + run;
         let mut seen = Vec::new();

@@ -39,11 +39,11 @@ pub mod load_balancer;
 pub mod retry;
 
 // Re-export key types
-pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
-pub use load_balancer::{Endpoint, EndpointPool, LoadBalanceStrategy};
 pub use crate::transport::embedded_python_env::{
     EmbeddedInterpreter, EmbeddedPythonEnv, EmbeddedWheel,
 };
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
+pub use load_balancer::{Endpoint, EndpointPool, LoadBalanceStrategy};
 pub use retry::{RetryConfig, RetryExecutor};
 
 /// Transport protocol type

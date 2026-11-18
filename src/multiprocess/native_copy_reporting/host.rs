@@ -110,16 +110,15 @@ impl Host {
         }
         let failure = self.shared.failure.lock().unwrap();
         Err(io::Error::other(
-            failure.clone().unwrap_or_else(|| "native copy reporter failed".into()),
+            failure
+                .clone()
+                .unwrap_or_else(|| "native copy reporter failed".into()),
         ))
     }
 
     /// Grant the next call id. Calls are serial per lane, and any failed round
     /// closes the lane, so ids reach the worker without gaps.
-    pub(in crate::multiprocess) fn next_call(
-        &self,
-        copies: &CopyContext,
-    ) -> io::Result<u64> {
+    pub(in crate::multiprocess) fn next_call(&self, copies: &CopyContext) -> io::Result<u64> {
         self.check()?;
         if copies.policy() != CopyPolicy::AllowCopies {
             return Err(invalid(
@@ -142,7 +141,9 @@ impl Host {
         let stream = doorbell
             .as_mut()
             .ok_or_else(|| invalid("native copy reporter is not connected"))?;
-        stream.write_all(&[1]).inspect_err(|error| self.shared.fail(error))
+        stream
+            .write_all(&[1])
+            .inspect_err(|error| self.shared.fail(error))
     }
 
     pub(in crate::multiprocess) fn close(&self) {

@@ -52,7 +52,11 @@ fn probe<T>(work: impl FnOnce() -> T) -> (T, u64, u64) {
     ACTIVE.store(true, Ordering::SeqCst);
     let value = work();
     ACTIVE.store(false, Ordering::SeqCst);
-    (value, BYTES.load(Ordering::Relaxed), LARGEST.load(Ordering::Relaxed))
+    (
+        value,
+        BYTES.load(Ordering::Relaxed),
+        LARGEST.load(Ordering::Relaxed),
+    )
 }
 
 fn counted(copies: &CopyContext, reason: CopyReason) -> u64 {
@@ -70,7 +74,10 @@ const PAYLOAD: usize = 38_400;
 fn audio_conversion_copies_match_their_counts_in_both_directions() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let audio = RuntimeData::Audio {
-        samples: (0..PAYLOAD / 4).map(|i| i as f32 * 0.5).collect::<Vec<f32>>().into(),
+        samples: (0..PAYLOAD / 4)
+            .map(|i| i as f32 * 0.5)
+            .collect::<Vec<f32>>()
+            .into(),
         sample_rate: 48000,
         channels: 1,
         stream_id: None,
@@ -94,14 +101,26 @@ fn audio_conversion_copies_match_their_counts_in_both_directions() {
             "decode": {"counted": counted(&decoding, CopyReason::PortableDeserialization),
                        "heap_bytes": decode_bytes, "largest": decode_largest}})
     );
-    assert_eq!(counted(&encoding, CopyReason::PortableSerialization), PAYLOAD as u64);
-    assert_eq!(counted(&decoding, CopyReason::PortableDeserialization), PAYLOAD as u64);
+    assert_eq!(
+        counted(&encoding, CopyReason::PortableSerialization),
+        PAYLOAD as u64
+    );
+    assert_eq!(
+        counted(&decoding, CopyReason::PortableDeserialization),
+        PAYLOAD as u64
+    );
     for (side, bytes, largest) in [
         ("encode", encode_bytes, encode_largest),
         ("decode", decode_bytes, decode_largest),
     ] {
-        assert!(largest >= PAYLOAD as u64, "{side}: no payload-sized destination");
-        assert!(bytes <= 4 * PAYLOAD as u64 + 16 * 1024, "{side}: more than one counted copy");
+        assert!(
+            largest >= PAYLOAD as u64,
+            "{side}: no payload-sized destination"
+        );
+        assert!(
+            bytes <= 4 * PAYLOAD as u64 + 16 * 1024,
+            "{side}: more than one counted copy"
+        );
     }
 }
 
@@ -124,7 +143,10 @@ fn byte_payloads_move_into_shared_owners_without_copying() {
             "heap_bytes": bytes, "largest": largest}})
     );
     assert_eq!(counted(&decoding, CopyReason::PortableDeserialization), 0);
-    assert!(largest < PAYLOAD as u64, "binary decode copied its payload ({largest} B)");
+    assert!(
+        largest < PAYLOAD as u64,
+        "binary decode copied its payload ({largest} B)"
+    );
 }
 
 #[test]
@@ -134,5 +156,8 @@ fn strict_encode_rejects_before_any_payload_copy() {
     let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "grpc-strict");
     let (result, _, largest) = probe(|| runtime_data_to_data_buffer_with_context(&binary, &strict));
     assert!(result.is_err());
-    assert!(largest < PAYLOAD as u64, "strict rejection allocated {largest} B");
+    assert!(
+        largest < PAYLOAD as u64,
+        "strict rejection allocated {largest} B"
+    );
 }

@@ -116,13 +116,25 @@ async fn media_ready_fires_once_per_member_and_again_after_reconnect() {
     // Not ready before anyone is connected.
     assert!(control.media_ready_members().is_empty());
 
-    let (alice_peer, alice) =
-        connect("alice", &config, executor.clone(), manifest.clone(), shared.clone()).await;
+    let (alice_peer, alice) = connect(
+        "alice",
+        &config,
+        executor.clone(),
+        manifest.clone(),
+        shared.clone(),
+    )
+    .await;
     events_until(&mut events, &mut seen, |s| count(s, "ready", "alice") >= 1).await;
     assert!(control.is_media_ready("alice"));
 
-    let (bob_peer, bob) =
-        connect("bob", &config, executor.clone(), manifest.clone(), shared.clone()).await;
+    let (bob_peer, bob) = connect(
+        "bob",
+        &config,
+        executor.clone(),
+        manifest.clone(),
+        shared.clone(),
+    )
+    .await;
     events_until(&mut events, &mut seen, |s| count(s, "ready", "bob") >= 1).await;
 
     // Once per member while they stay connected.
@@ -142,8 +154,14 @@ async fn media_ready_fires_once_per_member_and_again_after_reconnect() {
     assert!(!control.is_media_ready("alice"));
     assert!(control.is_media_ready("bob"));
 
-    let (alice_peer, alice) =
-        connect("alice", &config, executor.clone(), manifest.clone(), shared.clone()).await;
+    let (alice_peer, alice) = connect(
+        "alice",
+        &config,
+        executor.clone(),
+        manifest.clone(),
+        shared.clone(),
+    )
+    .await;
     events_until(&mut events, &mut seen, |s| count(s, "ready", "alice") >= 2).await;
     assert_eq!(count(&seen, "ready", "alice"), 2, "{seen:?}");
     assert_eq!(count(&seen, "ready", "bob"), 1, "{seen:?}");

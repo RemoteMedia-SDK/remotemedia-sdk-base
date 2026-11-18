@@ -53,7 +53,10 @@ fn context(session: &str, node_type: &str) -> ExecutorNodeContext {
 }
 
 fn session_id(label: &str) -> String {
-    format!("{label}{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
+    format!(
+        "{label}{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    )
 }
 
 /// The services a session opens for one node, with their pattern.
@@ -65,7 +68,10 @@ fn session_services(session: &str) -> Vec<(String, MessagingPattern)> {
         (wake_event_name(&output), MessagingPattern::Event),
         (input, MessagingPattern::PublishSubscribe),
         (output, MessagingPattern::PublishSubscribe),
-        (format!("control/{session}_{NODE}"), MessagingPattern::PublishSubscribe),
+        (
+            format!("control/{session}_{NODE}"),
+            MessagingPattern::PublishSubscribe,
+        ),
     ]
 }
 
@@ -110,7 +116,11 @@ async fn detached_shared_lane_releases_its_services() {
     use crate::python::multiprocess::shared_workers::WorkerSharingConfig;
     let Some(client) = enabled() else { return };
     let mut config = config(&client);
-    config.worker_sharing = WorkerSharingConfig { enabled: true, idle_ttl_secs: 30, ..Default::default() };
+    config.worker_sharing = WorkerSharingConfig {
+        enabled: true,
+        idle_ttl_secs: 30,
+        ..Default::default()
+    };
     let model = session_id("m");
     let mut sessions = Vec::new();
     // The first session keeps the worker alive while the second one ends.
@@ -120,22 +130,36 @@ async fn detached_shared_lane_releases_its_services() {
         ctx.params["model"] = model.clone().into();
         let mut executor = MultiprocessExecutor::new(config.clone());
         executor.register_module("shared_echo_node").await;
-        ExecutorNodeExecutor::initialize(&mut executor, &ctx).await.expect("session");
-        assert!(executor.sessions.read().await[&session].shared_lanes.contains_key(NODE));
+        ExecutorNodeExecutor::initialize(&mut executor, &ctx)
+            .await
+            .expect("session");
+        assert!(executor.sessions.read().await[&session]
+            .shared_lanes
+            .contains_key(NODE));
         echo(&executor, &session).await;
         sessions.push((session, executor));
     }
     let (session, executor) = sessions.pop().unwrap();
     drop(executor);
     let left = left_after(&session, Duration::from_secs(15)).await;
-    assert!(left.is_empty(), "a detached lane left services behind: {left:?}");
+    assert!(
+        left.is_empty(),
+        "a detached lane left services behind: {left:?}"
+    );
     assert_eq!(registered(&session).await, 0);
     let (keep, mut executor) = sessions.pop().unwrap();
-    assert_eq!(existing(&keep).len(), 5, "the other session keeps its services");
+    assert_eq!(
+        existing(&keep).len(),
+        5,
+        "the other session keeps its services"
+    );
     echo(&executor, &keep).await;
     ExecutorNodeExecutor::cleanup(&mut executor).await.unwrap();
     let left = left_after(&keep, Duration::from_secs(15)).await;
-    assert!(left.is_empty(), "cleanup of a shared lane left services behind: {left:?}");
+    assert!(
+        left.is_empty(),
+        "cleanup of a shared lane left services behind: {left:?}"
+    );
 }
 
 async fn echo(executor: &MultiprocessExecutor, session: &str) {
@@ -169,7 +193,10 @@ async fn start(client: &std::path::Path, session: &str) -> MultiprocessExecutor 
 }
 
 fn services_on_disk() -> Option<usize> {
-    let root = iceoryx2::config::Config::global_config().global.root_path().to_string();
+    let root = iceoryx2::config::Config::global_config()
+        .global
+        .root_path()
+        .to_string();
     std::fs::read_dir(std::path::Path::new(&root).join("services"))
         .ok()
         .map(|entries| entries.flatten().count())
@@ -210,8 +237,15 @@ async fn dropped_sessions_release_their_services() {
             before,
             open_handles()
         );
-        assert!(left.is_empty(), "session {index} left services behind: {left:?}");
-        assert_eq!(registered(&session).await, 0, "host registry still holds session {index}");
+        assert!(
+            left.is_empty(),
+            "session {index} left services behind: {left:?}"
+        );
+        assert_eq!(
+            registered(&session).await,
+            0,
+            "host registry still holds session {index}"
+        );
     }
 }
 
@@ -280,10 +314,14 @@ async fn failed_initialization_releases_its_services() {
     let session = session_id("fail");
     let mut executor = MultiprocessExecutor::new(config(&client));
     let result =
-        ExecutorNodeExecutor::initialize(&mut executor, &context(&session, "NoSuchPythonNode")).await;
+        ExecutorNodeExecutor::initialize(&mut executor, &context(&session, "NoSuchPythonNode"))
+            .await;
     assert!(result.is_err(), "an unknown node type must not initialize");
     drop(executor);
     let left = left_after(&session, Duration::from_secs(15)).await;
-    assert!(left.is_empty(), "failed initialization left services behind: {left:?}");
+    assert!(
+        left.is_empty(),
+        "failed initialization left services behind: {left:?}"
+    );
     assert_eq!(registered(&session).await, 0);
 }

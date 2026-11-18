@@ -91,7 +91,9 @@ impl AsyncStreamingNode for BodyNode {
 
     async fn background(&self, ctx: &dyn NodeRuntimeContextRead) -> crate::Result<()> {
         if self.mode == "missing" {
-            return Err(remotemedia_traits::streaming::missing_background(self.node_type()));
+            return Err(remotemedia_traits::streaming::missing_background(
+                self.node_type(),
+            ));
         }
         self.probe.body_started.lock().unwrap().push(Instant::now());
         let emitter = Emitter::for_call(ctx);
@@ -128,7 +130,9 @@ impl AsyncStreamingNode for BodyNode {
         F: FnMut(RuntimeData) -> crate::Result<()> + Send,
     {
         if let RuntimeData::Text(body) = &data {
-            Emitter::for_call(ctx).emit(text(format!("emitted-{body}"))).await?;
+            Emitter::for_call(ctx)
+                .emit(text(format!("emitted-{body}")))
+                .await?;
         }
         callback(data)?;
         Ok(1)
@@ -160,7 +164,11 @@ impl StreamingNodeFactory for BodyFactory {
         _session_id: Option<String>,
     ) -> crate::Result<Box<dyn StreamingNode>> {
         Ok(Box::new(AsyncNodeWrapper(Arc::new(BodyNode {
-            mode: params.get("mode").and_then(|v| v.as_str()).unwrap_or("none").to_string(),
+            mode: params
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none")
+                .to_string(),
             frames: params.get("frames").and_then(|v| v.as_u64()).unwrap_or(0),
             init_ms: params.get("init_ms").and_then(|v| v.as_u64()).unwrap_or(0),
             self_driven: params.get("self_driven").and_then(|v| v.as_bool()),
@@ -259,7 +267,10 @@ async fn a_body_emits_with_no_input_and_its_return_ends_a_source_only_session() 
         assert_eq!(next(&mut session).await, (format!("body-{n}"), None));
     }
     let end = tokio::time::timeout(Duration::from_secs(5), session.recv_output()).await;
-    assert!(matches!(end, Ok(Ok(None))), "the session did not end with its source: {end:?}");
+    assert!(
+        matches!(end, Ok(Ok(None))),
+        "the session did not end with its source: {end:?}"
+    );
     assert!(session.wait().await.is_ok());
 }
 
@@ -267,7 +278,11 @@ async fn a_body_emits_with_no_input_and_its_return_ends_a_source_only_session() 
 async fn a_node_with_a_body_that_is_not_self_driven_takes_input_and_keeps_its_emitter() {
     let (executor, probe) = executor().await;
     let mut session = executor
-        .create_session(manifest(&[("node", "BodyNode", serde_json::json!({"mode": "return", "frames": 1}))]))
+        .create_session(manifest(&[(
+            "node",
+            "BodyNode",
+            serde_json::json!({"mode": "return", "frames": 1}),
+        )]))
         .await
         .unwrap();
     assert_eq!(next(&mut session).await.0, "body-0");
@@ -275,7 +290,10 @@ async fn a_node_with_a_body_that_is_not_self_driven_takes_input_and_keeps_its_em
     // has no upstream, and still emits.
     until("the body to return", || probe.bodies() == 1).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    session.send_input(TransportData::new(text("hello"))).await.unwrap();
+    session
+        .send_input(TransportData::new(text("hello")))
+        .await
+        .unwrap();
     assert_eq!(next(&mut session).await.0, "emitted-hello");
     assert_eq!(next(&mut session).await.0, "hello");
     session.close().await.unwrap();
@@ -287,7 +305,10 @@ async fn a_body_that_returns_an_error_fails_the_node() {
     let (executor, _probe) = executor().await;
     let session = executor.create_session(source("error", 1)).await.unwrap();
     let error = failure(session).await;
-    assert!(error.contains("source") && error.contains("body sentinel error"), "{error}");
+    assert!(
+        error.contains("source") && error.contains("body sentinel error"),
+        "{error}"
+    );
     assert!(error.contains("background"), "{error}");
 }
 
@@ -296,7 +317,10 @@ async fn a_body_that_panics_fails_the_node_and_the_session_does_not_wait_for_it(
     let (executor, _probe) = executor().await;
     let session = executor.create_session(source("panic", 0)).await.unwrap();
     let error = failure(session).await;
-    assert!(error.contains("source") && error.contains("body sentinel panic"), "{error}");
+    assert!(
+        error.contains("source") && error.contains("body sentinel panic"),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -304,7 +328,10 @@ async fn a_node_that_reports_a_body_it_does_not_have_fails_and_is_named() {
     let (executor, _probe) = executor().await;
     let session = executor.create_session(source("missing", 0)).await.unwrap();
     let error = failure(session).await;
-    assert!(error.contains("BodyNode") && error.contains("does not override background"), "{error}");
+    assert!(
+        error.contains("BodyNode") && error.contains("does not override background"),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -314,7 +341,9 @@ async fn the_body_is_cancelled_before_shutdown_and_sees_no_failed_emit() {
     assert_eq!(next(&mut session).await.0, "body-0");
     session.close().await.unwrap();
     // Outputs still queued are of no interest; the router's result is.
-    let result = tokio::time::timeout(Duration::from_secs(5), session.wait()).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), session.wait())
+        .await
+        .unwrap();
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(probe.events(), ["body-cancelled", "shutdown"]);
 }
@@ -335,14 +364,29 @@ async fn each_per_participant_instance_runs_its_own_body_from_join_to_leave() {
         .unwrap();
     alice.join().await.unwrap();
     // Her instance's body emits as her.
-    assert_eq!(next(&mut session).await, ("body-0".to_string(), Some("alice".to_string())));
+    assert_eq!(
+        next(&mut session).await,
+        ("body-0".to_string(), Some("alice".to_string()))
+    );
     assert_eq!(probe.bodies(), 1);
     alice.leave().await.unwrap();
-    until("alice's body to be cancelled", || probe.events().contains(&"body-cancelled".to_string())).await;
+    until("alice's body to be cancelled", || {
+        probe.events().contains(&"body-cancelled".to_string())
+    })
+    .await;
     session.close().await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(5), session.wait()).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), session.wait())
+        .await
+        .unwrap();
     assert!(result.is_ok(), "{result:?}");
-    assert!(!probe.events().iter().any(|event| event.starts_with("emit-failed")), "{:?}", probe.events());
+    assert!(
+        !probe
+            .events()
+            .iter()
+            .any(|event| event.starts_with("emit-failed")),
+        "{:?}",
+        probe.events()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,7 +394,11 @@ async fn a_body_does_not_start_while_a_sibling_node_initializes() {
     let (executor, probe) = executor().await;
     let mut session = executor
         .create_session(manifest(&[
-            ("source", "BodyNode", serde_json::json!({"mode": "return", "frames": 1, "self_driven": true})),
+            (
+                "source",
+                "BodyNode",
+                serde_json::json!({"mode": "return", "frames": 1, "self_driven": true}),
+            ),
             ("slow", "BodyNode", serde_json::json!({"init_ms": 400})),
         ]))
         .await
@@ -365,7 +413,10 @@ async fn a_body_does_not_start_while_a_sibling_node_initializes() {
         .map(|(_, at)| *at)
         .expect("slow initialized");
     let body_started = probe.body_started.lock().unwrap()[0];
-    assert!(body_started >= slow_ready, "the body started before its sibling was ready");
+    assert!(
+        body_started >= slow_ready,
+        "the body started before its sibling was ready"
+    );
     session.close().await.unwrap();
 }
 
@@ -392,7 +443,10 @@ async fn a_task_a_node_spawned_itself_waits_for_the_start_of_a_parked_session() 
     let pool = WarmSessionPool::new(executor.clone());
     let manifest = Arc::new(Manifest {
         version: "v1".to_string(),
-        metadata: ManifestMetadata { name: "parked-interval".to_string(), ..Default::default() },
+        metadata: ManifestMetadata {
+            name: "parked-interval".to_string(),
+            ..Default::default()
+        },
         nodes: vec![NodeManifest {
             id: "clock".into(),
             node_type: "IntervalSource".into(),
@@ -412,7 +466,9 @@ async fn a_task_a_node_spawned_itself_waits_for_the_start_of_a_parked_session() 
         .unwrap()
         .unwrap()
         .expect("a tick");
-    let RuntimeData::Json(tick) = &output.data else { panic!("expected json") };
+    let RuntimeData::Json(tick) = &output.data else {
+        panic!("expected json")
+    };
     assert_eq!(tick["tick"], 0);
     // Counted from the start, not from the build 200 ms earlier.
     assert!(tick["elapsed_ms"].as_u64().unwrap() < 150, "{tick}");
@@ -458,7 +514,9 @@ mod attribute {
         ) -> Result<(), crate::Error> {
             let emitter = Emitter::for_call(ctx);
             for n in 0..self.config.count {
-                emitter.emit(RuntimeData::Text(format!("count-{n}"))).await?;
+                emitter
+                    .emit(RuntimeData::Text(format!("count-{n}")))
+                    .await?;
             }
             Ok(())
         }
@@ -476,7 +534,9 @@ impl StreamingNodeFactory for SilentFactory {
         _params: &serde_json::Value,
         _session_id: Option<String>,
     ) -> crate::Result<Box<dyn StreamingNode>> {
-        Ok(remotemedia_traits::SourceNodeWrapper::boxed(Counter { count: 1 }))
+        Ok(remotemedia_traits::SourceNodeWrapper::boxed(Counter {
+            count: 1,
+        }))
     }
     fn node_type(&self) -> &str {
         "Silent"
@@ -499,7 +559,9 @@ async fn source_executor() -> Arc<PipelineExecutor> {
             },
         )))
         .await;
-    executor.register_factory(MacroCounterNode::source_factory()).await;
+    executor
+        .register_factory(MacroCounterNode::source_factory())
+        .await;
     executor.register_factory(Arc::new(SilentFactory)).await;
     executor
 }
@@ -507,7 +569,11 @@ async fn source_executor() -> Arc<PipelineExecutor> {
 async fn runs_as_a_source(node_type: &str) {
     let executor = source_executor().await;
     let mut session = executor
-        .create_session(manifest(&[("source", node_type, serde_json::json!({"count": 3}))]))
+        .create_session(manifest(&[(
+            "source",
+            node_type,
+            serde_json::json!({"count": 3}),
+        )]))
         .await
         .unwrap();
     // Nothing is sent. Three frames, then the session ends with its source.
@@ -515,7 +581,10 @@ async fn runs_as_a_source(node_type: &str) {
         assert_eq!(next(&mut session).await, (format!("count-{n}"), None));
     }
     let end = tokio::time::timeout(Duration::from_secs(5), session.recv_output()).await;
-    assert!(matches!(end, Ok(Ok(None))), "{node_type}: the session did not end: {end:?}");
+    assert!(
+        matches!(end, Ok(Ok(None))),
+        "{node_type}: the session did not end: {end:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -543,11 +612,18 @@ async fn a_self_driven_source_that_declares_no_output_fails_validation_and_is_na
         .err()
         .expect("validation fails")
         .to_string();
-    assert!(error.contains("'mute'") && error.contains("output capabilities"), "{error}");
-    assert!(error.contains("output_caps") && error.contains("media_capabilities"), "{error}");
+    assert!(
+        error.contains("'mute'") && error.contains("output capabilities"),
+        "{error}"
+    );
+    assert!(
+        error.contains("output_caps") && error.contains("media_capabilities"),
+        "{error}"
+    );
 
     // The manifest says so, of a node whose factory declares nothing.
-    let mut by_manifest = (*manifest(&[("quiet", "BodyNode", serde_json::json!({"mode": "return"}))])).clone();
+    let mut by_manifest =
+        (*manifest(&[("quiet", "BodyNode", serde_json::json!({"mode": "return"}))])).clone();
     by_manifest.nodes[0].session_input = Some(false);
     let error = executor
         .create_session(Arc::new(by_manifest.clone()))
@@ -558,10 +634,14 @@ async fn a_self_driven_source_that_declares_no_output_fails_validation_and_is_na
     assert!(error.contains("'quiet'"), "{error}");
 
     // Declared on the manifest node: accepted.
-    by_manifest.nodes[0].media_capabilities = Some(crate::capabilities::MediaCapabilities::with_output(
-        crate::capabilities::MediaConstraints::Text(Default::default()),
-    ));
-    let mut session = executor.create_session(Arc::new(by_manifest)).await.unwrap();
+    by_manifest.nodes[0].media_capabilities =
+        Some(crate::capabilities::MediaCapabilities::with_output(
+            crate::capabilities::MediaConstraints::Text(Default::default()),
+        ));
+    let mut session = executor
+        .create_session(Arc::new(by_manifest))
+        .await
+        .unwrap();
     session.close().await.unwrap();
 
     // With an upstream node it is not a source: nothing to declare.
@@ -586,13 +666,24 @@ fn the_resolver_rejects_an_undeclared_self_driven_source() {
     registry.register(MacroCounterNode::source_factory());
     let resolver = crate::capabilities::resolver::CapabilityResolver::new(&registry);
     let error = resolver
-        .resolve(&[("mute".into(), "Silent".into())], &[], &Default::default())
+        .resolve(
+            &[("mute".into(), "Silent".into())],
+            &[],
+            &Default::default(),
+        )
         .err()
         .expect("resolution fails")
         .to_string();
-    assert!(error.contains("'mute'") && error.contains("Silent"), "{error}");
+    assert!(
+        error.contains("'mute'") && error.contains("Silent"),
+        "{error}"
+    );
     assert!(resolver
-        .resolve(&[("clock".into(), "MacroCounter".into())], &[], &Default::default())
+        .resolve(
+            &[("clock".into(), "MacroCounter".into())],
+            &[],
+            &Default::default()
+        )
         .is_ok());
 }
 
@@ -646,7 +737,10 @@ impl StreamingNodeFactory for PacedFactory {
         _session_id: Option<String>,
     ) -> crate::Result<Box<dyn StreamingNode>> {
         Ok(Box::new(AsyncNodeWrapper(Arc::new(PacedNode {
-            ticks: params.get("ticks").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
+            ticks: params
+                .get("ticks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX),
             done: Default::default(),
         }))))
     }
@@ -683,7 +777,10 @@ async fn client_input_is_not_delivered_to_a_paced_source() {
         ]))
         .await
         .unwrap();
-    session.send_input(TransportData::new(text("hello"))).await.unwrap();
+    session
+        .send_input(TransportData::new(text("hello")))
+        .await
+        .unwrap();
     // The ordinary source answers once; the paced source only ticks.
     let seen = drain(&mut session, Duration::from_millis(400)).await;
     assert_eq!(seen, ["emitted-hello", "hello", "tick-0", "tick-1"]);
@@ -696,7 +793,10 @@ async fn a_manifest_can_keep_a_paced_source_taking_client_input() {
     let mut manifest = (*manifest(&[("paced", "Paced", serde_json::json!({"ticks": 1}))])).clone();
     manifest.nodes[0].session_input = Some(true);
     let mut session = executor.create_session(Arc::new(manifest)).await.unwrap();
-    session.send_input(TransportData::new(text("hello"))).await.unwrap();
+    session
+        .send_input(TransportData::new(text("hello")))
+        .await
+        .unwrap();
     let seen = drain(&mut session, Duration::from_millis(400)).await;
     assert_eq!(seen, ["paced-heard:hello", "tick-0"]);
     session.close().await.unwrap();
@@ -752,6 +852,9 @@ async fn a_paced_source_that_has_not_finished_keeps_its_session_open() {
             break;
         }
     }
-    assert!(ticks > 5, "the session ended while a paced source was running");
+    assert!(
+        ticks > 5,
+        "the session ended while a paced source was running"
+    );
     session.close().await.unwrap();
 }

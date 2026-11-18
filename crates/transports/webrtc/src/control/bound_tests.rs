@@ -74,8 +74,15 @@ impl Harness {
     }
 
     async fn refused(&self, op: PbOp) -> String {
-        let error = self.send(op).await.expect_err("the operation is not granted");
-        assert_eq!(error.code, ControlErrorCode::Unauthorized as i32, "{error:?}");
+        let error = self
+            .send(op)
+            .await
+            .expect_err("the operation is not granted");
+        assert_eq!(
+            error.code,
+            ControlErrorCode::Unauthorized as i32,
+            "{error:?}"
+        );
         error.message
     }
 
@@ -85,7 +92,10 @@ impl Harness {
             .expect("a tap arrives")
             .expect("channel open");
         match outbound {
-            Outbound::Payload { data: RuntimeData::Text(text), .. } => text.to_string(),
+            Outbound::Payload {
+                data: RuntimeData::Text(text),
+                ..
+            } => text.to_string(),
             _ => panic!("expected a text tap"),
         }
     }
@@ -103,12 +113,16 @@ async fn ungranted_operations_are_refused_with_the_operation_and_node() {
     let harness = Harness::new(vec![ControlGrant::new(ControlOp::Tap, "calc")]).await;
 
     harness
-        .send(PbOp::Subscribe(Subscribe { addr: Some(out("calc")) }))
+        .send(PbOp::Subscribe(Subscribe {
+            addr: Some(out("calc")),
+        }))
         .await
         .expect("the granted tap is accepted");
 
     let message = harness
-        .refused(PbOp::Subscribe(Subscribe { addr: Some(out("other")) }))
+        .refused(PbOp::Subscribe(Subscribe {
+            addr: Some(out("other")),
+        }))
         .await;
     assert_eq!(message, "not granted: tap on 'other'");
 
@@ -121,17 +135,26 @@ async fn ungranted_operations_are_refused_with_the_operation_and_node() {
     assert_eq!(message, "not granted: publish on 'calc'");
 
     let message = harness
-        .refused(PbOp::Intercept(Intercept { addr: Some(out("calc")), deadline_ms: 100 }))
+        .refused(PbOp::Intercept(Intercept {
+            addr: Some(out("calc")),
+            deadline_ms: 100,
+        }))
         .await;
     assert_eq!(message, "not granted: intercept on 'calc'");
 
     let message = harness
-        .refused(PbOp::InterceptReply(InterceptReply { correlation_id: 1, decision: None }))
+        .refused(PbOp::InterceptReply(InterceptReply {
+            correlation_id: 1,
+            decision: None,
+        }))
         .await;
     assert_eq!(message, "not granted: intercept");
 
     let message = harness
-        .refused(PbOp::SetNodeState(SetNodeState { node_id: "calc".into(), state: 2 }))
+        .refused(PbOp::SetNodeState(SetNodeState {
+            node_id: "calc".into(),
+            state: 2,
+        }))
         .await;
     assert_eq!(message, "not granted: node_state on 'calc'");
     assert_eq!(
@@ -141,7 +164,10 @@ async fn ungranted_operations_are_refused_with_the_operation_and_node() {
     );
 
     let message = harness
-        .refused(PbOp::SetTelemetry(SetTelemetry { level: "full".into(), interval_ms: 0 }))
+        .refused(PbOp::SetTelemetry(SetTelemetry {
+            level: "full".into(),
+            interval_ms: 0,
+        }))
         .await;
     assert!(message.contains("telemetry"), "{message}");
 
@@ -169,17 +195,25 @@ async fn an_rpc_grant_allows_only_its_listed_methods() {
     assert_eq!(message, "not granted: rpc 'reset' on 'chat'");
     // The listed method passes the check (what the node does with it is its own).
     if let Err(error) = harness.send(call("calc", "add")).await {
-        assert_ne!(error.code, ControlErrorCode::Unauthorized as i32, "{error:?}");
+        assert_ne!(
+            error.code,
+            ControlErrorCode::Unauthorized as i32,
+            "{error:?}"
+        );
     }
     // The reply port of the callable node may be tapped; its output may not.
     harness
         .send(PbOp::Subscribe(Subscribe {
-            addr: Some(core_addr_to_pb(&CoreAddress::node_out("calc").with_port("__reply__"))),
+            addr: Some(core_addr_to_pb(
+                &CoreAddress::node_out("calc").with_port("__reply__"),
+            )),
         }))
         .await
         .expect("reply port");
     harness
-        .refused(PbOp::Subscribe(Subscribe { addr: Some(out("calc")) }))
+        .refused(PbOp::Subscribe(Subscribe {
+            addr: Some(out("calc")),
+        }))
         .await;
 
     harness.close().await;
@@ -189,7 +223,9 @@ async fn an_rpc_grant_allows_only_its_listed_methods() {
 async fn an_own_tap_delivers_only_the_members_frames() {
     let mut harness = Harness::new(vec![ControlGrant::new(ControlOp::Tap, "calc").own()]).await;
     harness
-        .send(PbOp::Subscribe(Subscribe { addr: Some(out("calc")) }))
+        .send(PbOp::Subscribe(Subscribe {
+            addr: Some(out("calc")),
+        }))
         .await
         .unwrap();
 
@@ -208,7 +244,10 @@ async fn an_own_tap_delivers_only_the_members_frames() {
 
     assert_eq!(harness.next_tap_text().await, "ana speaks");
     assert_eq!(harness.next_tap_text().await, "ana again");
-    assert!(harness.rx.try_recv().is_err(), "nothing of ben's and nothing unattributed");
+    assert!(
+        harness.rx.try_recv().is_err(),
+        "nothing of ben's and nothing unattributed"
+    );
     harness.close().await;
 }
 
@@ -216,7 +255,9 @@ async fn an_own_tap_delivers_only_the_members_frames() {
 async fn an_unrestricted_tap_delivers_every_members_frames() {
     let mut harness = Harness::new(vec![ControlGrant::new(ControlOp::Tap, "calc")]).await;
     harness
-        .send(PbOp::Subscribe(Subscribe { addr: Some(out("calc")) }))
+        .send(PbOp::Subscribe(Subscribe {
+            addr: Some(out("calc")),
+        }))
         .await
         .unwrap();
     let control = Arc::clone(&harness.control);
@@ -279,7 +320,9 @@ async fn hello_cannot_select_another_session() {
                 attach_id: "intruder".into(),
                 participant: None,
             }),
-            PbOp::Subscribe(Subscribe { addr: Some(out("calc")) }),
+            PbOp::Subscribe(Subscribe {
+                addr: Some(out("calc")),
+            }),
         ] {
             sender
                 .send(&ControlFrame { op: Some(op) }.encode_to_vec().into())
@@ -304,7 +347,8 @@ async fn hello_cannot_select_another_session() {
         match rx.recv().await.unwrap().event {
             Some(PbEvent::Tap(tap)) => {
                 let copies = my_control.transport_copy_context();
-                let RuntimeData::Text(text) = pb_to_runtime_data(tap.data.unwrap(), &copies).unwrap()
+                let RuntimeData::Text(text) =
+                    pb_to_runtime_data(tap.data.unwrap(), &copies).unwrap()
                 else {
                     panic!("text tap")
                 };

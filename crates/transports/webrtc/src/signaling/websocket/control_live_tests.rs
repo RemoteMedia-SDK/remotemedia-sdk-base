@@ -215,9 +215,17 @@ async fn websocket_raw_request_parser_preserves_errors_and_ordinary_signaling() 
         "{",
         r#"{"jsonrpc":"2.0","method":"peer.list","params":1e999,"id":7}"#,
     ] {
-        handle_message(text, &state, &peer_id, &tx, &control, None, &Default::default())
-            .await
-            .unwrap();
+        handle_message(
+            text,
+            &state,
+            &peer_id,
+            &tx,
+            &control,
+            None,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         let error: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
         assert_eq!(error["error"]["code"], error_codes::PARSE_ERROR);
         assert_eq!(error["id"], Value::Null);

@@ -36,8 +36,8 @@ pub use control::{
 };
 pub use control_host::{ControlHost, MemberLifecycle, RuntimeControlService};
 pub mod deployment;
-pub mod execution;
 pub mod embedded_plugin;
+pub mod execution;
 pub mod limits;
 pub mod metrics;
 pub mod plugin;

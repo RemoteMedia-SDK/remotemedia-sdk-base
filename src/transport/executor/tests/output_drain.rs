@@ -77,9 +77,11 @@ async fn waits_for_live_kind_and_preserves_cancelled_receive() {
             .await
             .is_err()
     );
-    tx.send(TransportData::new(RuntimeData::Text("after cancellation".into())))
-        .await
-        .unwrap();
+    tx.send(TransportData::new(RuntimeData::Text(
+        "after cancellation".into(),
+    )))
+    .await
+    .unwrap();
     drop(tx);
     let output = tokio::time::timeout(Duration::from_secs(1), session.recv_output())
         .await

@@ -17,9 +17,9 @@ use remotemedia_grpc::generated::{
     pipeline_control_client::PipelineControlClient, pipeline_control_server::PipelineControlServer,
     stream_request::Request as StreamRequestType, stream_response::Response as StreamResponseType,
     streaming_pipeline_service_client::StreamingPipelineServiceClient,
-    streaming_pipeline_service_server::StreamingPipelineServiceServer, ControlAddress, ControlDirection,
-    ControlFrame, DataChunk, Hello, ManifestMetadata, NodeManifest, ParticipantInfo, PipelineManifest,
-    Publish, StreamControl, StreamInit, StreamRequest,
+    streaming_pipeline_service_server::StreamingPipelineServiceServer, ControlAddress,
+    ControlDirection, ControlFrame, DataChunk, Hello, ManifestMetadata, NodeManifest,
+    ParticipantInfo, PipelineManifest, Publish, StreamControl, StreamInit, StreamRequest,
 };
 use remotemedia_grpc::metrics::ServiceMetrics;
 use remotemedia_grpc::{ServiceConfig, StreamingServiceImpl};
@@ -33,7 +33,10 @@ use tonic::transport::Server;
 fn manifest() -> PipelineManifest {
     PipelineManifest {
         version: "v1".to_string(),
-        metadata: Some(ManifestMetadata { name: "grpc-shared".to_string(), ..Default::default() }),
+        metadata: Some(ManifestMetadata {
+            name: "grpc-shared".to_string(),
+            ..Default::default()
+        }),
         nodes: vec![NodeManifest {
             id: "echo".to_string(),
             node_type: "PassThrough".to_string(),
@@ -74,7 +77,9 @@ struct Client {
 }
 
 async fn join(url: &str, key: &str, who: &str) -> Client {
-    let mut client = StreamingPipelineServiceClient::connect(url.to_string()).await.unwrap();
+    let mut client = StreamingPipelineServiceClient::connect(url.to_string())
+        .await
+        .unwrap();
     let (tx, rx) = mpsc::channel::<StreamRequest>(16);
     tx.send(StreamRequest {
         request: Some(StreamRequestType::Init(StreamInit {
@@ -91,7 +96,11 @@ async fn join(url: &str, key: &str, who: &str) -> Client {
     })
     .await
     .unwrap();
-    let mut responses = client.stream_pipeline(ReceiverStream::new(rx)).await.unwrap().into_inner();
+    let mut responses = client
+        .stream_pipeline(ReceiverStream::new(rx))
+        .await
+        .unwrap()
+        .into_inner();
     let session_id = loop {
         let response = tokio::time::timeout(Duration::from_secs(10), responses.message())
             .await
@@ -104,7 +113,11 @@ async fn join(url: &str, key: &str, who: &str) -> Client {
             _ => {}
         }
     };
-    Client { tx, responses, session_id }
+    Client {
+        tx,
+        responses,
+        session_id,
+    }
 }
 
 impl Client {
@@ -127,16 +140,19 @@ impl Client {
     /// Send 20 ms of 16 kHz audio whose `DataBuffer.metadata` names the
     /// microphone track.
     async fn speak(&self, track: &str, seq: u64) {
-        let mut buffer = remotemedia_grpc::adapters::runtime_data_to_data_buffer(&RuntimeData::Audio {
-            samples: vec![0.1f32; 320].into(),
-            sample_rate: 16000,
-            channels: 1,
-            stream_id: None,
-            timestamp_us: None,
-            arrival_ts_us: None,
-            metadata: None,
-        });
-        buffer.metadata.insert("participant.track_id".to_string(), track.to_string());
+        let mut buffer =
+            remotemedia_grpc::adapters::runtime_data_to_data_buffer(&RuntimeData::Audio {
+                samples: vec![0.1f32; 320].into(),
+                sample_rate: 16000,
+                channels: 1,
+                stream_id: None,
+                timestamp_us: None,
+                arrival_ts_us: None,
+                metadata: None,
+            });
+        buffer
+            .metadata
+            .insert("participant.track_id".to_string(), track.to_string());
         self.tx
             .send(StreamRequest {
                 request: Some(StreamRequestType::DataChunk(DataChunk {
@@ -157,7 +173,9 @@ impl Client {
                 .expect("output in time")
                 .unwrap()
                 .expect("stream open");
-            let Some(StreamResponseType::Result(mut result)) = response.response else { continue };
+            let Some(StreamResponseType::Result(mut result)) = response.response else {
+                continue;
+            };
             return result.data_outputs.remove("output").expect("output entry");
         }
     }
@@ -165,8 +183,14 @@ impl Client {
     /// Next output as `(participant.id, text)`.
     async fn next(&mut self) -> (String, String) {
         let buffer = self.next_buffer().await;
-        let Some(DataType::Text(text)) = &buffer.data_type else { panic!("{buffer:?}") };
-        let who = buffer.metadata.get("participant.id").cloned().unwrap_or_default();
+        let Some(DataType::Text(text)) = &buffer.data_type else {
+            panic!("{buffer:?}")
+        };
+        let who = buffer
+            .metadata
+            .get("participant.id")
+            .cloned()
+            .unwrap_or_default();
         (who, String::from_utf8(text.text_data.clone()).unwrap())
     }
 
@@ -174,7 +198,10 @@ impl Client {
         let _ = self
             .tx
             .send(StreamRequest {
-                request: Some(StreamRequestType::Control(StreamControl { command: 1, ..Default::default() })),
+                request: Some(StreamRequestType::Control(StreamControl {
+                    command: 1,
+                    ..Default::default()
+                })),
             })
             .await;
     }
@@ -187,7 +214,10 @@ async fn two_clients_on_one_key_share_a_session_with_attributed_outputs() {
     let mut bob = join(&url, "standup", "bob").await;
     assert_eq!(alice.session_id, bob.session_id, "one session for the key");
     let other = join(&url, "other-room", "carol").await;
-    assert_ne!(other.session_id, alice.session_id, "another key, another session");
+    assert_ne!(
+        other.session_id, alice.session_id,
+        "another key, another session"
+    );
     other.close().await;
 
     alice.say("hi from alice", 1).await;
@@ -202,9 +232,21 @@ async fn two_clients_on_one_key_share_a_session_with_attributed_outputs() {
     alice.speak("alice-mic", 3).await;
     for client in [&mut alice, &mut bob] {
         let buffer = client.next_buffer().await;
-        assert!(matches!(buffer.data_type, Some(DataType::Audio(_))), "{buffer:?}");
-        assert_eq!(buffer.metadata.get("participant.id").map(String::as_str), Some("alice"));
-        assert_eq!(buffer.metadata.get("participant.track_id").map(String::as_str), Some("alice-mic"));
+        assert!(
+            matches!(buffer.data_type, Some(DataType::Audio(_))),
+            "{buffer:?}"
+        );
+        assert_eq!(
+            buffer.metadata.get("participant.id").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            buffer
+                .metadata
+                .get("participant.track_id")
+                .map(String::as_str),
+            Some("alice-mic")
+        );
     }
 
     // A control attach that declares a participant publishes as it.
@@ -214,14 +256,29 @@ async fn two_clients_on_one_key_share_a_session_with_attributed_outputs() {
         op: Some(PbOp::Hello(Hello {
             session_id: alice.session_id.clone(),
             attach_id: "moderator".to_string(),
-            participant: Some(ParticipantInfo { id: "moderator".to_string(), role: "agent".to_string(), ..Default::default() }),
+            participant: Some(ParticipantInfo {
+                id: "moderator".to_string(),
+                role: "agent".to_string(),
+                ..Default::default()
+            }),
         })),
     })
     .await
     .unwrap();
-    let mut events = control.attach(ReceiverStream::new(crx)).await.unwrap().into_inner();
-    let first = tokio::time::timeout(Duration::from_secs(5), events.next()).await.unwrap().unwrap().unwrap();
-    assert!(matches!(first.event, Some(PbEvent::Attached(_))), "{first:?}");
+    let mut events = control
+        .attach(ReceiverStream::new(crx))
+        .await
+        .unwrap()
+        .into_inner();
+    let first = tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(first.event, Some(PbEvent::Attached(_))),
+        "{first:?}"
+    );
     ctx.send(ControlFrame {
         op: Some(PbOp::Publish(Publish {
             addr: Some(ControlAddress {
@@ -229,14 +286,17 @@ async fn two_clients_on_one_key_share_a_session_with_attributed_outputs() {
                 port: String::new(),
                 direction: ControlDirection::In as i32,
             }),
-            data: Some(remotemedia_grpc::adapters::runtime_data_to_data_buffer(&RuntimeData::Text(
-                "time is up".to_string(),
-            ))),
+            data: Some(remotemedia_grpc::adapters::runtime_data_to_data_buffer(
+                &RuntimeData::Text("time is up".to_string()),
+            )),
         })),
     })
     .await
     .unwrap();
-    assert_eq!(alice.next().await, ("moderator".into(), "time is up".into()));
+    assert_eq!(
+        alice.next().await,
+        ("moderator".into(), "time is up".into())
+    );
     assert_eq!(bob.next().await, ("moderator".into(), "time is up".into()));
 
     // Alice leaves; Bob keeps the session. The last one out closes it.
@@ -247,7 +307,10 @@ async fn two_clients_on_one_key_share_a_session_with_attributed_outputs() {
     bob.close().await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while executor.control_bus().get(&session_id).is_some() {
-        assert!(std::time::Instant::now() < deadline, "shared session not closed after the last client left");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shared session not closed after the last client left"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

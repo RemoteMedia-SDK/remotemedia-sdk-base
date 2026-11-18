@@ -32,9 +32,9 @@
 //! Both sides may call `service_builder(...).open_or_create()` —
 //! whichever attaches first creates the service.
 
-pub mod data_transfer;
 #[cfg(feature = "multiprocess")]
 pub(crate) mod control_frames;
+pub mod data_transfer;
 #[cfg(feature = "multiprocess")]
 mod native_copy_reporting;
 #[cfg(feature = "multiprocess")]
@@ -55,8 +55,8 @@ pub use remotemedia_plugin_sdk::mapped_python;
 #[cfg(feature = "multiprocess")]
 pub mod factory;
 #[cfg(feature = "multiprocess")]
-pub mod ipc_channel;
-#[cfg(feature = "multiprocess")]
 pub mod iox_hygiene;
+#[cfg(feature = "multiprocess")]
+pub mod ipc_channel;
 #[cfg(feature = "multiprocess")]
 pub mod runner;

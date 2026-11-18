@@ -292,7 +292,9 @@ impl ContentStore {
                     });
                 }
                 let destination = temporary.join(&relative);
-                let parent = destination.parent().expect("relative runtime path has parent");
+                let parent = destination
+                    .parent()
+                    .expect("relative runtime path has parent");
                 fs::create_dir_all(parent)?;
                 fs::copy(source, &destination)?;
                 File::open(&destination)?.sync_all()?;
@@ -452,7 +454,9 @@ fn validated_runtime_path(value: &str) -> Result<PathBuf, DeploymentError> {
     let path = Path::new(value);
     if value.is_empty()
         || path.is_absolute()
-        || path.components().any(|component| !matches!(component, Component::Normal(_)))
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(DeploymentError::InvalidRuntimePath(value.to_owned()));
     }
@@ -649,7 +653,10 @@ mod tests {
         let release = store
             .materialize_native_runtime(&bundle_digest, &closure)
             .unwrap();
-        assert_eq!(fs::read(release.join("lib/libwhisper.so.1")).unwrap(), bytes);
+        assert_eq!(
+            fs::read(release.join("lib/libwhisper.so.1")).unwrap(),
+            bytes
+        );
         assert_eq!(
             std::fs::read_link(release.join("lib/libwhisper.so.1")).unwrap(),
             PathBuf::from("libwhisper.so.1.9.1")

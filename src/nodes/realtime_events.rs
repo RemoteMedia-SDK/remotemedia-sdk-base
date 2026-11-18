@@ -53,8 +53,8 @@ use crate::data::RuntimeData;
 use crate::error::Error;
 use crate::nodes::schema::{NodeSchema, RuntimeDataType};
 use crate::nodes::{
-    AsyncNodeWrapper, AsyncStreamingNode, Emitter, InstanceScope, NodeRuntimeContext, StreamingNode,
-    StreamingNodeFactory,
+    AsyncNodeWrapper, AsyncStreamingNode, Emitter, InstanceScope, NodeRuntimeContext,
+    StreamingNode, StreamingNodeFactory,
 };
 use crate::transport::data::participant;
 use crate::transport::endpoint::CallOptions;
@@ -92,7 +92,8 @@ pub fn rt_frame_event(value: &Value) -> Option<&Value> {
 
 /// Whether a Json output is a D6 UI frame: `{ "v": 1, "turn", "chunk" }`.
 pub fn is_ui_frame(value: &Value) -> bool {
-    value.get("v").and_then(Value::as_u64) == Some(1) && value.get("chunk").is_some_and(Value::is_object)
+    value.get("v").and_then(Value::as_u64) == Some(1)
+        && value.get("chunk").is_some_and(Value::is_object)
 }
 
 /// Whether an admission (the value of `rm.realtime`) is for the hook over
@@ -100,7 +101,12 @@ pub fn is_ui_frame(value: &Value) -> bool {
 pub fn admission_is_webrtc(admission: &str) -> bool {
     serde_json::from_str::<Value>(admission)
         .ok()
-        .and_then(|value| value.get("transport").and_then(Value::as_str).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get("transport")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .as_deref()
         == Some(ADMISSION_TRANSPORT_WEBRTC)
 }
@@ -109,12 +115,14 @@ pub fn admission_is_webrtc(admission: &str) -> bool {
 /// browser set `field` of the session (`voice`, `turnDetection`, `language`,
 /// `instructions`).
 pub fn admission_allows(admission: &str, field: &str) -> bool {
-    serde_json::from_str::<Value>(admission).ok().is_some_and(|value| {
-        value
-            .get("configurable")
-            .and_then(Value::as_array)
-            .is_some_and(|fields| fields.iter().any(|allowed| allowed == field))
-    })
+    serde_json::from_str::<Value>(admission)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .get("configurable")
+                .and_then(Value::as_array)
+                .is_some_and(|fields| fields.iter().any(|allowed| allowed == field))
+        })
 }
 
 /// What the backend allowed a member's browser to configure (design D10,
@@ -144,7 +152,13 @@ impl Admission {
             configurable: parsed
                 .get("configurable")
                 .and_then(Value::as_array)
-                .map(|fields| fields.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default(),
             client_tools: parsed
                 .get("client_tools")
@@ -152,11 +166,14 @@ impl Admission {
                 .map(|tools| {
                     tools
                         .iter()
-                        .filter_map(|tool| Some((tool.get("name")?.as_str()?.to_string(), tool.clone())))
+                        .filter_map(|tool| {
+                            Some((tool.get("name")?.as_str()?.to_string(), tool.clone()))
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),
-            webrtc: parsed.get("transport").and_then(Value::as_str) == Some(ADMISSION_TRANSPORT_WEBRTC),
+            webrtc: parsed.get("transport").and_then(Value::as_str)
+                == Some(ADMISSION_TRANSPORT_WEBRTC),
         }
     }
 
@@ -179,7 +196,8 @@ impl Admission {
                 "inputAudioTranscription" if value.is_object() => {
                     for (field, value) in value.as_object().into_iter().flatten() {
                         if field == "language"
-                            && (self.allows("language") || self.allows("inputAudioTranscription.language"))
+                            && (self.allows("language")
+                                || self.allows("inputAudioTranscription.language"))
                         {
                             forward.insert(key.clone(), json!({ "language": value }));
                         } else {
@@ -192,10 +210,9 @@ impl Admission {
                         let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
                         // The schema must be the admitted one; the host
                         // already has the admitted definition.
-                        let admitted = self
-                            .client_tools
-                            .get(name)
-                            .is_some_and(|admitted| admitted.get("parameters") == tool.get("parameters"));
+                        let admitted = self.client_tools.get(name).is_some_and(|admitted| {
+                            admitted.get("parameters") == tool.get("parameters")
+                        });
                         if !admitted {
                             ignored.push(format!("tools.{name}"));
                             ignored_tools.push(name.to_string());
@@ -286,13 +303,25 @@ pub(crate) enum Action {
     /// A server event for `member`'s data channel.
     Frame { member: String, frame: Value },
     /// A typed-RPC call on a node.
-    Rpc { node: String, method: String, arg: Value },
+    Rpc {
+        node: String,
+        method: String,
+        arg: Value,
+    },
     /// Data for a node's input, as `member`'s.
-    Publish { node: String, member: String, data: Value },
+    Publish {
+        node: String,
+        member: String,
+        data: Value,
+    },
     /// A fire-and-forget `event` call on the agent's endpoint.
     HostEvent(Value),
     /// Call back ([`Core::on_timer`]) after `ms`.
-    Timer { member: String, turn: String, ms: u64 },
+    Timer {
+        member: String,
+        turn: String,
+        ms: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +464,11 @@ impl Core {
     /// The realtime members among `to`; with nobody named, all of them.
     fn recipients(&self, owner: Option<&str>, to: Option<&[String]>) -> Vec<String> {
         let mut members: Vec<String> = match to {
-            Some(to) => to.iter().filter(|member| self.is_realtime(member)).cloned().collect(),
+            Some(to) => to
+                .iter()
+                .filter(|member| self.is_realtime(member))
+                .cloned()
+                .collect(),
             None => self
                 .members
                 .iter()
@@ -495,7 +528,11 @@ impl Core {
             return;
         };
         let members = self.recipients(owner, to);
-        let Some(turn_id) = frame.get("turn").and_then(Value::as_str).map(str::to_string) else {
+        let Some(turn_id) = frame
+            .get("turn")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
             // Outside a turn (`session.send`): only data parts mean anything.
             if kind.starts_with("data-") {
                 for member in members {
@@ -506,7 +543,10 @@ impl Core {
         };
         match kind {
             "data-transcript" => {
-                let speaker = chunk["data"]["member"]["id"].as_str().or(owner).unwrap_or_default();
+                let speaker = chunk["data"]["member"]["id"]
+                    .as_str()
+                    .or(owner)
+                    .unwrap_or_default();
                 if !self.is_realtime(speaker) {
                     return;
                 }
@@ -572,7 +612,10 @@ impl Core {
             }
             "data-turn" => match chunk["data"]["status"].as_str() {
                 Some("interrupted") => {
-                    let spoken = chunk["data"]["spoken"].as_str().unwrap_or_default().to_string();
+                    let spoken = chunk["data"]["spoken"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
                     for member in members {
                         self.end_response(&turn_id, &member, Some(&spoken), out);
                     }
@@ -624,7 +667,10 @@ impl Core {
             .iter()
             .filter(|(id, turn)| {
                 id.as_str() != turn_id
-                    && turn.listeners.get(member).is_some_and(|listen| listen.open.is_some())
+                    && turn
+                        .listeners
+                        .get(member)
+                        .is_some_and(|listen| listen.open.is_some())
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -652,9 +698,13 @@ impl Core {
     /// End the member's response as completed, once its audio has left the
     /// member's track. `settled`: the turn node ended the turn.
     fn end_or_hold(&mut self, turn_id: &str, member: &str, settled: bool, out: &mut Vec<Action>) {
-        let Some(turn) = self.turns.get_mut(turn_id) else { return };
+        let Some(turn) = self.turns.get_mut(turn_id) else {
+            return;
+        };
         let end = turn.texts.len();
-        let Some(listen) = turn.listeners.get_mut(member) else { return };
+        let Some(listen) = turn.listeners.get_mut(member) else {
+            return;
+        };
         let Some(response) = listen.open else { return };
         let first = turn.responses[response - 1].min(end);
         listen.settled |= settled;
@@ -688,9 +738,15 @@ impl Core {
         interrupted: Option<&str>,
         out: &mut Vec<Action>,
     ) {
-        let Some(turn) = self.turns.get_mut(turn_id) else { return };
-        let Some(listen) = turn.listeners.get_mut(member) else { return };
-        let Some(response) = listen.open.take() else { return };
+        let Some(turn) = self.turns.get_mut(turn_id) else {
+            return;
+        };
+        let Some(listen) = turn.listeners.get_mut(member) else {
+            return;
+        };
+        let Some(response) = listen.open.take() else {
+            return;
+        };
         listen.pending_end = false;
         let first = turn.responses[response - 1].min(turn.texts.len());
         let end = turn
@@ -742,12 +798,20 @@ impl Core {
             "type": "audio-transcript-done",
             "responseId": response_id, "itemId": item_id, "transcript": transcript,
         })));
-        out.push(frame(json!({ "type": "response-done", "responseId": response_id, "status": status })));
+        out.push(frame(
+            json!({ "type": "response-done", "responseId": response_id, "status": status }),
+        ));
     }
 
     /// The model called a client tool: the browser runs it (design D10,
     /// "Tools"). Only the member whose turn it is gets the call.
-    fn client_tool_call(&mut self, turn_id: &str, owner: Option<&str>, chunk: &Value, out: &mut Vec<Action>) {
+    fn client_tool_call(
+        &mut self,
+        turn_id: &str,
+        owner: Option<&str>,
+        chunk: &Value,
+        out: &mut Vec<Action>,
+    ) {
         let turn = self.turn_mut(turn_id);
         let Some(owner) = turn.owner.clone().or_else(|| owner.map(str::to_string)) else {
             return;
@@ -756,7 +820,11 @@ impl Core {
             return;
         }
         let data = &chunk["data"];
-        let call_id = data["callId"].as_str().or(chunk["id"].as_str()).unwrap_or_default().to_string();
+        let call_id = data["callId"]
+            .as_str()
+            .or(chunk["id"].as_str())
+            .unwrap_or_default()
+            .to_string();
         let name = data["name"].as_str().unwrap_or_default();
         let arguments = match &data["arguments"] {
             Value::String(text) => text.clone(),
@@ -791,7 +859,9 @@ impl Core {
 
     /// The turn goes on as a new response, for everyone hearing it.
     fn continue_turn(&mut self, turn_id: &str, out: &mut Vec<Action>) {
-        let Some(turn) = self.turns.get_mut(turn_id) else { return };
+        let Some(turn) = self.turns.get_mut(turn_id) else {
+            return;
+        };
         turn.awaiting = false;
         let first_chunk = turn.texts.len();
         let mut listeners: Vec<String> = turn.listeners.keys().cloned().collect();
@@ -884,9 +954,13 @@ impl Core {
             return;
         }
         let member = report.member.as_str();
-        let Some(turn) = self.turns.get_mut(&report.turn_id) else { return };
+        let Some(turn) = self.turns.get_mut(&report.turn_id) else {
+            return;
+        };
         let end = turn.texts.len();
-        let Some(listen) = turn.listeners.get_mut(member) else { return };
+        let Some(listen) = turn.listeners.get_mut(member) else {
+            return;
+        };
         // Chunks wholly written; with a drained sender, also the chunk whose
         // audio so far has all been written (as the turn node counts).
         let mut counted = report.chunks_released as usize;
@@ -898,7 +972,10 @@ impl Core {
         listen.released_ms = listen.released_ms.max(report.released_ms);
         let Some(response) = listen.open else { return };
         let first = turn.responses[response - 1].min(end);
-        let (response_id, item_id) = (response_id(&report.turn_id, response), item_id(&report.turn_id, response));
+        let (response_id, item_id) = (
+            response_id(&report.turn_id, response),
+            item_id(&report.turn_id, response),
+        );
         for chunk in listen.sent_chunks.max(first)..counted {
             out.push(Action::Frame {
                 member: member.to_string(),
@@ -954,13 +1031,20 @@ impl Core {
     }
 
     fn turn_node(&self) -> Option<String> {
-        self.config.turn_node.clone().filter(|node| !node.is_empty())
+        self.config
+            .turn_node
+            .clone()
+            .filter(|node| !node.is_empty())
     }
 
     fn on_item_create(&mut self, member: &str, item: &Value, out: &mut Vec<Action>) {
         match item.get("type").and_then(Value::as_str) {
             Some("text-message") => {
-                let text = item.get("text").and_then(Value::as_str).unwrap_or_default().trim();
+                let text = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
                 if !text.is_empty() {
                     self.members
                         .entry(member.to_string())
@@ -1019,7 +1103,9 @@ impl Core {
                 .is_some_and(|turn| turn.awaiting && turn.owner.as_deref() == Some(member))
         });
         if let Some(turn_id) = awaiting.cloned() {
-            out.push(Action::HostEvent(json!({ "type": "response_create", "turn_id": turn_id })));
+            out.push(Action::HostEvent(
+                json!({ "type": "response_create", "turn_id": turn_id }),
+            ));
             self.continue_turn(&turn_id, out);
         }
         // Otherwise the pipeline's own turn detection starts turns.
@@ -1027,11 +1113,21 @@ impl Core {
 
     /// Apply the admitted fields of a `session-update`. Returns the fields no
     /// node of the pipeline accepts at runtime.
-    fn apply_session_config(&mut self, member: &str, config: &Value, out: &mut Vec<Action>) -> Vec<&'static str> {
-        let Some(config) = config.as_object() else { return Vec::new() };
+    fn apply_session_config(
+        &mut self,
+        member: &str,
+        config: &Value,
+        out: &mut Vec<Action>,
+    ) -> Vec<&'static str> {
+        let Some(config) = config.as_object() else {
+            return Vec::new();
+        };
         let mut ignored: Vec<&'static str> = Vec::new();
         let rpc = self.config.config_rpc.clone();
-        let apply = |node: &Option<String>, method: &Option<String>, value: &Value, out: &mut Vec<Action>| {
+        let apply = |node: &Option<String>,
+                     method: &Option<String>,
+                     value: &Value,
+                     out: &mut Vec<Action>| {
             match (node, method) {
                 (Some(node), Some(method)) => {
                     out.push(Action::Rpc {
@@ -1080,8 +1176,10 @@ impl Core {
                 }
                 "instructions" => {
                     let instructions = value.as_str().filter(|text| !text.trim().is_empty());
-                    self.members.entry(member.to_string()).or_default().instructions =
-                        instructions.map(str::to_string);
+                    self.members
+                        .entry(member.to_string())
+                        .or_default()
+                        .instructions = instructions.map(str::to_string);
                     // The turn node passes them on with the member's turns,
                     // typed or spoken, as `client_instructions`.
                     if let Some(node) = self.turn_node() {
@@ -1101,10 +1199,16 @@ impl Core {
     /// `input-audio-commit` / `input-audio-clear`: the browser ends or drops
     /// an utterance itself. Only when it turned server turn detection off.
     fn on_manual_turn(&mut self, member: &str, kind: &str, out: &mut Vec<Action>) {
-        if !self.members.get(member).is_some_and(|state| state.manual_turns) {
+        if !self
+            .members
+            .get(member)
+            .is_some_and(|state| state.manual_turns)
+        {
             return;
         }
-        let Some(node) = self.config.accumulator_node.clone() else { return };
+        let Some(node) = self.config.accumulator_node.clone() else {
+            return;
+        };
         let mut event = |start: bool| {
             out.push(Action::Publish {
                 node: node.clone(),
@@ -1136,8 +1240,9 @@ type SharedCore = Arc<parking_lot::Mutex<Core>>;
 
 /// The state the instances of one session's node share, by session and node.
 fn shared_core(session: &str, node: &str, config: &RealtimeEventsConfig) -> SharedCore {
-    static CORES: OnceLock<parking_lot::Mutex<HashMap<(String, String), Weak<parking_lot::Mutex<Core>>>>> =
-        OnceLock::new();
+    static CORES: OnceLock<
+        parking_lot::Mutex<HashMap<(String, String), Weak<parking_lot::Mutex<Core>>>>,
+    > = OnceLock::new();
     let mut cores = CORES.get_or_init(Default::default).lock();
     cores.retain(|_, core| core.strong_count() > 0);
     let key = (session.to_string(), node.to_string());
@@ -1154,7 +1259,11 @@ fn shared_core(session: &str, node: &str, config: &RealtimeEventsConfig) -> Shar
 /// The node id without the suffix of a per-participant instance.
 fn base_node_id(node_id: &str) -> &str {
     match node_id.rsplit_once("__p") {
-        Some((base, number)) if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) => base,
+        Some((base, number))
+            if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            base
+        }
         _ => node_id,
     }
 }
@@ -1203,12 +1312,16 @@ impl RealtimeEventsNode {
         self.core
             .get_or_init(|| {
                 let mut config = self.config.clone();
-                let descriptor = NodeRuntimeContext::of(ctx).and_then(|ctx| ctx.control.descriptor());
+                let descriptor =
+                    NodeRuntimeContext::of(ctx).and_then(|ctx| ctx.control.descriptor());
                 if let Some(descriptor) = descriptor {
-                    let turn = descriptor.nodes.iter().find(|node| match &config.turn_node {
-                        Some(id) => &node.id == id,
-                        None => node.node_type == crate::nodes::hosted_turn::HOSTED_TURN_NODE,
-                    });
+                    let turn = descriptor
+                        .nodes
+                        .iter()
+                        .find(|node| match &config.turn_node {
+                            Some(id) => &node.id == id,
+                            None => node.node_type == crate::nodes::hosted_turn::HOSTED_TURN_NODE,
+                        });
                     if let Some(turn) = turn {
                         config.turn_node.get_or_insert_with(|| turn.id.clone());
                         if config.endpoint.is_none() {
@@ -1226,7 +1339,11 @@ impl RealtimeEventsNode {
     }
 
     fn endpoint(&self, core: &SharedCore) -> Option<String> {
-        core.lock().config.endpoint.clone().filter(|endpoint| !endpoint.is_empty())
+        core.lock()
+            .config
+            .endpoint
+            .clone()
+            .filter(|endpoint| !endpoint.is_empty())
     }
 
     fn note(&self, origin: &Origin) {
@@ -1245,7 +1362,13 @@ impl RealtimeEventsNode {
 
     /// Follow what `member`'s WebRTC audio sender releases, for as long as
     /// this instance lives: the transcript deltas follow these reports.
-    fn follow_media(&self, member: &str, core: &SharedCore, control: &Arc<SessionControl>, emitter: Emitter) {
+    fn follow_media(
+        &self,
+        member: &str,
+        core: &SharedCore,
+        control: &Arc<SessionControl>,
+        emitter: Emitter,
+    ) {
         let mut media = control.subscribe_media();
         let member = member.to_string();
         let core = core.clone();
@@ -1258,7 +1381,8 @@ impl RealtimeEventsNode {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                let Some(MediaEvent::AudioReleased(report)) = MediaEvent::from_runtime(&data) else {
+                let Some(MediaEvent::AudioReleased(report)) = MediaEvent::from_runtime(&data)
+                else {
                     continue;
                 };
                 if report.member != member {
@@ -1339,7 +1463,9 @@ impl RealtimeEventsNode {
                     return;
                 };
                 let corr = self.corr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let opts = CallOptions::default().mode(RpcMode::FireAndForget).deadline_ms(5000);
+                let opts = CallOptions::default()
+                    .mode(RpcMode::FireAndForget)
+                    .deadline_ms(5000);
                 let mut request = remotemedia_traits::call::CallRequestEnvelope::new(
                     endpoint,
                     "event",
@@ -1366,7 +1492,8 @@ impl RealtimeEventsNode {
                         for action in actions {
                             match action {
                                 Action::Frame { member: to, frame } => {
-                                    emit_frame(&node_id, &emitter, fields.clone(), &to, frame).await;
+                                    emit_frame(&node_id, &emitter, fields.clone(), &to, frame)
+                                        .await;
                                 }
                                 // The same timer, again.
                                 Action::Timer { ms, .. } => wait = Some(ms),
@@ -1456,7 +1583,9 @@ impl AsyncStreamingNode for RealtimeEventsNode {
                     }
                 }
                 if TurnTag::from_metadata(&tags).is_some()
-                    && !self.audio_warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    && !self
+                        .audio_warned
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
                 {
                     tracing::warn!(
                         node = %self.node_id,
@@ -1477,7 +1606,10 @@ impl AsyncStreamingNode for RealtimeEventsNode {
             // turn's `ui` frames carry the turn's member, who may be
             // another one.)
             let own = rt_frame_event(&value).is_some() || vad_edge(&value).is_some();
-            if own && self.connection.get().is_none() && self.connection.set(origin.id().to_string()).is_ok() {
+            if own
+                && self.connection.get().is_none()
+                && self.connection.set(origin.id().to_string()).is_ok()
+            {
                 core.lock()
                     .connected(origin.id(), Admission::from_fields(origin.fields()));
                 if let Some(control) = control.as_ref() {
@@ -1495,13 +1627,15 @@ impl AsyncStreamingNode for RealtimeEventsNode {
             }
         } else if is_ui_frame(&value) {
             let to = addressed_to(origin.as_deref());
-            core.lock().on_ui(owner.as_deref(), to.as_deref(), &value, &mut actions);
+            core.lock()
+                .on_ui(owner.as_deref(), to.as_deref(), &value, &mut actions);
         } else if let (Some(start), Some(member)) = (vad_edge(&value), owner.as_deref()) {
             core.lock().on_vad(member, start, &mut actions);
         }
         if !actions.is_empty() {
             let emitter = Emitter::for_call(ctx);
-            self.perform(actions, &core, control.as_ref(), &emitter).await;
+            self.perform(actions, &core, control.as_ref(), &emitter)
+                .await;
         }
         Ok(0)
     }
@@ -1521,13 +1655,19 @@ impl StreamingNodeFactory for RealtimeEventsNodeFactory {
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        let params = if params.is_null() { json!({}) } else { params.clone() };
+        let params = if params.is_null() {
+            json!({})
+        } else {
+            params.clone()
+        };
         let config: RealtimeEventsConfig = serde_json::from_value(params).map_err(|error| {
-            Error::Execution(format!("{REALTIME_EVENTS_NODE} '{node_id}': invalid params: {error}"))
+            Error::Execution(format!(
+                "{REALTIME_EVENTS_NODE} '{node_id}': invalid params: {error}"
+            ))
         })?;
-        Ok(Box::new(AsyncNodeWrapper(Arc::new(RealtimeEventsNode::new(
-            node_id, config,
-        )))))
+        Ok(Box::new(AsyncNodeWrapper(Arc::new(
+            RealtimeEventsNode::new(node_id, config),
+        ))))
     }
 
     fn node_type(&self) -> &str {

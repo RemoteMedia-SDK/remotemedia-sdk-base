@@ -108,8 +108,7 @@ impl WorkerSharingConfig {
     /// node opts out with `__share__: false`, and opts in with `__share__: true`
     /// when `allow_manifest_opt_in` permits it (the node-type list still applies).
     pub fn applies_to(&self, node_type: &str, params: &Value) -> bool {
-        let listed =
-            self.node_types.is_empty() || self.node_types.iter().any(|t| t == node_type);
+        let listed = self.node_types.is_empty() || self.node_types.iter().any(|t| t == node_type);
         match params.get("__share__").and_then(Value::as_bool) {
             Some(false) => false,
             Some(true) => listed && (self.enabled || self.allow_manifest_opt_in),
@@ -134,7 +133,10 @@ fn stem_key(node_type: &str, spawn: &SpawnConfig) -> String {
 /// The full sharing key: the stem, the sharing scope (`__share_scope__`, for
 /// example a tenant; default the whole executor) and the declared parameters.
 fn sharing_key(stem: &str, names: &[String], params: &Value) -> String {
-    let scope = params.get("__share_scope__").map(Value::to_string).unwrap_or_default();
+    let scope = params
+        .get("__share_scope__")
+        .map(Value::to_string)
+        .unwrap_or_default();
     let values: Vec<Value> = names
         .iter()
         .map(|name| params.get(name).cloned().unwrap_or(Value::Null))
@@ -204,7 +206,9 @@ impl SharedWorkerPool {
             Some(None) => return Ok(None),
             Some(Some(names)) => names.clone(),
             None => {
-                let worker = self.start(node_type, String::new(), &stem, spawn.clone(), config).await?;
+                let worker = self
+                    .start(node_type, String::new(), &stem, spawn.clone(), config)
+                    .await?;
                 let Some(names) = worker.shareable.clone() else {
                     tracing::info!("{node_type} does not declare @shareable; running it unshared");
                     guard.names = Some(None);
@@ -236,10 +240,16 @@ impl SharedWorkerPool {
         }
         let worker = self.start(node_type, key, &stem, spawn, config).await?;
         if !worker.try_reserve(policy.max_sessions_per_worker) {
-            return Err(Error::Execution("shared worker refused its first session".into()));
+            return Err(Error::Execution(
+                "shared worker refused its first session".into(),
+            ));
         }
         // `guard` borrows from `stem`; re-borrow the list after the await.
-        guard.workers.get_mut(&worker.key()).unwrap().push(worker.clone());
+        guard
+            .workers
+            .get_mut(&worker.key())
+            .unwrap()
+            .push(worker.clone());
         Ok(Some(worker))
     }
 
@@ -327,7 +337,11 @@ impl Worker {
         let events_name = format!("worker/{id}/events");
         let mut channels = Vec::new();
         for name in [&commands_name, &events_name] {
-            channels.push(registry.create_channel(name, CONTROL_CAPACITY, false).await?);
+            channels.push(
+                registry
+                    .create_channel(name, CONTROL_CAPACITY, false)
+                    .await?,
+            );
             registry.create_wake_event(name).await?;
         }
 
@@ -373,11 +387,17 @@ impl Worker {
             let wait_ready = async {
                 while let Some(bytes) = event_rx.recv().await {
                     match serde_json::from_slice::<Value>(&bytes) {
-                        Ok(event) if event.get("event").and_then(Value::as_str) == Some("ready") => {
+                        Ok(event)
+                            if event.get("event").and_then(Value::as_str) == Some("ready") =>
+                        {
                             return Ok(event);
                         }
-                        Ok(event) => tracing::warn!("shared worker {id}: event before ready: {event}"),
-                        Err(error) => tracing::warn!("shared worker {id}: malformed event: {error}"),
+                        Ok(event) => {
+                            tracing::warn!("shared worker {id}: event before ready: {event}")
+                        }
+                        Err(error) => {
+                            tracing::warn!("shared worker {id}: malformed event: {error}")
+                        }
                     }
                 }
                 Err("event channel closed".to_string())
@@ -409,12 +429,15 @@ impl Worker {
                 )));
             }
         };
-        let shareable = ready.get("shareable").and_then(Value::as_array).map(|names| {
-            names
-                .iter()
-                .filter_map(|n| n.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        });
+        let shareable = ready
+            .get("shareable")
+            .and_then(Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| n.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            });
 
         let worker = Arc::new(Self {
             id: id.clone(),
@@ -427,7 +450,11 @@ impl Worker {
             attached: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
             idle_ttl: Duration::from_secs(
-                config.worker_sharing.clone().with_env_overrides().idle_ttl_secs,
+                config
+                    .worker_sharing
+                    .clone()
+                    .with_env_overrides()
+                    .idle_ttl_secs,
             ),
             commands: std::sync::Mutex::new(Some(command_tx)),
             lanes: std::sync::Mutex::new(HashMap::new()),
@@ -443,7 +470,9 @@ impl Worker {
                 let Some(worker) = weak.upgrade() else { break };
                 match serde_json::from_slice::<Value>(&bytes) {
                     Ok(event) => worker.dispatch(&event),
-                    Err(error) => tracing::warn!("shared worker {}: malformed event: {error}", worker.id),
+                    Err(error) => {
+                        tracing::warn!("shared worker {}: malformed event: {error}", worker.id)
+                    }
                 }
             }
         });
@@ -456,7 +485,11 @@ impl Worker {
             }
             let reason = death.borrow().clone().unwrap_or_default();
             if let Some(worker) = weak.upgrade() {
-                tracing::error!("shared worker {} ({}) died: {reason}", worker.id, worker.node_type);
+                tracing::error!(
+                    "shared worker {} ({}) died: {reason}",
+                    worker.id,
+                    worker.node_type
+                );
                 for lane in worker.lanes.lock().unwrap().values_mut() {
                     if let Some(attached) = lane.attached.take() {
                         let _ = attached.send(Err(reason.clone()));
@@ -497,7 +530,9 @@ impl Worker {
         }
         let reserved = self
             .attached
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max_sessions).then_some(n + 1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max_sessions).then_some(n + 1)
+            })
             .is_ok();
         if reserved {
             self.generation.fetch_add(1, Ordering::AcqRel);
@@ -517,7 +552,9 @@ impl Worker {
         tokio::spawn(async move {
             tokio::time::sleep(ttl).await;
             let Some(worker) = weak.upgrade() else { return };
-            let Some(stem) = worker.stem.upgrade() else { return };
+            let Some(stem) = worker.stem.upgrade() else {
+                return;
+            };
             let mut guard = stem.lock().await;
             if worker.attached.load(Ordering::Acquire) != 0
                 || worker.generation.load(Ordering::Acquire) != generation
@@ -528,7 +565,11 @@ impl Worker {
                 list.retain(|w| !Arc::ptr_eq(w, &worker));
             }
             drop(guard);
-            tracing::info!("shared worker {} idle for {:?}; shutting it down", worker.id, ttl);
+            tracing::info!(
+                "shared worker {} idle for {:?}; shutting it down",
+                worker.id,
+                ttl
+            );
             worker.shutdown().await;
         });
     }
@@ -539,18 +580,34 @@ impl Worker {
             .as_ref()
             .ok_or_else(|| Error::Execution(format!("shared worker {} is stopped", self.id)))?
             .send(command.to_string().into_bytes())
-            .map_err(|_| Error::Execution(format!("shared worker {} control thread is gone", self.id)))
+            .map_err(|_| {
+                Error::Execution(format!("shared worker {} control thread is gone", self.id))
+            })
     }
 
     fn dispatch(&self, event: &Value) {
-        let kind = event.get("event").and_then(Value::as_str).unwrap_or_default();
+        let kind = event
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let lane_id = (
-            event.get("session").and_then(Value::as_str).unwrap_or_default().to_string(),
-            event.get("node").and_then(Value::as_str).unwrap_or_default().to_string(),
+            event
+                .get("session")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            event
+                .get("node")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         );
         let mut lanes = self.lanes.lock().unwrap();
         let Some(lane) = lanes.get_mut(&lane_id) else {
-            tracing::debug!("shared worker {}: {kind} event for unknown lane {lane_id:?}", self.id);
+            tracing::debug!(
+                "shared worker {}: {kind} event for unknown lane {lane_id:?}",
+                self.id
+            );
             return;
         };
         match kind {
@@ -565,8 +622,15 @@ impl Worker {
                 }
             }
             "failed" => {
-                let error = event.get("error").and_then(Value::as_str).unwrap_or("lane failed").to_string();
-                tracing::error!("shared worker {}: lane {lane_id:?} failed: {error}", self.id);
+                let error = event
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("lane failed")
+                    .to_string();
+                tracing::error!(
+                    "shared worker {}: lane {lane_id:?} failed: {error}",
+                    self.id
+                );
                 if let Some(attached) = lane.attached.take() {
                     let _ = attached.send(Err(error.clone()));
                 }
@@ -604,7 +668,11 @@ impl Worker {
             }
             lanes.insert(
                 lane_id.clone(),
-                Lane { attached: Some(attached_tx), detached: None, failure: failure_tx },
+                Lane {
+                    attached: Some(attached_tx),
+                    detached: None,
+                    failure: failure_tx,
+                },
             );
         }
         let bootstrap = copy_authority
@@ -663,7 +731,11 @@ impl Worker {
         while self.process.exit_status().await.is_none() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if let Err(error) = self.manager.terminate_process(self.process.clone(), Duration::from_secs(1)).await {
+        if let Err(error) = self
+            .manager
+            .terminate_process(self.process.clone(), Duration::from_secs(1))
+            .await
+        {
             tracing::warn!("shared worker {}: {error}", self.id);
         }
         self.commands.lock().unwrap().take();
@@ -710,11 +782,19 @@ impl std::fmt::Debug for Lease {
 impl Lease {
     /// Why the lane failed, if it has (its node stopped, or the worker died).
     pub fn failure(&self) -> Option<String> {
-        self.failure.borrow().clone().or_else(|| self.worker.death.borrow().clone())
+        self.failure
+            .borrow()
+            .clone()
+            .or_else(|| self.worker.death.borrow().clone())
     }
 
     /// A receiver that resolves when the lane fails or the worker dies.
-    pub fn failure_watch(&self) -> (watch::Receiver<Option<String>>, watch::Receiver<Option<String>>) {
+    pub fn failure_watch(
+        &self,
+    ) -> (
+        watch::Receiver<Option<String>>,
+        watch::Receiver<Option<String>>,
+    ) {
         (self.failure.clone(), self.worker.death.clone())
     }
 
@@ -745,7 +825,10 @@ impl Lease {
             if tokio::time::timeout(DETACH_TIMEOUT, rx).await.is_err() {
                 tracing::warn!(
                     "shared worker {}: session {} node {} did not detach within {:?}",
-                    self.worker.id, self.session_id, self.node_id, DETACH_TIMEOUT
+                    self.worker.id,
+                    self.session_id,
+                    self.node_id,
+                    DETACH_TIMEOUT
                 );
             }
         }
@@ -848,7 +931,9 @@ fn spawn_control_thread(
                     match commands.try_recv() {
                         Ok(command) => {
                             if let Err(error) = publisher.send(&command) {
-                                tracing::error!("shared worker {worker_id}: command not sent: {error}");
+                                tracing::error!(
+                                    "shared worker {worker_id}: command not sent: {error}"
+                                );
                             }
                             let _ = notifier.notify();
                         }
@@ -875,18 +960,28 @@ fn spawn_control_thread(
                         }
                         Ok(None) => break,
                         Err(error) => {
-                            tracing::warn!("shared worker {worker_id}: event receive failed: {error:?}");
+                            tracing::warn!(
+                                "shared worker {worker_id}: event receive failed: {error:?}"
+                            );
                             break;
                         }
                     }
                 }
             }
         })
-        .map_err(|error| Error::Execution(format!("cannot start shared worker control thread: {error}")))?;
+        .map_err(|error| {
+            Error::Execution(format!(
+                "cannot start shared worker control thread: {error}"
+            ))
+        })?;
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(Error::IpcError(format!("shared worker control ports: {error}"))),
-        Err(_) => Err(Error::IpcError("shared worker control thread exited".into())),
+        Ok(Err(error)) => Err(Error::IpcError(format!(
+            "shared worker control ports: {error}"
+        ))),
+        Err(_) => Err(Error::IpcError(
+            "shared worker control thread exited".into(),
+        )),
     }
 }
 
@@ -898,7 +993,10 @@ mod tests {
     fn policy_is_off_by_default_and_honours_opt_out() {
         let policy = WorkerSharingConfig::default();
         assert!(!policy.applies_to("KokoroTTSNode", &serde_json::json!({})));
-        let policy = WorkerSharingConfig { enabled: true, ..Default::default() };
+        let policy = WorkerSharingConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(policy.applies_to("KokoroTTSNode", &serde_json::json!({})));
         assert!(!policy.applies_to("KokoroTTSNode", &serde_json::json!({"__share__": false})));
         let policy = WorkerSharingConfig {
@@ -919,10 +1017,22 @@ mod tests {
         let other_voice = serde_json::json!({"model": "a", "device": "cuda", "voice": "y"});
         let other_device = serde_json::json!({"model": "a", "device": "cpu", "voice": "x"});
         let tenant = serde_json::json!({"model": "a", "device": "cuda", "__share_scope__": "t1"});
-        assert_eq!(sharing_key(&stem, &names, &base), sharing_key(&stem, &names, &other_voice));
-        assert_ne!(sharing_key(&stem, &names, &base), sharing_key(&stem, &names, &other_device));
-        assert_ne!(sharing_key(&stem, &names, &base), sharing_key(&stem, &names, &tenant));
-        let other_env = SpawnConfig { python_executable: "other/python".into(), ..Default::default() };
+        assert_eq!(
+            sharing_key(&stem, &names, &base),
+            sharing_key(&stem, &names, &other_voice)
+        );
+        assert_ne!(
+            sharing_key(&stem, &names, &base),
+            sharing_key(&stem, &names, &other_device)
+        );
+        assert_ne!(
+            sharing_key(&stem, &names, &base),
+            sharing_key(&stem, &names, &tenant)
+        );
+        let other_env = SpawnConfig {
+            python_executable: "other/python".into(),
+            ..Default::default()
+        };
         assert_ne!(stem, stem_key("KokoroTTSNode", &other_env));
     }
 }

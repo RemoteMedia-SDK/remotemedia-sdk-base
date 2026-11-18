@@ -359,7 +359,8 @@ impl Default for SpawnConfig {
 /// Process manager for spawning and monitoring Python nodes
 pub struct ProcessManager {
     /// Each reporting service retains the exact initialization ledger until joined exit.
-    copy_authorities: Arc<std::sync::Mutex<HashMap<u32, Arc<super::copy_authority::CopyAuthority>>>>,
+    copy_authorities:
+        Arc<std::sync::Mutex<HashMap<u32, Arc<super::copy_authority::CopyAuthority>>>>,
     /// Active processes
     processes: Arc<RwLock<HashMap<u32, ProcessHandle>>>,
 
@@ -462,7 +463,9 @@ impl Drop for ProcessManager {
             move || {
                 let deadline = Instant::now() + grace;
                 while Instant::now() < deadline
-                    && waiting.iter().any(|worker| worker.exited_now() != Some(true))
+                    && waiting
+                        .iter()
+                        .any(|worker| worker.exited_now() != Some(true))
                 {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -538,7 +541,8 @@ impl ProcessManager {
         params: &Value,
         session_id: &str,
     ) -> Result<ProcessHandle> {
-        self.spawn_node_with_copy_context(node_type, node_id, params, session_id, None).await
+        self.spawn_node_with_copy_context(node_type, node_id, params, session_id, None)
+            .await
     }
 
     /// Native legacy launch with acknowledged reports to the retained host ledger.
@@ -550,9 +554,10 @@ impl ProcessManager {
         session_id: &str,
         copies: Option<remotemedia_types::CopyContext>,
     ) -> Result<ProcessHandle> {
-        let authority = copies.map(|copies| {
-            super::copy_authority::CopyAuthority::start(copies, node_id, session_id)
-        }).transpose().map_err(|error| Error::Execution(format!("Copy authority startup failed: {error}")))?;
+        let authority = copies
+            .map(|copies| super::copy_authority::CopyAuthority::start(copies, node_id, session_id))
+            .transpose()
+            .map_err(|error| Error::Execution(format!("Copy authority startup failed: {error}")))?;
         tracing::info!(
             "Spawning process for node: {} ({}) in session: {}",
             node_id,
@@ -563,7 +568,7 @@ impl ProcessManager {
             "--node-id".into(),
             node_id.into(),
             "--session-id".into(),
-            session_id.into(), // Pass session_id for channel naming
+            session_id.into(),       // Pass session_id for channel naming
             "--params-stdin".into(), // Signal that params come from stdin
         ];
         if authority.is_some() {
@@ -576,8 +581,15 @@ impl ProcessManager {
             }),
             None => params.clone(),
         };
-        self.spawn_runner(node_type, node_id, session_id, args, Some(bootstrap.to_string().into_bytes()), authority)
-            .await
+        self.spawn_runner(
+            node_type,
+            node_id,
+            session_id,
+            args,
+            Some(bootstrap.to_string().into_bytes()),
+            authority,
+        )
+        .await
     }
 
     /// Spawn a shared model worker (`runner --shared-worker-id`) for
@@ -585,11 +597,26 @@ impl ProcessManager {
     /// the worker-scoped channels `worker/{worker_id}/...`, which must exist
     /// before this is called. Its logs are recorded under the session label
     /// `shared-worker/{worker_id}`.
-    pub async fn spawn_shared_worker(&self, node_type: &str, worker_id: &str) -> Result<ProcessHandle> {
-        tracing::info!("Spawning shared worker {} for node type {}", worker_id, node_type);
+    pub async fn spawn_shared_worker(
+        &self,
+        node_type: &str,
+        worker_id: &str,
+    ) -> Result<ProcessHandle> {
+        tracing::info!(
+            "Spawning shared worker {} for node type {}",
+            worker_id,
+            node_type
+        );
         let args = vec!["--shared-worker-id".to_string(), worker_id.to_string()];
-        self.spawn_runner(node_type, node_type, &format!("shared-worker/{worker_id}"), args, None, None)
-            .await
+        self.spawn_runner(
+            node_type,
+            node_type,
+            &format!("shared-worker/{worker_id}"),
+            args,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Start `python -m remotemedia.core.multiprocessing.runner --node-type
@@ -612,7 +639,12 @@ impl ProcessManager {
         let mut command = Command::new(&spawn_config.python_executable);
 
         // Add multiprocess runner module
-        command.args(["-m", "remotemedia.core.multiprocessing.runner", "--node-type", node_type]);
+        command.args([
+            "-m",
+            "remotemedia.core.multiprocessing.runner",
+            "--node-type",
+            node_type,
+        ]);
         command.args(&args);
 
         // Add custom node registration modules
@@ -624,14 +656,22 @@ impl ProcessManager {
         // add-node-initiated-output); the worker then tags its frames.
         command.env(
             crate::multiprocess::python_wire::TURN_TAG_ENV,
-            if crate::multiprocess::python_wire::turn_tags_enabled() { "1" } else { "0" },
+            if crate::multiprocess::python_wire::turn_tags_enabled() {
+                "1"
+            } else {
+                "0"
+            },
         );
 
         // This host tells a worker when its session starts (openspec:
         // add-source-node-lifecycle); a node's `background()` waits for it.
         command.env(
             crate::multiprocess::python_wire::START_ENV,
-            if crate::multiprocess::python_wire::start_signal_enabled() { "1" } else { "0" },
+            if crate::multiprocess::python_wire::start_signal_enabled() {
+                "1"
+            } else {
+                "0"
+            },
         );
 
         // Set environment variables
@@ -686,7 +726,11 @@ impl ProcessManager {
         }
 
         // Configure I/O
-        command.stdin(if stdin_payload.is_some() { Stdio::piped() } else { Stdio::null() });
+        command.stdin(if stdin_payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         let capture_output = spawn_config.capture_output;
         if capture_output {
             command.stdout(Stdio::piped());
@@ -740,17 +784,25 @@ impl ProcessManager {
             use std::io::Write;
             // Always close stdin, including null parameters. On failure reap the
             // newly spawned child before releasing its reporting capability.
-            let result = child.stdin.take().ok_or_else(|| std::io::Error::other("missing child stdin"))
+            let result = child
+                .stdin
+                .take()
+                .ok_or_else(|| std::io::Error::other("missing child stdin"))
                 .and_then(|mut stdin| stdin.write_all(&payload));
             if let Err(error) = result {
                 tree.kill();
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(Error::Execution(format!("Failed to write child bootstrap: {error}")));
+                return Err(Error::Execution(format!(
+                    "Failed to write child bootstrap: {error}"
+                )));
             }
         }
         if let Some(authority) = authority {
-            self.copy_authorities.lock().unwrap().insert(pid, Arc::new(authority));
+            self.copy_authorities
+                .lock()
+                .unwrap()
+                .insert(pid, Arc::new(authority));
         }
 
         // Create process handle
@@ -848,13 +900,23 @@ impl ProcessManager {
         // The worker exited; end anything it left behind in its tree.
         process.tree.kill();
         if let Some(child) = process.inner.lock().await.as_mut() {
-            child.wait().map_err(|error| Error::Execution(format!("Failed to confirm process exit: {error}")))?;
+            child.wait().map_err(|error| {
+                Error::Execution(format!("Failed to confirm process exit: {error}"))
+            })?;
         }
-        let authority = self.copy_authorities.lock().unwrap().get(&process.id).cloned();
+        let authority = self
+            .copy_authorities
+            .lock()
+            .unwrap()
+            .get(&process.id)
+            .cloned();
         let accounting_ok = if let Some(authority) = authority {
-            tokio::task::spawn_blocking(move || authority.finish()).await
+            tokio::task::spawn_blocking(move || authority.finish())
+                .await
                 .is_ok_and(|result| result.is_ok())
-        } else { true };
+        } else {
+            true
+        };
         // Termination succeeded even if forced shutdown interrupted reporting.
         // Preserve that distinction in status and the failed-operation ledger.
         let mut status = process.status.write().await;
@@ -912,7 +974,10 @@ impl ProcessManager {
             let mut reporting_failed = false;
             loop {
                 if !reporting_failed {
-                    reporting_failed = copy_authorities.lock().unwrap().get(&process.id)
+                    reporting_failed = copy_authorities
+                        .lock()
+                        .unwrap()
+                        .get(&process.id)
                         .is_some_and(|authority| authority.failed());
                     if reporting_failed {
                         // An idle worker must not survive loss of its reporting authority.
@@ -924,12 +989,18 @@ impl ProcessManager {
                     // Process exited
                     let authority = copy_authorities.lock().unwrap().get(&process.id).cloned();
                     let accounting_ok = if let Some(authority) = authority {
-                        tokio::task::spawn_blocking(move || authority.finish()).await
+                        tokio::task::spawn_blocking(move || authority.finish())
+                            .await
                             .is_ok_and(|result| result.is_ok())
-                    } else { true };
+                    } else {
+                        true
+                    };
                     copy_authorities.lock().unwrap().remove(&process.id);
                     let reason = if !accounting_ok {
-                        tracing::error!("Python copy accounting did not close cleanly for node {}", process.node_id);
+                        tracing::error!(
+                            "Python copy accounting did not close cleanly for node {}",
+                            process.node_id
+                        );
                         ExitReason::Error(-1)
                     } else if exit_status.success() {
                         ExitReason::Normal
@@ -1084,7 +1155,10 @@ mod tests {
             super::python_path_with_inherited(&configured, Some(&inherited)),
             ["client-src", "my-nodes", "more"].join(sep)
         );
-        assert_eq!(super::python_path_with_inherited(&configured, None), "client-src");
+        assert_eq!(
+            super::python_path_with_inherited(&configured, None),
+            "client-src"
+        );
     }
 
     use super::*;
@@ -1107,7 +1181,8 @@ mod tests {
                     return false;
                 };
                 let mut code = 0u32;
-                let running = GetExitCodeProcess(process, &mut code).is_ok() && code == STILL_ACTIVE;
+                let running =
+                    GetExitCodeProcess(process, &mut code).is_ok() && code == STILL_ACTIVE;
                 let _ = CloseHandle(process);
                 running
             }
@@ -1146,7 +1221,10 @@ mod tests {
             {
                 break pid;
             }
-            assert!(Instant::now() < deadline, "worker did not start its grandchild");
+            assert!(
+                Instant::now() < deadline,
+                "worker did not start its grandchild"
+            );
             std::thread::sleep(Duration::from_millis(20));
         };
         assert!(alive(grandchild));
@@ -1156,7 +1234,10 @@ mod tests {
     fn assert_ends(pid: u32) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while alive(pid) {
-            assert!(Instant::now() < deadline, "process {pid} survived its worker's tree");
+            assert!(
+                Instant::now() < deadline,
+                "process {pid} survived its worker's tree"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -1169,7 +1250,10 @@ mod tests {
         use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
         let node = format!("node-{}", std::process::id());
-        assert!(!win_job::request_stop("stop-test", &node), "nothing listens yet");
+        assert!(
+            !win_job::request_stop("stop-test", &node),
+            "nothing listens yet"
+        );
         let name: Vec<u16> = win_job::stop_event_name("stop-test", &node)
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -1247,7 +1331,9 @@ pub(crate) fn no_window_flag() -> Option<u32> {
         fn GetConsoleWindow() -> *mut core::ffi::c_void;
     }
     // SAFETY: takes no arguments; returns this process's console window or null.
-    unsafe { GetConsoleWindow() }.is_null().then_some(0x0800_0000)
+    unsafe { GetConsoleWindow() }
+        .is_null()
+        .then_some(0x0800_0000)
 }
 
 /// Each Python node worker on Windows is the only member of its own job object,
@@ -1306,7 +1392,9 @@ mod win_job {
                     &info as *const _ as *const core::ffi::c_void,
                     std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 ) {
-                    tracing::warn!("Python worker {pid} may outlive its node: job setup failed: {e}");
+                    tracing::warn!(
+                        "Python worker {pid} may outlive its node: job setup failed: {e}"
+                    );
                     let _ = CloseHandle(job);
                     return None;
                 }
@@ -1366,11 +1454,15 @@ mod win_job {
                 tracing::error!("cannot resume Python worker {pid}: thread snapshot failed");
                 return;
             };
-            let mut entry = THREADENTRY32 { dwSize: std::mem::size_of::<THREADENTRY32>() as u32, ..Default::default() };
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
             let mut ok = Thread32First(snap, &mut entry).is_ok();
             while ok {
                 if entry.th32OwnerProcessID == pid {
-                    if let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
+                    if let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
+                    {
                         ResumeThread(thread);
                         let _ = CloseHandle(thread);
                     }

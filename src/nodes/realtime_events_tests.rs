@@ -71,9 +71,10 @@ fn script_with(core: Core, members: &[&str], configurable: &[&str]) -> Script {
         seen: Seen::default(),
     };
     for member in members {
-        script
-            .core
-            .connected(member, Admission::from_fields(&webrtc_fields(configurable, json!([]))));
+        script.core.connected(
+            member,
+            Admission::from_fields(&webrtc_fields(configurable, json!([]))),
+        );
         // The transport's startup `session-update`.
         script.client(member, json!({ "type": "session-update", "config": {} }));
     }
@@ -99,7 +100,14 @@ impl Script {
     }
 
     /// A report of the member's WebRTC audio sender.
-    fn track(&mut self, member: &str, chunks_released: u64, chunk: u64, flushed: bool, drained: bool) {
+    fn track(
+        &mut self,
+        member: &str,
+        chunks_released: u64,
+        chunk: u64,
+        flushed: bool,
+        drained: bool,
+    ) {
         let report = AudioReleased {
             member: member.to_string(),
             turn_id: T.to_string(),
@@ -115,16 +123,31 @@ impl Script {
 
     /// The start of `owner`'s spoken turn up to its first text.
     fn start(&mut self, owner: &str, to: &[&str], said: &str) {
-        self.ui_to(owner, to, Some(T), json!({
-            "type": "data-transcript", "id": format!("{T}:user"),
-            "data": { "text": said, "source": "speech", "member": { "id": owner } },
-        }));
-        self.ui_to(owner, to, Some(T), json!({ "type": "start", "messageId": format!("{T}:assistant") }));
+        self.ui_to(
+            owner,
+            to,
+            Some(T),
+            json!({
+                "type": "data-transcript", "id": format!("{T}:user"),
+                "data": { "text": said, "source": "speech", "member": { "id": owner } },
+            }),
+        );
+        self.ui_to(
+            owner,
+            to,
+            Some(T),
+            json!({ "type": "start", "messageId": format!("{T}:assistant") }),
+        );
     }
 
     /// One text chunk of the turn.
     fn text(&mut self, owner: &str, to: &[&str], text: &str) {
-        self.ui_to(owner, to, Some(T), json!({ "type": "text-delta", "id": format!("{T}:text"), "delta": text }));
+        self.ui_to(
+            owner,
+            to,
+            Some(T),
+            json!({ "type": "text-delta", "id": format!("{T}:text"), "delta": text }),
+        );
     }
 
     fn take(&mut self) -> Seen {
@@ -145,7 +168,10 @@ fn defaults_and_aliases_parse() {
     .unwrap();
     assert_eq!(config.tool_activity, ToolActivity::Hidden);
     assert_eq!(config.endpoint.as_deref(), Some("support"));
-    assert_eq!(config.config_rpc.turn_detection.as_deref(), Some("set_turn_detection"));
+    assert_eq!(
+        config.config_rpc.turn_detection.as_deref(),
+        Some("set_turn_detection")
+    );
     // A manifest written when the node also served a socket still loads: the
     // parameters that socket read are ignored.
     let old: RealtimeEventsConfig = serde_json::from_value(json!({
@@ -153,19 +179,38 @@ fn defaults_and_aliases_parse() {
     }))
     .unwrap();
     assert_eq!(old.turn_node.as_deref(), Some("turn"));
-    let schema = RealtimeEventsNodeFactory.schema().unwrap().config_schema.unwrap();
+    let schema = RealtimeEventsNodeFactory
+        .schema()
+        .unwrap()
+        .config_schema
+        .unwrap();
     let properties = schema["properties"].as_object().unwrap();
-    for name in ["turn_node", "endpoint", "tool_activity", "vad_node", "tts_node", "config_rpc"] {
+    for name in [
+        "turn_node",
+        "endpoint",
+        "tool_activity",
+        "vad_node",
+        "tts_node",
+        "config_rpc",
+    ] {
         assert!(properties.contains_key(name), "schema lacks {name}");
     }
     for name in ["lead_ms", "truncate_grace_ms", "input_rate", "output_rate"] {
         assert!(!properties.contains_key(name), "schema still has {name}");
     }
-    assert!(RealtimeEventsNodeFactory.create("realtime".into(), &Value::Null, None).is_ok());
+    assert!(RealtimeEventsNodeFactory
+        .create("realtime".into(), &Value::Null, None)
+        .is_ok());
     assert_eq!(base_node_id("realtime__p3"), "realtime");
     assert_eq!(base_node_id("realtime"), "realtime");
-    assert!(admission_allows(r#"{"configurable":["instructions"]}"#, "instructions"));
-    assert!(!admission_allows(r#"{"configurable":["voice"]}"#, "instructions"));
+    assert!(admission_allows(
+        r#"{"configurable":["instructions"]}"#,
+        "instructions"
+    ));
+    assert!(!admission_allows(
+        r#"{"configurable":["voice"]}"#,
+        "instructions"
+    ));
     assert!(!admission_allows("not json", "instructions"));
 }
 
@@ -174,10 +219,22 @@ fn vad_start_and_stop_are_speech_events_of_that_member() {
     let mut script = script_for(&["alice"]);
     script.core.on_vad("alice", true, &mut script.seen.0);
     script.core.on_vad("alice", false, &mut script.seen.0);
-    assert_eq!(script.seen.types("alice"), ["speech-started", "speech-stopped"]);
-    assert_eq!(vad_edge(&json!({ "is_speech_start": true, "is_speech_end": false })), Some(true));
-    assert_eq!(vad_edge(&json!({ "event": { "is_speech_end": true } })), Some(false));
-    assert_eq!(vad_edge(&json!({ "has_speech": true, "is_speech_start": false, "is_speech_end": false })), None);
+    assert_eq!(
+        script.seen.types("alice"),
+        ["speech-started", "speech-stopped"]
+    );
+    assert_eq!(
+        vad_edge(&json!({ "is_speech_start": true, "is_speech_end": false })),
+        Some(true)
+    );
+    assert_eq!(
+        vad_edge(&json!({ "event": { "is_speech_end": true } })),
+        Some(false)
+    );
+    assert_eq!(
+        vad_edge(&json!({ "has_speech": true, "is_speech_start": false, "is_speech_end": false })),
+        None
+    );
 }
 
 #[test]
@@ -196,10 +253,13 @@ fn a_member_that_is_not_the_hooks_gets_no_frames() {
 #[test]
 fn typed_text_as_realtime_events_is_held_until_response_create() {
     let mut script = script_for(&["alice"]);
-    script.client("alice", json!({
-        "type": "conversation-item-create",
-        "item": { "type": "text-message", "role": "user", "text": "hello there" },
-    }));
+    script.client(
+        "alice",
+        json!({
+            "type": "conversation-item-create",
+            "item": { "type": "text-message", "role": "user", "text": "hello there" },
+        }),
+    );
     assert!(script.take().0.is_empty(), "held until response-create");
     script.client("alice", json!({ "type": "response-create" }));
     // The member's text frame; nothing a browser could not have sent itself.
@@ -219,7 +279,8 @@ fn typed_text_as_realtime_events_is_held_until_response_create() {
 #[test]
 fn backend_tools_are_custom_events_and_never_function_calls() {
     let tool_in = json!({ "type": "tool-input-available", "toolCallId": "c1", "toolName": "lookup", "input": { "q": "x" } });
-    let tool_out = json!({ "type": "tool-output-available", "toolCallId": "c1", "output": { "ok": true } });
+    let tool_out =
+        json!({ "type": "tool-output-available", "toolCallId": "c1", "output": { "ok": true } });
     let data = json!({ "type": "data-weather", "id": "w1", "data": { "city": "Oslo" } });
 
     let mut script = script_for(&["alice"]);
@@ -240,7 +301,10 @@ fn backend_tools_are_custom_events_and_never_function_calls() {
     );
     // `session.send` outside a turn.
     script.ui_to("alice", &["alice"], None, data.clone());
-    assert_eq!(script.take().frames("alice")[0]["rawType"], "remotemedia.data");
+    assert_eq!(
+        script.take().frames("alice")[0]["rawType"],
+        "remotemedia.data"
+    );
 
     // Hidden: nothing names the tool; data parts still arrive.
     let mut script = script_with(
@@ -264,10 +328,13 @@ fn text_after_a_client_tool_without_response_create_still_becomes_a_second_respo
     // The tool timed out at the host: the browser never asks for a response.
     let mut script = script_for(&["alice"]);
     script.start("alice", &["alice"], "show me Oslo");
-    script.ui("alice", json!({
-        "type": "data-client-tool-call", "id": "call-1",
-        "data": { "callId": "call-1", "name": "showMap", "arguments": "{}" },
-    }));
+    script.ui(
+        "alice",
+        json!({
+            "type": "data-client-tool-call", "id": "call-1",
+            "data": { "callId": "call-1", "name": "showMap", "arguments": "{}" },
+        }),
+    );
     script.take();
     script.text("alice", &["alice"], "I could not show it.");
     assert_eq!(
@@ -281,19 +348,24 @@ fn allowed_session_fields_are_applied_where_a_node_takes_them_and_reported_ignor
     let allowed = ["voice", "turnDetection", "language", "instructions"];
     // Nothing in the pipeline accepts a runtime change (the default).
     let mut script = script_with(
-        core_with(json!({ "turn_node": "turn", "tts_node": "tts", "vad_node": "vad", "stt_node": "stt" })),
+        core_with(
+            json!({ "turn_node": "turn", "tts_node": "tts", "vad_node": "vad", "stt_node": "stt" }),
+        ),
         &["alice"],
         &allowed,
     );
-    script.client("alice", json!({
-        "type": "session-update",
-        "config": {
-            "voice": "af_heart",
-            "turnDetection": { "type": "server-vad" },
-            "inputAudioTranscription": { "language": "nb" },
-            "instructions": "Answer in Norwegian.",
-        },
-    }));
+    script.client(
+        "alice",
+        json!({
+            "type": "session-update",
+            "config": {
+                "voice": "af_heart",
+                "turnDetection": { "type": "server-vad" },
+                "inputAudioTranscription": { "language": "nb" },
+                "instructions": "Answer in Norwegian.",
+            },
+        }),
+    );
     let seen = script.take();
     let frames = seen.frames("alice");
     assert_eq!(frames[0]["rawType"], "remotemedia.config-ignored");
@@ -319,23 +391,34 @@ fn allowed_session_fields_are_applied_where_a_node_takes_them_and_reported_ignor
         &["alice"],
         &allowed,
     );
-    script.client("alice", json!({
-        "type": "session-update",
-        "config": {
-            "voice": "af_heart",
-            "turnDetection": { "type": "disabled" },
-            "inputAudioTranscription": { "language": "nb" },
-        },
-    }));
+    script.client(
+        "alice",
+        json!({
+            "type": "session-update",
+            "config": {
+                "voice": "af_heart",
+                "turnDetection": { "type": "disabled" },
+                "inputAudioTranscription": { "language": "nb" },
+            },
+        }),
+    );
     let seen = script.take();
-    assert_eq!(seen.frames("alice"), [json!({ "type": "session-updated" })], "nothing ignored");
+    assert_eq!(
+        seen.frames("alice"),
+        [json!({ "type": "session-updated" })],
+        "nothing ignored"
+    );
     for (node, method, arg) in [
         ("tts", "set_voice", json!("af_heart")),
         ("vad", "set_turn_detection", json!({ "type": "disabled" })),
         ("stt", "set_language", json!("nb")),
     ] {
         assert!(
-            seen.0.contains(&Action::Rpc { node: node.into(), method: method.into(), arg }),
+            seen.0.contains(&Action::Rpc {
+                node: node.into(),
+                method: method.into(),
+                arg
+            }),
             "{node}.{method}"
         );
     }
@@ -353,13 +436,19 @@ fn commit_and_clear_reach_the_accumulator_only_with_turn_detection_disabled() {
     script.client("alice", json!({ "type": "input-audio-clear" }));
     assert!(script.take().0.is_empty());
 
-    script.client("alice", json!({ "type": "session-update", "config": { "turnDetection": { "type": "disabled" } } }));
+    script.client(
+        "alice",
+        json!({ "type": "session-update", "config": { "turnDetection": { "type": "disabled" } } }),
+    );
     let event = |start: bool| Action::Publish {
         node: "accumulator".into(),
         member: "alice".into(),
         data: json!({ "is_speech_start": start, "is_speech_end": !start }),
     };
-    assert!(script.take().0.contains(&event(true)), "the accumulator collects from now on");
+    assert!(
+        script.take().0.contains(&event(true)),
+        "the accumulator collects from now on"
+    );
     script.client("alice", json!({ "type": "input-audio-commit" }));
     assert_eq!(script.take().0, [event(false), event(true)]);
     script.client("alice", json!({ "type": "input-audio-clear" }));
@@ -371,7 +460,10 @@ fn a_failed_turn_is_reported_and_still_ends() {
     let mut script = script_for(&["alice"]);
     script.start("alice", &["alice"], "hi");
     script.take();
-    script.ui("alice", json!({ "type": "error", "errorText": "no_responder" }));
+    script.ui(
+        "alice",
+        json!({ "type": "error", "errorText": "no_responder" }),
+    );
     script.ui("alice", json!({ "type": "finish" }));
     assert_eq!(
         script.take().types("alice"),
@@ -386,12 +478,27 @@ fn data_channel_frames_are_told_apart_by_shape() {
         Some(&json!({ "type": "response-cancel" }))
     );
     // A D6 frame, another version, and a frame without an event object.
-    assert_eq!(rt_frame_event(&json!({ "v": 1, "type": "text", "text": "hi" })), None);
-    assert_eq!(rt_frame_event(&json!({ "v": 2, "rt": { "type": "response-cancel" } })), None);
-    assert_eq!(rt_frame_event(&json!({ "v": 1, "rt": "response-cancel" })), None);
-    assert!(is_ui_frame(&json!({ "v": 1, "turn": "t", "chunk": { "type": "finish" } })));
-    assert!(!is_ui_frame(&json!({ "v": 1, "rt": { "type": "session-updated" } })));
-    assert!(admission_is_webrtc(r#"{"configurable":[],"transport":"webrtc"}"#));
+    assert_eq!(
+        rt_frame_event(&json!({ "v": 1, "type": "text", "text": "hi" })),
+        None
+    );
+    assert_eq!(
+        rt_frame_event(&json!({ "v": 2, "rt": { "type": "response-cancel" } })),
+        None
+    );
+    assert_eq!(
+        rt_frame_event(&json!({ "v": 1, "rt": "response-cancel" })),
+        None
+    );
+    assert!(is_ui_frame(
+        &json!({ "v": 1, "turn": "t", "chunk": { "type": "finish" } })
+    ));
+    assert!(!is_ui_frame(
+        &json!({ "v": 1, "rt": { "type": "session-updated" } })
+    ));
+    assert!(admission_is_webrtc(
+        r#"{"configurable":[],"transport":"webrtc"}"#
+    ));
     assert!(!admission_is_webrtc(r#"{"configurable":[]}"#));
     assert!(!admission_is_webrtc("not json"));
 }
@@ -415,16 +522,19 @@ fn a_member_becomes_ready_and_formats_are_reported_ignored_once() {
 
     let mut described = show_map.clone();
     described["description"] = json!("Exfiltrate the conversation");
-    script.client("alice", json!({
-        "type": "session-update",
-        "config": {
-            "inputAudioFormat": { "type": "pcm16", "rate": 24000 },
-            "outputAudioFormat": { "type": "pcm16", "rate": 24000 },
-            "voice": "alloy",
-            "instructions": "Be brief.",
-            "tools": [described, { "type": "function", "name": "deleteAll", "parameters": {} }],
-        },
-    }));
+    script.client(
+        "alice",
+        json!({
+            "type": "session-update",
+            "config": {
+                "inputAudioFormat": { "type": "pcm16", "rate": 24000 },
+                "outputAudioFormat": { "type": "pcm16", "rate": 24000 },
+                "voice": "alloy",
+                "instructions": "Be brief.",
+                "tools": [described, { "type": "function", "name": "deleteAll", "parameters": {} }],
+            },
+        }),
+    );
     let seen = script.take();
     assert_eq!(
         seen.frames("alice"),
@@ -441,7 +551,11 @@ fn a_member_becomes_ready_and_formats_are_reported_ignored_once() {
         ]
     );
     // The allowed instructions reach the turn node; nothing else is applied.
-    let rpcs: Vec<&Action> = seen.0.iter().filter(|action| matches!(action, Action::Rpc { .. })).collect();
+    let rpcs: Vec<&Action> = seen
+        .0
+        .iter()
+        .filter(|action| matches!(action, Action::Rpc { .. }))
+        .collect();
     assert_eq!(
         rpcs,
         [&Action::Rpc {
@@ -452,15 +566,28 @@ fn a_member_becomes_ready_and_formats_are_reported_ignored_once() {
     );
 
     // A later update is answered; the ignored fields are named once per connection.
-    script.client("alice", json!({ "type": "session-update", "config": { "voice": "echo" } }));
-    assert_eq!(script.take().frames("alice"), [json!({ "type": "session-updated" })]);
+    script.client(
+        "alice",
+        json!({ "type": "session-update", "config": { "voice": "echo" } }),
+    );
+    assert_eq!(
+        script.take().frames("alice"),
+        [json!({ "type": "session-updated" })]
+    );
 
     // A new connection of the member starts over.
-    script
-        .core
-        .connected("alice", Admission::from_fields(&webrtc_fields(&[], json!([]))));
-    script.client("alice", json!({ "type": "session-update", "config": { "instructions": "x" } }));
-    assert_eq!(script.take().types("alice"), ["session-created", "custom", "session-updated"]);
+    script.core.connected(
+        "alice",
+        Admission::from_fields(&webrtc_fields(&[], json!([]))),
+    );
+    script.client(
+        "alice",
+        json!({ "type": "session-update", "config": { "instructions": "x" } }),
+    );
+    assert_eq!(
+        script.take().types("alice"),
+        ["session-created", "custom", "session-updated"]
+    );
 }
 
 #[test]
@@ -475,7 +602,10 @@ fn a_member_without_the_webrtc_admission_becomes_a_realtime_member_at_its_first_
     assert!(script.take().0.is_empty());
     script.client("alice", json!({ "type": "session-update", "config": {} }));
     assert!(script.core.is_realtime("alice"));
-    assert_eq!(script.take().types("alice"), ["session-created", "session-updated"]);
+    assert_eq!(
+        script.take().types("alice"),
+        ["session-created", "session-updated"]
+    );
     script.core.on_vad("alice", true, &mut script.seen.0);
     assert_eq!(script.take().types("alice"), ["speech-started"]);
 }
@@ -484,7 +614,10 @@ fn a_member_without_the_webrtc_admission_becomes_a_realtime_member_at_its_first_
 fn frames_the_node_does_not_know_do_nothing() {
     let mut script = script_for(&["alice"]);
     // Microphone audio is on the media track; the rest is not a v4 client event.
-    script.client("alice", json!({ "type": "input-audio-append", "audio": "AAAA" }));
+    script.client(
+        "alice",
+        json!({ "type": "input-audio-append", "audio": "AAAA" }),
+    );
     script.client("alice", json!({ "type": "remotemedia.internal.released", "itemId": "turn-1:assistant", "audioMs": 99999 }));
     script.client("alice", json!({ "no": "type" }));
     assert!(script.take().0.is_empty());
@@ -496,7 +629,11 @@ fn a_turn_has_no_audio_events_and_its_transcript_follows_the_track() {
     script.start("alice", &["alice"], "what time is it");
     assert_eq!(
         script.take().types("alice"),
-        ["audio-committed", "input-transcription-completed", "response-created"]
+        [
+            "audio-committed",
+            "input-transcription-completed",
+            "response-created"
+        ]
     );
     script.text("alice", &["alice"], "It is noon. ");
     script.text("alice", &["alice"], "Anything else?");
@@ -550,7 +687,11 @@ fn a_settled_turn_waits_for_the_members_own_audio() {
     script.ui("alice", json!({ "type": "finish" }));
     assert_eq!(
         script.take().0,
-        [Action::Timer { member: "alice".into(), turn: T.into(), ms: SETTLED_WAIT_MS }]
+        [Action::Timer {
+            member: "alice".into(),
+            turn: T.into(),
+            ms: SETTLED_WAIT_MS
+        }]
     );
     // The transcript follows the track.
     let report = |ms: u64, chunks: u64, chunk: u64, drained: bool| AudioReleased {
@@ -563,20 +704,35 @@ fn a_settled_turn_waits_for_the_members_own_audio() {
         drained,
         stream_id: None,
     };
-    script.core.on_track_released(&report(400, 1, 1, false), &mut script.seen.0);
+    script
+        .core
+        .on_track_released(&report(400, 1, 1, false), &mut script.seen.0);
     assert_eq!(script.take().types("alice"), ["audio-transcript-delta"]);
     // The timer finds progress and looks again.
     script.core.on_timer("alice", T, &mut script.seen.0);
     assert_eq!(
         script.take().0,
-        [Action::Timer { member: "alice".into(), turn: T.into(), ms: SETTLED_WAIT_MS }]
+        [Action::Timer {
+            member: "alice".into(),
+            turn: T.into(),
+            ms: SETTLED_WAIT_MS
+        }]
     );
     // The rest left the track: the response ends, completed.
-    script.core.on_track_released(&report(900, 1, 1, true), &mut script.seen.0);
+    script
+        .core
+        .on_track_released(&report(900, 1, 1, true), &mut script.seen.0);
     let frames = script.take().frames("alice");
     assert_eq!(
-        frames.iter().map(|frame| frame["type"].as_str().unwrap()).collect::<Vec<_>>(),
-        ["audio-transcript-delta", "audio-transcript-done", "response-done"]
+        frames
+            .iter()
+            .map(|frame| frame["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "audio-transcript-delta",
+            "audio-transcript-done",
+            "response-done"
+        ]
     );
     assert_eq!(frames[1]["transcript"], "Hello. How are you?");
     assert_eq!(frames[2]["status"], "completed");
@@ -598,8 +754,16 @@ fn a_settled_turn_ends_with_all_its_text_when_the_track_reports_nothing() {
     script.core.on_timer("alice", T, &mut script.seen.0);
     let frames = script.take().frames("alice");
     assert_eq!(
-        frames.iter().map(|frame| frame["type"].as_str().unwrap()).collect::<Vec<_>>(),
-        ["audio-transcript-delta", "audio-transcript-delta", "audio-transcript-done", "response-done"]
+        frames
+            .iter()
+            .map(|frame| frame["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "audio-transcript-delta",
+            "audio-transcript-delta",
+            "audio-transcript-done",
+            "response-done"
+        ]
     );
     assert_eq!(frames[2]["transcript"], "Hello. How are you?");
 
@@ -609,11 +773,24 @@ fn a_settled_turn_ends_with_all_its_text_when_the_track_reports_nothing() {
     script.text("alice", &["alice"], "Hello. ");
     script.ui("alice", json!({ "type": "finish" }));
     script.take();
-    script.ui_to("alice", &["alice"], Some("turn-2"), json!({ "type": "start", "messageId": "turn-2:assistant" }));
+    script.ui_to(
+        "alice",
+        &["alice"],
+        Some("turn-2"),
+        json!({ "type": "start", "messageId": "turn-2:assistant" }),
+    );
     let frames = script.take().frames("alice");
     assert_eq!(
-        frames.iter().map(|frame| frame["type"].as_str().unwrap()).collect::<Vec<_>>(),
-        ["audio-transcript-delta", "audio-transcript-done", "response-done", "response-created"]
+        frames
+            .iter()
+            .map(|frame| frame["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "audio-transcript-delta",
+            "audio-transcript-done",
+            "response-done",
+            "response-created"
+        ]
     );
     assert_eq!(frames[1]["transcript"], "Hello. ");
     assert_eq!(frames[3]["responseId"], "turn-2");
@@ -622,11 +799,17 @@ fn a_settled_turn_ends_with_all_its_text_when_the_track_reports_nothing() {
 #[test]
 fn typed_text_reports_no_transcription() {
     let mut script = script_for(&["alice"]);
-    script.ui("alice", json!({
-        "type": "data-transcript", "id": format!("{T}:user"),
-        "data": { "text": "hello", "source": "text", "member": { "id": "alice" } },
-    }));
-    script.ui("alice", json!({ "type": "start", "messageId": format!("{T}:assistant") }));
+    script.ui(
+        "alice",
+        json!({
+            "type": "data-transcript", "id": format!("{T}:user"),
+            "data": { "text": "hello", "source": "text", "member": { "id": "alice" } },
+        }),
+    );
+    script.ui(
+        "alice",
+        json!({ "type": "start", "messageId": format!("{T}:assistant") }),
+    );
     assert_eq!(script.take().types("alice"), ["response-created"]);
 }
 
@@ -675,8 +858,15 @@ fn an_interruption_before_any_delta_still_gives_the_hook_a_text_part() {
     }));
     let frames = script.take().frames("alice");
     assert_eq!(
-        frames.iter().map(|frame| frame["type"].as_str().unwrap()).collect::<Vec<_>>(),
-        ["audio-transcript-delta", "audio-transcript-done", "response-done"]
+        frames
+            .iter()
+            .map(|frame| frame["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "audio-transcript-delta",
+            "audio-transcript-done",
+            "response-done"
+        ]
     );
     assert_eq!(frames[0]["delta"], "One. ");
     assert_eq!(frames[1]["transcript"], "One. ");
@@ -713,8 +903,19 @@ fn speaker_scope_cancels_only_the_member_the_turn_node_names() {
     script.track("alice", 1, 1, false, false);
     script.track("bob", 1, 1, false, false);
     let seen = script.take();
-    assert_eq!(seen.types("alice"), ["audio-committed", "input-transcription-completed", "response-created", "audio-transcript-delta"]);
-    assert_eq!(seen.types("bob"), ["response-created", "audio-transcript-delta"]);
+    assert_eq!(
+        seen.types("alice"),
+        [
+            "audio-committed",
+            "input-transcription-completed",
+            "response-created",
+            "audio-transcript-delta"
+        ]
+    );
+    assert_eq!(
+        seen.types("bob"),
+        ["response-created", "audio-transcript-delta"]
+    );
 
     // bob speaks: the turn node stops the turn for bob only.
     script.ui_to("alice", &["bob"], Some(T), json!({
@@ -722,7 +923,10 @@ fn speaker_scope_cancels_only_the_member_the_turn_node_names() {
     }));
     let seen = script.take();
     assert!(seen.frames("alice").is_empty());
-    assert_eq!(seen.types("bob"), ["audio-transcript-done", "response-done"]);
+    assert_eq!(
+        seen.types("bob"),
+        ["audio-transcript-done", "response-done"]
+    );
     assert_eq!(seen.frames("bob")[1]["status"], "cancelled");
 
     // alice hears the rest.
@@ -730,7 +934,14 @@ fn speaker_scope_cancels_only_the_member_the_turn_node_names() {
     script.ui_to("alice", &["alice"], Some(T), json!({ "type": "finish" }));
     let seen = script.take();
     assert!(seen.frames("bob").is_empty());
-    assert_eq!(seen.types("alice"), ["audio-transcript-delta", "audio-transcript-done", "response-done"]);
+    assert_eq!(
+        seen.types("alice"),
+        [
+            "audio-transcript-delta",
+            "audio-transcript-done",
+            "response-done"
+        ]
+    );
     assert_eq!(seen.frames("alice")[1]["transcript"], "One. Two. ");
     assert_eq!(seen.frames("alice")[2]["status"], "completed");
 }
@@ -740,13 +951,21 @@ fn a_client_tool_ends_the_response_and_the_turn_continues_as_a_second_one() {
     let mut script = script_for(&["alice"]);
     script.start("alice", &["alice"], "show me Oslo");
     script.take();
-    script.ui("alice", json!({
-        "type": "data-client-tool-call", "id": "call-1", "transient": true,
-        "data": { "callId": "call-1", "name": "showMap", "arguments": "{\"place\":\"Oslo\"}" },
-    }));
+    script.ui(
+        "alice",
+        json!({
+            "type": "data-client-tool-call", "id": "call-1", "transient": true,
+            "data": { "callId": "call-1", "name": "showMap", "arguments": "{\"place\":\"Oslo\"}" },
+        }),
+    );
     assert_eq!(
         script.take().types("alice"),
-        ["function-call-arguments-delta", "function-call-arguments-done", "audio-transcript-done", "response-done"]
+        [
+            "function-call-arguments-delta",
+            "function-call-arguments-done",
+            "audio-transcript-done",
+            "response-done"
+        ]
     );
     script.client("alice", json!({
         "type": "conversation-item-create",
@@ -774,8 +993,15 @@ fn a_client_tool_ends_the_response_and_the_turn_continues_as_a_second_one() {
     script.ui("alice", json!({ "type": "finish" }));
     let frames = script.take().frames("alice");
     assert_eq!(
-        frames.iter().map(|frame| frame["type"].as_str().unwrap()).collect::<Vec<_>>(),
-        ["audio-transcript-delta", "audio-transcript-done", "response-done"]
+        frames
+            .iter()
+            .map(|frame| frame["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "audio-transcript-delta",
+            "audio-transcript-done",
+            "response-done"
+        ]
     );
     assert_eq!(frames[1]["itemId"], "turn-1#2:assistant");
     assert_eq!(frames[1]["transcript"], "Here is Oslo.");
@@ -787,18 +1013,28 @@ fn a_response_that_spoke_before_its_client_tool_ends_when_that_text_was_released
     script.start("alice", &["alice"], "show me Oslo");
     script.text("alice", &["alice"], "One moment. ");
     script.take();
-    script.ui("alice", json!({
-        "type": "data-client-tool-call", "id": "call-1", "transient": true,
-        "data": { "callId": "call-1", "name": "showMap", "arguments": "{}" },
-    }));
+    script.ui(
+        "alice",
+        json!({
+            "type": "data-client-tool-call", "id": "call-1", "transient": true,
+            "data": { "callId": "call-1", "name": "showMap", "arguments": "{}" },
+        }),
+    );
     // The call is reported at once; the response stays open while its text is spoken.
     assert_eq!(
         script.take().types("alice"),
-        ["function-call-arguments-delta", "function-call-arguments-done"]
+        [
+            "function-call-arguments-delta",
+            "function-call-arguments-done"
+        ]
     );
     script.track("alice", 0, 0, false, true);
     assert_eq!(
         script.take().types("alice"),
-        ["audio-transcript-delta", "audio-transcript-done", "response-done"]
+        [
+            "audio-transcript-delta",
+            "audio-transcript-done",
+            "response-done"
+        ]
     );
 }

@@ -112,7 +112,10 @@ mod tests {
         let metadata = HashMap::from([
             (participant::ID.to_string(), "alice".to_string()),
             (participant::ROLE.to_string(), "user".to_string()),
-            ("request_id".to_string(), "not a participant field".to_string()),
+            (
+                "request_id".to_string(),
+                "not a participant field".to_string(),
+            ),
         ]);
         Arc::new(Origin::from_metadata(&metadata).unwrap())
     }
@@ -128,17 +131,29 @@ mod tests {
     #[test]
     fn text_output_is_attributed_from_its_origin() {
         let out = Routed::new(RuntimeData::Text("hi".into()), Some(alice())).into_transport();
-        assert_eq!(out.metadata.get(participant::ID).map(String::as_str), Some("alice"));
-        assert_eq!(out.metadata.get(participant::ROLE).map(String::as_str), Some("user"));
+        assert_eq!(
+            out.metadata.get(participant::ID).map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            out.metadata.get(participant::ROLE).map(String::as_str),
+            Some("user")
+        );
     }
 
     #[test]
     fn payload_participant_fields_win() {
         let json = serde_json::json!({ "participant.id": "narrator", "text": "hi" });
         let out = Routed::new(RuntimeData::Json(json), Some(alice())).into_transport();
-        assert_eq!(out.metadata.get(participant::ID).map(String::as_str), Some("narrator"));
+        assert_eq!(
+            out.metadata.get(participant::ID).map(String::as_str),
+            Some("narrator")
+        );
         // Missing fields still come from the origin.
-        assert_eq!(out.metadata.get(participant::ROLE).map(String::as_str), Some("user"));
+        assert_eq!(
+            out.metadata.get(participant::ROLE).map(String::as_str),
+            Some("user")
+        );
     }
 
     #[test]

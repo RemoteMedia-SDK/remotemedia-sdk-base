@@ -667,7 +667,10 @@ impl WarmSessionPool {
                 }
 
                 // Cold-build outside the lock.
-                let result = this.executor.cold_build_parked_session(manifest.clone()).await;
+                let result = this
+                    .executor
+                    .cold_build_parked_session(manifest.clone())
+                    .await;
 
                 match result {
                     Ok(handle) => {
@@ -675,9 +678,8 @@ impl WarmSessionPool {
                         // retained cap to the freshly-built session.
                         if let Some(control) = this.executor.control_bus().get(&handle.session_id) {
                             control.set_system_retained_cap(this.config.system_retained_cap);
-                            control.set_phase(
-                                crate::transport::session_control::SessionPhase::Warm,
-                            );
+                            control
+                                .set_phase(crate::transport::session_control::SessionPhase::Warm);
                         }
                         let should_continue = {
                             let mut state = this.state.lock().await;

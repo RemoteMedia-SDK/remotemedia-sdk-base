@@ -28,8 +28,8 @@ pub use config::{
     SipRateLimitConfig, TelephonyTransportConfig,
 };
 pub use error::{Error, Result};
-pub use media_loop::{CallAudioSender, CallMedia};
 pub use hermes::{CallControlCommand, HermesToolState, TelephonyHermesEvent};
+pub use media_loop::{CallAudioSender, CallMedia};
 pub use metrics::{CallMetrics, RtpCounters};
 pub use plugin::TelephonyTransportPlugin;
 pub use rtp::{RtpMediaSession, RtpOutboundMediaSession, RtpPacket};

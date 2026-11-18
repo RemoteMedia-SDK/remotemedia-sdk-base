@@ -52,11 +52,12 @@ use crate::adapters::{
 use crate::generated::{
     execute_response::Outcome, pipeline_execution_service_client::PipelineExecutionServiceClient,
     stream_control::Command, stream_request::Request as StreamRequestKind,
-    stream_response::Response as StreamResponseKind, streaming_pipeline_service_client::
-        StreamingPipelineServiceClient, DataChunk, EmbeddedPluginBlob, EmbeddedInterpreter as ProtoEmbeddedInterpreter,
+    stream_response::Response as StreamResponseKind,
+    streaming_pipeline_service_client::StreamingPipelineServiceClient, DataChunk,
+    EmbeddedInterpreter as ProtoEmbeddedInterpreter, EmbeddedPluginBlob,
     EmbeddedPythonEnv as ProtoEmbeddedPythonEnv, EmbeddedWheel as ProtoEmbeddedWheel,
-    ExecuteRequest, ExecuteResponse,
-    ExecutionStatus, PipelineManifest, StreamControl, StreamInit, StreamRequest, StreamResponse,
+    ExecuteRequest, ExecuteResponse, ExecutionStatus, PipelineManifest, StreamControl, StreamInit,
+    StreamRequest, StreamResponse,
 };
 
 /// Bound on the outbound streaming chunk queue. Sends block when the server
@@ -498,9 +499,7 @@ impl ClientStreamSession for GrpcStreamSession {
                 .message()
                 .await
                 .map_err(|s| Error::Transport(format!("StreamPipeline receive failed: {}", s)))?
-                .ok_or_else(|| {
-                    Error::Transport("stream ended without StreamClosed".to_string())
-                })?;
+                .ok_or_else(|| Error::Transport("stream ended without StreamClosed".to_string()))?;
 
             match message.response {
                 Some(StreamResponseKind::Ready(ready)) => {

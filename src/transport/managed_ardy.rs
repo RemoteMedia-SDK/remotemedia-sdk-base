@@ -56,11 +56,19 @@ impl ManagedArdyDaemons {
             }
             let config: Config =
                 serde_json::from_value(raw.clone()).map_err(|e| Error::Execution(e.to_string()))?;
-            if config.scene.is_some() && !manifest.nodes.iter().any(|renderer| {
-                renderer.node_type == "CcRenderNode"
-                    && renderer.params.pointer("/avatar_session/motion_node").and_then(|v| v.as_str()) == Some(node.id.as_str())
-            }) {
-                return Err(Error::Execution("scene daemon requires a bound CcRenderNode".into()));
+            if config.scene.is_some()
+                && !manifest.nodes.iter().any(|renderer| {
+                    renderer.node_type == "CcRenderNode"
+                        && renderer
+                            .params
+                            .pointer("/avatar_session/motion_node")
+                            .and_then(|v| v.as_str())
+                            == Some(node.id.as_str())
+                })
+            {
+                return Err(Error::Execution(
+                    "scene daemon requires a bound CcRenderNode".into(),
+                ));
             }
             let key = raw.to_string();
             let mut daemons = self.0.lock().await;
@@ -77,7 +85,11 @@ impl ManagedArdyDaemons {
             }
             node.params["ardy_socket"] = daemons[&key].socket.to_string_lossy().into_owned().into();
             if let Some(scene) = &config.scene {
-                scene_bindings.push((node.id.clone(), daemons[&key].directory.join("scene.key"), scene.renderer_geometry.clone()));
+                scene_bindings.push((
+                    node.id.clone(),
+                    daemons[&key].directory.join("scene.key"),
+                    scene.renderer_geometry.clone(),
+                ));
             }
             node.params
                 .as_object_mut()
@@ -88,15 +100,26 @@ impl ManagedArdyDaemons {
             let mut bound = false;
             for renderer in &mut prepared.nodes {
                 if renderer.node_type == "CcRenderNode"
-                    && renderer.params.pointer("/avatar_session/motion_node").and_then(|v| v.as_str()) == Some(motion_node.as_str()) {
-                    renderer.params["scene_key_file"] = key_file.to_string_lossy().into_owned().into();
+                    && renderer
+                        .params
+                        .pointer("/avatar_session/motion_node")
+                        .and_then(|v| v.as_str())
+                        == Some(motion_node.as_str())
+                {
+                    renderer.params["scene_key_file"] =
+                        key_file.to_string_lossy().into_owned().into();
                     if let Some(path) = &geometry_file {
-                        renderer.params["scene_geometry_file"] = path.to_string_lossy().into_owned().into();
+                        renderer.params["scene_geometry_file"] =
+                            path.to_string_lossy().into_owned().into();
                     }
                     bound = true;
                 }
             }
-            if !bound { return Err(Error::Execution("scene daemon requires a bound CcRenderNode".into())); }
+            if !bound {
+                return Err(Error::Execution(
+                    "scene daemon requires a bound CcRenderNode".into(),
+                ));
+            }
         }
         Ok(prepared)
     }
@@ -114,21 +137,33 @@ async fn start(config: &Config) -> Result<Daemon> {
     let mut command = Command::new(&config.python);
     command.arg("-u").arg(&config.script);
     if let Some(scene) = &config.scene {
-        use std::{io::{Read, Write}, os::unix::fs::OpenOptionsExt};
+        use std::{
+            io::{Read, Write},
+            os::unix::fs::OpenOptionsExt,
+        };
         let mut key = [0_u8; 32];
         let provision = (|| -> std::io::Result<()> {
             std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
-            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
                 .open(directory.join("scene.key"))?;
             file.write_all(&key)
         })();
         if let Err(error) = provision {
             let _ = std::fs::remove_dir_all(&directory);
-            return Err(Error::Execution(format!("scene key provisioning failed: {error}")));
+            return Err(Error::Execution(format!(
+                "scene key provisioning failed: {error}"
+            )));
         }
-        command.arg("--scene-profile").arg(&scene.profile)
-            .arg("--scene-avatar").arg(&scene.avatar)
-            .arg("--scene-key-file").arg(directory.join("scene.key"));
+        command
+            .arg("--scene-profile")
+            .arg(&scene.profile)
+            .arg("--scene-avatar")
+            .arg(&scene.avatar)
+            .arg("--scene-key-file")
+            .arg(directory.join("scene.key"));
     }
     let child = command
         .arg("--socket")
@@ -178,9 +213,13 @@ async fn start(config: &Config) -> Result<Daemon> {
                     "ARDY daemon returned invalid readiness".into(),
                 ));
             }
-            if config.scene.is_some() && (ready["scene_sampler"]["protocol"] != 3
-                || ready["scene_sampler"]["authenticated_context"] != true) {
-                return Err(Error::Execution("ARDY scene sampler did not register authenticated context".into()));
+            if config.scene.is_some()
+                && (ready["scene_sampler"]["protocol"] != 3
+                    || ready["scene_sampler"]["authenticated_context"] != true)
+            {
+                return Err(Error::Execution(
+                    "ARDY scene sampler did not register authenticated context".into(),
+                ));
             }
             return Ok(daemon);
         }
@@ -231,7 +270,10 @@ while True:
         let prepared = owner.prepare(&manifest).await.unwrap();
         let key = PathBuf::from(prepared.nodes[1].params["scene_key_file"].as_str().unwrap());
         assert_eq!(std::fs::read(&key).unwrap().len(), 32);
-        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(prepared.nodes[2].params.get("scene_key_file").is_none());
         assert!(prepared.nodes[0].params.get("scene_key_file").is_none());
         drop(owner);

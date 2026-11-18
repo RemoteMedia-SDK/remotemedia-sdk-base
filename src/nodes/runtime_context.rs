@@ -100,7 +100,10 @@ impl CallCancel {
     /// The request to forward across a boundary once the token fired: the
     /// router's request if it recorded one, else the token's cancellation as
     /// final.
-    pub fn forwarded(&self, cancellation: &remotemedia_traits::Cancellation) -> remotemedia_traits::CancelRequest {
+    pub fn forwarded(
+        &self,
+        cancellation: &remotemedia_traits::Cancellation,
+    ) -> remotemedia_traits::CancelRequest {
         self.request
             .get()
             .copied()

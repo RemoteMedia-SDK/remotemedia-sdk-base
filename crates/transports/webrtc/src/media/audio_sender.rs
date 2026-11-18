@@ -20,7 +20,9 @@ use webrtc::media::Sample;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use remotemedia_core::transport::session_control::{MediaClock, SessionControl};
-use remotemedia_core::transport::turn_audio::{AudioReleased, ReleaseReport, ReleaseTracker, TurnTag};
+use remotemedia_core::transport::turn_audio::{
+    AudioReleased, ReleaseReport, ReleaseTracker, TurnTag,
+};
 
 /// Per-stream media_clock publisher. Attached to an AudioSender via
 /// [`AudioSender::with_media_clock`]; when present, the transmission
@@ -126,7 +128,9 @@ impl ReleaseReporter {
         member: impl AsRef<str>,
         stream_id: impl AsRef<str>,
     ) -> Self {
-        Self::new(member, stream_id, move |report| control.publish_audio_released(report))
+        Self::new(member, stream_id, move |report| {
+            control.publish_audio_released(report)
+        })
     }
 
     fn publish(&self, reports: &mut Vec<ReleaseReport>) {
@@ -301,7 +305,10 @@ impl AudioRingBuffer {
         let before = buffer.iter().filter(|frame| !frame.mark).count();
         let mut discarded = Vec::new();
         buffer.retain(|frame| {
-            let of_turn = frame.tag.as_ref().is_some_and(|tag| &*tag.turn_id == turn_id);
+            let of_turn = frame
+                .tag
+                .as_ref()
+                .is_some_and(|tag| &*tag.turn_id == turn_id);
             if of_turn {
                 discarded.push(frame.clone());
             }

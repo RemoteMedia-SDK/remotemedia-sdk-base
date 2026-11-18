@@ -45,16 +45,17 @@ impl EmitSink {
             self.emitter.body_finished();
             return;
         }
-        let data = match crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(
-            frame,
-            &self.copies,
-        ) {
-            Ok(data) => data,
-            Err(error) => {
-                tracing::error!(node_id = %self.node_id, "emitted frame could not be decoded: {error}");
-                return;
-            }
-        };
+        let data =
+            match crate::multiprocess::data_transfer::from_owned_python_wire_with_copy_context(
+                frame,
+                &self.copies,
+            ) {
+                Ok(data) => data,
+                Err(error) => {
+                    tracing::error!(node_id = %self.node_id, "emitted frame could not be decoded: {error}");
+                    return;
+                }
+            };
         let origin = match origin {
             EmitTag::Default => EmitOrigin::Default,
             EmitTag::Unattributed => EmitOrigin::Unattributed,
@@ -206,7 +207,9 @@ async fn drain_abandoned(
             match tokio::time::timeout(timeout, responses.recv()).await {
                 Ok(Some(IpcResponse::OutputData(frame))) if is_end_of_input(&frame) => break true,
                 Ok(Some(IpcResponse::Error(_))) => break true,
-                Ok(Some(IpcResponse::Tagged { frame, .. })) if is_end_of_input(&frame) => break true,
+                Ok(Some(IpcResponse::Tagged { frame, .. })) if is_end_of_input(&frame) => {
+                    break true
+                }
                 Ok(Some(_)) => continue,
                 Ok(None) | Err(_) => break false,
             }
@@ -237,7 +240,10 @@ where
     S: std::future::Future<Output = Result<()>>,
     F: FnMut(RuntimeData) -> Result<()> + Send,
 {
-    run_turn(responses, turns, timeouts, node_id, send, decode, callback, None).await
+    run_turn(
+        responses, turns, timeouts, node_id, send, decode, callback, None,
+    )
+    .await
 }
 
 /// One received response, as this turn sees it.
@@ -251,7 +257,11 @@ enum Seen {
 /// Sort a response: forward an emitted frame, drop another turn's frame.
 async fn sort(response: IpcResponse, turn: Option<&Turn<'_>>) -> Seen {
     match response {
-        IpcResponse::Tagged { seq: 0, origin, frame } => {
+        IpcResponse::Tagged {
+            seq: 0,
+            origin,
+            frame,
+        } => {
             if let Some(sink) = turn.and_then(|turn| turn.emits) {
                 sink.deliver(frame, origin).await;
             }
@@ -290,7 +300,10 @@ where
     // From here on the worker owns this input and will end it with EndOfInput.
     // A tagged turn that ends early needs no bookkeeping: its frames carry
     // its sequence number.
-    let guard = TurnGuard { turns, armed: turn.is_none() };
+    let guard = TurnGuard {
+        turns,
+        armed: turn.is_none(),
+    };
 
     loop {
         let response = match tokio::time::timeout(timeouts.send_ack, responses.recv()).await {

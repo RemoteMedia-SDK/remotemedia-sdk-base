@@ -133,10 +133,12 @@ impl FfiNodeFactory for DeclaringFactory {
             instance_scope: Some("shared".into()),
             capability_behavior: Some(crate::capabilities::CapabilityBehavior::Configured),
             media_capabilities: Some(crate::capabilities::MediaCapabilities::with_output(
-                crate::capabilities::MediaConstraints::Audio(crate::capabilities::AudioConstraints {
-                    sample_rate: Some(crate::capabilities::ConstraintValue::Exact(rate)),
-                    ..Default::default()
-                }),
+                crate::capabilities::MediaConstraints::Audio(
+                    crate::capabilities::AudioConstraints {
+                        sample_rate: Some(crate::capabilities::ConstraintValue::Exact(rate)),
+                        ..Default::default()
+                    },
+                ),
             )),
             ..Default::default()
         }
@@ -147,8 +149,12 @@ impl FfiNodeFactory for DeclaringFactory {
 
 async fn executor() -> PipelineExecutor {
     let executor = PipelineExecutor::new().unwrap();
-    executor.register_factory(wrap_ffi_factory(PluginFactory)).await;
-    executor.register_factory(wrap_ffi_factory(DeclaringFactory)).await;
+    executor
+        .register_factory(wrap_ffi_factory(PluginFactory))
+        .await;
+    executor
+        .register_factory(wrap_ffi_factory(DeclaringFactory))
+        .await;
     executor
 }
 
@@ -197,7 +203,10 @@ async fn a_plugin_body_emits_and_its_return_finishes_a_self_driven_plugin_node()
         assert_eq!(next(&mut session).await, (format!("body-{n}"), None));
     }
     let end = tokio::time::timeout(Duration::from_secs(5), session.recv_output()).await;
-    assert!(matches!(end, Ok(Ok(None))), "the session did not end: {end:?}");
+    assert!(
+        matches!(end, Ok(Ok(None))),
+        "the session did not end: {end:?}"
+    );
     assert!(session.wait().await.is_ok());
 }
 
@@ -216,7 +225,10 @@ async fn a_plugin_body_that_fails_is_a_failure_of_the_node() {
         .expect("the session ended")
         .expect_err("the session failed")
         .to_string();
-    assert!(error.contains("plugin") && error.contains("plugin body sentinel"), "{error}");
+    assert!(
+        error.contains("plugin") && error.contains("plugin body sentinel"),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -229,10 +241,16 @@ async fn a_plugin_reads_the_origin_of_an_input_and_emits_with_it_later() {
     let alice = session
         .join_participant(Participant::new("alice", participant::role::USER))
         .unwrap();
-    alice.send(TransportData::new(RuntimeData::Text("remember".into()))).await.unwrap();
+    alice
+        .send(TransportData::new(RuntimeData::Text("remember".into())))
+        .await
+        .unwrap();
     assert_eq!(
         next(&mut session).await,
-        ("remembered Some(\"alice\")".to_string(), Some("alice".to_string()))
+        (
+            "remembered Some(\"alice\")".to_string(),
+            Some("alice".to_string())
+        )
     );
     // An input from nobody; the emitted frame still goes out as alice.
     session
@@ -245,7 +263,10 @@ async fn a_plugin_reads_the_origin_of_an_input_and_emits_with_it_later() {
         seen,
         [
             ("ack".to_string(), None),
-            ("for the one I remember".to_string(), Some("alice".to_string())),
+            (
+                "for the one I remember".to_string(),
+                Some("alice".to_string())
+            ),
         ]
     );
     session.close().await.unwrap();
@@ -288,5 +309,8 @@ async fn a_plugin_factory_declares_its_node_before_creating_it() {
     assert_eq!(next(&mut session).await.0, "body-0");
     assert_eq!(next(&mut session).await.0, "body-1");
     let end = tokio::time::timeout(Duration::from_secs(5), session.recv_output()).await;
-    assert!(matches!(end, Ok(Ok(None))), "the session did not end: {end:?}");
+    assert!(
+        matches!(end, Ok(Ok(None))),
+        "the session did not end: {end:?}"
+    );
 }

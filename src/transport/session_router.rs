@@ -45,8 +45,8 @@ use children::Children;
 mod call_cancel;
 mod input_queue;
 mod partition;
-pub(crate) use partition::ParticipantEvent;
 use input_queue::InputQueue;
+pub(crate) use partition::ParticipantEvent;
 #[cfg(test)]
 mod cancellation_tests;
 #[cfg(test)]
@@ -73,8 +73,8 @@ use crate::telemetry::node_logs::node_span;
 use crate::telemetry::{approx_payload_bytes, QueueCapacity, SessionDescriptor, SessionTelemetry};
 use crate::transport::origin::Routed;
 use crate::transport::perf_aggregator::PerfAggregator;
-use crate::transport::TransportData;
 use crate::transport::session_control::{aux_port_of, CloseReason, SessionControl, BARGE_IN_PORT};
+use crate::transport::TransportData;
 use crate::{Error, Result};
 use parking_lot::RwLock as DriftRwLock;
 use std::collections::HashMap;
@@ -654,9 +654,12 @@ struct Successor {
 /// The payload of an output a node emitted on a named stream port.
 fn port_payload(data: &RuntimeData) -> RuntimeData {
     match data {
-        RuntimeData::Json(value) => {
-            RuntimeData::Json(value.get("payload").cloned().unwrap_or(serde_json::Value::Null))
-        }
+        RuntimeData::Json(value) => RuntimeData::Json(
+            value
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ),
         other => other.clone(),
     }
 }
@@ -960,7 +963,9 @@ impl SessionRouter {
     pub fn set_ingress_budget(&self, budget: remotemedia_types::BufferBudget) -> Result<()> {
         self.input_tx
             .as_ref()
-            .ok_or_else(|| Error::ConfigError("ingress budget cannot be bound after router start".into()))?
+            .ok_or_else(|| {
+                Error::ConfigError("ingress budget cannot be bound after router start".into())
+            })?
             .bind_budget(budget)
     }
 
@@ -1008,7 +1013,8 @@ impl SessionRouter {
     fn validate_instance_scopes(&self) -> Result<()> {
         for (node_id, node) in &self.cached_nodes {
             let spec = self.manifest.nodes.iter().find(|n| &n.id == node_id);
-            if self.instance_scope(spec, node.as_ref()) == crate::nodes::InstanceScope::PerParticipant
+            if self.instance_scope(spec, node.as_ref())
+                == crate::nodes::InstanceScope::PerParticipant
                 && !matches!(node.pacing_nature(), crate::nodes::PacingNature::Reactive)
             {
                 return Err(Error::ConfigError(format!(
@@ -1210,12 +1216,12 @@ impl SessionRouter {
                 .and_then(|contracts| contracts.get(&node_spec.id))
                 .and_then(Option::as_ref)
             {
-                let allocator = remotemedia_types::BoundOutputAllocator::new(
-                    self.output_allocator.clone(),
-                );
+                let allocator =
+                    remotemedia_types::BoundOutputAllocator::new(self.output_allocator.clone());
                 let allocator = match contract.retention {
                     Some(limit) => allocator.with_budget(remotemedia_types::BufferBudget::new(
-                        limit.owners, limit.bytes,
+                        limit.owners,
+                        limit.bytes,
                     )),
                     None => allocator,
                 };
@@ -1483,7 +1489,12 @@ impl SessionRouter {
             .iter()
             .map(|(id, node)| {
                 let spec = self.manifest.nodes.iter().find(|n| &n.id == id);
-                (id.clone(), self.instance_scope(spec, node.as_ref()).as_str().to_string())
+                (
+                    id.clone(),
+                    self.instance_scope(spec, node.as_ref())
+                        .as_str()
+                        .to_string(),
+                )
             })
             .collect();
         self.descriptor.set_instance_scopes(&scopes);
@@ -1544,11 +1555,8 @@ impl SessionRouter {
     /// connection is checked. Mismatches involving a discovered (device)
     /// format fail startup, all of them in one error.
     async fn propagate_runtime_capabilities(&mut self) -> Result<()> {
-        let outcome = super::caps_handshake::negotiate(
-            &self.session_id,
-            &self.manifest,
-            &self.cached_nodes,
-        );
+        let outcome =
+            super::caps_handshake::negotiate(&self.session_id, &self.manifest, &self.cached_nodes);
         for w in &outcome.warnings {
             tracing::warn!(session_id = %self.session_id, "capability handshake: {w}");
         }
@@ -1575,8 +1583,10 @@ impl SessionRouter {
                 "Pipeline formats do not fit ({} problems):
 - {}",
                 outcome.errors.len(),
-                outcome.errors.join("
-- ")
+                outcome.errors.join(
+                    "
+- "
+                )
             )
         }))
     }
@@ -2030,41 +2040,43 @@ impl SessionRouter {
                     let node_live = node_live.clone();
                     let start = self.start.clone();
                     let on_cancel = spec.on_cancel;
-                    Arc::new(move |node: Box<dyn StreamingNode>,
-                                   input_rx: mpsc::Receiver<Routed>,
-                                   emitter: crate::nodes::Emitter,
-                                   participant: Option<Arc<crate::transport::origin::Origin>>,
-                                   primary: bool| {
-                        Self::spawn_node_pipeline(
-                            output_allocator.clone(),
-                            materialization.clone(),
-                            node_id.clone(),
-                            node,
-                            input_rx,
-                            succ_txs.clone(),
-                            snap_inputs.clone(),
-                            client.clone(),
-                            session_id.clone(),
-                            scheduler.clone(),
-                            control.clone(),
-                            probes.clone(),
-                            perf.clone(),
-                            NodeTelemetryHandle {
-                                tel: tel.clone(),
-                                idx: node_idx,
-                                egress_edge,
-                                input_weak: input_weak.clone(),
-                            },
-                            shutdown.clone(),
-                            primary,
-                            emitter,
-                            participant,
-                            roster.clone(),
-                            node_live.clone(),
-                            start.clone(),
-                            on_cancel,
-                        )
-                    })
+                    Arc::new(
+                        move |node: Box<dyn StreamingNode>,
+                              input_rx: mpsc::Receiver<Routed>,
+                              emitter: crate::nodes::Emitter,
+                              participant: Option<Arc<crate::transport::origin::Origin>>,
+                              primary: bool| {
+                            Self::spawn_node_pipeline(
+                                output_allocator.clone(),
+                                materialization.clone(),
+                                node_id.clone(),
+                                node,
+                                input_rx,
+                                succ_txs.clone(),
+                                snap_inputs.clone(),
+                                client.clone(),
+                                session_id.clone(),
+                                scheduler.clone(),
+                                control.clone(),
+                                probes.clone(),
+                                perf.clone(),
+                                NodeTelemetryHandle {
+                                    tel: tel.clone(),
+                                    idx: node_idx,
+                                    egress_edge,
+                                    input_weak: input_weak.clone(),
+                                },
+                                shutdown.clone(),
+                                primary,
+                                emitter,
+                                participant,
+                                roster.clone(),
+                                node_live.clone(),
+                                start.clone(),
+                                on_cancel,
+                            )
+                        },
+                    )
                 };
                 let factory = Arc::new(partition::InstanceFactory {
                     registry: self.registry.clone(),
@@ -2089,7 +2101,9 @@ impl SessionRouter {
                     primary: Some((node, emitter)),
                     factory,
                     spawn,
-                    max_instances: spec.max_instances.unwrap_or_else(partition::default_max_instances),
+                    max_instances: spec
+                        .max_instances
+                        .unwrap_or_else(partition::default_max_instances),
                     control: self.control.clone(),
                     telemetry: self.telemetry.clone(),
                     node_index: node_idx,
@@ -2099,7 +2113,11 @@ impl SessionRouter {
                 };
                 handles.push((
                     format!("{node_id} participants"),
-                    tokio::spawn(dispatcher.run().instrument(node_span(&self.session_id, &node_id))),
+                    tokio::spawn(
+                        dispatcher
+                            .run()
+                            .instrument(node_span(&self.session_id, &node_id)),
+                    ),
                 ));
                 continue;
             }
@@ -2393,9 +2411,12 @@ impl SessionRouter {
                         let edge = egress_edge.and_then(|e| tel.edge(e));
                         // Attributed to the participant whose input produced it,
                         // and, on a sink that delivers to the author, for it alone.
-                        let author = out_router
-                            .is_to_author()
-                            .then(|| origin.as_deref().map(|origin| origin.id().to_string()).unwrap_or_default());
+                        let author = out_router.is_to_author().then(|| {
+                            origin
+                                .as_deref()
+                                .map(|origin| origin.id().to_string())
+                                .unwrap_or_default()
+                        });
                         let mut kept = Routed::new(kept, origin).into_transport();
                         if let Some(author) = author {
                             kept.metadata
@@ -2566,8 +2587,8 @@ impl SessionRouter {
                     // instead of queueing behind it. The new input always
                     // runs: it is sent after any bump. `try_cancel` honours
                     // ProtectGuard, and is a no-op when nothing is in flight.
-                    let request = filter_profile
-                        .request(remotemedia_traits::CancelReason::Superseded, None);
+                    let request =
+                        filter_profile.request(remotemedia_traits::CancelReason::Superseded, None);
                     if filter_profile.discard_pending(&request) {
                         filter_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     }
@@ -2702,14 +2723,16 @@ impl SessionRouter {
                 children.add_cooperative(
                     "RPC",
                     rpc_shutdown,
-                    tokio::spawn(super::rpc_dispatch::run(
-                        node.clone(),
-                        bound_ctx.clone(),
-                        rx,
-                        call_replies,
-                        rpc_stop,
-                    )
-                    .in_current_span()),
+                    tokio::spawn(
+                        super::rpc_dispatch::run(
+                            node.clone(),
+                            bound_ctx.clone(),
+                            rx,
+                            call_replies,
+                            rpc_stop,
+                        )
+                        .in_current_span(),
+                    ),
                 );
             }
 
@@ -2734,33 +2757,35 @@ impl SessionRouter {
                 let cap_addr = addr.clone();
                 children.add(
                     format!("capability {addr:?}"),
-                    tokio::spawn(async move {
-                        loop {
-                            match rx.recv().await {
-                                Ok(caps) => {
-                                    let _ = cap_node
-                                        .on_capability_update(&cap_addr, caps, &cap_ctx)
-                                        .await;
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                    // Slow consumer fell behind. Re-seed from
-                                    // the retained value so we can't observe
-                                    // a stale capability and drop a real one
-                                    // — `current_capability` is always the
-                                    // latest publish.
-                                    if let Some(seed) =
-                                        cap_ctx.control.current_capability(&cap_addr)
-                                    {
+                    tokio::spawn(
+                        async move {
+                            loop {
+                                match rx.recv().await {
+                                    Ok(caps) => {
                                         let _ = cap_node
-                                            .on_capability_update(&cap_addr, seed, &cap_ctx)
+                                            .on_capability_update(&cap_addr, caps, &cap_ctx)
                                             .await;
                                     }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                        // Slow consumer fell behind. Re-seed from
+                                        // the retained value so we can't observe
+                                        // a stale capability and drop a real one
+                                        // — `current_capability` is always the
+                                        // latest publish.
+                                        if let Some(seed) =
+                                            cap_ctx.control.current_capability(&cap_addr)
+                                        {
+                                            let _ = cap_node
+                                                .on_capability_update(&cap_addr, seed, &cap_ctx)
+                                                .await;
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         }
-                    }
-                    .in_current_span()),
+                        .in_current_span(),
+                    ),
                 );
             }
 
@@ -2848,7 +2873,10 @@ impl SessionRouter {
                     },
                 };
                 // The participant whose input this is; outputs of this call inherit it.
-                let Routed { data: input, origin } = input;
+                let Routed {
+                    data: input,
+                    origin,
+                } = input;
                 if node_trace_enabled() {
                     tracing::info!(
                         session_id = %main_session_id,
@@ -2907,7 +2935,8 @@ impl SessionRouter {
                         // can tell whose start it stands for.
                         let mut control_ctx = bound_ctx.clone();
                         control_ctx.origin = origin.clone();
-                        if let Err(e) = node_ref.process_control_message(input, &control_ctx).await {
+                        if let Err(e) = node_ref.process_control_message(input, &control_ctx).await
+                        {
                             tracing::debug!(
                                 node_id = %main_node_id,
                                 "process_control_message(barge_in) error (ignored): {}",
@@ -3265,14 +3294,16 @@ impl SessionRouter {
                 )))
             }
         };
-        let main_handle = tokio::spawn(async move {
-            let result = children::supervise(supervised_children, main_body).await;
-            if primary {
-                tel.set_alive(node_idx, false);
+        let main_handle = tokio::spawn(
+            async move {
+                let result = children::supervise(supervised_children, main_body).await;
+                if primary {
+                    tel.set_alive(node_idx, false);
+                }
+                result
             }
-            result
-        }
-        .instrument(span));
+            .instrument(span),
+        );
 
         (main_handle, fan_handle)
     }
@@ -3288,7 +3319,10 @@ impl SessionRouter {
         lifecycle: &tokio::sync::broadcast::Sender<ParticipantEvent>,
     ) {
         // A participant leaving is a session event, not data for a node.
-        if packet.metadata.get(crate::transport::origin::LIFECYCLE).map(String::as_str)
+        if packet
+            .metadata
+            .get(crate::transport::origin::LIFECYCLE)
+            .map(String::as_str)
             == Some(crate::transport::origin::LEAVE)
         {
             if let Some(id) = packet.metadata.get(crate::transport::data::participant::ID) {
@@ -3301,7 +3335,10 @@ impl SessionRouter {
             return;
         }
         // An explicit join carries no data either.
-        if packet.metadata.get(crate::transport::origin::LIFECYCLE).map(String::as_str)
+        if packet
+            .metadata
+            .get(crate::transport::origin::LIFECYCLE)
+            .map(String::as_str)
             == Some(crate::transport::origin::JOIN)
         {
             if let Some(origin) =
@@ -3322,7 +3359,8 @@ impl SessionRouter {
             .as_micros() as u64;
 
         // Who sent this frame; carried next to the payload through the graph.
-        let origin = crate::transport::origin::Origin::from_metadata(&packet.metadata).map(Arc::new);
+        let origin =
+            crate::transport::origin::Origin::from_metadata(&packet.metadata).map(Arc::new);
         // Agent speech (a turn-tagged frame, e.g. `SessionControl::speak`) is
         // attributed to the member it is for but is not that member's input:
         // it neither joins the member nor replaces its identity.
@@ -4101,11 +4139,14 @@ mod tests {
             output,
         )
         .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), router.initialize_nodes())
-            .await
-            .expect("initialize_nodes returned")
-            .expect_err("startup fails")
-            .to_string()
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.initialize_nodes(),
+        )
+        .await
+        .expect("initialize_nodes returned")
+        .expect_err("startup fails")
+        .to_string()
     }
 
     #[tokio::test]
@@ -4119,10 +4160,17 @@ mod tests {
             ],
         )
         .await;
-        assert!(msg.contains("2 of 3 nodes failed to initialize:
-"), "{msg}");
+        assert!(
+            msg.contains(
+                "2 of 3 nodes failed to initialize:
+"
+            ),
+            "{msg}"
+        );
         let mic = msg.find("- Node 'mic' (FailA): ").expect("mic listed");
-        let spk = msg.find("- Node 'speaker' (FailB): ").expect("speaker listed");
+        let spk = msg
+            .find("- Node 'speaker' (FailB): ")
+            .expect("speaker listed");
         assert!(mic < spk, "manifest order: {msg}");
         assert!(msg.contains("1 channel unsupported") && msg.contains("16000 Hz unsupported"));
         assert!(!msg.contains("Not checked"), "{msg}");
@@ -4162,8 +4210,13 @@ mod tests {
             ],
         )
         .await;
-        assert!(msg.contains("2 of 3 nodes could not be created:
-"), "{msg}");
+        assert!(
+            msg.contains(
+                "2 of 3 nodes could not be created:
+"
+            ),
+            "{msg}"
+        );
         assert!(msg.contains("- Node 'a' (BadA): ") && msg.contains("- Node 'c' (BadC): "));
     }
 

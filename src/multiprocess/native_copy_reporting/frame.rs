@@ -37,9 +37,7 @@ pub(in crate::multiprocess) const MAX_ERROR_CHARS: usize = 256;
 /// Byte length of the input prefix for `boundary`.
 pub(in crate::multiprocess) fn input_prefix_len(boundary: &str) -> Result<usize, String> {
     if boundary.len() > MAX_BOUNDARY {
-        return Err(format!(
-            "native copy boundary exceeds {MAX_BOUNDARY} bytes"
-        ));
+        return Err(format!("native copy boundary exceeds {MAX_BOUNDARY} bytes"));
     }
     Ok(INPUT_FIXED + boundary.len())
 }
@@ -85,8 +83,7 @@ pub(in crate::multiprocess) fn parse_input(bytes: &[u8]) -> Result<Input<'_>, St
     let name = bytes
         .get(INPUT_FIXED..INPUT_FIXED + length)
         .ok_or("native input frame is truncated")?;
-    let boundary =
-        std::str::from_utf8(name).map_err(|_| "native input boundary is not UTF-8")?;
+    let boundary = std::str::from_utf8(name).map_err(|_| "native input boundary is not UTF-8")?;
     Ok(Input {
         call,
         boundary,

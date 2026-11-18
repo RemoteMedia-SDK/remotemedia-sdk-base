@@ -84,7 +84,10 @@ async fn interrupted_turn_reports_a_strict_prefix_and_no_queued_frames() {
     assert_eq!(after.turn_id, "t1");
     assert!(after.released_ms < 1200, "a prefix: {after:?}");
     assert!(after.chunks_released < 3, "a strict prefix: {after:?}");
-    assert!(after.chunks_released >= 1, "the first chunk was sent: {after:?}");
+    assert!(
+        after.chunks_released >= 1,
+        "the first chunk was sent: {after:?}"
+    );
     // Exactly what was written to the track: the RTP clock advances 960
     // samples per written 20 ms frame, and dropped frames never advance it.
     assert_eq!(after.released_ms, u64::from(track.timestamp().await) / 48);

@@ -30,12 +30,12 @@ pub mod avatar_session;
 pub mod buffer_preflight;
 pub mod buffer_validation;
 mod call_routing;
-pub mod caps_handshake;
 pub mod cancel_gate;
-pub(crate) mod device_delivery;
+pub mod caps_handshake;
 pub mod client;
 pub mod control_transport;
 pub mod data;
+pub(crate) mod device_delivery;
 pub mod embedded_python_env;
 mod ingress;
 pub use ingress::{IngressSendError, SessionPacketPermit, SessionPacketSender};
@@ -69,20 +69,17 @@ pub use control_transport::{
     ControlTransport, EndpointHostSession, InProcControlTransport, InterceptReplyHandle,
     InterceptRequest, InterceptSession,
 };
+pub use data::{Participant, TransportData};
 pub use endpoint::{
     CallOptions, CancelReason, EndpointCallError, EndpointCallStream, EndpointError, EndpointHost,
     EndpointInfo, EndpointMethodInfo, EndpointPresence, EndpointReplier, EndpointSpec, HostEvent,
     HostKind, IncomingCall,
 };
-pub use data::{Participant, TransportData};
-pub use origin::{Origin, Routed};
-pub use turn_audio::{
-    AudioReleased, FlushTarget, MediaEvent, SpeechAccepted, SpeechRequest, TurnTag,
-};
 pub use executor::{
     ExecutorConfig, ParticipantSessionHandle, PipelineExecutor, PipelineSessionHost, SessionHandle,
     SessionInputSender,
 };
+pub use origin::{Origin, Routed};
 pub use plugin_registry::TransportPluginRegistry;
 pub use session::{StreamSession, StreamSessionHandle};
 pub use session_router::{
@@ -91,6 +88,9 @@ pub use session_router::{
 };
 pub use shared_session::{
     SharedPipelineOutputReceivers, SharedPipelineSession, SharedPipelineStreamSession,
+};
+pub use turn_audio::{
+    AudioReleased, FlushTarget, MediaEvent, SpeechAccepted, SpeechRequest, TurnTag,
 };
 pub use warm_session_pool::{WarmPoolConfig, WarmSessionPool};
 

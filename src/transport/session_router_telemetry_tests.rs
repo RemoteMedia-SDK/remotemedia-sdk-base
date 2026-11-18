@@ -184,7 +184,11 @@ fn node<'a>(s: &'a TelemetrySnapshot, id: &str) -> &'a crate::telemetry::NodeTel
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn edge_frames_match_node_outputs() {
     let mut h = start(
-        &[("A", Behaviour::default()), ("B", Behaviour::default()), ("C", Behaviour::default())],
+        &[
+            ("A", Behaviour::default()),
+            ("B", Behaviour::default()),
+            ("C", Behaviour::default()),
+        ],
         &[("A", "B"), ("B", "C")],
         256,
     )
@@ -331,7 +335,8 @@ async fn errors_are_counted_and_published_coalesced() {
     let mut events = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
     while total < 50 && tokio::time::Instant::now() < deadline {
-        let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), sys.recv()).await else {
+        let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), sys.recv()).await
+        else {
             continue;
         };
         if let RuntimeData::Json(v) = ev {
@@ -399,7 +404,11 @@ async fn idle_without_observers_and_late_subscriber_sees_cumulative() {
     }
     tokio::time::sleep(Duration::from_millis(700)).await;
     // Nobody subscribed → no snapshot was ever built.
-    assert_eq!(h.tel.next_seq(), 1, "publisher must not build snapshots unobserved");
+    assert_eq!(
+        h.tel.next_seq(),
+        1,
+        "publisher must not build snapshots unobserved"
+    );
     // Histograms were off while unobserved.
     assert!(!h.tel.perf().is_enabled());
     let mut tap = h
