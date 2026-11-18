@@ -19,10 +19,12 @@ async fn every_bulk_type_roundtrips_or_rejects_under_real_session_policy() {
         let mut stream = bounded(client.create_stream_session(manifest(), &[], None))
             .await
             .unwrap();
-        let mut total = 0;
+        let (mut total, mut decoded) = (0, 0);
         for data in crate::copy_tests::bulk_cases() {
             let payload = data.bulk_payload_bytes() as u64;
+            let copied_in = crate::copy_tests::decode_copy_bytes(&data);
             total += payload;
+            decoded += copied_in;
             let unary = bounded(client.execute_unary(
                 manifest(),
                 TransportData::new(data.clone()),
@@ -30,18 +32,25 @@ async fn every_bulk_type_roundtrips_or_rejects_under_real_session_policy() {
                 None,
             ))
             .await;
-            let sent = bounded(stream.send(TransportData::new(data.clone()))).await;
             if policy == CopyPolicy::RequireZeroCopy {
+                // Audio is refused on the way in; every other payload is
+                // taken without a copy, then refused on the way out.
                 assert!(unary.is_err());
-                assert!(sent.is_err());
+                if copied_in > 0 {
+                    assert!(bounded(stream.send(TransportData::new(data.clone())))
+                        .await
+                        .is_err());
+                }
             } else {
                 assert_eq!(without_arrival(unary.unwrap().data), data);
-                sent.unwrap();
+                bounded(stream.send(TransportData::new(data.clone())))
+                    .await
+                    .unwrap();
                 let output = bounded(stream.receive()).await.unwrap().unwrap();
                 assert_eq!(without_arrival(output.data), data);
                 let reports = fixture.reports.lock().unwrap();
                 let unary = &reports.last().unwrap().1;
-                assert_eq!(bytes(unary, CopyReason::PortableDeserialization), payload);
+                assert_eq!(bytes(unary, CopyReason::PortableDeserialization), copied_in);
                 assert_eq!(bytes(unary, CopyReason::PortableSerialization), payload);
             }
         }
@@ -50,20 +59,20 @@ async fn every_bulk_type_roundtrips_or_rejects_under_real_session_policy() {
             .session_copy_context(stream.session_id())
             .await
             .unwrap();
-        let expected = if policy == CopyPolicy::AllowCopies {
-            total
-        } else {
-            0
-        };
+        let allowed = policy == CopyPolicy::AllowCopies;
         assert_eq!(
             bytes(&context, CopyReason::PortableDeserialization),
-            expected
+            if allowed { decoded } else { 0 }
         );
-        assert_eq!(bytes(&context, CopyReason::PortableSerialization), expected);
+        assert_eq!(
+            bytes(&context, CopyReason::PortableSerialization),
+            if allowed { total } else { 0 }
+        );
         assert_eq!(bytes(&context, CopyReason::VecMaterialization), 0);
+        // Strict: the five non-audio unary inputs reach the node.
         assert_eq!(
             fixture.calls.load(Ordering::SeqCst),
-            if expected == 0 { 0 } else { 12 }
+            if allowed { 12 } else { 5 }
         );
         bounded(stream.close()).await.unwrap();
         fixture.finish().await;
@@ -95,13 +104,13 @@ async fn two_network_subscribers_receive_one_serialized_output() {
     let mut wire = response.bytes_stream();
     bounded(first.send(audio())).await.unwrap();
     assert_audio(bounded(first.receive()).await.unwrap().unwrap());
-    let mut frames = crate::sse::Frames::default();
+    let mut frames = crate::stream::Events::default();
     let ledger = CopyContext::new(CopyPolicy::AllowCopies, "second-network-subscriber");
     let second = bounded(async {
         loop {
             frames.push(wire.next().await.unwrap().unwrap());
             while let Some(frame) = frames.next(&ledger).unwrap() {
-                if let Some(data) = crate::sse::decode(&frame, &ledger).unwrap() {
+                if let Some(data) = crate::stream::decode(frame, &ledger).unwrap() {
                     return data;
                 }
             }
@@ -122,7 +131,7 @@ async fn two_network_subscribers_receive_one_serialized_output() {
     bounded(async {
         loop {
             while let Some(frame) = frames.next(&ledger).unwrap() {
-                assert!(crate::sse::decode(&frame, &ledger).unwrap().is_none());
+                assert!(crate::stream::decode(frame, &ledger).unwrap().is_none());
             }
             match wire.next().await {
                 Some(chunk) => frames.push(chunk.unwrap()),
@@ -158,10 +167,33 @@ async fn unary_node_and_encoding_failures_return_errors_and_join_cleanup() {
 #[tokio::test]
 async fn malformed_typed_input_returns_bad_request_and_cleans_created_core() {
     let fixture = Fixture::new(CopyPolicy::AllowCopies).await;
-    let response = bounded(reqwest::Client::new().post(format!("{}/execute", fixture.url))
-        .json(&serde_json::json!({"manifest":manifest().as_ref(), "input":{"data":{"Unknown":0}}}))
-        .send()).await.unwrap();
+    use prost::Message;
+    // A frame without a payload.
+    let body = codec::ExecuteRequest {
+        manifest_json: serde_json::to_string(manifest().as_ref()).unwrap(),
+        input: Some(remotemedia_wire::DataBuffer::default()),
+    }
+    .encode_to_vec();
+    let response = bounded(
+        reqwest::Client::new()
+            .post(format!("{}/execute", fixture.url))
+            .header("content-type", codec::PROTOBUF)
+            .body(body)
+            .send(),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // JSON frames are refused outright.
+    let response = bounded(
+        reqwest::Client::new()
+            .post(format!("{}/execute", fixture.url))
+            .json(&serde_json::json!({"manifest": manifest().as_ref(), "input": {}}))
+            .send(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.reports.lock().unwrap().len(), 1);
     fixture.finish().await;
@@ -170,9 +202,11 @@ async fn malformed_typed_input_returns_bad_request_and_cleans_created_core() {
 #[tokio::test]
 async fn fragmented_network_request_uses_session_accounting_without_body_staging() {
     let fixture = Fixture::new(CopyPolicy::AllowCopies).await;
-    let wire = serde_json::to_vec(&serde_json::json!({
-        "input":audio(), "manifest":manifest().as_ref(),
-    }))
+    let wire = codec::encode_execute_request(
+        &serde_json::to_vec(manifest().as_ref()).unwrap(),
+        &audio(),
+        CopyContext::legacy(),
+    )
     .unwrap();
     let chunks: Vec<_> = wire
         .chunks(3)
@@ -181,7 +215,7 @@ async fn fragmented_network_request_uses_session_accounting_without_body_staging
     let response = bounded(
         reqwest::Client::new()
             .post(format!("{}/execute", fixture.url))
-            .header("content-type", "application/json")
+            .header("content-type", codec::PROTOBUF)
             .body(reqwest::Body::wrap_stream(futures::stream::iter(chunks)))
             .send(),
     )
@@ -189,14 +223,10 @@ async fn fragmented_network_request_uses_session_accounting_without_body_staging
     .unwrap()
     .error_for_status()
     .unwrap();
-    let body = JsonBody::collect(response.bytes_stream(), usize::MAX)
+    let body = Body::collect(response.bytes_stream(), usize::MAX)
         .await
         .unwrap();
-    #[derive(Deserialize)]
-    struct Reply {
-        output: TransportData,
-    }
-    assert_audio(body.decode::<Reply>(CopyContext::legacy()).unwrap().output);
+    assert_audio(codec::frame_from_buffer(body.decode().unwrap(), CopyContext::legacy()).unwrap());
     let context = fixture.reports.lock().unwrap()[0].1.clone();
     assert_eq!(bytes(&context, CopyReason::PortableDeserialization), 16);
     assert_eq!(bytes(&context, CopyReason::VecMaterialization), 0);

@@ -144,11 +144,13 @@ fn create_test_video_buffer(frame_number: u64) -> DataBuffer {
         format: PixelFormat::Rgb24 as i32,
         frame_number,
         timestamp_us: frame_number * 33333, // ~30 FPS
+        ..Default::default()
     };
 
     DataBuffer {
         data_type: Some(DataType::Video(video_frame)),
         metadata: std::collections::HashMap::new(),
+        sequence: None,
     }
 }
 

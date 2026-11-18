@@ -47,12 +47,16 @@ message DataBuffer {
     ControlMessage control = 7;  // Spec 007: Control messages for low-latency streaming
     NumpyBuffer numpy = 8;  // Zero-copy numpy array passthrough
     FileBuffer file = 9;  // Spec 001: File reference with metadata
+    ImageBuffer image = 11;  // Still image with its encoding and geometry
   }
 
   // Optional metadata for extensibility
   // Examples: compression="gzip", encoding="base64", custom_key="value"
   // Convention: Use lowercase snake_case for keys
   map<string, string> metadata = 10;
+
+  // Position of the frame in its stream, when the sender numbers frames
+  optional uint64 sequence = 12;
 }
 
 // ============================================================================
@@ -87,6 +91,16 @@ message AudioBuffer {
   // Optional extensible metadata as JSON bytes (UTF-8)
   // Used for annotations like speaker diarization, confidence scores
   optional bytes metadata_json = 6;
+
+  // Stream the audio belongs to (e.g. a call leg or track id)
+  optional string stream_id = 7;
+
+  // Capture/presentation timestamp in microseconds
+  optional uint64 timestamp_us = 8;
+
+  // When the sender's transport received the frame, in microseconds
+  // (spec 026). Receivers may stamp their own arrival instead.
+  optional uint64 arrival_ts_us = 9;
 }
 
 // Audio sample encoding format
@@ -147,6 +161,13 @@ message VideoFrame {
   // True for I-frames (can be decoded independently)
   // False for P/B-frames (require previous frames)
   bool is_keyframe = 8;
+
+  // Stream the frame belongs to (e.g. a camera track id)
+  optional string stream_id = 9;
+
+  // When the sender's transport received the frame, in microseconds
+  // (spec 026). Receivers may stamp their own arrival instead.
+  optional uint64 arrival_ts_us = 10;
 }
 
 // Pixel format enumeration
@@ -228,6 +249,9 @@ message TensorBuffer {
   // Nodes document expected layout in capabilities
   // No automatic conversion performed
   string layout = 4;
+
+  // Optional extensible metadata as JSON bytes (UTF-8)
+  optional bytes metadata_json = 5;
 }
 
 // Tensor data type enumeration
@@ -374,6 +398,38 @@ message BinaryBuffer {
   // Examples: "application/octet-stream", "image/png", "application/protobuf"
   // Not validated by protocol (client responsibility)
   string mime_type = 2;
+}
+
+// ============================================================================
+// Image Types
+// ============================================================================
+
+// A still image: an encoded file (JPEG/PNG/WebP) or raw pixels.
+message ImageBuffer {
+  // Encoded image bytes, or raw pixels laid out per `pixel_format`
+  bytes data = 1;
+
+  ImageEncoding encoding = 2;
+
+  // Pixel layout of a RAW image; UNSPECIFIED otherwise
+  PixelFormat pixel_format = 3;
+
+  uint32 width = 4;
+  uint32 height = 5;
+
+  optional uint64 timestamp_us = 6;
+  optional string stream_id = 7;
+
+  // Optional extensible metadata as JSON bytes (UTF-8)
+  optional bytes metadata_json = 8;
+}
+
+enum ImageEncoding {
+  IMAGE_ENCODING_UNSPECIFIED = 0;
+  IMAGE_ENCODING_JPEG = 1;
+  IMAGE_ENCODING_PNG = 2;
+  IMAGE_ENCODING_WEBP = 3;
+  IMAGE_ENCODING_RAW = 4;
 }
 
 // ============================================================================

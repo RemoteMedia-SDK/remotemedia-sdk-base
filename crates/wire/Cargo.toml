@@ -1,0 +1,26 @@
+[package]
+name = "remotemedia-wire"
+description = "Lossless protobuf wire form of RemoteMedia frames (DataBuffer <-> RuntimeData)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+prost = { workspace = true }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "e8fc165eea4064717b6fb23de5f1a18d925533d4" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+# Only for regenerating the committed bindings in src/generated/ (see build.rs).
+tonic-prost-build = { workspace = true, optional = true }
+protox = { workspace = true, optional = true }
+
+[features]
+default = []
+# Regenerate (REMOTEMEDIA_REGEN_PROTOS=1) or check the committed protobuf
+# bindings in src/generated/ against proto/common.proto.
+regen-protos = ["dep:tonic-prost-build", "dep:protox"]

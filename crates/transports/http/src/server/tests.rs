@@ -233,7 +233,7 @@ async fn stream_inputs_return_while_outputs_drain_and_fanout_shares_one_wire_own
     drop(handle);
     fixture.finish().await;
     for wire in retained {
-        assert_audio(codec::decode(&wire, CopyContext::legacy()).unwrap());
+        assert_audio(codec::decode_frame(wire, CopyContext::legacy()).unwrap());
     }
 }
 
@@ -264,7 +264,7 @@ async fn strict_server_rejects_bulk_ingress_before_node_execution() {
 }
 
 #[tokio::test]
-async fn strict_output_and_core_errors_are_visible_to_sse_consumers() {
+async fn strict_output_and_core_errors_are_visible_to_stream_consumers() {
     for (policy, input, message) in [
         (CopyPolicy::RequireZeroCopy, "produce", "copy"),
         (CopyPolicy::AllowCopies, "fail", "node failure sentinel"),
@@ -297,11 +297,14 @@ async fn strict_output_and_core_errors_are_visible_to_sse_consumers() {
 #[tokio::test]
 async fn abandoned_unary_handler_signals_core_cleanup() {
     let fixture = Fixture::new(CopyPolicy::AllowCopies).await;
-    let body = serde_json::to_vec(&serde_json::json!({"manifest":manifest().as_ref(),
-        "input":TransportData::new(RuntimeData::Text("block".into()))}))
+    let body = codec::encode_execute_request(
+        &serde_json::to_vec(manifest().as_ref()).unwrap(),
+        &TransportData::new(RuntimeData::Text("block".into())),
+        CopyContext::legacy(),
+    )
     .unwrap();
     let request = Request::builder()
-        .header("content-type", "application/json")
+        .header("content-type", codec::PROTOBUF)
         .body(axum::body::Body::from(body))
         .unwrap();
     let state = fixture.server.state.clone();
@@ -327,24 +330,29 @@ async fn abandoned_unary_handler_signals_core_cleanup() {
 }
 
 #[tokio::test]
-async fn fragmented_request_body_skips_bulk_then_decodes_under_exact_authority() {
-    let wire =
-        serde_json::to_vec(&serde_json::json!({"manifest":manifest().as_ref(), "input":audio()}))
-            .unwrap();
+async fn fragmented_request_body_decodes_under_exact_authority() {
+    let wire = codec::encode_execute_request(
+        &serde_json::to_vec(manifest().as_ref()).unwrap(),
+        &audio(),
+        CopyContext::legacy(),
+    )
+    .unwrap();
     let chunks: Vec<_> = wire
         .into_iter()
         .map(|byte| Ok::<_, Infallible>(bytes::Bytes::from(vec![byte])))
         .collect();
-    let body = JsonBody::collect(futures::stream::iter(chunks), usize::MAX)
+    let body = Body::collect(futures::stream::iter(chunks), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(body.manifest().unwrap().nodes[0].node_type, "HttpFixture");
+    let request: codec::ExecuteRequest = body.decode().unwrap();
+    let manifest: Manifest = serde_json::from_str(&request.manifest_json).unwrap();
+    assert_eq!(manifest.nodes[0].node_type, "HttpFixture");
     let copies = CopyContext::new(CopyPolicy::AllowCopies, "fragmented-request");
-    assert_audio(body.decode::<ExecuteRequest>(&copies).unwrap().input);
+    assert_audio(codec::frame_from_buffer(request.input.clone().unwrap(), &copies).unwrap());
     assert_eq!(bytes(&copies, CopyReason::PortableDeserialization), 16);
     assert_eq!(bytes(&copies, CopyReason::VecMaterialization), 0);
     let strict = CopyContext::new(CopyPolicy::RequireZeroCopy, "strict-request");
-    assert!(body.decode::<ExecuteRequest>(&strict).is_err());
+    assert!(codec::frame_from_buffer(request.input.unwrap(), &strict).is_err());
     assert_eq!(bytes(&strict, CopyReason::PortableDeserialization), 0);
 }
 

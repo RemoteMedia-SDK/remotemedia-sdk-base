@@ -15,10 +15,14 @@ async fn framing_retains_wire_owner_and_drains_before_completion() {
     let pointer = wire.as_ptr();
     tx.send(wire).unwrap();
     finished.send_replace(Some(Ok(())));
-    assert_eq!(output.next().await.unwrap(), "data: ");
+    // A delimited StreamEvent header (event length, field 1, frame length),
+    // then the frame bytes themselves.
+    assert_eq!(
+        output.next().await.unwrap(),
+        codec::frame_event_header(1024)
+    );
     let retained = output.next().await.unwrap();
     assert_eq!(retained.as_ptr(), pointer);
-    assert_eq!(output.next().await.unwrap(), "\n\n");
     assert!(output.next().await.is_none());
     drop(output);
     drop(tx);
@@ -39,10 +43,11 @@ async fn lagged_subscriber_receives_terminal_error_instead_of_partial_history() 
     for _ in 0..3 {
         tx.send(Bytes::from_static(b"payload")).unwrap();
     }
-    assert_eq!(output.next().await.unwrap(), "event: error\ndata: ");
-    let error: String = serde_json::from_slice(&output.next().await.unwrap()).unwrap();
+    let event = output.next().await.unwrap();
+    let error = crate::stream::decode(event.slice(1..), remotemedia_types::CopyContext::legacy())
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("missed 1 outputs"), "{error}");
-    assert_eq!(output.next().await.unwrap(), "\n\n");
     assert!(output.next().await.is_none());
     assert_eq!(tx.len(), 2);
     drop(output);

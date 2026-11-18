@@ -26,13 +26,13 @@ use std::sync::Arc;
 ///
 /// Provides HTTP/REST-based client and server implementations for the RemoteMedia pipeline
 /// execution framework. This plugin enables remote execution of pipelines via HTTP with
-/// Server-Sent Events (SSE) for streaming.
+/// a stream of delimited protobuf events for output.
 ///
 /// # Features
 ///
 /// - Unary execution via POST /execute
 /// - Streaming sessions via POST /stream
-/// - SSE for continuous output streaming
+/// - Delimited protobuf output stream
 /// - Health checks via GET /health
 /// - Authentication via Bearer tokens
 pub struct HttpTransportPlugin;

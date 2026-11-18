@@ -1,4 +1,4 @@
-//! HTTP/REST client implementation with SSE streaming support
+//! HTTP/REST client implementation with streamed protobuf output
 //!
 //! This module provides an HTTP client that implements the `PipelineClient` trait
 //! for executing pipelines on remote HTTP/REST servers.
@@ -6,10 +6,10 @@
 //! # Features
 //!
 //! - Unary execution via POST /execute
-//! - SSE streaming via POST /stream (create session) and GET /stream/:id/output
+//! - Streaming via POST /stream (create session) and GET /stream/:id/output
 //! - Health checks via GET /health
 //! - Authentication via Authorization header
-//! - JSON serialization of manifests and data
+//! - Frames as protobuf `DataBuffer` (see `codec`); manifests as JSON
 //!
 //! # Usage
 //!
@@ -21,7 +21,7 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::{codec, sse};
+use crate::{codec, stream};
 use async_trait::async_trait;
 use futures::StreamExt;
 use remotemedia_core::manifest::Manifest;
@@ -29,6 +29,7 @@ use remotemedia_core::transport::client::EmbeddedPythonEnv;
 use remotemedia_core::transport::{ClientStreamSession, PipelineClient, TransportData};
 use remotemedia_types::{CopyContext, CopyPolicy};
 use serde::{Deserialize, Serialize};
+
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -83,7 +84,7 @@ impl HttpPipelineClient {
             )));
         }
 
-        // Bound individual RPC requests; SSE connections remain open until closed.
+        // Bound individual RPC requests; output streams remain open until closed.
         let client = reqwest::Client::builder()
             .build()
             .map_err(|e| Error::ConnectionError(format!("Failed to create HTTP client: {}", e)))?;
@@ -119,22 +120,6 @@ impl HttpPipelineClient {
     }
 }
 
-/// Request body for /execute endpoint
-#[derive(Debug, Serialize)]
-struct ExecuteRequest {
-    /// Pipeline manifest
-    manifest: serde_json::Value,
-    /// Input data
-    input: TransportData,
-}
-
-/// Response body from /execute endpoint
-#[derive(Debug, Deserialize)]
-struct ExecuteResponse {
-    /// Output data
-    output: TransportData,
-}
-
 /// Request body for POST /stream (create session)
 #[derive(Debug, Serialize)]
 struct CreateStreamRequest {
@@ -147,13 +132,6 @@ struct CreateStreamRequest {
 struct CreateStreamResponse {
     /// Unique session ID
     session_id: String,
-}
-
-/// Request body for POST /stream/:id/input
-#[derive(Debug, Serialize)]
-struct StreamInputRequest {
-    /// Input data
-    data: TransportData,
 }
 
 #[async_trait]
@@ -170,27 +148,17 @@ impl PipelineClient for HttpPipelineClient {
     ) -> remotemedia_core::Result<TransportData> {
         let url = format!("{}/execute", self.base_url);
 
-        // Serialize manifest to JSON
-        let manifest_json = serde_json::to_value(manifest.as_ref()).map_err(|e| {
+        // The manifest is configuration (JSON); the input is a protobuf frame.
+        let manifest_json = serde_json::to_vec(manifest.as_ref()).map_err(|e| {
             remotemedia_core::Error::Transport(format!("Failed to serialize manifest: {}", e))
         })?;
-
-        let request_body = ExecuteRequest {
-            manifest: manifest_json,
-            input,
-        };
-
-        // Build request
-        let bytes = codec::encode(
-            &request_body,
-            request_body.input.data.bulk_payload_bytes(),
-            &self.copies,
-        )?;
+        let bytes = codec::encode_execute_request(&manifest_json, &input, &self.copies)?;
         let mut request = self
             .client
             .post(&url)
             .timeout(std::time::Duration::from_secs(30))
-            .header("content-type", "application/json")
+            .header("content-type", codec::PROTOBUF)
+            .header("accept", codec::PROTOBUF)
             .body(bytes);
 
         // Add auth header if present
@@ -208,17 +176,14 @@ impl PipelineClient for HttpPipelineClient {
             .await
             .map_err(remotemedia_core::Error::RemoteExecutionFailed)?;
 
-        // Parse response
-        let body = crate::body::JsonBody::collect(response.bytes_stream(), usize::MAX).await?;
-        let execute_response: ExecuteResponse = body.decode(&self.copies)?;
-
-        Ok(execute_response.output)
+        let body = crate::body::Body::collect(response.bytes_stream(), usize::MAX).await?;
+        codec::frame_from_buffer(body.decode()?, &self.copies)
     }
 
-    /// Create a streaming session with SSE
+    /// Create a streaming session
     ///
     /// Creates a session on the server and returns a handle for sending inputs
-    /// and receiving outputs via Server-Sent Events.
+    /// and receiving outputs on a stream of delimited protobuf events.
     async fn create_stream_session(
         &self,
         manifest: Arc<Manifest>,
@@ -323,9 +288,9 @@ impl PipelineClient for HttpPipelineClient {
     }
 }
 
-/// HTTP streaming session using SSE for output
+/// HTTP streaming session: inputs are POSTed, outputs arrive on one stream
 ///
-/// Uses Server-Sent Events (SSE) for receiving outputs from the server.
+/// of delimited protobuf events.
 /// Inputs are sent via POST requests.
 pub struct HttpStreamSession {
     /// Unique session ID
@@ -340,10 +305,10 @@ pub struct HttpStreamSession {
     /// HTTP client
     client: reqwest::Client,
 
-    /// Receiver for output data from SSE stream.
+    /// Receiver for output data from the output stream.
     ///
-    /// Bounded — the background SSE parser task `.await`s its send, so
-    /// a slow consumer back-pressures the SSE stream parsing rather
+    /// Bounded — the background parser task `.await`s its send, so
+    /// a slow consumer back-pressures stream parsing rather
     /// than buffering events unboundedly in memory.
     output_rx: mpsc::Receiver<remotemedia_core::Result<TransportData>>,
     copies: CopyContext,
@@ -351,12 +316,12 @@ pub struct HttpStreamSession {
     /// Whether the session is active
     active: bool,
 
-    /// Handle to the background SSE task
-    sse_task: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the background output-stream task
+    output_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HttpStreamSession {
-    /// Create a new HTTP stream session with SSE
+    /// Create a new HTTP stream session
     async fn new(
         session_id: String,
         base_url: String,
@@ -364,9 +329,8 @@ impl HttpStreamSession {
         client: reqwest::Client,
         copies: CopyContext,
     ) -> Result<Self> {
-        // Create bounded channel for SSE outputs. Small capacity because
-        // SSE events are typically text/JSON frames and we want to
-        // back-pressure the stream quickly when the consumer falls behind.
+        // Bounded channel for stream outputs, small so a consumer that falls
+        // behind back-pressures the stream quickly.
         // Override via `REMOTEMEDIA_HTTP_CLIENT_OUTPUT_CAPACITY`.
         let capacity: usize = std::env::var("REMOTEMEDIA_HTTP_CLIENT_OUTPUT_CAPACITY")
             .ok()
@@ -377,8 +341,10 @@ impl HttpStreamSession {
 
         // Establish the subscription before returning, so the first input cannot
         // race the server's subscriber registration. HTTP failures remain visible.
-        let sse_url = format!("{}/stream/{}/output", base_url, session_id);
-        let mut request = client.get(sse_url);
+        let output_url = format!("{}/stream/{}/output", base_url, session_id);
+        let mut request = client
+            .get(output_url)
+            .header("accept", codec::PROTOBUF_STREAM);
         if let Some(token) = &auth_token {
             request = request.bearer_auth(token);
         }
@@ -387,8 +353,8 @@ impl HttpStreamSession {
             .map_err(|e| Error::ConnectionError(e.to_string()))??
             .error_for_status()?;
         let stream_copies = copies.clone();
-        let sse_task = tokio::spawn(async move {
-            if let Err(error) = receive_sse(response, &output_tx, &stream_copies).await {
+        let output_task = tokio::spawn(async move {
+            if let Err(error) = receive_stream(response, &output_tx, &stream_copies).await {
                 let _ = output_tx.send(Err(error)).await;
             }
         });
@@ -400,7 +366,7 @@ impl HttpStreamSession {
             client,
             output_rx,
             active: true,
-            sse_task: Some(sse_task),
+            output_task: Some(output_task),
             copies,
         })
     }
@@ -421,19 +387,12 @@ impl ClientStreamSession for HttpStreamSession {
 
         let url = format!("{}/stream/{}/input", self.base_url, self.session_id);
 
-        let request_body = StreamInputRequest { data };
-
-        // Build request
-        let bytes = codec::encode(
-            &request_body,
-            request_body.data.data.bulk_payload_bytes(),
-            &self.copies,
-        )?;
+        let bytes = codec::encode_frame(&data, &self.copies)?;
         let mut request = self
             .client
             .post(&url)
             .timeout(std::time::Duration::from_secs(30))
-            .header("content-type", "application/json")
+            .header("content-type", codec::PROTOBUF)
             .body(bytes);
         if let Some(auth_header) = self.build_auth_header() {
             request = request.header("authorization", auth_header);
@@ -456,7 +415,7 @@ impl ClientStreamSession for HttpStreamSession {
             return Ok(None);
         }
 
-        // Receive from SSE stream channel
+        // Receive from the output stream channel
         match self.output_rx.recv().await {
             Some(Ok(data)) => Ok(Some(data)),
             Some(Err(error)) => {
@@ -464,7 +423,7 @@ impl ClientStreamSession for HttpStreamSession {
                 Err(error)
             }
             None => {
-                // SSE stream ended
+                // Output stream ended
                 self.active = false;
                 Ok(None)
             }
@@ -474,7 +433,7 @@ impl ClientStreamSession for HttpStreamSession {
     async fn close(&mut self) -> remotemedia_core::Result<()> {
         self.active = false;
         self.output_rx.close();
-        if let Some(task) = self.sse_task.take() {
+        if let Some(task) = self.output_task.take() {
             task.abort();
             // Join releases retained wire chunks, including a blocked output send.
             let _ = task.await;
@@ -504,33 +463,42 @@ impl HttpStreamSession {
 
 impl Drop for HttpStreamSession {
     fn drop(&mut self) {
-        if let Some(task) = &self.sse_task {
+        if let Some(task) = &self.output_task {
             task.abort();
         }
     }
 }
 
-async fn receive_sse(
+async fn receive_stream(
     response: reqwest::Response,
     outputs: &mpsc::Sender<remotemedia_core::Result<TransportData>>,
     copies: &CopyContext,
 ) -> remotemedia_core::Result<()> {
-    let mut stream = response.bytes_stream();
-    let mut frames = sse::Frames::default();
-    while let Some(chunk) = stream.next().await {
-        frames.push(chunk.map_err(codec::error)?);
-        while let Some(frame) = frames.next(copies)? {
-            if let Some(data) = sse::decode(&frame, copies)? {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !codec::is_protobuf(content_type) {
+        return Err(codec::error(format!(
+            "output stream has content-type {content_type:?}, expected {}",
+            codec::PROTOBUF_STREAM
+        )));
+    }
+    let mut body = response.bytes_stream();
+    let mut events = stream::Events::default();
+    while let Some(chunk) = body.next().await {
+        events.push(chunk.map_err(codec::error)?);
+        while let Some(event) = events.next(copies)? {
+            if let Some(data) = stream::decode(event, copies)? {
                 if outputs.send(Ok(data)).await.is_err() {
                     return Ok(());
                 }
             }
         }
     }
-    if !frames.is_empty() {
-        return Err(codec::error(
-            "SSE connection ended with an incomplete event",
-        ));
+    if !events.is_empty() {
+        return Err(codec::error("output stream ended with an incomplete event"));
     }
     Ok(())
 }

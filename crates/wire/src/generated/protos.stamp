@@ -1,0 +1,3 @@
+# Hashes (FNV-1a 64, LF-normalized) of the .proto files these bindings were
+# generated from. Written by the `regen-protos` build; do not edit by hand.
+8cc791518f4ad6f6  common.proto

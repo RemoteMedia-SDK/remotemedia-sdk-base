@@ -1,5 +1,8 @@
-//! SSE framing uses separate owning chunks; payload bytes are never recopied.
+//! Output stream framing: each encoded frame goes out as its own chunk after
+//! a small header that makes it a delimited `StreamEvent`; payload bytes are
+//! never recopied.
 use super::session::{Completion, HttpSession};
+use crate::codec;
 use axum::{
     body::Body,
     http::header,
@@ -36,7 +39,7 @@ pub(super) fn response(session: &HttpSession) -> Response {
     });
     (
         [
-            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CONTENT_TYPE, codec::PROTOBUF_STREAM),
             (header::CACHE_CONTROL, "no-cache"),
         ],
         Body::from_stream(stream),
@@ -46,12 +49,7 @@ pub(super) fn response(session: &HttpSession) -> Response {
 
 impl Output {
     fn error(&mut self, message: &str) {
-        // Error metadata is JSON escaped so arbitrary messages cannot inject SSE fields.
-        self.pending.extend([
-            Bytes::from_static(b"event: error\ndata: "),
-            Bytes::from(serde_json::to_vec(&message).expect("string serialization is infallible")),
-            Bytes::from_static(b"\n\n"),
-        ]);
+        self.pending.push_back(codec::error_event(message));
         self.terminal = true;
     }
 
@@ -78,16 +76,14 @@ impl Output {
             tokio::select! {
                 biased;
                 event = self.rx.recv() => match event {
-                    Ok(wire) => self.pending.extend([
-                        Bytes::from_static(b"data: "), wire, Bytes::from_static(b"\n\n"),
-                    ]),
-                    Err(broadcast::error::RecvError::Lagged(count)) => self.error(&format!("SSE subscriber missed {count} outputs")),
+                    Ok(wire) => self.pending.extend([codec::frame_event_header(wire.len()), wire]),
+                    Err(broadcast::error::RecvError::Lagged(count)) => self.error(&format!("output subscriber missed {count} outputs")),
                     Err(broadcast::error::RecvError::Closed) => return None,
                 },
                 changed = self.completion.changed() => {
                     if changed.is_err() { self.error("HTTP output drainer ended without a completion report"); }
                 },
-                _ = self.heartbeat.tick() => return Some(Bytes::from_static(b": keepalive\n\n")),
+                _ = self.heartbeat.tick() => return Some(Bytes::from_static(codec::KEEPALIVE)),
             }
         }
     }
