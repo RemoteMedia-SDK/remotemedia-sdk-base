@@ -481,6 +481,158 @@ fn decode_stdin(
     Ok((metadata, vec![chunk]))
 }
 
+/// Audio decoded by FFmpeg: interleaved f32 samples at the source rate and
+/// channel count.
+#[cfg(feature = "video")]
+#[derive(Debug, Clone)]
+pub struct DecodedAudio {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub channels: u32,
+    /// Name of the decoder FFmpeg chose (`mp3float`, `opus`, ...).
+    pub codec: Option<String>,
+}
+
+/// Decode the first audio stream of a container from any seekable reader
+/// (a file, or bytes in memory) with the runtime's FFmpeg. Every frame is
+/// converted to interleaved f32 at the source rate and
+/// channel layout, so planar decoder output (MP3, AAC, Opus, Vorbis) keeps
+/// every channel. `label` names the source in errors.
+#[cfg(feature = "video")]
+pub fn decode_audio_with_ffmpeg<R>(source: R, label: &str) -> Result<DecodedAudio, Error>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    use ac_ffmpeg::codec::audio::{AudioDecoder, AudioFrame};
+    use ac_ffmpeg::codec::Decoder;
+    use ac_ffmpeg::format::demuxer::Demuxer;
+    use ac_ffmpeg::format::io::IO;
+
+    let io = IO::from_seekable_read_stream(source);
+    let mut demuxer = Demuxer::builder()
+        .build(io)
+        .map_err(|e| Error::Other(format!("FFmpeg cannot open {label}: {e}")))?
+        .find_stream_info(None)
+        .map_err(|(_, e)| Error::Other(format!("FFmpeg cannot read the streams of {label}: {e}")))?;
+
+    let (stream_index, stream) = demuxer
+        .streams()
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.codec_parameters().is_audio_codec())
+        .ok_or_else(|| Error::Other(format!("No audio stream found in {label}")))?;
+    let codec_params = stream
+        .codec_parameters()
+        .into_audio_codec_parameters()
+        .ok_or_else(|| Error::Other(format!("{label}: no audio codec parameters")))?;
+    let codec = codec_params.decoder_name().map(|s| s.to_string());
+    let mut decoder = AudioDecoder::from_stream(stream)
+        .map_err(|e| Error::Other(format!("{label}: no decoder for the audio stream: {e}")))?
+        .build()
+        .map_err(|e| Error::Other(format!("{label}: the audio decoder failed to start: {e}")))?;
+
+    let mut samples: Vec<f32> = Vec::new();
+    let mut sample_rate = codec_params.sample_rate();
+    let mut channels = codec_params.channel_layout().channels();
+    let mut first = true;
+
+    let mut convert = |frame: AudioFrame, samples: &mut Vec<f32>| -> Result<(), Error> {
+        if first {
+            first = false;
+            sample_rate = frame.sample_rate();
+            channels = frame.channel_layout().channels();
+        }
+        append_interleaved_f32(&frame, samples)
+            .map_err(|format| Error::Other(format!("{label}: unsupported sample format {format}")))
+    };
+
+    loop {
+        match demuxer.take() {
+            Ok(Some(packet)) => {
+                if packet.stream_index() != stream_index {
+                    continue;
+                }
+                decoder
+                    .push(packet)
+                    .map_err(|e| Error::Other(format!("{label}: decode error: {e}")))?;
+                while let Some(frame) = decoder
+                    .take()
+                    .map_err(|e| Error::Other(format!("{label}: decode error: {e}")))?
+                {
+                    convert(frame, &mut samples)?;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(Error::Other(format!("{label}: demuxer error: {e}"))),
+        }
+    }
+    decoder
+        .flush()
+        .map_err(|e| Error::Other(format!("{label}: decoder flush error: {e}")))?;
+    while let Some(frame) = decoder
+        .take()
+        .map_err(|e| Error::Other(format!("{label}: decoder flush error: {e}")))?
+    {
+        convert(frame, &mut samples)?;
+    }
+
+    tracing::debug!(
+        "FFmpeg decode of {label}: {} samples, {}Hz {} ch",
+        samples.len(),
+        sample_rate,
+        channels
+    );
+    Ok(DecodedAudio {
+        samples,
+        sample_rate,
+        channels,
+        codec,
+    })
+}
+
+/// Append one decoded frame as interleaved f32: packed or planar `u8`,
+/// `s16`, `s32`, `flt` or `dbl` (FFmpeg's decoder output formats). Planar
+/// frames hold one plane per channel and are interleaved here. Returns the
+/// format name when it is none of these.
+#[cfg(feature = "video")]
+fn append_interleaved_f32(
+    frame: &ac_ffmpeg::codec::audio::AudioFrame,
+    out: &mut Vec<f32>,
+) -> Result<(), &'static str> {
+    let format = frame.sample_format();
+    let name = format.name();
+    let (bytes_per_sample, read): (usize, fn(&[u8]) -> f32) = match name.trim_end_matches('p') {
+        "u8" => (1, |b| (b[0] as f32 - 128.0) / 128.0),
+        "s16" => (2, |b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0),
+        "s32" => (4, |b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2147483648.0),
+        "flt" => (4, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        "dbl" => (8, |b| {
+            f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+        }),
+        _ => return Err(name),
+    };
+    let count = frame.samples();
+    let channels = frame.channel_layout().channels() as usize;
+    let planes = frame.planes();
+    if format.is_planar() {
+        out.reserve(count * channels);
+        for i in 0..count {
+            for c in 0..channels.min(planes.len()) {
+                let data = planes[c].data();
+                let at = i * bytes_per_sample;
+                if at + bytes_per_sample <= data.len() {
+                    out.push(read(&data[at..at + bytes_per_sample]));
+                }
+            }
+        }
+    } else if let Some(plane) = planes.first() {
+        // The plane may carry padding past the samples.
+        let len = (count * channels * bytes_per_sample).min(plane.data().len());
+        out.extend(plane.data()[..len].chunks_exact(bytes_per_sample).map(read));
+    }
+    Ok(())
+}
+
 /// Decode with ac-ffmpeg (when video feature is enabled)
 #[cfg(feature = "video")]
 fn decode_with_ffmpeg(
@@ -488,61 +640,24 @@ fn decode_with_ffmpeg(
     path: &PathBuf,
     audio_config: Option<&AudioConfig>,
 ) -> Result<(IngestMetadata, Vec<RuntimeData>), Error> {
-    use ac_ffmpeg::codec::audio::AudioDecoder;
-    use ac_ffmpeg::codec::Decoder;
-    use ac_ffmpeg::format::demuxer::Demuxer;
-    use ac_ffmpeg::format::io::IO;
-
-    // Note: We don't resample here - the pipeline can handle format conversion
-    // via FastResampleNode/AutoResampleStreamingNode if needed
-    // These are kept for reference but the actual output format is the source format
+    // We don't resample here - the pipeline can handle format conversion via
+    // FastResampleNode/AutoResampleStreamingNode if needed.
     let _ = audio_config; // Config is informational only for FFmpeg decode
 
-    // Create IO wrapper
-    let io = IO::from_seekable_read_stream(file);
+    let decoded = decode_audio_with_ffmpeg(file, &path.display().to_string())?;
+    let output_sample_rate = decoded.sample_rate;
+    let output_channels = decoded.channels;
 
-    // Create demuxer
-    let mut demuxer = Demuxer::builder()
-        .build(io)
-        .map_err(|e| {
-            Error::Other(format!(
-                "Failed to create demuxer for {}: {}",
-                path.display(),
-                e
-            ))
-        })?
-        .find_stream_info(None)
-        .map_err(|(_, e)| Error::Other(format!("Failed to find stream info: {}", e)))?;
-
-    // Find audio stream
-    let (stream_index, stream) = demuxer
-        .streams()
-        .iter()
-        .enumerate()
-        .find(|(_, s)| s.codec_parameters().is_audio_codec())
-        .ok_or_else(|| Error::Other(format!("No audio stream found in {}", path.display())))?;
-
-    // Get codec parameters
-    let codec_params = stream
-        .codec_parameters()
-        .into_audio_codec_parameters()
-        .ok_or_else(|| Error::Other("Failed to get audio codec parameters".to_string()))?;
-
-    let source_sample_rate = codec_params.sample_rate();
-    let source_channels = codec_params.channel_layout().channels() as u16;
-    let codec_name = codec_params.decoder_name().map(|s| s.to_string());
-
-    // Build metadata (using source format since we don't resample)
     let metadata = IngestMetadata {
         tracks: vec![TrackInfo {
             media_type: MediaType::Audio,
             index: 0,
             stream_id: "audio:0".to_string(),
             language: None,
-            codec: codec_name,
+            codec: decoded.codec.clone(),
             properties: TrackProperties::Audio(AudioTrackProperties {
-                sample_rate: source_sample_rate,
-                channels: source_channels,
+                sample_rate: output_sample_rate,
+                channels: output_channels as u16,
                 bit_depth: None,
             }),
         }],
@@ -552,149 +667,9 @@ fn decode_with_ffmpeg(
                 .unwrap_or("unknown")
                 .to_string(),
         ),
-        duration_ms: None, // Could calculate from demuxer
+        duration_ms: None,
         bitrate: None,
     };
-
-    // Create decoder
-    let mut decoder = AudioDecoder::from_stream(stream)
-        .map_err(|e| Error::Other(format!("Failed to create audio decoder: {}", e)))?
-        .build()
-        .map_err(|e| Error::Other(format!("Failed to build audio decoder: {}", e)))?;
-
-    // Decode without resampling - the pipeline can handle format conversion
-    // via FastResampleNode/AutoResampleStreamingNode if needed
-    let mut all_samples: Vec<f32> = Vec::new();
-    let mut actual_sample_rate: Option<u32> = None;
-    let mut actual_channels: Option<u32> = None;
-
-    loop {
-        match demuxer.take() {
-            Ok(Some(packet)) => {
-                if packet.stream_index() != stream_index {
-                    continue;
-                }
-
-                decoder
-                    .push(packet)
-                    .map_err(|e| Error::Other(format!("Decode push error: {}", e)))?;
-
-                while let Some(frame) = decoder
-                    .take()
-                    .map_err(|e| Error::Other(format!("Decode take error: {}", e)))?
-                {
-                    // Track actual format from first frame
-                    if actual_sample_rate.is_none() {
-                        actual_sample_rate = Some(frame.sample_rate());
-                        actual_channels = Some(frame.channel_layout().channels() as u32);
-                        tracing::debug!(
-                            "Decoded audio: {}Hz {} ch",
-                            frame.sample_rate(),
-                            frame.channel_layout().channels()
-                        );
-                    }
-
-                    // Extract samples from frame - convert to f32
-                    let planes = frame.planes();
-                    if !planes.is_empty() {
-                        let data = planes[0].data();
-
-                        // Determine bytes per sample based on frame's sample format
-                        // Common formats: s16 (2 bytes), s32 (4 bytes), flt (4 bytes), dbl (8 bytes)
-                        let bytes_per_sample =
-                            frame.samples() as usize * frame.channel_layout().channels() as usize;
-                        let bytes_in_plane = data.len();
-
-                        if bytes_in_plane > 0 && bytes_per_sample > 0 {
-                            let bytes_per_actual_sample = bytes_in_plane / bytes_per_sample;
-
-                            let samples: Vec<f32> = match bytes_per_actual_sample {
-                                // 16-bit signed integer (s16)
-                                2 => data
-                                    .chunks_exact(2)
-                                    .map(|chunk| {
-                                        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                                        sample as f32 / 32768.0
-                                    })
-                                    .collect(),
-                                // 32-bit float (flt) or 32-bit signed integer (s32)
-                                4 => {
-                                    // Try interpreting as float first (most common for decoded audio)
-                                    data.chunks_exact(4)
-                                        .map(|chunk| {
-                                            f32::from_le_bytes([
-                                                chunk[0], chunk[1], chunk[2], chunk[3],
-                                            ])
-                                        })
-                                        .collect()
-                                }
-                                // 64-bit double (dbl)
-                                8 => data
-                                    .chunks_exact(8)
-                                    .map(|chunk| {
-                                        let bytes: [u8; 8] = [
-                                            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4],
-                                            chunk[5], chunk[6], chunk[7],
-                                        ];
-                                        f64::from_le_bytes(bytes) as f32
-                                    })
-                                    .collect(),
-                                _ => {
-                                    tracing::warn!(
-                                        "Unknown bytes per sample: {}, defaulting to f32 interpretation",
-                                        bytes_per_actual_sample
-                                    );
-                                    // Default to f32 interpretation
-                                    data.chunks_exact(4)
-                                        .map(|chunk| {
-                                            f32::from_le_bytes([
-                                                chunk[0], chunk[1], chunk[2], chunk[3],
-                                            ])
-                                        })
-                                        .collect()
-                                }
-                            };
-                            all_samples.extend(samples);
-                        }
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(e) => return Err(Error::Other(format!("Demuxer error: {}", e))),
-        }
-    }
-
-    // Flush decoder
-    decoder
-        .flush()
-        .map_err(|e| Error::Other(format!("Flush decoder error: {}", e)))?;
-
-    while let Some(frame) = decoder
-        .take()
-        .map_err(|e| Error::Other(format!("Flush take error: {}", e)))?
-    {
-        let planes = frame.planes();
-        if !planes.is_empty() {
-            let data = planes[0].data();
-            // Use same format detection as above (simplified to f32 for flush)
-            let samples: Vec<f32> = data
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
-            all_samples.extend(samples);
-        }
-    }
-
-    // Use actual detected sample rate and channels, or fall back to source metadata
-    let output_sample_rate = actual_sample_rate.unwrap_or(source_sample_rate);
-    let output_channels = actual_channels.unwrap_or(source_channels as u32);
-
-    tracing::debug!(
-        "FFmpeg decode complete: {} samples, {}Hz {} ch",
-        all_samples.len(),
-        output_sample_rate,
-        output_channels
-    );
 
     // Create chunks (split into ~100ms chunks for streaming)
     let chunk_size = (output_sample_rate as usize * output_channels as usize) / 10; // 100ms
@@ -702,9 +677,8 @@ fn decode_with_ffmpeg(
     let mut timestamp_us = 0u64;
     let samples_per_second = output_sample_rate as u64 * output_channels as u64;
 
-    // Promote the decoded buffer once; every chunk is a shared view of it
-    // (previously each chunk was copied out with `to_vec`).
-    let all_samples = remotemedia_types::SharedBuffer::from(all_samples);
+    // Promote the decoded buffer once; every chunk is a shared view of it.
+    let all_samples = remotemedia_types::SharedBuffer::from(decoded.samples);
     let step = chunk_size.max(1);
     for start in (0..all_samples.len()).step_by(step) {
         let chunk_samples = all_samples
@@ -726,8 +700,6 @@ fn decode_with_ffmpeg(
             metadata: None,
         };
         chunks.push(chunk);
-
-        // Calculate timestamp increment in microseconds
         if samples_per_second > 0 {
             timestamp_us += (chunk_len as u64 * 1_000_000) / samples_per_second;
         }

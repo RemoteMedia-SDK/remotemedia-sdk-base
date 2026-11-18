@@ -30,6 +30,8 @@ pub mod builder;
 pub mod client;
 pub mod control;
 pub mod control_host;
+/// `StreamPipeline` on the control address: a live core session.
+pub mod control_stream;
 pub use control::{
     serve_control, serve_control_with_host, serve_control_with_host_incoming,
     serve_control_with_incoming, ControlServiceImpl,

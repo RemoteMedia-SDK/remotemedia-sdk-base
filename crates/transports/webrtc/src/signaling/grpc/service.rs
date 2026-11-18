@@ -366,7 +366,7 @@ impl WebRtcSignalingService {
 
         match req.request {
             Some(signaling_request::Request::Announce(announce)) => {
-                Self::handle_announce(announce, peers, tx, peer_id, &request_id).await
+                Self::handle_announce(announce, peers, executor, manifest, tx, peer_id, &request_id).await
             }
             Some(signaling_request::Request::Offer(offer)) => {
                 Self::handle_offer(
@@ -405,10 +405,18 @@ impl WebRtcSignalingService {
     async fn handle_announce(
         announce: AnnounceRequest,
         peers: &Arc<RwLock<HashMap<String, PeerConnection>>>,
+        executor: &Arc<dyn PipelineSessionHost>,
+        manifest: &Arc<Manifest>,
         tx: &mpsc::Sender<Result<SignalingResponse, Status>>,
         peer_id: &mut Option<String>,
         request_id: &str,
     ) -> Result<(), Status> {
+        // The outputs this member will be sent (openspec:
+        // extend-ai-sdk-media-streaming, D1).
+        let media = crate::peer::scanner::session_media_plan(executor.as_ref(), manifest)
+            .await
+            .to_signaling_json();
+
         let mut peers_write = peers.write().await;
 
         // Check if peer already exists
@@ -448,7 +456,8 @@ impl WebRtcSignalingService {
         let ack_data = serde_json::json!({
             "peer_id": announce.peer_id,
             "peers_count": other_peers.len() + 1,
-            "other_peers": other_peers
+            "other_peers": other_peers,
+            "media": media
         });
 
         let response = SignalingResponse {
@@ -655,7 +664,10 @@ impl WebRtcSignalingService {
             let ack_data = serde_json::json!({
                 "offer_id": offer_id,
                 "to_peer_id": offer.to_peer_id,
-                "answer_sent": true
+                "answer_sent": true,
+                "media": crate::peer::scanner::answered_media_json(
+                    &server_peer.answered_media().await
+                )
             });
 
             let response = SignalingResponse {

@@ -33,6 +33,7 @@ use remotemedia_core::{
     },
 };
 use std::collections::HashMap;
+use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex, RwLock};
 use tracing::{debug, error, info, trace, warn};
@@ -769,9 +770,53 @@ pub struct ServerPeer {
     /// Extra `participant.*` attribution the host that admitted the peer
     /// gave it (`participant.metadata.<key>`).
     participant_metadata: Arc<std::sync::RwLock<HashMap<String, String>>>,
+
+    /// Planned outputs the last answer carried, with their `mid`s, for the
+    /// `peer.offer` result (openspec: extend-ai-sdk-media-streaming, D1).
+    answered_media: Arc<RwLock<Vec<crate::peer::scanner::AnsweredMedia>>>,
+
+    /// Outbound video tracks by stream id, for the `video_frames_unreceived`
+    /// count.
+    video_outputs: Arc<RwLock<Vec<(String, Arc<VideoTrack>)>>>,
+
+    /// The video outputs the member asked to receive (`receive.video` of
+    /// `peer.offer`), in its order. `None`: every planned video output.
+    video_receive: Arc<std::sync::RwLock<Option<Vec<String>>>>,
 }
 
 impl ServerPeer {
+    /// Planned outputs the last answer carried: `(mid, kind, stream)` for
+    /// each. A planned output the offer gave no section for is absent.
+    pub async fn answered_media(&self) -> Vec<crate::peer::scanner::AnsweredMedia> {
+        self.answered_media.read().await.clone()
+    }
+
+    /// Video frames dropped before encoding because this member does not
+    /// receive the track (`video_frames_unreceived`), summed over tracks.
+    pub async fn video_frames_unreceived(&self) -> u64 {
+        self.video_outputs
+            .read()
+            .await
+            .iter()
+            .map(|(_, track)| track.frames_unreceived())
+            .sum()
+    }
+
+    /// Outbound video tracks by stream id.
+    pub async fn video_output_tracks(&self) -> Vec<(String, Arc<VideoTrack>)> {
+        self.video_outputs.read().await.clone()
+    }
+
+    /// Restrict the video outputs this member receives to `streams`, in
+    /// that order (`peer.offer`'s `receive.video`). Call before the offer is
+    /// handled. Offer sections are matched to outputs by kind, in the order
+    /// tracks are registered, so the requested outputs are registered first;
+    /// an output that is not requested is never reported in the answer's
+    /// `media` and never encoded. `None` receives every planned output.
+    pub fn set_video_receive(&self, streams: Option<Vec<String>>) {
+        *self.video_receive.write().expect("video receive lock") = streams;
+    }
+
     /// How this peer's `remotemedia-control` data channel is treated: open to
     /// the whole bus (the default), refused, or bound to the peer's own
     /// session with a member's access. Call before handling the offer.
@@ -841,6 +886,9 @@ impl ServerPeer {
             control_policy: Default::default(),
             display_name: Default::default(),
             participant_metadata: Default::default(),
+            answered_media: Default::default(),
+            video_outputs: Default::default(),
+            video_receive: Default::default(),
         })
     }
 
@@ -890,6 +938,9 @@ impl ServerPeer {
             control_policy: Default::default(),
             display_name: Default::default(),
             participant_metadata: Default::default(),
+            answered_media: Default::default(),
+            video_outputs: Default::default(),
+            video_receive: Default::default(),
         })
     }
 
@@ -1058,11 +1109,14 @@ impl ServerPeer {
         // tracks before set_remote_description guarantees the answer SDP
         // carries one m-line per track — no later renegotiation needed.
         // See spec 2026-04-29-webrtc-multi-track-video-design.
-        let plan = {
-            let registry_arc = self.executor.registry();
-            let registry = registry_arc.read().await;
-            crate::peer::scanner::scan(&self.manifest, &registry)
-        };
+        // Back-compat: if no node declared an audio output (e.g. the
+        // simpler LFM2 example whose audio node has no schema declaring
+        // it produces Audio), the plan still carries a single default
+        // audio track. The pipeline emits Audio with stream_id: None and
+        // extract_stream_id then resolves to DEFAULT_STREAM_ID. The same
+        // plan is what `peer.announce` sends the client.
+        let plan =
+            crate::peer::scanner::session_media_plan(self.executor.as_ref(), &self.manifest).await;
         info!(
             "Media plan for peer {}: {} audio, {} video",
             self.peer_id,
@@ -1070,18 +1124,12 @@ impl ServerPeer {
             plan.video_outputs.len()
         );
 
-        // Back-compat: if no node declared an audio output (e.g. the
-        // simpler LFM2 example whose audio node has no schema declaring
-        // it produces Audio), still register a single default audio
-        // track. The pipeline emits Audio with stream_id: None and
-        // extract_stream_id then resolves to DEFAULT_STREAM_ID.
-        let audio_specs = if plan.audio_outputs.is_empty() {
-            vec![crate::peer::scanner::AudioStreamSpec::default_named(
-                DEFAULT_STREAM_ID,
-            )]
-        } else {
-            plan.audio_outputs
-        };
+        let audio_specs = plan.audio_outputs.clone();
+        let video_receive = self.video_receive.read().expect("video receive lock").clone();
+        let video_specs = order_video_outputs(&plan.video_outputs, video_receive.as_deref());
+        // Each planned output's RTP sender, to read its `mid` once answered.
+        let mut planned_senders: Vec<PlannedSender> = Vec::new();
+        let mut video_tracks: Vec<(String, Arc<VideoTrack>, Arc<RTCRtpSender>)> = Vec::new();
 
         for spec in &audio_specs {
             // Opus on the wire is always 48 kHz mono — RTCRtpCodecCapability
@@ -1111,6 +1159,11 @@ impl ServerPeer {
                     Error::InternalError("audio_track missing after add_audio_track".into())
                 })?;
                 if let Some(sender) = self.peer_connection.audio_rtp_sender().await {
+                    planned_senders.push((
+                        crate::peer::scanner::MediaKind::Audio,
+                        spec.stream_id.clone(),
+                        Arc::clone(&sender),
+                    ));
                     audio_rtp_senders.push(sender);
                 }
                 if let Some(ctrl) = &session_control {
@@ -1138,6 +1191,11 @@ impl ServerPeer {
                         ))
                     })?;
                 audio_rtp_senders.push(Arc::clone(&sender));
+                planned_senders.push((
+                    crate::peer::scanner::MediaKind::Audio,
+                    spec.stream_id.clone(),
+                    Arc::clone(&sender),
+                ));
                 self.track_senders.write().await.push(sender);
                 if let Some(ctrl) = &session_control {
                     track
@@ -1159,7 +1217,7 @@ impl ServerPeer {
             );
         }
 
-        for spec in &plan.video_outputs {
+        for spec in &video_specs {
             let cfg = crate::media::video::VideoEncoderConfig {
                 width: spec.width,
                 height: spec.height,
@@ -1177,6 +1235,12 @@ impl ServerPeer {
                         spec.stream_id, e
                     ))
                 })?;
+            planned_senders.push((
+                crate::peer::scanner::MediaKind::Video,
+                spec.stream_id.clone(),
+                Arc::clone(&sender),
+            ));
+            video_tracks.push((spec.stream_id.clone(), Arc::clone(&track), Arc::clone(&sender)));
             self.track_senders.write().await.push(sender);
             self.track_registry
                 .register_video_track(&spec.stream_id, track)
@@ -1218,6 +1282,45 @@ impl ServerPeer {
             .map_err(|e| Error::WebRtcError(format!("Failed to set local description: {}", e)))?;
 
         info!("Generated SDP answer for peer {}", self.peer_id);
+
+        // Which planned outputs the answer carries, and on which `mid`. A
+        // video output the member did not ask for is not received, even when
+        // a section of its own (a camera's) was matched to it.
+        let mut answered =
+            answered_outputs(self.peer_connection.peer_connection(), &planned_senders).await;
+        if let Some(wanted) = &video_receive {
+            answered.retain(|m| {
+                m.kind != crate::peer::scanner::MediaKind::Video || wanted.contains(&m.stream)
+            });
+        }
+        info!(
+            "Peer {} receives {} of {} planned outputs",
+            self.peer_id,
+            answered.len(),
+            planned_senders.len()
+        );
+
+        // Video nobody receives is not encoded; video that is received
+        // starts with a keyframe and gets another on picture loss.
+        for (stream_id, track, sender) in &video_tracks {
+            let receiving = answered.iter().any(|m| {
+                m.kind == crate::peer::scanner::MediaKind::Video && &m.stream == stream_id
+            });
+            track.set_receiving(receiving);
+            if receiving {
+                spawn_picture_loss_reader(Arc::clone(sender), Arc::clone(track), stream_id.clone());
+            } else {
+                info!(
+                    "Video stream '{}' is not received by peer {}; its frames are not encoded",
+                    stream_id, self.peer_id
+                );
+            }
+        }
+        *self.video_outputs.write().await = video_tracks
+            .iter()
+            .map(|(id, track, _)| (id.clone(), Arc::clone(track)))
+            .collect();
+        *self.answered_media.write().await = answered;
 
         // Tell the session when this member can hear output.
         if let Some(ctrl) = session_control {
@@ -1792,6 +1895,107 @@ impl Drop for ServerPeer {
     }
 }
 
+
+/// Video outputs in registration order: the requested ones first, in the
+/// order asked for, then the rest in plan order. Unknown ids are ignored.
+pub(crate) fn order_video_outputs(
+    planned: &[crate::peer::scanner::VideoStreamSpec],
+    wanted: Option<&[String]>,
+) -> Vec<crate::peer::scanner::VideoStreamSpec> {
+    let Some(wanted) = wanted else {
+        return planned.to_vec();
+    };
+    let mut ordered: Vec<_> = wanted
+        .iter()
+        .filter_map(|id| planned.iter().find(|spec| &spec.stream_id == id).cloned())
+        .collect();
+    for spec in planned {
+        if !wanted.contains(&spec.stream_id) {
+            ordered.push(spec.clone());
+        }
+    }
+    ordered
+}
+
+/// `receive.video` of `peer.offer` params: a list of stream ids, or `false`
+/// for none. `true` or absent: every planned video output (`None`).
+pub fn video_receive_from_params(params: &serde_json::Value) -> Option<Vec<String>> {
+    match params.get("receive").and_then(|r| r.get("video")) {
+        Some(serde_json::Value::Bool(false)) => Some(Vec::new()),
+        Some(serde_json::Value::Array(ids)) => Some(
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// A planned output's kind, stream id and RTP sender.
+pub(crate) type PlannedSender = (crate::peer::scanner::MediaKind, String, Arc<RTCRtpSender>);
+
+/// The planned outputs an answer carries: for each planned sender whose
+/// transceiver was given a `mid` and a direction that sends, its `mid`,
+/// kind and stream id. In planned order.
+pub(crate) async fn answered_outputs(
+    pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+    planned: &[PlannedSender],
+) -> Vec<crate::peer::scanner::AnsweredMedia> {
+    use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection as Dir;
+    let transceivers = pc.get_transceivers().await;
+    let mut by_sender = Vec::with_capacity(transceivers.len());
+    for t in &transceivers {
+        let sender = t.sender().await;
+        let current = t.current_direction();
+        let direction = if current == Dir::Unspecified { t.direction() } else { current };
+        by_sender.push((sender, t.mid().map(|m| m.to_string()), direction));
+    }
+    let mut out = Vec::new();
+    for (kind, stream, sender) in planned {
+        let Some((_, mid, direction)) = by_sender.iter().find(|(s, _, _)| Arc::ptr_eq(s, sender))
+        else {
+            continue;
+        };
+        let Some(mid) = mid.clone() else { continue };
+        if !matches!(direction, Dir::Sendrecv | Dir::Sendonly) {
+            continue;
+        }
+        out.push(crate::peer::scanner::AnsweredMedia {
+            mid,
+            kind: *kind,
+            stream: stream.clone(),
+        });
+    }
+    out
+}
+
+/// Read RTCP from a video sender for as long as it lives, and request a
+/// keyframe on Picture Loss Indication or Full Intra Request. Reading also
+/// keeps the interceptors (NACK) fed.
+pub(crate) fn spawn_picture_loss_reader(
+    sender: Arc<RTCRtpSender>,
+    track: Arc<VideoTrack>,
+    stream_id: String,
+) {
+    tokio::spawn(async move {
+        while let Ok((packets, _)) = sender.read_rtcp().await {
+            if packets.iter().any(|p| is_picture_loss(p.as_ref())) {
+                debug!("Picture loss on video stream '{}'; forcing a keyframe", stream_id);
+                track.request_keyframe();
+            }
+        }
+    });
+}
+
+/// Whether an RTCP packet asks for a new keyframe (PLI or FIR).
+pub(crate) fn is_picture_loss(packet: &(dyn webrtc::rtcp::packet::Packet + Send + Sync)) -> bool {
+    use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+    use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+    let any = packet.as_any();
+    any.downcast_ref::<PictureLossIndication>().is_some()
+        || any.downcast_ref::<FullIntraRequest>().is_some()
+}
+
 #[cfg(test)]
 #[path = "audio_dispatch_tests.rs"]
 mod audio_dispatch_tests;
@@ -1807,6 +2011,10 @@ mod media_ready_tests;
 #[cfg(all(test, feature = "video"))]
 #[path = "video_dispatch_tests.rs"]
 mod video_dispatch_tests;
+
+#[cfg(all(test, feature = "video"))]
+#[path = "media_plan_tests.rs"]
+mod media_plan_tests;
 
 #[cfg(test)]
 mod tests {

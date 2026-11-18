@@ -864,13 +864,20 @@ async fn handle_announce(
         ))
         .await;
 
+    // The outputs this member will be sent, so the client can offer a
+    // section for each (openspec: extend-ai-sdk-media-streaming, D1).
+    let media = crate::peer::scanner::session_media_plan(state.runner.as_ref(), &state.manifest)
+        .await
+        .to_signaling_json();
+
     // Send success response
     let response = JsonRpcResponse::new(
         json!({
             "success": true,
             "peer_id": params.peer_id,
             "peers_count": other_peers.len() + 1,
-            "other_peers": other_peers
+            "other_peers": other_peers,
+            "media": media
         }),
         request_id,
     );
@@ -1020,6 +1027,10 @@ async fn handle_offer(
             // cannot claim.
             server_peer.set_participant_metadata(admitted_participant_metadata(&peer_metadata));
         }
+        // `receive.video`: which video outputs this member asked for.
+        server_peer.set_video_receive(crate::peer::server_peer::video_receive_from_params(
+            &request.params,
+        ));
         let answered = match peer_room.as_deref() {
             Some(key) => match state.room(key).await {
                 Ok(room) => {
@@ -1164,13 +1175,16 @@ async fn handle_offer(
             },
         ));
 
-        // Send JSON-RPC response with answer (T009-T010: per contract, answer in result)
+        // Send JSON-RPC response with answer (T009-T010: per contract, answer in result).
+        // `media` maps each answered media section to the stream it carries.
+        let media = crate::peer::scanner::answered_media_json(&server_peer.answered_media().await);
         let response = JsonRpcResponse::new(
             json!({
                 "type": "answer",
                 "sdp": answer_sdp,
                 "from": "remotemedia-server",
-                "to": from_peer_id
+                "to": from_peer_id,
+                "media": media
             }),
             request_id,
         );

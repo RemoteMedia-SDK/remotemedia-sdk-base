@@ -176,6 +176,14 @@ impl VideoEncoderNode {
         &self.config
     }
 
+    /// Make the next encoded frame a keyframe. Used when a receiver starts
+    /// receiving the stream, and on RTCP picture-loss feedback.
+    pub fn request_keyframe(&self) {
+        if let Ok(mut enc) = self.encoder.lock() {
+            enc.request_keyframe();
+        }
+    }
+
     /// Reconfigure the encoder (bitrate, quality, etc.)
     ///
     /// # Arguments

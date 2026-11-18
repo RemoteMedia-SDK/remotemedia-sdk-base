@@ -105,6 +105,16 @@ pub trait ControlHost: Send + Sync + 'static {
     async fn managed_llm(&self, _model: &str) -> Result<ManagedLlmResponse, Status> {
         Err(unimplemented("managed language models"))
     }
+
+    /// The executor that live pipeline sessions run on. With one, the control
+    /// server also serves `StreamingPipelineService.StreamPipeline` on the
+    /// same address and behind the same token, so a client of the control
+    /// address can hold a session open for live input (openspec:
+    /// extend-ai-sdk-media-streaming, design D10). `None` (the default):
+    /// `StreamPipeline` answers `UNIMPLEMENTED` there.
+    fn pipeline_executor(&self) -> Option<Arc<PipelineExecutor>> {
+        None
+    }
 }
 
 /// Run `manifest_json` on `inputs` in a new session of `executor` and stream
