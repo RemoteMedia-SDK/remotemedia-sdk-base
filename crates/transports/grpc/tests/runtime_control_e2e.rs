@@ -233,12 +233,13 @@ async fn a_host_that_does_nothing_answers_unimplemented_naming_each_operation() 
         );
     }
 
-    // `PipelineControl` is served on the same listener.
-    let listed = PipelineControlClient::new(server.channel.clone())
+    // `PipelineControl` is served on the same listener. (Its session list is
+    // the process-wide bus, which other tests here add sessions to, so only
+    // the call's success is checked.)
+    PipelineControlClient::new(server.channel.clone())
         .list_sessions(ListSessionsRequest {})
         .await
         .unwrap();
-    assert!(listed.into_inner().sessions.is_empty());
 }
 
 #[tokio::test]
@@ -373,9 +374,13 @@ async fn watch_members_starts_with_ready_then_streams_joins_and_leaves() {
 async fn run_pipeline_streams_every_output_then_ends_and_leaves_no_session() {
     let server = serve(None, false).await;
     let mut client = RuntimeControlClient::new(server.channel.clone());
+    // Every executor in this process shares one session bus, and other tests
+    // here open sessions of their own; a unique pipeline name lets this test
+    // wait for its own session only.
+    const PIPELINE: &str = "run-pipeline-one-shot";
     let manifest = serde_json::json!({
         "version": "v1",
-        "metadata": { "name": "echo" },
+        "metadata": { "name": PIPELINE },
         "nodes": [{ "id": "pass", "node_type": "PassThrough", "params": {} }],
         "connections": []
     });
@@ -412,7 +417,15 @@ async fn run_pipeline_streams_every_output_then_ends_and_leaves_no_session() {
 
     // The run's session is gone once the stream has ended.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !server.executor.control_bus().list().is_empty() {
+    let listed = || {
+        server
+            .executor
+            .control_bus()
+            .list()
+            .iter()
+            .any(|session| session.pipeline_name == PIPELINE)
+    };
+    while listed() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the one-shot session is still listed"
