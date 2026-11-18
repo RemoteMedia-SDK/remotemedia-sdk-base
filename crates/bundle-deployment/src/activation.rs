@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use remotemedia_bundle::{canonical_json, AssetDescriptor, NativeRuntimeClosure};
@@ -185,7 +185,11 @@ impl ActivationRegistry {
         let bytes = canonical_json(&self.state)?;
         let temporary = self.state_path.with_extension("json.new");
         fs::write(&temporary, bytes)?;
-        File::open(&temporary)?.sync_all()?;
+        // A writable handle: Windows refuses to flush a read-only one.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)?
+            .sync_all()?;
         fs::rename(&temporary, &self.state_path)?;
         sync_parent(&self.state_path)?;
         Ok(())
@@ -204,10 +208,16 @@ fn validate_name(name: &str) -> Result<(), DeploymentError> {
     Ok(())
 }
 
+/// Make a rename or creation in `path`'s directory durable. Windows has no
+/// directory handle to sync (opening one this way is refused), and commits
+/// the directory entry with the operation itself.
 fn sync_parent(path: &Path) -> Result<(), DeploymentError> {
+    #[cfg(not(windows))]
     if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
+        fs::File::open(parent)?.sync_all()?;
     }
+    #[cfg(windows)]
+    let _ = path;
     Ok(())
 }
 

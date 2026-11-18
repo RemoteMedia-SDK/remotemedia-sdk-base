@@ -297,7 +297,11 @@ impl ContentStore {
                     .expect("relative runtime path has parent");
                 fs::create_dir_all(parent)?;
                 fs::copy(source, &destination)?;
-                File::open(&destination)?.sync_all()?;
+                // A writable handle: Windows refuses to flush a read-only one.
+                OpenOptions::new()
+                    .write(true)
+                    .open(&destination)?
+                    .sync_all()?;
                 set_runtime_mode(&destination, file.mode)?;
             }
             for symlink in &closure.symlinks {
@@ -413,9 +417,10 @@ impl UploadSession {
                 actual: self.offset,
             });
         }
-        let mut file = File::open(&self.path)?;
         let mut bytes = Vec::with_capacity(self.offset as usize);
-        file.read_to_end(&mut bytes)?;
+        // Closed before the file is renamed or removed below: Windows refuses
+        // both while a handle is open.
+        File::open(&self.path)?.read_to_end(&mut bytes)?;
         let actual = sha256_digest(&bytes);
         if actual != self.descriptor.digest {
             let quarantine = quarantine_path(&self.store.root, &self.path, "digest-mismatch");
@@ -506,10 +511,16 @@ fn quarantine_path(root: &Path, upload: &Path, reason: &str) -> PathBuf {
     root.join("quarantine").join(format!("{name}.{reason}"))
 }
 
+/// Make a rename or creation in `path`'s directory durable. Windows has no
+/// directory handle to sync (opening one this way is refused), and commits
+/// the directory entry with the operation itself.
 fn sync_parent(path: &Path) -> Result<(), DeploymentError> {
+    #[cfg(not(windows))]
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }
+    #[cfg(windows)]
+    let _ = path;
     Ok(())
 }
 
@@ -622,6 +633,9 @@ mod tests {
         ));
     }
 
+    // SONAME aliases are symlinks, which a native runtime closure has only
+    // on Unix (`create_runtime_symlink`).
+    #[cfg(unix)]
     #[test]
     fn materializes_release_local_native_files_and_soname_aliases() {
         let temp = tempfile::tempdir().unwrap();

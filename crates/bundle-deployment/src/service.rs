@@ -741,13 +741,17 @@ mod tests {
             .resolve_native_plugin_paths(&revision, manifest)
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&resolved).unwrap();
+        // The release directory in this platform's own separators, joined
+        // with the file's path as the bundle wrote it.
         assert_eq!(
             value["plugins"][0]["path"],
-            format!(
-                "{}/releases/{}/plugins/libplugin.so",
-                temp.path().join("cas").display(),
-                "d".repeat(64)
-            )
+            temp.path()
+                .join("cas")
+                .join("releases")
+                .join("d".repeat(64))
+                .join("plugins/libplugin.so")
+                .display()
+                .to_string()
         );
     }
 
