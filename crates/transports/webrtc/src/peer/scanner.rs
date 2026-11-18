@@ -51,6 +51,92 @@ pub struct MediaStreamPlan {
     pub video_outputs: Vec<VideoStreamSpec>,
 }
 
+impl MediaStreamPlan {
+    /// The plan a peer registers its outbound tracks from: the scanned
+    /// outputs, plus a single [`crate::media::DEFAULT_STREAM_ID`] audio
+    /// output when no node declared audio (the back-compat fallback).
+    pub fn with_default_audio(mut self) -> Self {
+        if self.audio_outputs.is_empty() {
+            self.audio_outputs.push(AudioStreamSpec::default_named(
+                crate::media::DEFAULT_STREAM_ID,
+            ));
+        }
+        self
+    }
+
+    /// The plan as sent to the client in the `peer.announce` result's
+    /// `media` field (openspec: extend-ai-sdk-media-streaming, design D1).
+    pub fn to_signaling_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1,
+            "audio": self
+                .audio_outputs
+                .iter()
+                .map(|a| serde_json::json!({ "stream": a.stream_id }))
+                .collect::<Vec<_>>(),
+            "video": self
+                .video_outputs
+                .iter()
+                .map(|v| serde_json::json!({
+                    "stream": v.stream_id,
+                    "width": v.width,
+                    "height": v.height,
+                    "framerate": v.framerate,
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Kind of an answered media section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Audio,
+    Video,
+}
+
+impl MediaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaKind::Audio => "audio",
+            MediaKind::Video => "video",
+        }
+    }
+}
+
+/// One planned output that the answer carries: the media section it was
+/// answered on and the stream id it carries. Sent to the client in the
+/// `peer.offer` result's `media` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnsweredMedia {
+    pub mid: String,
+    pub kind: MediaKind,
+    pub stream: String,
+}
+
+impl AnsweredMedia {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "mid": self.mid, "kind": self.kind.as_str(), "stream": self.stream })
+    }
+}
+
+/// The `peer.offer` result's `media` list.
+pub fn answered_media_json(media: &[AnsweredMedia]) -> serde_json::Value {
+    serde_json::Value::Array(media.iter().map(AnsweredMedia::to_json).collect())
+}
+
+/// The media plan of a session: the scan of its manifest against the
+/// host's node registry, with the default audio fallback applied. This is
+/// what a peer registers tracks from, and what `peer.announce` returns.
+pub async fn session_media_plan(
+    host: &dyn remotemedia_core::transport::PipelineSessionHost,
+    manifest: &Manifest,
+) -> MediaStreamPlan {
+    let registry = host.registry();
+    let registry = registry.read().await;
+    scan(manifest, &registry).with_default_audio()
+}
+
 /// Scan a manifest for outbound audio/video stream declarations.
 ///
 /// The scanner is best-effort: nodes whose factory isn't registered (e.g.
@@ -177,6 +263,15 @@ pub fn scan(manifest: &Manifest, registry: &StreamingNodeRegistry) -> MediaStrea
                 continue;
             };
             for produced in &schema.produces {
+                // A node that also accepts this kind forwards it (a
+                // pass-through, a UI sink, a filter): it is not a source of
+                // its own, and the node it forwards from is planned already.
+                // Planning it made every voice-agent manifest (its
+                // `PassThrough` UI sink) announce a phantom `default` video
+                // stream (openspec: extend-ai-sdk-media-streaming).
+                if schema.accepts.contains(produced) {
+                    continue;
+                }
                 match produced {
                     RuntimeDataType::Video => {
                         let stream_id = node
@@ -453,6 +548,50 @@ mod tests {
                     .produces([RuntimeDataType::Video]),
             )
         }
+    }
+
+    /// Test factory: a pass-through whose schema lists every kind both ways.
+    struct PassThroughLikeFactory;
+    impl StreamingNodeFactory for PassThroughLikeFactory {
+        fn create(
+            &self,
+            _node_id: String,
+            _params: &Value,
+            _session_id: Option<String>,
+        ) -> Result<Box<dyn StreamingNode>, Error> {
+            unreachable!()
+        }
+        fn node_type(&self) -> &str {
+            "PassThroughLike"
+        }
+        fn schema(&self) -> Option<remotemedia_core::nodes::schema::NodeSchema> {
+            use remotemedia_core::nodes::schema::{NodeSchema, RuntimeDataType};
+            let all = [
+                RuntimeDataType::Audio,
+                RuntimeDataType::Video,
+                RuntimeDataType::Text,
+                RuntimeDataType::Json,
+            ];
+            Some(
+                NodeSchema::new("PassThroughLike")
+                    .accepts(all)
+                    .produces(all),
+            )
+        }
+    }
+
+    #[test]
+    fn a_node_that_forwards_video_is_not_a_video_source() {
+        let registry = registry_with(vec![Arc::new(PassThroughLikeFactory)]);
+        let manifest = manifest_with(vec![NodeManifest {
+            id: "ui_out".into(),
+            node_type: "PassThroughLike".into(),
+            params: serde_json::json!({}),
+            ..Default::default()
+        }]);
+        let plan = scan(&manifest, &registry);
+        assert!(plan.video_outputs.is_empty(), "{:?}", plan.video_outputs);
+        assert!(plan.audio_outputs.is_empty(), "{:?}", plan.audio_outputs);
     }
 
     #[test]

@@ -29,8 +29,8 @@ use crate::generated::{
     AdmitMemberRequest, AdmitMemberResponse, DataBuffer, EndSessionRequest, EndSessionResponse,
     GetSessionRequest, GetSessionResponse, ListMembersRequest, ListMembersResponse,
     ManagedLlmRequest, ManagedLlmResponse, MemberChange, MemberEvent, MemberInfo,
-    RemoveMemberRequest, RemoveMemberResponse, RunPipelineOutput, RunPipelineRequest,
-    WatchMembersReady, WatchMembersRequest,
+    RegisterPipelineRequest, RegisterPipelineResponse, RemoveMemberRequest, RemoveMemberResponse,
+    RunPipelineOutput, RunPipelineRequest, WatchMembersReady, WatchMembersRequest,
 };
 
 /// A member joined or left a session the host admits members to.
@@ -53,6 +53,14 @@ pub type RunOutputs = mpsc::Receiver<Result<DataBuffer, Status>>;
 /// client as they are.
 #[tonic::async_trait]
 pub trait ControlHost: Send + Sync + 'static {
+    /// Make `manifest_json` admissible as `name` (openspec
+    /// extend-ai-sdk-media-streaming, design D10). `Ok(false)` when the same
+    /// manifest is already registered under the name; `ALREADY_EXISTS` for
+    /// another manifest under it; `INVALID_ARGUMENT` naming every problem.
+    async fn register_pipeline(&self, _name: &str, _manifest_json: &str) -> Result<bool, Status> {
+        Err(unimplemented("registering a pipeline"))
+    }
+
     /// Start the session of `(pipeline, session_key)` if it is not running
     /// and mint a single-use ticket for the member.
     async fn admit_member(
@@ -237,6 +245,22 @@ type RunOutputStream =
 impl RuntimeControl for RuntimeControlService {
     type WatchMembersStream = MemberStream;
     type RunPipelineStream = RunOutputStream;
+
+    async fn register_pipeline(
+        &self,
+        request: Request<RegisterPipelineRequest>,
+    ) -> Result<Response<RegisterPipelineResponse>, Status> {
+        self.check_auth(&request)?;
+        let request = request.into_inner();
+        if request.name.trim().is_empty() {
+            return Err(Status::invalid_argument("a pipeline needs a name"));
+        }
+        let registered = self
+            .host
+            .register_pipeline(&request.name, &request.manifest_json)
+            .await?;
+        Ok(Response::new(RegisterPipelineResponse { registered }))
+    }
 
     async fn admit_member(
         &self,

@@ -77,7 +77,13 @@ async fn output_drainer_promotes_once_for_every_subscriber() {
     let (broadcast, _) = tokio::sync::broadcast::channel(4);
     let mut first = broadcast.subscribe();
     let mut second = broadcast.subscribe();
-    SharedPipelineSession::spawn_output_drainer(rx, broadcast);
+    SharedPipelineSession::spawn_output_drainer(
+        rx,
+        broadcast.clone(),
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        [broadcast.clone(), broadcast.clone(), broadcast],
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
     let samples = vec![0.5_f32; 32];
     let original = samples.as_ptr();
     tx.send(crate::transport::TransportData::new(

@@ -54,6 +54,7 @@ impl VideoEncoderNode {
             "Video support is disabled".to_string(),
         ))
     }
+    pub fn request_keyframe(&self) {}
 }
 
 #[cfg(not(feature = "video"))]
@@ -652,6 +653,22 @@ pub struct VideoTrack {
     /// set once at session bind and otherwise only read by the send
     /// path.
     media_clock: Arc<RwLock<Option<MediaClockPublisher>>>,
+
+    /// Whether a member receives this track: its sender's transceiver was
+    /// answered with a `mid` and a direction that sends. `true` until the
+    /// peer has negotiated, so tracks used outside a peer are unaffected.
+    receiving: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Frames dropped before the encoder because nobody receives the track
+    /// (`video_frames_unreceived` in the peer's telemetry).
+    frames_unreceived: Arc<std::sync::atomic::AtomicU64>,
+
+    /// The next frame sent is encoded as a keyframe: set when the track
+    /// starts being received and on RTCP picture-loss feedback.
+    keyframe_pending: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Keyframes requested so far (first frame after negotiation, PLI, FIR).
+    keyframes_requested: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl VideoTrack {
@@ -707,7 +724,55 @@ impl VideoTrack {
             codec,
             framerate,
             media_clock: Arc::new(RwLock::new(None)),
+            receiving: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            frames_unreceived: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            keyframe_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            keyframes_requested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Record, after negotiation, whether a member receives this track.
+    ///
+    /// A track nobody receives drops its frames before the encoder and
+    /// counts them ([`Self::frames_unreceived`]). A track that is received
+    /// encodes its next frame as a keyframe, so the receiver can start
+    /// decoding at once.
+    pub fn set_receiving(&self, receiving: bool) {
+        use std::sync::atomic::Ordering;
+        self.receiving.store(receiving, Ordering::Release);
+        if receiving {
+            self.request_keyframe();
+        }
+    }
+
+    /// Whether a member receives this track.
+    pub fn is_receiving(&self) -> bool {
+        self.receiving.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Frames dropped because nobody receives the track.
+    pub fn frames_unreceived(&self) -> u64 {
+        self.frames_unreceived
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Encode the next frame as a keyframe (a receiver reported picture loss
+    /// with RTCP PLI or FIR, or started receiving).
+    pub fn request_keyframe(&self) {
+        use std::sync::atomic::Ordering;
+        self.keyframe_pending.store(true, Ordering::Release);
+        self.keyframes_requested.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Frames encoded and sent so far.
+    pub fn frames_encoded(&self) -> u32 {
+        self.frame_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Keyframes requested so far.
+    pub fn keyframes_requested(&self) -> u64 {
+        self.keyframes_requested
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Send video frame over RTP (legacy VideoFrame API)
@@ -748,6 +813,16 @@ impl VideoTrack {
         runtime_data: RuntimeData,
         copies: &CopyContext,
     ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        // Nobody receives this track: skip the encode entirely.
+        if !self.receiving.load(Ordering::Acquire) {
+            self.frames_unreceived.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        if self.keyframe_pending.swap(false, Ordering::AcqRel) {
+            self.encoder.request_keyframe();
+        }
+
         // Encode raw frame using core VideoEncoderNode
         let encoded = self
             .encoder

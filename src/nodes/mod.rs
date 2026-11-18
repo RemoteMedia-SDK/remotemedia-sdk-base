@@ -196,10 +196,15 @@ pub mod realtime_events;
 pub use member_media::{
     MemberFlushNode, MemberFlushNodeFactory, MemberMediaRelayNode, MemberMediaRelayNodeFactory,
 };
+/// Decodes an audio file's bytes with the runtime's FFmpeg (`video` feature).
+#[cfg(feature = "video")]
+pub mod audio_file_decoder;
 /// Passes on only the listed kinds of data; heads the audio and text paths of a voice pipeline.
 pub mod media_kind_filter;
 /// Test stand-in for a VAD node (loud = speech); not a speech detector.
 pub mod test_energy_vad;
+/// Test stand-in for a video source (a moving bar under a stream id); not a renderer.
+pub mod test_pattern_video;
 /// Test stand-in for a TTS node (a tone per text chunk); not speech synthesis.
 pub mod test_tone_tts;
 pub use realtime_events::{RealtimeEventsConfig, RealtimeEventsNode, RealtimeEventsNodeFactory};

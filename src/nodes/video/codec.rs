@@ -78,6 +78,10 @@ pub trait VideoEncoderBackend: Send + Sync {
 
     /// Reconfigure encoder (bitrate, quality, etc.)
     fn reconfigure(&mut self, config: &VideoEncoderConfig) -> Result<()>;
+
+    /// Make the next encoded frame a keyframe (a receiver joined, or reported
+    /// picture loss). Backends that cannot force one ignore the request.
+    fn request_keyframe(&mut self) {}
 }
 
 /// Video decoder backend trait
@@ -121,6 +125,8 @@ pub struct FFmpegEncoder {
     config: VideoEncoderConfig,
     frame_count: u64,
     encoder: Option<ac_ffmpeg::codec::video::VideoEncoder>,
+    /// The next frame is pushed as an intra picture.
+    force_keyframe: bool,
 }
 
 #[cfg(feature = "video")]
@@ -130,6 +136,7 @@ impl FFmpegEncoder {
             config,
             frame_count: 0,
             encoder: None, // Lazy initialization on first frame
+            force_keyframe: false,
         })
     }
 }
@@ -247,7 +254,8 @@ impl VideoEncoderBackend for FFmpegEncoder {
                         .set_option("rc", "cbr")
                         .set_option("zerolatency", "1")
                         .set_option("delay", "2")
-                        .set_option("gpu", "1"),
+                        .set_option("gpu", "1")
+                        .set_option("forced-idr", "1"),
                     // libx264 fallback: explicit ultrafast + zerolatency.
                     // Default `medium` preset cannot keep up with 30fps at
                     // typical avatar resolutions on a single CPU core.
@@ -260,7 +268,8 @@ impl VideoEncoderBackend for FFmpegEncoder {
                                 preset.as_str()
                             },
                         )
-                        .set_option("tune", "zerolatency"),
+                        .set_option("tune", "zerolatency")
+                        .set_option("forced-idr", "1"),
                     // Media Foundation: CBR for the remote-display
                     // scenario, no B-frames. Software MFT: hardware MFTs
                     // (NVIDIA's included) only negotiate NV12, and this
@@ -312,7 +321,13 @@ impl VideoEncoderBackend for FFmpegEncoder {
 
         // Set timestamp
         let pts = Timestamp::new(self.frame_count as i64, time_base);
-        let frame = frame.with_time_base(time_base).with_pts(pts).freeze();
+        let frame = frame.with_time_base(time_base).with_pts(pts);
+        let frame = if std::mem::take(&mut self.force_keyframe) {
+            frame.with_picture_type(ac_ffmpeg::codec::video::frame::PictureType::I)
+        } else {
+            frame
+        };
+        let frame = frame.freeze();
 
         // Encode frame
         encoder.push(frame).map_err(|e| {
@@ -346,6 +361,10 @@ impl VideoEncoderBackend for FFmpegEncoder {
     fn reconfigure(&mut self, config: &VideoEncoderConfig) -> Result<()> {
         self.config = config.clone();
         Ok(())
+    }
+
+    fn request_keyframe(&mut self) {
+        self.force_keyframe = true;
     }
 }
 

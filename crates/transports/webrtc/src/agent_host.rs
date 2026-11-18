@@ -104,6 +104,10 @@ pub struct AgentTicketRequest {
     pub ttl: Duration,
     /// Control grants. Empty: media and the pipeline data channel only.
     pub grants: Vec<TicketGrant>,
+    /// End the session as soon as its last member leaves, instead of after
+    /// the empty-session timeout (a provider call's private session; openspec
+    /// extend-ai-sdk-media-streaming, design D10).
+    pub end_on_leave: bool,
 }
 
 /// A minted ticket.
@@ -164,6 +168,8 @@ struct Session {
     members: HashMap<String, AgentMember>,
     /// Since when the session has had no member.
     empty_since: Instant,
+    /// End when the last member leaves (an admission asked for it).
+    end_on_leave: bool,
 }
 
 impl Session {
@@ -326,7 +332,10 @@ impl Inner {
         let core = self
             .state
             .runner
-            .get_or_create_shared_session(format!("agent-session:{room_key}"), manifest)
+            .get_or_create_shared_session(
+                format!("agent-session:{room_key}"),
+                Arc::clone(&manifest),
+            )
             .await
             .map_err(|e| {
                 AgentHostError::Session(format!(
@@ -342,6 +351,8 @@ impl Inner {
             .map_err(|e| {
                 AgentHostError::Session(format!("Failed to serve session {session_id}: {e}"))
             })?;
+        // Members are planned from this pipeline, not the server's manifest.
+        room.set_manifest(Arc::clone(&manifest));
         self.state.host_room(&room_key, Arc::clone(&room)).await;
 
         let session = Session {
@@ -353,6 +364,7 @@ impl Inner {
             room,
             members: HashMap::new(),
             empty_since: Instant::now(),
+            end_on_leave: false,
         };
         let started = session.event(AgentSessionEventKind::SessionStarted, None, None);
         self.sessions
@@ -450,15 +462,16 @@ impl Inner {
         self.emit(event);
     }
 
-    /// A member's connection ended.
-    fn member_disconnected(&self, peer_id: &str, transport_reason: Option<&str>) {
+    /// A member's connection ended. Returns the room to end at once: the
+    /// member was the last of a session admitted with `end_on_leave`.
+    fn member_disconnected(&self, peer_id: &str, transport_reason: Option<&str>) -> Option<String> {
         let Some(record) = self
             .connected
             .lock()
             .expect("connected members")
             .remove(peer_id)
         else {
-            return;
+            return None;
         };
         let reason = self
             .removing
@@ -469,22 +482,49 @@ impl Inner {
                 Some(reason) if reason.starts_with("replaced") => "replaced".to_string(),
                 _ => "disconnected".to_string(),
             });
-        let event = {
+        let (event, end_now) = {
             let mut sessions = self.sessions.lock().expect("sessions");
             let Some(session) = sessions.get_mut(&record.room) else {
-                return;
+                return None;
             };
             session.members.remove(peer_id);
             if session.members.is_empty() {
                 session.empty_since = Instant::now();
             }
-            session.event(
-                AgentSessionEventKind::MemberLeft,
-                Some(record.member),
-                Some(reason),
+            let end_now = session.members.is_empty() && session.end_on_leave;
+            (
+                session.event(
+                    AgentSessionEventKind::MemberLeft,
+                    Some(record.member),
+                    Some(reason),
+                ),
+                end_now,
             )
         };
         self.emit(event);
+        end_now.then_some(record.room)
+    }
+
+    /// End `room_key` now if it is still empty and nobody holds a ticket for
+    /// it (an `end_on_leave` session whose last member left).
+    async fn end_if_left(&self, room_key: &str) {
+        let _guard = self.lifecycle.lock().await;
+        let empty = self
+            .sessions
+            .lock()
+            .expect("sessions")
+            .get(room_key)
+            .map(|session| session.members.is_empty())
+            .unwrap_or(false);
+        if empty
+            && self
+                .tickets
+                .store
+                .pending_for_room(room_key, SystemTime::now())
+                == 0
+        {
+            self.end_session(room_key, "left").await;
+        }
     }
 
     /// End sessions whose pipeline stopped, and sessions nobody is in or
@@ -597,7 +637,11 @@ impl AgentHost {
                         inner.member_connected(&peer_id);
                     }
                     WebRtcEventBridge::PeerDisconnected { peer_id, reason } => {
-                        inner.member_disconnected(&peer_id, reason.as_deref());
+                        if let Some(room_key) =
+                            inner.member_disconnected(&peer_id, reason.as_deref())
+                        {
+                            inner.end_if_left(&room_key).await;
+                        }
                     }
                     _ => {}
                 }
@@ -639,6 +683,31 @@ impl AgentHost {
             .insert(name.into(), manifest);
     }
 
+    /// Make a pipeline available under `name` unless that name is taken
+    /// (`RuntimeControl.RegisterPipeline`). `Ok(true)` when it was added,
+    /// `Ok(false)` when the same manifest is already registered under the
+    /// name, and an error naming the name when another manifest is.
+    pub fn add_pipeline(
+        &self,
+        name: &str,
+        manifest: Arc<Manifest>,
+    ) -> Result<bool, AgentHostError> {
+        let mut pipelines = self.inner.pipelines.lock().expect("pipelines");
+        if let Some(existing) = pipelines.get(name) {
+            let same = serde_json::to_value(existing.as_ref()).ok()
+                == serde_json::to_value(manifest.as_ref()).ok();
+            return if same {
+                Ok(false)
+            } else {
+                Err(AgentHostError::Invalid(format!(
+                    "pipeline '{name}' is already registered with another manifest"
+                )))
+            };
+        }
+        pipelines.insert(name.to_string(), manifest);
+        Ok(true)
+    }
+
     /// Session lifecycle notifications from now on.
     pub fn subscribe(&self) -> broadcast::Receiver<AgentSessionEvent> {
         self.inner.events.subscribe()
@@ -672,6 +741,22 @@ impl AgentHost {
         let session_id = inner
             .ensure_session(&request.pipeline, &request.session_key)
             .await?;
+        if request.end_on_leave {
+            if let Some(session) =
+                inner
+                    .sessions
+                    .lock()
+                    .expect("sessions")
+                    .get_mut(&agent_tickets::room_key(
+                        &request.pipeline,
+                        &request.session_key,
+                    ))
+            {
+                session.end_on_leave = true;
+                // Its members may end their input; the session then drains.
+                session.room.set_drain_on_end_input(true);
+            }
+        }
         let ticket = new_ticket();
         let expires = inner
             .tickets

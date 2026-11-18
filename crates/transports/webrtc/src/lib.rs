@@ -86,6 +86,12 @@ mod signaling;
 pub mod signaling;
 
 pub mod channels;
+/// A non-browser WebRTC member peer (openspec extend-ai-sdk-media-streaming,
+/// design D11).
+#[cfg(feature = "grpc-signaling")]
+pub mod member;
+#[cfg(all(test, feature = "ws-signaling"))]
+mod member_tests;
 pub mod media;
 mod peer;
 mod session;

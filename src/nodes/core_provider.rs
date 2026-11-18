@@ -98,9 +98,19 @@ impl NodeProvider for CoreNodesProvider {
         registry.register(Arc::new(
             crate::nodes::media_kind_filter::MediaKindFilterNodeFactory,
         ));
+        // An audio file's bytes in, its audio out, with the runtime's FFmpeg
+        // (openspec: extend-ai-sdk-media-streaming, design D9).
+        #[cfg(feature = "video")]
+        registry.register(Arc::new(
+            crate::nodes::audio_file_decoder::AudioFileDecoderNodeFactory,
+        ));
         // Test stand-in for a TTS node: a tone per text chunk, not speech.
         registry.register(Arc::new(
             crate::nodes::test_tone_tts::TestToneTtsNodeFactory,
+        ));
+        // Test stand-in for a video source: the pipeline's video without a camera or model.
+        registry.register(Arc::new(
+            crate::nodes::test_pattern_video::TestPatternVideoNodeFactory,
         ));
         // Test stand-in for a VAD node: loud input is "speech".
         registry.register(Arc::new(

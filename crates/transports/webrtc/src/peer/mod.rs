@@ -26,4 +26,10 @@ pub use lifecycle::{
 pub use manager::{PeerInfo, PeerManager};
 
 #[cfg(any(feature = "grpc-signaling", feature = "ws-signaling"))]
+pub(crate) use data_channel_ingress::{decode_pipeline_input, END_OF_INPUT_ACTION};
+#[cfg(any(feature = "grpc-signaling", feature = "ws-signaling"))]
+pub(crate) use server_peer::send_framed;
+#[cfg(any(feature = "grpc-signaling", feature = "ws-signaling"))]
+pub use server_peer::DATA_CHANNEL_FRAME_LIMIT;
+#[cfg(any(feature = "grpc-signaling", feature = "ws-signaling"))]
 pub use server_peer::{ServerPeer, SharedPipelineSession};

@@ -5256,6 +5256,28 @@ pub struct AdmitMemberRequest {
     /// Empty: media and the pipeline data channel only, no control channel.
     #[prost(message, repeated, tag = "5")]
     pub grants: ::prost::alloc::vec::Vec<MemberGrant>,
+    /// End the session as soon as its last member leaves, instead of after the
+    /// runtime's empty-session timeout (a provider call's private session).
+    #[prost(bool, tag = "6")]
+    pub end_on_leave: bool,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RegisterPipelineRequest {
+    /// The name members are admitted by. Becomes the manifest's
+    /// `metadata.name`.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// The pipeline manifest as JSON.
+    #[prost(string, tag = "2")]
+    pub manifest_json: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RegisterPipelineResponse {
+    /// `false` when the same manifest was already registered under the name.
+    #[prost(bool, tag = "1")]
+    pub registered: bool,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -5497,6 +5519,37 @@ pub mod runtime_control_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
+        /// Make a manifest admissible by name (`AdmitMember.pipeline`), after the
+        /// checks the runtime applies to the manifest it started with. Registering
+        /// the same name with the same manifest again changes nothing; with another
+        /// manifest it is ALREADY_EXISTS. Pipeline input never crosses this service:
+        /// members join the pipeline's own transport with a ticket.
+        pub async fn register_pipeline(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RegisterPipelineRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RegisterPipelineResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/remotemedia.v1.RuntimeControl/RegisterPipeline",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("remotemedia.v1.RuntimeControl", "RegisterPipeline"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Admit one member to the session of `(pipeline, session_key)`, starting
         /// the session if it is not running. Returns a single-use ticket.
         pub async fn admit_member(
@@ -5659,6 +5712,11 @@ pub mod runtime_control_client {
         /// Run a manifest on `inputs` in a session of its own and stream every
         /// output of its sinks; the stream ends when the pipeline has drained.
         /// Cancelling the call ends the run.
+        ///
+        /// Deprecated: it feeds pipeline input through the control address.
+        /// Register the pipeline and join it as a member instead (openspec
+        /// extend-ai-sdk-media-streaming, design D10).
+        #[deprecated]
         pub async fn run_pipeline(
             &mut self,
             request: impl tonic::IntoRequest<super::RunPipelineRequest>,
@@ -5724,6 +5782,18 @@ pub mod runtime_control_server {
     /// Generated trait containing gRPC methods that should be implemented for use with RuntimeControlServer.
     #[async_trait]
     pub trait RuntimeControl: std::marker::Send + std::marker::Sync + 'static {
+        /// Make a manifest admissible by name (`AdmitMember.pipeline`), after the
+        /// checks the runtime applies to the manifest it started with. Registering
+        /// the same name with the same manifest again changes nothing; with another
+        /// manifest it is ALREADY_EXISTS. Pipeline input never crosses this service:
+        /// members join the pipeline's own transport with a ticket.
+        async fn register_pipeline(
+            &self,
+            request: tonic::Request<super::RegisterPipelineRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RegisterPipelineResponse>,
+            tonic::Status,
+        >;
         /// Admit one member to the session of `(pipeline, session_key)`, starting
         /// the session if it is not running. Returns a single-use ticket.
         async fn admit_member(
@@ -5792,6 +5862,10 @@ pub mod runtime_control_server {
         /// Run a manifest on `inputs` in a session of its own and stream every
         /// output of its sinks; the stream ends when the pipeline has drained.
         /// Cancelling the call ends the run.
+        ///
+        /// Deprecated: it feeds pipeline input through the control address.
+        /// Register the pipeline and join it as a member instead (openspec
+        /// extend-ai-sdk-media-streaming, design D10).
         async fn run_pipeline(
             &self,
             request: tonic::Request<super::RunPipelineRequest>,
@@ -5885,6 +5959,52 @@ pub mod runtime_control_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
+                "/remotemedia.v1.RuntimeControl/RegisterPipeline" => {
+                    #[allow(non_camel_case_types)]
+                    struct RegisterPipelineSvc<T: RuntimeControl>(pub Arc<T>);
+                    impl<
+                        T: RuntimeControl,
+                    > tonic::server::UnaryService<super::RegisterPipelineRequest>
+                    for RegisterPipelineSvc<T> {
+                        type Response = super::RegisterPipelineResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RegisterPipelineRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RuntimeControl>::register_pipeline(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RegisterPipelineSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/remotemedia.v1.RuntimeControl/AdmitMember" => {
                     #[allow(non_camel_case_types)]
                     struct AdmitMemberSvc<T: RuntimeControl>(pub Arc<T>);

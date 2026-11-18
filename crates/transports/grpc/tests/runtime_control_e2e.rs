@@ -4,6 +4,10 @@
 //! answers that name the operation, member events, and a one-shot pipeline
 //! run on a real `PipelineExecutor`.
 
+// `RunPipeline` is deprecated (it feeds pipeline input through the control
+// address); its behaviour is still covered here while it exists.
+#![allow(deprecated)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +22,7 @@ use remotemedia_grpc::generated::runtime_control_client::RuntimeControlClient;
 use remotemedia_grpc::generated::{
     AdmitMemberRequest, AdmitMemberResponse, DataBuffer, EndSessionRequest, GetSessionRequest,
     ListMembersRequest, ListSessionsRequest, ManagedLlmRequest, MemberChange, MemberInfo,
-    RemoveMemberRequest, RunPipelineRequest, WatchMembersRequest,
+    RegisterPipelineRequest, RemoveMemberRequest, RunPipelineRequest, WatchMembersRequest,
 };
 use tokio::sync::broadcast;
 use tonic::transport::Channel;
@@ -73,6 +77,13 @@ impl ControlHost for TestHost {
     ) -> Result<RunOutputs, Status> {
         remotemedia_grpc::control_host::run_pipeline(self.executor.clone(), &manifest_json, inputs)
             .await
+    }
+
+    async fn register_pipeline(&self, name: &str, manifest_json: &str) -> Result<bool, Status> {
+        if manifest_json.trim().is_empty() {
+            return Err(Status::invalid_argument("no manifest"));
+        }
+        Ok(name != "voice")
     }
 }
 
@@ -144,6 +155,7 @@ fn admit(pipeline: &str) -> AdmitMemberRequest {
         member: Some(member("ada")),
         ttl_secs: 60,
         grants: vec![],
+        end_on_leave: false,
     }
 }
 
@@ -153,6 +165,16 @@ async fn a_host_that_does_nothing_answers_unimplemented_naming_each_operation() 
     let mut client = RuntimeControlClient::new(server.channel.clone());
 
     let cases: Vec<(&str, Status)> = vec![
+        (
+            "registering a pipeline",
+            client
+                .register_pipeline(RegisterPipelineRequest {
+                    name: "p".into(),
+                    manifest_json: "{}".into(),
+                })
+                .await
+                .unwrap_err(),
+        ),
         (
             "admitting a member",
             client.admit_member(admit("voice")).await.unwrap_err(),
@@ -229,12 +251,13 @@ async fn a_host_that_does_nothing_answers_unimplemented_naming_each_operation() 
         );
     }
 
-    // `PipelineControl` is served on the same listener.
-    let listed = PipelineControlClient::new(server.channel.clone())
+    // `PipelineControl` is served on the same listener. (Its session list is
+    // the process-wide bus, which other tests here add sessions to, so only
+    // the call's success is checked.)
+    PipelineControlClient::new(server.channel.clone())
         .list_sessions(ListSessionsRequest {})
         .await
         .unwrap();
-    assert!(listed.into_inner().sessions.is_empty());
 }
 
 #[tokio::test]
@@ -369,9 +392,13 @@ async fn watch_members_starts_with_ready_then_streams_joins_and_leaves() {
 async fn run_pipeline_streams_every_output_then_ends_and_leaves_no_session() {
     let server = serve(None, false).await;
     let mut client = RuntimeControlClient::new(server.channel.clone());
+    // Every executor in this process shares one session bus, and other tests
+    // here open sessions of their own; a unique pipeline name lets this test
+    // wait for its own session only.
+    const PIPELINE: &str = "run-pipeline-one-shot";
     let manifest = serde_json::json!({
         "version": "v1",
-        "metadata": { "name": "echo" },
+        "metadata": { "name": PIPELINE },
         "nodes": [{ "id": "pass", "node_type": "PassThrough", "params": {} }],
         "connections": []
     });
@@ -408,7 +435,15 @@ async fn run_pipeline_streams_every_output_then_ends_and_leaves_no_session() {
 
     // The run's session is gone once the stream has ended.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !server.executor.control_bus().list().is_empty() {
+    let listed = || {
+        server
+            .executor
+            .control_bus()
+            .list()
+            .iter()
+            .any(|session| session.pipeline_name == PIPELINE)
+    };
+    while listed() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the one-shot session is still listed"
@@ -476,4 +511,52 @@ async fn a_control_server_without_a_host_has_no_runtime_control_service() {
         .await
         .unwrap_err();
     assert_eq!(refused.code(), Code::Unimplemented);
+}
+
+#[tokio::test]
+async fn register_pipeline_reaches_the_host_and_needs_a_name() {
+    let server = serve(None, false).await;
+    let mut client = RuntimeControlClient::new(server.channel.clone());
+    let added = client
+        .register_pipeline(RegisterPipelineRequest {
+            name: "provider-0123456789abcdef".into(),
+            manifest_json: "{\"version\":\"v1\",\"nodes\":[]}".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(added.registered);
+    // The same name again: already there.
+    let again = client
+        .register_pipeline(RegisterPipelineRequest {
+            name: "voice".into(),
+            manifest_json: "{}".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!again.registered);
+    let refused = client
+        .register_pipeline(RegisterPipelineRequest {
+            name: "  ".into(),
+            manifest_json: "{}".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(refused.message().contains("name"), "{}", refused.message());
+}
+
+#[tokio::test]
+async fn the_control_address_serves_no_pipeline_input() {
+    // Pipeline input crosses the pipeline's own transport (design D10):
+    // `StreamPipeline` is not on the control address.
+    use remotemedia_grpc::generated::streaming_pipeline_service_client::StreamingPipelineServiceClient;
+    let server = serve(None, false).await;
+    let mut client = StreamingPipelineServiceClient::new(server.channel.clone());
+    let refused = client
+        .stream_pipeline(tokio_stream::iter(Vec::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unimplemented);
 }
