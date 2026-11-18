@@ -9,8 +9,8 @@
 //! `SharedEchoNode` answers a text input with `{session}:{count}:{model}:{text}`
 //! and appends one line to `load_log` per model load.
 
-use crate::python::multiprocess::shared_workers::{pool, WorkerSharingConfig, AT_CAPACITY};
 use super::*;
+use crate::python::multiprocess::shared_workers::{pool, WorkerSharingConfig, AT_CAPACITY};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -47,7 +47,11 @@ impl Fixture {
         // pool is process-wide and tests run concurrently).
         let model = format!("m{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
         let load_log = std::env::temp_dir().join(format!("shared-echo-{model}.log"));
-        Self { config, model, load_log }
+        Self {
+            config,
+            model,
+            load_log,
+        }
     }
 
     async fn session(&self, session_id: &str) -> Result<MultiprocessExecutor> {
@@ -65,7 +69,9 @@ impl Fixture {
     }
 
     fn loads(&self) -> usize {
-        std::fs::read_to_string(&self.load_log).map(|s| s.lines().count()).unwrap_or(0)
+        std::fs::read_to_string(&self.load_log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
     }
 
     async fn workers(&self) -> Vec<crate::python::multiprocess::shared_workers::WorkerSnapshot> {
@@ -117,7 +123,11 @@ async fn lane_worker_pid(executor: &MultiprocessExecutor, session: &str) -> Opti
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_sessions_share_one_worker_and_model() {
     let Some(client) = enabled() else { return };
-    let sharing = WorkerSharingConfig { enabled: true, idle_ttl_secs: 1, ..Default::default() };
+    let sharing = WorkerSharingConfig {
+        enabled: true,
+        idle_ttl_secs: 1,
+        ..Default::default()
+    };
     let fixture = Fixture::new(client, sharing);
     let (a_id, b_id) = (session_id("sa"), session_id("sb"));
 
@@ -135,7 +145,12 @@ async fn two_sessions_share_one_worker_and_model() {
 
     // Ending A detaches it; the worker keeps serving B.
     ExecutorNodeExecutor::cleanup(&mut a).await.unwrap();
-    let worker = fixture.workers().await.into_iter().find(|w| w.pid == pid).expect("worker alive");
+    let worker = fixture
+        .workers()
+        .await
+        .into_iter()
+        .find(|w| w.pid == pid)
+        .expect("worker alive");
     assert_eq!(worker.attached_sessions, 1);
     assert_eq!(ask(&b, &b_id, "four").await, format!("{b_id}:2:{m}:four"));
 
@@ -151,7 +166,10 @@ async fn two_sessions_share_one_worker_and_model() {
     ExecutorNodeExecutor::cleanup(&mut c).await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while fixture.workers().await.iter().any(|w| w.pid == pid) {
-        assert!(std::time::Instant::now() < deadline, "idle worker was not shut down");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "idle worker was not shut down"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -173,10 +191,17 @@ async fn full_workers_refuse_with_at_capacity() {
     // A full worker causes a second worker for the same key...
     let mut b = fixture.session(&b_id).await.expect("session b");
     eprintln!("[capacity] b attached");
-    let (pa, pb) = (lane_worker_pid(&a, &a_id).await.unwrap(), lane_worker_pid(&b, &b_id).await.unwrap());
+    let (pa, pb) = (
+        lane_worker_pid(&a, &a_id).await.unwrap(),
+        lane_worker_pid(&b, &b_id).await.unwrap(),
+    );
     assert_ne!(pa, pb);
     // ...up to the per-key limit.
-    let error = fixture.session(&session_id("cc")).await.err().expect("third session refused");
+    let error = fixture
+        .session(&session_id("cc"))
+        .await
+        .err()
+        .expect("third session refused");
     assert!(error.to_string().contains(AT_CAPACITY), "{error}");
     eprintln!("[capacity] c refused");
     // Detaching frees a place on the existing worker.
@@ -192,7 +217,11 @@ async fn full_workers_refuse_with_at_capacity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_crash_ends_every_attached_session_and_respawns() {
     let Some(client) = enabled() else { return };
-    let sharing = WorkerSharingConfig { enabled: true, idle_ttl_secs: 1, ..Default::default() };
+    let sharing = WorkerSharingConfig {
+        enabled: true,
+        idle_ttl_secs: 1,
+        ..Default::default()
+    };
     let fixture = Fixture::new(client, sharing);
     let (a_id, b_id) = (session_id("ka"), session_id("kb"));
     let a = fixture.session(&a_id).await.expect("session a");
@@ -211,7 +240,10 @@ async fn worker_crash_ends_every_attached_session_and_respawns() {
         if a_gone && b_gone {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "sessions not terminated: a gone {a_gone}, b gone {b_gone}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sessions not terminated: a gone {a_gone}, b gone {b_gone}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -221,7 +253,10 @@ async fn worker_crash_ends_every_attached_session_and_respawns() {
     let mut c = fixture.session(&c_id).await.expect("session after crash");
     let new_pid = lane_worker_pid(&c, &c_id).await.expect("shared");
     assert_ne!(new_pid, pid);
-    assert_eq!(ask(&c, &c_id, "hi").await, format!("{c_id}:1:{}:hi", fixture.model));
+    assert_eq!(
+        ask(&c, &c_id, "hi").await,
+        format!("{c_id}:1:{}:hi", fixture.model)
+    );
     ExecutorNodeExecutor::cleanup(&mut c).await.unwrap();
 }
 
@@ -246,7 +281,10 @@ async fn sharing_off_spawns_a_process_per_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn undeclared_node_is_never_shared() {
     let Some(client) = enabled() else { return };
-    let sharing = WorkerSharingConfig { enabled: true, ..Default::default() };
+    let sharing = WorkerSharingConfig {
+        enabled: true,
+        ..Default::default()
+    };
     let fixture = Fixture::new(client, sharing);
     let (a_id, b_id) = (session_id("pa"), session_id("pb"));
     let start = |session: String| {
@@ -262,7 +300,9 @@ async fn undeclared_node_is_never_shared() {
                 session_id: Some(session),
                 metadata: HashMap::new(),
             };
-            ExecutorNodeExecutor::initialize(&mut executor, &ctx).await.map(|_| executor)
+            ExecutorNodeExecutor::initialize(&mut executor, &ctx)
+                .await
+                .map(|_| executor)
         }
     };
     let mut a = start(a_id.clone()).await.expect("session a");
@@ -330,9 +370,14 @@ mod participant_lanes {
             Ok(())
         }
 
-        async fn process(&self, data: crate::data::RuntimeData) -> Result<crate::data::RuntimeData> {
+        async fn process(
+            &self,
+            data: crate::data::RuntimeData,
+        ) -> Result<crate::data::RuntimeData> {
             let guard = self.executor.lock().await;
-            let executor = guard.as_ref().ok_or_else(|| Error::Execution("lane stopped".into()))?;
+            let executor = guard
+                .as_ref()
+                .ok_or_else(|| Error::Execution("lane stopped".into()))?;
             let mut replies = Vec::new();
             executor
                 .process_runtime_data_streaming(data, self.session.get().cloned(), |out| {
@@ -340,7 +385,9 @@ mod participant_lanes {
                     Ok(())
                 })
                 .await?;
-            replies.pop().ok_or_else(|| Error::Execution("no reply".into()))
+            replies
+                .pop()
+                .ok_or_else(|| Error::Execution("no reply".into()))
         }
 
         async fn process_control_message(
@@ -393,15 +440,23 @@ mod participant_lanes {
     /// Three participants, two rounds each, through a per-participant Python
     /// node (scope declared only by the Python class). Returns each
     /// participant's `(instance, count)` replies and every lane's worker pid.
-    async fn three_participants(fixture: &Fixture) -> (BTreeMap<String, Vec<(String, u32)>>, Vec<u32>) {
+    async fn three_participants(
+        fixture: &Fixture,
+    ) -> (BTreeMap<String, Vec<(String, u32)>>, Vec<u32>) {
         let executor = PipelineExecutor::new().unwrap();
         let lanes: Lanes = Arc::default();
         executor
-            .register_factory(Arc::new(LaneFactory { config: fixture.config.clone(), lanes: lanes.clone() }))
+            .register_factory(Arc::new(LaneFactory {
+                config: fixture.config.clone(),
+                lanes: lanes.clone(),
+            }))
             .await;
         let manifest = Arc::new(Manifest {
             version: "v1".into(),
-            metadata: ManifestMetadata { name: "python-lanes".into(), ..Default::default() },
+            metadata: ManifestMetadata {
+                name: "python-lanes".into(),
+                ..Default::default()
+            },
             nodes: vec![NodeManifest {
                 id: "echo".into(),
                 node_type: "ScopedEchoNode".into(),
@@ -415,13 +470,19 @@ mod participant_lanes {
         let mut session = executor.create_session(manifest).await.expect("session");
         let users: Vec<_> = ["ann", "ben", "cat"]
             .iter()
-            .map(|id| session.join_participant(Participant::new(*id, participant::role::USER)).unwrap())
+            .map(|id| {
+                session
+                    .join_participant(Participant::new(*id, participant::role::USER))
+                    .unwrap()
+            })
             .collect();
         for round in 1..=2 {
             for user in &users {
-                user.send(TransportData::new(crate::data::RuntimeData::Text(format!("r{round}"))))
-                    .await
-                    .unwrap();
+                user.send(TransportData::new(crate::data::RuntimeData::Text(format!(
+                    "r{round}"
+                ))))
+                .await
+                .unwrap();
             }
         }
         let mut replies: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
@@ -431,11 +492,17 @@ mod participant_lanes {
                 .expect("reply in time")
                 .unwrap()
                 .expect("session open");
-            let crate::data::RuntimeData::Text(body) = &output.data else { panic!("{:?}", output.data) };
+            let crate::data::RuntimeData::Text(body) = &output.data else {
+                panic!("{:?}", output.data)
+            };
             let mut parts = body.splitn(3, ':');
             let instance = parts.next().unwrap().to_string();
             let count = parts.next().unwrap().parse().unwrap();
-            let who = output.metadata.get(participant::ID).cloned().expect("attributed");
+            let who = output
+                .metadata
+                .get(participant::ID)
+                .cloned()
+                .expect("attributed");
             replies.entry(who).or_default().push((instance, count));
         }
         let mut pids = Vec::new();
@@ -476,7 +543,11 @@ mod participant_lanes {
             assert_eq!((seen[0].1, seen[1].1), (1, 2), "{who} has its own count");
             instances.insert(seen[0].0.clone());
         }
-        assert_eq!(instances.len(), 3, "one instance per participant: {replies:?}");
+        assert_eq!(
+            instances.len(),
+            3,
+            "one instance per participant: {replies:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -486,19 +557,31 @@ mod participant_lanes {
         let (replies, pids) = three_participants(&fixture).await;
         assert_isolated(&replies);
         let distinct: HashSet<_> = pids.iter().collect();
-        assert_eq!((pids.len(), distinct.len()), (3, 3), "a process per lane: {pids:?}");
+        assert_eq!(
+            (pids.len(), distinct.len()),
+            (3, 3),
+            "a process per lane: {pids:?}"
+        );
         assert_eq!(fixture.loads(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shared_workers_serve_every_participant_lane_from_one_process() {
         let Some(client) = enabled() else { return };
-        let sharing = WorkerSharingConfig { enabled: true, idle_ttl_secs: 1, ..Default::default() };
+        let sharing = WorkerSharingConfig {
+            enabled: true,
+            idle_ttl_secs: 1,
+            ..Default::default()
+        };
         let fixture = Fixture::new(client, sharing);
         let (replies, pids) = three_participants(&fixture).await;
         assert_isolated(&replies);
         let distinct: HashSet<_> = pids.iter().collect();
-        assert_eq!((pids.len(), distinct.len()), (3, 1), "lanes share one worker: {pids:?}");
+        assert_eq!(
+            (pids.len(), distinct.len()),
+            (3, 1),
+            "lanes share one worker: {pids:?}"
+        );
         assert_eq!(fixture.loads(), 1, "one model load for three participants");
     }
 }

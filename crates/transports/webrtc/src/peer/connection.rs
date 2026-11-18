@@ -879,11 +879,17 @@ impl PeerConnection {
         handler: F,
     ) -> Result<()>
     where
-        F: Fn(std::result::Result<DataChannelMessage, crate::channels::DataChannelDecodeError>) -> Fut
-            + Send + Sync + 'static,
+        F: Fn(
+                std::result::Result<DataChannelMessage, crate::channels::DataChannelDecodeError>,
+            ) -> Fut
+            + Send
+            + Sync
+            + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        self.channel_for_operation().await?.on_message_with_context(copies, handler);
+        self.channel_for_operation()
+            .await?
+            .on_message_with_context(copies, handler);
         Ok(())
     }
 

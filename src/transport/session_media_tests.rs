@@ -116,11 +116,20 @@ async fn speech_is_queued_until_media_ready_and_enters_tts_with_a_turn_id() {
     control.attach_input_sender(tx).await;
 
     // Alice is not connected yet: both greetings wait, in order.
-    let first = control.speak(speech("Hi Alice.", &["alice"])).await.unwrap();
-    let second = control.speak(speech("How can I help?", &["alice"])).await.unwrap();
+    let first = control
+        .speak(speech("Hi Alice.", &["alice"]))
+        .await
+        .unwrap();
+    let second = control
+        .speak(speech("How can I help?", &["alice"]))
+        .await
+        .unwrap();
     assert!(first.queued && second.queued);
     assert_ne!(first.turn_id, second.turn_id);
-    assert!(rx.try_recv().is_err(), "nothing reaches TTS before media_ready");
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing reaches TTS before media_ready"
+    );
 
     // Bob becoming ready does not release speech for Alice.
     control.publish_media_ready("bob", "webrtc", "c-bob");
@@ -155,7 +164,10 @@ async fn speech_is_queued_until_media_ready_and_enters_tts_with_a_turn_id() {
     let mut request = speech("One more thing.", &["alice", "bob"]);
     request.turn_id = Some("greeting-3".into());
     let third = control.speak(request).await.unwrap();
-    assert_eq!((third.turn_id.as_str(), third.queued), ("greeting-3", false));
+    assert_eq!(
+        (third.turn_id.as_str(), third.queued),
+        ("greeting-3", false)
+    );
     let packet = rx.try_recv().unwrap();
     assert_eq!(packet.metadata[participant::TO], "alice,bob");
     assert_eq!(packet.metadata[keys::TURN_ID], "greeting-3");

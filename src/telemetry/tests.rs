@@ -55,8 +55,14 @@ fn descriptor_edges_follow_connections_then_client_edges() {
     assert_eq!(d.schema_version, SCHEMA_VERSION);
     assert_eq!(d.nodes.len(), 3);
     assert_eq!(d.edges.len(), 4);
-    assert_eq!((d.edges[0].from.as_str(), d.edges[0].to.as_str()), ("a", "b"));
-    assert_eq!((d.edges[1].from.as_str(), d.edges[1].to.as_str()), ("b", "c"));
+    assert_eq!(
+        (d.edges[0].from.as_str(), d.edges[0].to.as_str()),
+        ("a", "b")
+    );
+    assert_eq!(
+        (d.edges[1].from.as_str(), d.edges[1].to.as_str()),
+        ("b", "c")
+    );
     assert_eq!(d.edges[2].kind, EdgeKind::Ingress);
     assert_eq!(d.edges[2].to, "a");
     assert_eq!(d.edges[3].kind, EdgeKind::Egress);
@@ -76,7 +82,11 @@ fn mark_inserted_and_pacing() {
     let m = manifest(&["a", "b"], &[("a", "b")]);
     let (mut d, _) = telemetry_for(&m);
     d.mark_inserted(&["b".to_string()].into_iter().collect());
-    d.set_pacing(&[("a".to_string(), "reactive".to_string())].into_iter().collect());
+    d.set_pacing(
+        &[("a".to_string(), "reactive".to_string())]
+            .into_iter()
+            .collect(),
+    );
     assert!(!d.nodes[0].inserted_by_negotiation);
     assert!(d.nodes[1].inserted_by_negotiation);
     assert_eq!(d.nodes[0].pacing.as_deref(), Some("reactive"));
@@ -172,7 +182,10 @@ fn long_error_messages_are_truncated() {
 #[test]
 fn level_parse_and_interval_clamp() {
     assert_eq!(TelemetryLevel::parse("FULL"), Some(TelemetryLevel::Full));
-    assert_eq!(TelemetryLevel::parse("counters"), Some(TelemetryLevel::Counters));
+    assert_eq!(
+        TelemetryLevel::parse("counters"),
+        Some(TelemetryLevel::Counters)
+    );
     assert_eq!(TelemetryLevel::parse("bogus"), None);
     let m = manifest(&["a"], &[]);
     let (_, t) = telemetry_for(&m);

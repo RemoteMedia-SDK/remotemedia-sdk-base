@@ -47,7 +47,11 @@ impl SessionIpc {
     pub(super) fn take(session: &mut SessionState) -> Self {
         Self {
             session_id: session.session_id.clone(),
-            threads: session.ipc_threads.drain().map(|(_, thread)| thread).collect(),
+            threads: session
+                .ipc_threads
+                .drain()
+                .map(|(_, thread)| thread)
+                .collect(),
             channels: session.channels.drain().map(|(name, _)| name).collect(),
             workers: session
                 .node_processes
@@ -84,7 +88,12 @@ impl SessionIpc {
     ///
     /// Blocks; call it from a thread that is not running async tasks.
     pub(super) fn release(self, registry: &ChannelRegistry) {
-        let Self { session_id, threads, channels, workers } = self;
+        let Self {
+            session_id,
+            threads,
+            channels,
+            workers,
+        } = self;
 
         // No new command reaches the threads. A session's nodes each have
         // their own executor: only this one's routes are removed.
@@ -138,8 +147,11 @@ impl SessionIpc {
 
         // The workers were asked to stop by whoever ended the session. One
         // that closes its ports on the way out removes the services itself.
-        let exit_by = Instant::now() + super::super::process_manager::stop_grace() + WORKER_EXIT_MARGIN;
-        while workers.iter().any(|worker| worker.exited_now() != Some(true))
+        let exit_by =
+            Instant::now() + super::super::process_manager::stop_grace() + WORKER_EXIT_MARGIN;
+        while workers
+            .iter()
+            .any(|worker| worker.exited_now() != Some(true))
             && Instant::now() < exit_by
         {
             std::thread::sleep(Duration::from_millis(20));
@@ -152,7 +164,10 @@ impl SessionIpc {
             left = existing_services(&channels);
         }
         if left.is_empty() {
-            tracing::debug!("Session {session_id}: released {} IPC channel(s)", channels.len());
+            tracing::debug!(
+                "Session {session_id}: released {} IPC channel(s)",
+                channels.len()
+            );
             return;
         }
 
@@ -250,21 +265,25 @@ impl Drop for ReleaseOnDrop {
                 if taken.is_empty() {
                     return;
                 }
-                std::thread::Builder::new().name("py-ipc-release".into()).spawn(move || {
-                    for ipc in taken {
-                        ipc.release(&registry);
-                    }
-                })
+                std::thread::Builder::new()
+                    .name("py-ipc-release".into())
+                    .spawn(move || {
+                        for ipc in taken {
+                            ipc.release(&registry);
+                        }
+                    })
             }
             // A task is using the session table; wait for it on the thread.
             Err(_) => {
                 let sessions = self.sessions.clone();
-                std::thread::Builder::new().name("py-ipc-release".into()).spawn(move || {
-                    let taken = take(&mut sessions.blocking_write());
-                    for ipc in taken {
-                        ipc.release(&registry);
-                    }
-                })
+                std::thread::Builder::new()
+                    .name("py-ipc-release".into())
+                    .spawn(move || {
+                        let taken = take(&mut sessions.blocking_write());
+                        for ipc in taken {
+                            ipc.release(&registry);
+                        }
+                    })
             }
         };
         if let Err(error) = spawned {

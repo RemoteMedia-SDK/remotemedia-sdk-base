@@ -175,7 +175,10 @@ fn transport_metadata_rides_in_data_buffer_metadata_for_every_payload() {
     ]
     .into_iter()
     .collect();
-    for data in [RuntimeData::Text("hello".into()), audio(vec![0.25, -0.5, 1.0, 0.0])] {
+    for data in [
+        RuntimeData::Text("hello".into()),
+        audio(vec![0.25, -0.5, 1.0, 0.0]),
+    ] {
         let transport = remotemedia_core::transport::TransportData {
             data: data.clone(),
             sequence: None,
@@ -185,9 +188,13 @@ fn transport_metadata_rides_in_data_buffer_metadata_for_every_payload() {
         let decoded = DataBuffer::decode(wire.clone()).unwrap();
         assert_eq!(decoded.metadata, metadata);
         // The payload is the same as without metadata.
-        let bare = DataBuffer::decode(encode_runtime_data_with_context(&data, &copies).unwrap()).unwrap();
+        let bare =
+            DataBuffer::decode(encode_runtime_data_with_context(&data, &copies).unwrap()).unwrap();
         assert_eq!(decoded.data_type, bare.data_type);
-        assert!(matches!(decoded.data_type, Some(DataType::Text(_)) | Some(DataType::Audio(_))));
+        assert!(matches!(
+            decoded.data_type,
+            Some(DataType::Text(_)) | Some(DataType::Audio(_))
+        ));
         // No metadata: identical to the plain encoder.
         let plain = remotemedia_core::transport::TransportData {
             data: data.clone(),

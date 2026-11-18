@@ -194,8 +194,8 @@ impl PipelineExecutionService for ExecutionServiceImpl {
                     // The guard already wired `UV_FIND_LINKS` for the request
                     // lifetime; record the same source on the manifest so the
                     // managed uv env system resolves the shipped wheels offline.
-                    let python_version = Some(decoded.interpreter.version.clone())
-                        .filter(|v| !v.trim().is_empty());
+                    let python_version =
+                        Some(decoded.interpreter.version.clone()).filter(|v| !v.trim().is_empty());
                     manifest.python_env = Some(remotemedia_core::manifest::ManifestPythonEnv {
                         python_version,
                         scope: Some(remotemedia_core::python::env_manager::EnvScope::PerPipeline),

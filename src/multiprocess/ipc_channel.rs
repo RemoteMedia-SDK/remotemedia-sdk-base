@@ -404,7 +404,10 @@ impl ChannelRegistry {
     pub async fn create_wake_notifier(&self, channel_name: &str) -> Result<WakeNotifier> {
         let events = self.wake_events.read().await;
         let service = events.get(channel_name).ok_or_else(|| {
-            Error::IpcError(format!("Wake event not found for channel: {}", channel_name))
+            Error::IpcError(format!(
+                "Wake event not found for channel: {}",
+                channel_name
+            ))
         })?;
         service
             .notifier_builder()
@@ -418,7 +421,10 @@ impl ChannelRegistry {
     pub async fn create_wake_listener(&self, channel_name: &str) -> Result<WakeListener> {
         let events = self.wake_events.read().await;
         let service = events.get(channel_name).ok_or_else(|| {
-            Error::IpcError(format!("Wake event not found for channel: {}", channel_name))
+            Error::IpcError(format!(
+                "Wake event not found for channel: {}",
+                channel_name
+            ))
         })?;
         service
             .listener_builder()

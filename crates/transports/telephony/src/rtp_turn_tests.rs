@@ -10,7 +10,12 @@ fn outbound() -> RtpOutboundMediaSession {
 /// `ms` of 8 kHz mono audio of a turn's chunk.
 fn speak(session: &mut RtpOutboundMediaSession, turn: &str, chunk: u64, ms: usize) {
     session
-        .queue_audio_tagged(vec![0.1f32; 8 * ms].into(), 8000, 1, Some(TurnTag::new(turn, chunk)))
+        .queue_audio_tagged(
+            vec![0.1f32; 8 * ms].into(),
+            8000,
+            1,
+            Some(TurnTag::new(turn, chunk)),
+        )
         .unwrap();
 }
 
@@ -38,7 +43,10 @@ fn an_interrupted_turn_reports_a_strict_prefix_and_no_queued_audio() {
     assert_eq!(last.member, "call-1:caller");
     assert_eq!(last.turn_id, "t1");
     assert_eq!(last.released_ms, 540);
-    assert_eq!(last.chunks_released, 1, "chunk 1 was cut and chunk 2 never left");
+    assert_eq!(
+        last.chunks_released, 1,
+        "chunk 1 was cut and chunk 2 never left"
+    );
     // Nothing of the turn is left, and its later audio is refused.
     speak(&mut call, "t1", 2, 100);
     assert_eq!(take_packets(&mut call, 100), 0);

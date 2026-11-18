@@ -21,7 +21,7 @@
 //! All instances share the node's successors, its control-bus identity (state,
 //! taps, intercepts) and its telemetry slot.
 
-use super::{NODE_INPUT_CAPACITY, StreamingNode};
+use super::{StreamingNode, NODE_INPUT_CAPACITY};
 use crate::nodes::Emitter;
 use crate::transport::origin::{Origin, Routed};
 use crate::transport::session_control::{aux_port_of, SessionControl};
@@ -239,13 +239,15 @@ impl Dispatcher {
             }
             let instance = self.open(&key, frame.origin.clone(), tasks, created);
             instances.insert(key.clone(), instance);
-            self.telemetry.set_instances(self.node_index, instances.len());
+            self.telemetry
+                .set_instances(self.node_index, instances.len());
         }
         let tx = instances[&key].tx.clone();
         if tx.send(frame).await.is_err() {
             // The instance failed to start or stopped; its error was reported.
             instances.remove(&key);
-            self.telemetry.set_instances(self.node_index, instances.len());
+            self.telemetry
+                .set_instances(self.node_index, instances.len());
         }
     }
 
@@ -257,7 +259,11 @@ impl Dispatcher {
         created: &mut usize,
     ) -> Instance {
         let (tx, rx) = mpsc::channel(NODE_INPUT_CAPACITY);
-        let who = if key == DEFAULT_KEY { "unattributed input" } else { key };
+        let who = if key == DEFAULT_KEY {
+            "unattributed input"
+        } else {
+            key
+        };
         if let Some((node, emitter)) = self.primary.take() {
             tracing::info!(
                 session_id = %self.session_id,
@@ -291,7 +297,8 @@ impl Dispatcher {
             let (node, emitter) = match factory.create(&instance_id).await {
                 Ok(created) => created,
                 Err(error) => {
-                    let message = format!("instance for participant '{who}' failed to start: {error}");
+                    let message =
+                        format!("instance for participant '{who}' failed to start: {error}");
                     tracing::error!(node_id = %node_id, instance = %instance_id, "{message}");
                     crate::telemetry::publisher::record_node_error(
                         &telemetry,

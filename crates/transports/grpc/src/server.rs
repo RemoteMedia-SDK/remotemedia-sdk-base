@@ -21,7 +21,8 @@ use crate::{
 
 use async_trait::async_trait;
 use remotemedia_bundle::{
-    AcceleratorBackend, CompatibilityRange, PythonTarget, RuntimeCapabilities, BUNDLE_SCHEMA_VERSION,
+    AcceleratorBackend, CompatibilityRange, PythonTarget, RuntimeCapabilities,
+    BUNDLE_SCHEMA_VERSION,
 };
 use remotemedia_bundle_deployment::{
     ActivationRegistry, ContentStore, DeploymentService, ReqwestExternalAssetTransport,
@@ -112,7 +113,7 @@ impl GrpcServer {
             .named_layer(
                 PipelineExecutionServiceServer::new(execution_service)
                     .max_decoding_message_size(10 * 1024 * 1024)
-                    .max_encoding_message_size(10 * 1024 * 1024)
+                    .max_encoding_message_size(10 * 1024 * 1024),
             );
 
         let streaming_service = tower::ServiceBuilder::new()
@@ -122,7 +123,7 @@ impl GrpcServer {
             .named_layer(
                 StreamingPipelineServiceServer::new(streaming_service)
                     .max_decoding_message_size(10 * 1024 * 1024)
-                    .max_encoding_message_size(10 * 1024 * 1024)
+                    .max_encoding_message_size(10 * 1024 * 1024),
             );
 
         let control_service = tower::ServiceBuilder::new()
@@ -206,7 +207,7 @@ impl GrpcServer {
             .named_layer(
                 PipelineExecutionServiceServer::new(execution_service)
                     .max_decoding_message_size(10 * 1024 * 1024)
-                    .max_encoding_message_size(10 * 1024 * 1024)
+                    .max_encoding_message_size(10 * 1024 * 1024),
             );
 
         let streaming_service = tower::ServiceBuilder::new()
@@ -216,7 +217,7 @@ impl GrpcServer {
             .named_layer(
                 StreamingPipelineServiceServer::new(streaming_service)
                     .max_decoding_message_size(10 * 1024 * 1024)
-                    .max_encoding_message_size(10 * 1024 * 1024)
+                    .max_encoding_message_size(10 * 1024 * 1024),
             );
 
         let control_service = tower::ServiceBuilder::new()
@@ -382,7 +383,6 @@ fn deployment_service_from_env(
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error>> {
-
     match std::env::var(name) {
         Ok(value) => Ok(value
             .parse()

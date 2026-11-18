@@ -49,7 +49,9 @@ fn audio(turn: Option<(&str, u64)>, ms: usize) -> TransportData {
 /// The TTS node's end mark for a text chunk.
 fn speech_end(turn: &str, chunk: u64) -> TransportData {
     tagged(
-        TransportData::new(RuntimeData::Json(serde_json::json!({ "kind": "speech_end" }))),
+        TransportData::new(RuntimeData::Json(
+            serde_json::json!({ "kind": "speech_end" }),
+        )),
         Some((turn, chunk)),
     )
 }
@@ -108,10 +110,14 @@ async fn a_tagged_turn_is_reported_on_the_bus_and_a_targeted_flush_leaves_a_stri
         .iter()
         .all(|report| report.member == MEMBER && report.turn_id == "t1" && !report.flushed));
     assert!(
-        reports.iter().any(|report| report.chunks_released == 1 && report.released_ms == 400),
+        reports
+            .iter()
+            .any(|report| report.chunks_released == 1 && report.released_ms == 400),
         "chunk 0's end mark is reported when its last packet is taken: {reports:?}"
     );
-    assert!(reports.windows(2).all(|pair| pair[0].released_ms <= pair[1].released_ms));
+    assert!(reports
+        .windows(2)
+        .all(|pair| pair[0].released_ms <= pair[1].released_ms));
     assert!(reports.last().unwrap().released_ms <= 540);
 
     let target = flush_for(&control, &mut requests, &[MEMBER], "t1");
@@ -120,16 +126,27 @@ async fn a_tagged_turn_is_reported_on_the_bus_and_a_targeted_flush_leaves_a_stri
     assert_eq!(reports.len(), 1, "{reports:?}");
     let last = &reports[0];
     assert!(last.flushed);
-    assert_eq!((last.member.as_str(), last.turn_id.as_str()), (MEMBER, "t1"));
-    assert_eq!(last.released_ms, 540, "what left, not what was generated (1200 ms)");
-    assert_eq!(last.chunks_released, 1, "chunk 1 was cut and chunk 2 never left");
+    assert_eq!(
+        (last.member.as_str(), last.turn_id.as_str()),
+        (MEMBER, "t1")
+    );
+    assert_eq!(
+        last.released_ms, 540,
+        "what left, not what was generated (1200 ms)"
+    );
+    assert_eq!(
+        last.chunks_released, 1,
+        "chunk 1 was cut and chunk 2 never left"
+    );
 
     // Nothing of the turn is left, and its later audio and end mark are refused.
     assert_eq!(take(&mut call, 100), 0);
     call.push_output(audio(Some(("t1", 2)), 100)).unwrap();
     call.push_output(speech_end("t1", 2)).unwrap();
     assert_eq!(take(&mut call, 100), 0);
-    assert!(released(&mut events).iter().all(|report| report.released_ms == 540));
+    assert!(released(&mut events)
+        .iter()
+        .all(|report| report.released_ms == 540));
 }
 
 #[tokio::test]
@@ -149,7 +166,11 @@ async fn flushing_one_turn_leaves_a_later_turn_and_other_calls_queued() {
     assert_eq!(take(&mut call, 5), 5);
     let target = flush_for(&control, &mut requests, &[MEMBER], "t");
     assert_eq!(call.apply_flush(&target), Some(8 * 300));
-    assert_eq!(other.apply_flush(&target), None, "the flush names another call");
+    assert_eq!(
+        other.apply_flush(&target),
+        None,
+        "the flush names another call"
+    );
 
     // All of u still plays on the flushed call; the other call plays both.
     assert_eq!(take(&mut call, 100), 20);
@@ -166,7 +187,10 @@ async fn flushing_one_turn_leaves_a_later_turn_and_other_calls_queued() {
     let t = last(MEMBER, "t");
     assert_eq!((t.released_ms, t.flushed), (100, true));
     let u = last(MEMBER, "u");
-    assert_eq!((u.released_ms, u.chunks_released, u.flushed), (400, 1, false));
+    assert_eq!(
+        (u.released_ms, u.chunks_released, u.flushed),
+        (400, 1, false)
+    );
     assert_eq!(last("call-2:caller", "t").released_ms, 400);
     assert_eq!(last("call-2:caller", "u").released_ms, 400);
 }
@@ -182,11 +206,21 @@ async fn the_session_wide_flush_drops_everything_queued_and_refuses_nothing() {
     call.push_output(audio(None, 400)).unwrap();
     assert_eq!(take(&mut call, 5), 5);
     call.flush_all();
-    assert_eq!(take(&mut call, 100), 0, "every turn and the untagged audio are gone");
+    assert_eq!(
+        take(&mut call, 100),
+        0,
+        "every turn and the untagged audio are gone"
+    );
     let reports = released(&mut events);
     let last = reports.last().unwrap();
-    assert_eq!((last.turn_id.as_str(), last.released_ms, last.flushed), ("t", 100, true));
-    assert!(reports.iter().all(|report| report.turn_id == "t"), "u never left: {reports:?}");
+    assert_eq!(
+        (last.turn_id.as_str(), last.released_ms, last.flushed),
+        ("t", 100, true)
+    );
+    assert!(
+        reports.iter().all(|report| report.turn_id == "t"),
+        "u never left: {reports:?}"
+    );
 
     // Unlike a targeted flush with `drop_rest`, later audio is accepted,
     // tagged or not, as before.
@@ -276,7 +310,13 @@ async fn rig(session: &str) -> Rig {
         }),
         socket,
         caller.local_addr().unwrap(),
-        RtpMediaSession::new("call-1".into(), MEMBER.into(), ParticipantRole::User, codec_map, 4),
+        RtpMediaSession::new(
+            "call-1".into(),
+            MEMBER.into(),
+            ParticipantRole::User,
+            codec_map,
+            4,
+        ),
         sender(&control),
         Duration::from_millis(20),
     );
@@ -340,10 +380,18 @@ async fn the_loop_paces_packets_and_publishes_what_it_released() {
     );
 
     let reports = released(&mut events);
-    assert!(reports.len() >= 3, "a report about every 100 ms: {reports:?}");
-    assert!(reports.windows(2).all(|pair| pair[0].released_ms <= pair[1].released_ms));
+    assert!(
+        reports.len() >= 3,
+        "a report about every 100 ms: {reports:?}"
+    );
+    assert!(reports
+        .windows(2)
+        .all(|pair| pair[0].released_ms <= pair[1].released_ms));
     let last = reports.last().unwrap();
-    assert_eq!((last.member.as_str(), last.turn_id.as_str()), (MEMBER, "t1"));
+    assert_eq!(
+        (last.member.as_str(), last.turn_id.as_str()),
+        (MEMBER, "t1")
+    );
     assert_eq!((last.released_ms, last.chunks_released), (400, 1));
     rig.stop().await;
 }
@@ -352,7 +400,10 @@ async fn the_loop_paces_packets_and_publishes_what_it_released() {
 async fn a_targeted_flush_reaches_the_loop_and_cuts_only_its_turn() {
     let rig = rig("s-loop-flush").await;
     let mut events = rig.control.subscribe_media();
-    rig.outputs.send(audio(Some(("t1", 0)), 1000)).await.unwrap();
+    rig.outputs
+        .send(audio(Some(("t1", 0)), 1000))
+        .await
+        .unwrap();
     rig.outputs.send(audio(Some(("u", 0)), 200)).await.unwrap();
     rig.outputs.send(speech_end("u", 0)).await.unwrap();
 
@@ -376,8 +427,15 @@ async fn a_targeted_flush_reaches_the_loop_and_cuts_only_its_turn() {
         "a strict prefix of the 1000 ms generated: {t1:?}"
     );
     assert_eq!(t1.chunks_released, 0, "its only chunk was cut");
-    let u = reports.iter().rev().find(|report| report.turn_id == "u").expect("a report of u");
-    assert_eq!((u.released_ms, u.chunks_released, u.flushed), (200, 1, false));
+    let u = reports
+        .iter()
+        .rev()
+        .find(|report| report.turn_id == "u")
+        .expect("a report of u");
+    assert_eq!(
+        (u.released_ms, u.chunks_released, u.flushed),
+        (200, 1, false)
+    );
     // What the caller received is what was reported: t1's prefix and all of u.
     assert_eq!(arrivals.len() as u64 * 20, t1.released_ms + 200);
     rig.stop().await;
@@ -387,7 +445,10 @@ async fn a_targeted_flush_reaches_the_loop_and_cuts_only_its_turn() {
 async fn the_session_wide_flush_reaches_the_loop() {
     let rig = rig("s-loop-wide").await;
     let mut events = rig.control.subscribe_media();
-    rig.outputs.send(audio(Some(("t1", 0)), 1000)).await.unwrap();
+    rig.outputs
+        .send(audio(Some(("t1", 0)), 1000))
+        .await
+        .unwrap();
     rig.outputs.send(audio(None, 1000)).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -405,7 +466,12 @@ async fn the_session_wide_flush_reaches_the_loop() {
 
     // Audio after the flush plays.
     rig.outputs.send(audio(None, 100)).await.unwrap();
-    assert_eq!(rig.packets_until_quiet(Duration::from_millis(300)).await.len(), 5);
+    assert_eq!(
+        rig.packets_until_quiet(Duration::from_millis(300))
+            .await
+            .len(),
+        5
+    );
     rig.stop().await;
 }
 
@@ -424,13 +490,25 @@ async fn caller_rtp_reaches_the_pipeline_and_makes_the_member_media_ready() {
             },
             payload: vec![0xff; 160].into(),
         };
-        rig.caller.send_to(&packet.write(), rig.call_addr).await.unwrap();
+        rig.caller
+            .send_to(&packet.write(), rig.call_addr)
+            .await
+            .unwrap();
     }
     let frame = tokio::time::timeout(Duration::from_secs(2), rig.inputs.recv())
         .await
         .expect("decoded caller audio")
         .unwrap();
-    assert!(matches!(frame.data, RuntimeData::Audio { sample_rate: 8000, .. }));
-    assert!(rig.control.is_media_ready(MEMBER), "the caller's media is flowing");
+    assert!(matches!(
+        frame.data,
+        RuntimeData::Audio {
+            sample_rate: 8000,
+            ..
+        }
+    ));
+    assert!(
+        rig.control.is_media_ready(MEMBER),
+        "the caller's media is flowing"
+    );
     rig.stop().await;
 }

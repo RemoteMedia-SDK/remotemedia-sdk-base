@@ -1,7 +1,9 @@
 //! Per-participant node instances (openspec: add-multi-participant-sessions,
 //! `participant-scoped-nodes`).
 use super::*;
-use crate::nodes::{AsyncNodeWrapper, AsyncStreamingNode, InstanceScope, StreamingNode, StreamingNodeFactory};
+use crate::nodes::{
+    AsyncNodeWrapper, AsyncStreamingNode, InstanceScope, StreamingNode, StreamingNodeFactory,
+};
 use crate::transport::data::participant;
 use crate::transport::session_control::aux_port_of;
 use std::collections::{BTreeMap, HashSet};
@@ -26,9 +28,16 @@ impl AsyncStreamingNode for Counter {
             return Ok(data);
         };
         let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(RuntimeData::Text(format!("{}|{count}|{text}", self.instance)))
+        Ok(RuntimeData::Text(format!(
+            "{}|{count}|{text}",
+            self.instance
+        )))
     }
-    async fn process_control_message(&self, data: RuntimeData, _: Option<String>) -> crate::Result<bool> {
+    async fn process_control_message(
+        &self,
+        data: RuntimeData,
+        _: Option<String>,
+    ) -> crate::Result<bool> {
         if aux_port_of(&data).as_deref() == Some("shutdown") {
             self.shutdowns.fetch_add(1, Ordering::SeqCst);
             return Ok(true);
@@ -80,7 +89,11 @@ async fn fixture() -> Fixture {
             shutdowns: shutdowns.clone(),
         }))
         .await;
-    Fixture { executor, created, shutdowns }
+    Fixture {
+        executor,
+        created,
+        shutdowns,
+    }
 }
 
 /// `nodes`: (id, type, manifest instance_scope, max_instances).
@@ -145,7 +158,11 @@ async fn collect(session: &mut SessionHandle, n: usize) -> Vec<(String, String, 
         let instance = parts.next().unwrap().to_string();
         let count = parts.next().unwrap().parse().unwrap();
         let text = parts.next().unwrap().to_string();
-        let who = output.metadata.get(participant::ID).cloned().unwrap_or_default();
+        let who = output
+            .metadata
+            .get(participant::ID)
+            .cloned()
+            .unwrap_or_default();
         out.push((who, instance, count, text));
     }
     out
@@ -166,13 +183,20 @@ async fn five_participants_get_their_own_instance_and_state() {
     let mut session = f
         .executor
         .create_session(manifest(
-            &[("count", "ParticipantCounter", None, None), ("echo", "PassThrough", None, None)],
+            &[
+                ("count", "ParticipantCounter", None, None),
+                ("echo", "PassThrough", None, None),
+            ],
             &[("count", "echo")],
         ))
         .await
         .unwrap();
     let users: Vec<_> = (1..=5)
-        .map(|i| session.join_participant(user(&format!("user-{i}"))).unwrap())
+        .map(|i| {
+            session
+                .join_participant(user(&format!("user-{i}")))
+                .unwrap()
+        })
         .collect();
     // Interleaved: every participant's frames alternate with the others'.
     for round in 1..=3 {
@@ -190,7 +214,11 @@ async fn five_participants_get_their_own_instance_and_state() {
     assert_eq!(per_user.len(), 5, "{per_user:?}");
     for (who, seen) in &per_user {
         // Each participant's own counter, in order: 1, 2, 3.
-        assert_eq!(seen, &[(1, "r1".to_string()), (2, "r2".into()), (3, "r3".into())], "{who}");
+        assert_eq!(
+            seen,
+            &[(1, "r1".to_string()), (2, "r2".into()), (3, "r3".into())],
+            "{who}"
+        );
         assert_eq!(instance_of[who].len(), 1, "{who} used one instance");
     }
     let instances: HashSet<_> = instance_of.values().flatten().cloned().collect();
@@ -205,7 +233,10 @@ async fn a_participant_that_leaves_has_its_instance_shut_down() {
     let f = fixture().await;
     let mut session = f
         .executor
-        .create_session(manifest(&[("count", "ParticipantCounter", None, None)], &[]))
+        .create_session(manifest(
+            &[("count", "ParticipantCounter", None, None)],
+            &[],
+        ))
         .await
         .unwrap();
     let alice = session.join_participant(user("alice")).unwrap();
@@ -218,7 +249,10 @@ async fn a_participant_that_leaves_has_its_instance_shut_down() {
     alice.leave().await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while f.shutdowns.load(Ordering::SeqCst) == 0 {
-        assert!(std::time::Instant::now() < deadline, "alice's instance did not shut down");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "alice's instance did not shut down"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     // Bob's instance keeps its state.
@@ -240,7 +274,10 @@ async fn unattributed_input_has_its_own_default_instance() {
     let f = fixture().await;
     let mut session = f
         .executor
-        .create_session(manifest(&[("count", "ParticipantCounter", None, None)], &[]))
+        .create_session(manifest(
+            &[("count", "ParticipantCounter", None, None)],
+            &[],
+        ))
         .await
         .unwrap();
     let alice = session.join_participant(user("alice")).unwrap();
@@ -254,7 +291,9 @@ async fn unattributed_input_has_its_own_default_instance() {
     let mut out = collect(&mut session, 3).await;
     out.sort();
     assert_eq!(
-        out.iter().map(|(who, _, count, _)| (who.as_str(), *count)).collect::<Vec<_>>(),
+        out.iter()
+            .map(|(who, _, count, _)| (who.as_str(), *count))
+            .collect::<Vec<_>>(),
         vec![("", 1), ("", 2), ("alice", 1)]
     );
     session.close().await.unwrap();
@@ -265,7 +304,10 @@ async fn max_instances_refuses_further_participants() {
     let f = fixture().await;
     let mut session = f
         .executor
-        .create_session(manifest(&[("count", "ParticipantCounter", None, Some(2))], &[]))
+        .create_session(manifest(
+            &[("count", "ParticipantCounter", None, Some(2))],
+            &[],
+        ))
         .await
         .unwrap();
     let handles: Vec<_> = ["alice", "bob", "carol"]
@@ -290,7 +332,12 @@ async fn the_manifest_can_make_a_per_participant_node_shared() {
     let mut session = f
         .executor
         .create_session(manifest(
-            &[("count", "ParticipantCounter", Some(InstanceScope::Shared), None)],
+            &[(
+                "count",
+                "ParticipantCounter",
+                Some(InstanceScope::Shared),
+                None,
+            )],
             &[],
         ))
         .await
@@ -314,7 +361,10 @@ async fn a_chain_of_per_participant_nodes_keeps_each_participant_apart() {
     let mut session = f
         .executor
         .create_session(manifest(
-            &[("first", "ParticipantCounter", None, None), ("second", "ParticipantCounter", None, None)],
+            &[
+                ("first", "ParticipantCounter", None, None),
+                ("second", "ParticipantCounter", None, None),
+            ],
             &[("first", "second")],
         ))
         .await
@@ -377,13 +427,21 @@ async fn a_paced_node_cannot_run_per_participant() {
     let error = f
         .executor
         .create_session(manifest(
-            &[("ticker", "PacedTicker", Some(InstanceScope::PerParticipant), None)],
+            &[(
+                "ticker",
+                "PacedTicker",
+                Some(InstanceScope::PerParticipant),
+                None,
+            )],
             &[],
         ))
         .await
         .err()
         .expect("session creation fails");
-    assert!(error.to_string().contains("cannot run per participant"), "{error}");
+    assert!(
+        error.to_string().contains("cannot run per participant"),
+        "{error}"
+    );
     assert!(error.to_string().contains("ticker"), "{error}");
 }
 
@@ -395,12 +453,19 @@ fn built_in_stateful_audio_nodes_run_per_participant() {
         ("AudioChunkerNode", serde_json::json!({})),
         ("TextCollectorNode", serde_json::json!({})),
         ("SpeculativeVADGate", serde_json::json!({})), // declared through #[node]
-        ("FastResampleNode", serde_json::json!({"target_rate": 16000})),
+        (
+            "FastResampleNode",
+            serde_json::json!({"target_rate": 16000}),
+        ),
     ] {
         let node = registry
             .create_node(node_type, "n".into(), &params, Some("s".into()))
             .unwrap_or_else(|e| panic!("{node_type}: {e}"));
-        assert_eq!(node.instance_scope(), Some(InstanceScope::PerParticipant), "{node_type}");
+        assert_eq!(
+            node.instance_scope(),
+            Some(InstanceScope::PerParticipant),
+            "{node_type}"
+        );
     }
     // Stateless nodes keep the default (shared).
     let node = registry
@@ -415,12 +480,19 @@ async fn the_descriptor_shows_scope_and_telemetry_counts_live_instances() {
     let mut session = f
         .executor
         .create_session(manifest(
-            &[("count", "ParticipantCounter", None, None), ("echo", "PassThrough", None, None)],
+            &[
+                ("count", "ParticipantCounter", None, None),
+                ("echo", "PassThrough", None, None),
+            ],
             &[("count", "echo")],
         ))
         .await
         .unwrap();
-    let control = f.executor.control_bus().get(&session.session_id).expect("session control");
+    let control = f
+        .executor
+        .control_bus()
+        .get(&session.session_id)
+        .expect("session control");
     let descriptor = control.descriptor().expect("descriptor");
     let scope = |id: &str| {
         descriptor
@@ -441,7 +513,11 @@ async fn the_descriptor_shows_scope_and_telemetry_counts_live_instances() {
             false,
             false,
         );
-        snapshot.nodes.iter().find(|n| n.id == id).and_then(|n| n.instances)
+        snapshot
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.instances)
     };
     assert_eq!(instances("count"), None, "no participant yet");
 
@@ -451,12 +527,20 @@ async fn the_descriptor_shows_scope_and_telemetry_counts_live_instances() {
     text(&bob, "b1").await;
     collect(&mut session, 2).await;
     assert_eq!(instances("count"), Some(2));
-    assert_eq!(instances("echo"), None, "shared nodes report no instance count");
+    assert_eq!(
+        instances("echo"),
+        None,
+        "shared nodes report no instance count"
+    );
 
     alice.leave().await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while instances("count") != Some(1) {
-        assert!(std::time::Instant::now() < deadline, "count stayed {:?}", instances("count"));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "count stayed {:?}",
+            instances("count")
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     session.close().await.unwrap();

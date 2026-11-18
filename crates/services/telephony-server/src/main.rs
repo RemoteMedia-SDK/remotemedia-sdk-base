@@ -528,8 +528,8 @@ mod tests {
     #[test]
     fn test_manifest_loading() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let manifest_path = std::path::Path::new(manifest_dir)
-            .join("tests/fixtures/telephony_passthrough.json");
+        let manifest_path =
+            std::path::Path::new(manifest_dir).join("tests/fixtures/telephony_passthrough.json");
         let content = std::fs::read_to_string(manifest_path).expect("failed to read test manifest");
         let parsed = manifest::parse(&content).unwrap();
         assert_eq!(parsed.version, "v1");
@@ -690,7 +690,10 @@ mod tests {
             a=ptime:20\r\n",
             caller_rtp.local_addr().unwrap().port()
         );
-        client.send_to(invite_req.as_bytes(), server_addr).await.unwrap();
+        client
+            .send_to(invite_req.as_bytes(), server_addr)
+            .await
+            .unwrap();
 
         let mut resp_buf = [0_u8; 2048];
         let (resp_len, _) =
@@ -704,11 +707,13 @@ mod tests {
 
         // The call's media loop runs: its RTP reaches the caller.
         let mut rtp_buf = [0_u8; 1500];
-        let (rtp_len, _) =
-            tokio::time::timeout(Duration::from_millis(1500), caller_rtp.recv_from(&mut rtp_buf))
-                .await
-                .expect("RTP from the call's media loop")
-                .unwrap();
+        let (rtp_len, _) = tokio::time::timeout(
+            Duration::from_millis(1500),
+            caller_rtp.recv_from(&mut rtp_buf),
+        )
+        .await
+        .expect("RTP from the call's media loop")
+        .unwrap();
         let packet = RtpPacket::parse(&rtp_buf[..rtp_len]).unwrap();
         assert_eq!((packet.info.payload_type, packet.payload.len()), (0, 160));
 

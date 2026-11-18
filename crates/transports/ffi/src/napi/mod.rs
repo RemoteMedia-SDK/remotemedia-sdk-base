@@ -13,11 +13,11 @@
 
 pub mod buffer_config;
 mod buffers;
-mod output_loans;
 pub mod channel;
 pub mod control_session;
 pub mod error;
 pub mod node;
+mod output_loans;
 pub mod pipeline;
 pub mod publisher;
 pub mod runtime_data;

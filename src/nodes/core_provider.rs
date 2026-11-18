@@ -85,17 +85,27 @@ impl NodeProvider for CoreNodesProvider {
         // add-ai-sdk-voice-library).
         registry.register(Arc::new(crate::nodes::hosted_turn::HostedTurnNodeFactory));
         // A voice agent's turns as AI SDK realtime events (design D10).
-        registry.register(Arc::new(crate::nodes::realtime_events::RealtimeEventsNodeFactory));
+        registry.register(Arc::new(
+            crate::nodes::realtime_events::RealtimeEventsNodeFactory,
+        ));
         // The members' media events for a turn node in another process, and
         // its flushes carried out where the members are connected (design D12).
-        registry.register(Arc::new(crate::nodes::member_media::MemberMediaRelayNodeFactory));
+        registry.register(Arc::new(
+            crate::nodes::member_media::MemberMediaRelayNodeFactory,
+        ));
         registry.register(Arc::new(crate::nodes::member_media::MemberFlushNodeFactory));
         // Keeps member audio and typed frames on their own paths of a voice pipeline.
-        registry.register(Arc::new(crate::nodes::media_kind_filter::MediaKindFilterNodeFactory));
+        registry.register(Arc::new(
+            crate::nodes::media_kind_filter::MediaKindFilterNodeFactory,
+        ));
         // Test stand-in for a TTS node: a tone per text chunk, not speech.
-        registry.register(Arc::new(crate::nodes::test_tone_tts::TestToneTtsNodeFactory));
+        registry.register(Arc::new(
+            crate::nodes::test_tone_tts::TestToneTtsNodeFactory,
+        ));
         // Test stand-in for a VAD node: loud input is "speech".
-        registry.register(Arc::new(crate::nodes::test_energy_vad::TestEnergyVadNodeFactory));
+        registry.register(Arc::new(
+            crate::nodes::test_energy_vad::TestEnergyVadNodeFactory,
+        ));
 
         // Avatar control bridge — appends LLM/UI motion intents to an
         // NDJSON file the standalone avatar prototype watches.

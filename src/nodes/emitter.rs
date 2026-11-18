@@ -313,7 +313,11 @@ impl Emitter {
                 }
             },
         };
-        Target::Ready(Ok((binding.tx.clone(), resolved, binding.telemetry.clone())))
+        Target::Ready(Ok((
+            binding.tx.clone(),
+            resolved,
+            binding.telemetry.clone(),
+        )))
     }
 
     fn stopped(&self) -> Error {
@@ -392,7 +396,10 @@ mod tests {
         RuntimeData::Text(value.into())
     }
 
-    fn open(capacity: usize, default: Option<Arc<Origin>>) -> (Emitter, mpsc::Receiver<Routed>, Arc<Roster>) {
+    fn open(
+        capacity: usize,
+        default: Option<Arc<Origin>>,
+    ) -> (Emitter, mpsc::Receiver<Routed>, Arc<Roster>) {
         let (tx, rx) = mpsc::channel(capacity);
         let roster = Arc::new(Roster::default());
         let emitter = Emitter::pending("node");
@@ -410,7 +417,10 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!early.is_finished());
-        assert!(matches!(emitter.try_emit(text("x")), Err(TryEmitError::NotStarted(_))));
+        assert!(matches!(
+            emitter.try_emit(text("x")),
+            Err(TryEmitError::NotStarted(_))
+        ));
 
         let (tx, mut rx) = mpsc::channel(4);
         emitter.bind(tx, None, Arc::new(Roster::default()), None);
@@ -418,7 +428,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!early.is_finished());
         assert!(!emitter.is_running());
-        assert!(tokio::time::timeout(Duration::from_millis(20), emitter.started()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), emitter.started())
+                .await
+                .is_err()
+        );
         emitter.start();
         emitter.started().await;
         early.await.unwrap().unwrap();
@@ -431,10 +445,19 @@ mod tests {
         roster.note(&origin("bob"));
 
         emitter.emit(text("default")).await.unwrap();
-        emitter.emit_as(text("nobody"), EmitOrigin::Unattributed).await.unwrap();
-        emitter.emit_as(text("kept"), origin("carol")).await.unwrap();
+        emitter
+            .emit_as(text("nobody"), EmitOrigin::Unattributed)
+            .await
+            .unwrap();
+        emitter
+            .emit_as(text("kept"), origin("carol"))
+            .await
+            .unwrap();
         emitter.emit_as(text("by id"), "bob").await.unwrap();
-        emitter.emit_as(text("input without one"), None).await.unwrap();
+        emitter
+            .emit_as(text("input without one"), None)
+            .await
+            .unwrap();
 
         let mut seen = Vec::new();
         for _ in 0..5 {
@@ -443,7 +466,13 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec![Some("alice".into()), None, Some("carol".into()), Some("bob".into()), None]
+            vec![
+                Some("alice".into()),
+                None,
+                Some("carol".into()),
+                Some("bob".into()),
+                None
+            ]
         );
     }
 
@@ -465,7 +494,9 @@ mod tests {
     async fn a_full_queue_makes_emit_wait_and_try_emit_report_it() {
         let (emitter, mut rx, _roster) = open(1, None);
         emitter.emit(text("1")).await.unwrap();
-        assert!(matches!(emitter.try_emit(text("2")), Err(TryEmitError::Full(RuntimeData::Text(t))) if t == "2"));
+        assert!(
+            matches!(emitter.try_emit(text("2")), Err(TryEmitError::Full(RuntimeData::Text(t))) if t == "2")
+        );
 
         let waiting = tokio::spawn({
             let emitter = emitter.clone();
@@ -494,7 +525,10 @@ mod tests {
 
         assert!(clone.is_closed());
         assert!(clone.emit(text("after")).await.is_err());
-        assert!(matches!(clone.try_emit(text("after")), Err(TryEmitError::Rejected(..))));
+        assert!(matches!(
+            clone.try_emit(text("after")),
+            Err(TryEmitError::Rejected(..))
+        ));
         // The queued frame is still delivered, then the queue ends: the
         // emitter holds no sender once closed.
         assert!(rx.recv().await.is_some());

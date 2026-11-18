@@ -105,11 +105,7 @@ struct Run {
     seen: Arc<Seen>,
 }
 
-async fn start(
-    discards_queue: bool,
-    protect: bool,
-    on_cancel: Option<DispositionOverride>,
-) -> Run {
+async fn start(discards_queue: bool, protect: bool, on_cancel: Option<DispositionOverride>) -> Run {
     let mut manifest = create_test_manifest(vec![("gen", "Gen")], vec![]);
     manifest.nodes[0].on_cancel = on_cancel;
     let (output, received) = ClientOutputRouter::new(32);
@@ -196,7 +192,8 @@ impl Run {
 #[tokio::test]
 async fn an_interrupt_fires_the_token_before_the_drop_and_keeps_queued_input() {
     let mut run = start(false, false, None).await;
-    run.send(RuntimeData::Text("said while it spoke".into())).await;
+    run.send(RuntimeData::Text("said while it spoke".into()))
+        .await;
     run.barge(None).await;
     run.send(RuntimeData::Text("said after".into())).await;
     // The audio/text the user produced around the barge reaches the next call.
@@ -274,7 +271,9 @@ async fn a_protected_call_is_not_cancelled_and_its_token_does_not_fire() {
     run.barge(None).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(run.seen.on_cancel.lock().unwrap().is_empty());
-    assert!(run.seen.at_drop.lock().unwrap().is_empty(), "the call kept running");
+    assert!(
+        run.seen.at_drop.lock().unwrap().is_empty(),
+        "the call kept running"
+    );
     run.finish().await;
 }
-

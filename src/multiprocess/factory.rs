@@ -131,7 +131,10 @@ impl MultiprocessNativeNode {
         let child = command
             .env("RM_SESSION_ID", session_id)
             .env("RM_NODE_ID", node_id)
-            .env(PROTOCOL_ENV, super::native_copy_reporting::VERSION.to_string())
+            .env(
+                PROTOCOL_ENV,
+                super::native_copy_reporting::VERSION.to_string(),
+            )
             .stdin(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -418,8 +421,12 @@ fn round_trip<P: PublishApi, S: ReceiveApi>(
 }
 
 trait PublishApi {
-    fn publish_call(&self, call: u64, data: &RuntimeData, copies: &CopyContext)
-        -> Result<(), String>;
+    fn publish_call(
+        &self,
+        call: u64,
+        data: &RuntimeData,
+        copies: &CopyContext,
+    ) -> Result<(), String>;
 }
 trait ReceiveApi {
     /// `Ok(None)`: nothing yet. `Ok(Some(result))`: the call's terminal frame,
@@ -477,9 +484,7 @@ impl ReceiveApi for super::runner::NativeSubscriber {
         }
         frame::replay(copies, &output.totals);
         if !output.ok {
-            return Ok(Some(Err(
-                String::from_utf8_lossy(output.body).into_owned()
-            )));
+            return Ok(Some(Err(String::from_utf8_lossy(output.body).into_owned())));
         }
         // Decode while the native loan is alive, eliminating the private wire snapshot.
         Ok(Some(super::data_transfer::from_bytes_with_copy_context(

@@ -168,7 +168,9 @@ impl ControlAccess {
     }
 
     pub fn intercept(&self, node: &str) -> Result<(), String> {
-        if matches!(self, ControlAccess::Full) || self.grants(ControlOp::Intercept, node).next().is_some() {
+        if matches!(self, ControlAccess::Full)
+            || self.grants(ControlOp::Intercept, node).next().is_some()
+        {
             Ok(())
         } else {
             Err(Self::refused("intercept", node))
@@ -176,7 +178,9 @@ impl ControlAccess {
     }
 
     pub fn node_state(&self, node: &str) -> Result<(), String> {
-        if matches!(self, ControlAccess::Full) || self.grants(ControlOp::NodeState, node).next().is_some() {
+        if matches!(self, ControlAccess::Full)
+            || self.grants(ControlOp::NodeState, node).next().is_some()
+        {
             Ok(())
         } else {
             Err(Self::refused("node_state", node))
@@ -187,7 +191,11 @@ impl ControlAccess {
     pub fn intercept_reply(&self) -> Result<(), String> {
         match self {
             ControlAccess::Full => Ok(()),
-            ControlAccess::Granted(grants) if grants.iter().any(|g| g.op == ControlOp::Intercept) => Ok(()),
+            ControlAccess::Granted(grants)
+                if grants.iter().any(|g| g.op == ControlOp::Intercept) =>
+            {
+                Ok(())
+            }
             ControlAccess::Granted(_) => Err("not granted: intercept".to_string()),
         }
     }
@@ -256,7 +264,10 @@ mod tests {
         let access = access();
         assert_eq!(access.tap("transcriber", None), Ok(TapScope::Own));
         assert_eq!(access.tap("mixer", None), Ok(TapScope::All));
-        assert_eq!(access.tap("llm", None), Err("not granted: tap on 'llm'".into()));
+        assert_eq!(
+            access.tap("llm", None),
+            Err("not granted: tap on 'llm'".into())
+        );
         // An rpc grant covers the reply port of that node, and nothing else of it.
         assert_eq!(access.tap("avatar", Some("__reply__")), Ok(TapScope::All));
         assert!(access.tap("avatar", None).is_err());
@@ -282,7 +293,9 @@ mod tests {
             access.publish("chat_in", Some("reset"), true),
             Err("not granted: rpc 'reset' on 'chat_in'".into())
         );
-        assert!(access.publish("avatar", Some("set_expression"), true).is_ok());
+        assert!(access
+            .publish("avatar", Some("set_expression"), true)
+            .is_ok());
         assert!(access.publish("avatar", Some("shutdown"), true).is_err());
         // An rpc grant does not let the member publish media.
         assert_eq!(

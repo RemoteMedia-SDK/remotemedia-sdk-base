@@ -161,7 +161,12 @@ async fn stream_pipeline_sessions_report_live_telemetry() {
             match responses.message().await {
                 Ok(Some(r)) => {
                     if std::env::var_os("TEL_TEST_TRACE").is_some() {
-                        eprintln!("response: {:?}", r.response.as_ref().map(|x| format!("{x:?}").chars().take(200).collect::<String>()));
+                        eprintln!(
+                            "response: {:?}",
+                            r.response
+                                .as_ref()
+                                .map(|x| format!("{x:?}").chars().take(200).collect::<String>())
+                        );
                     }
                 }
                 Ok(None) => break,

@@ -226,8 +226,14 @@ mod tests {
                 ..Default::default()
             }),
         );
-        assert_eq!(req.cancellation.disposition.partial_output, Retention::Discard);
-        assert_eq!(req.cancellation.disposition.pending_input, Retention::Retain);
+        assert_eq!(
+            req.cancellation.disposition.partial_output,
+            Retention::Discard
+        );
+        assert_eq!(
+            req.cancellation.disposition.pending_input,
+            Retention::Retain
+        );
         assert!(!p.discard_pending(&req));
     }
 }

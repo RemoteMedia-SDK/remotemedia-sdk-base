@@ -65,7 +65,11 @@ async fn text_outputs_carry_their_speaker_through_a_two_node_path() {
     let alice = session.join_participant(user("alice")).unwrap();
     let bob = session.join_participant(user("bob")).unwrap();
 
-    for (handle, text) in [(&alice, "from alice"), (&bob, "from bob"), (&alice, "alice again")] {
+    for (handle, text) in [
+        (&alice, "from alice"),
+        (&bob, "from bob"),
+        (&alice, "alice again"),
+    ] {
         handle
             .send(TransportData::new(RuntimeData::Text(text.into())))
             .await
@@ -135,9 +139,11 @@ async fn a_bypassed_node_keeps_the_speaker() {
         .expect("session on the control bus")
         .set_node_state("calc", NodeState::Bypass);
     let dave = session.join_participant(user("dave")).unwrap();
-    dave.send(TransportData::new(RuntimeData::Text("not a calculation".into())))
-        .await
-        .unwrap();
+    dave.send(TransportData::new(RuntimeData::Text(
+        "not a calculation".into(),
+    )))
+    .await
+    .unwrap();
     let output = next(&mut session).await;
     assert!(matches!(&output.data, RuntimeData::Text(text) if text == "not a calculation"));
     assert_eq!(speaker(&output), Some("dave"));

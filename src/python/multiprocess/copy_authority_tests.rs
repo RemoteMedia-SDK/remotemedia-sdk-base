@@ -108,7 +108,8 @@ fn legacy_copy_protocol_faults_preserve_unfinished_attempts() {
         (2, json!({"op":"fail","unexpected":true})),
     ] {
         let copies = CopyContext::new(CopyPolicy::AllowCopies, "fault");
-        let server = CopyAuthority::start_with_version(copies.clone(), "node", "session", 1).unwrap();
+        let server =
+            CopyAuthority::start_with_version(copies.clone(), "node", "session", 1).unwrap();
         let mut client = connect(&server);
         request(
             &mut client,
@@ -431,10 +432,19 @@ fn copy_report_v2_close_replays_totals() {
     server.finish().unwrap();
     let sent = counts(&copies, CopyReason::BorrowedInput);
     assert_eq!(
-        (sent.completed, sent.copied_bytes, sent.failed, sent.failed_requested_bytes, sent.in_flight),
+        (
+            sent.completed,
+            sent.copied_bytes,
+            sent.failed,
+            sent.failed_requested_bytes,
+            sent.in_flight
+        ),
         (3, 30, 1, 5, 0)
     );
-    assert_eq!(counts(&copies, CopyReason::PrivateIpcIngress).copied_bytes, 7);
+    assert_eq!(
+        counts(&copies, CopyReason::PrivateIpcIngress).copied_bytes,
+        7
+    );
 }
 
 #[test]
@@ -447,7 +457,10 @@ fn copy_report_v2_accepts_only_close_and_records_unreported_loss() {
         let server = CopyAuthority::start(copies.clone(), "node", "session").unwrap();
         let mut client = connect(&server);
         write_frame(&mut client, &json!({"seq":1,"action":action})).unwrap();
-        assert!(read_frame::<Value>(&mut client).is_err(), "accepted {action}");
+        assert!(
+            read_frame::<Value>(&mut client).is_err(),
+            "accepted {action}"
+        );
         assert!(server.finish().is_err());
         let lost = counts(&copies, CopyReason::BorrowedInput);
         assert_eq!((lost.failed, lost.copied_bytes, lost.in_flight), (1, 0, 0));
@@ -464,19 +477,32 @@ fn copy_report_v2_accepts_only_close_and_records_unreported_loss() {
 fn copy_report_v2_end_of_input_replays_or_rejects() {
     let copies = CopyContext::new(CopyPolicy::AllowCopies, "v2");
     replay_end_of_input(&copies, &end_of_input(b"")).unwrap();
-    assert!(copies.report().entries.iter().all(|(_, c)| c.completed == 0 && c.failed == 0));
+    assert!(copies
+        .report()
+        .entries
+        .iter()
+        .all(|(_, c)| c.completed == 0 && c.failed == 0));
     replay_end_of_input(
         &copies,
         &end_of_input(br#"{"v":2,"reasons":[["portable_serialization",[2,24,0,0]]]}"#),
     )
     .unwrap();
     let serialized = counts(&copies, CopyReason::PortableSerialization);
-    assert_eq!((serialized.completed, serialized.copied_bytes, serialized.in_flight), (2, 24, 0));
+    assert_eq!(
+        (
+            serialized.completed,
+            serialized.copied_bytes,
+            serialized.in_flight
+        ),
+        (2, 24, 0)
+    );
 
     for malformed in [
         end_of_input(br#"{"v":3,"reasons":[]}"#),
         end_of_input(br#"{"v":2,"reasons":[["borrowed_input",[0,5,0,0]]]}"#),
-        end_of_input(br#"{"v":2,"reasons":[["borrowed_input",[1,1,0,0]],["borrowed_input",[1,1,0,0]]]}"#),
+        end_of_input(
+            br#"{"v":2,"reasons":[["borrowed_input",[1,1,0,0]],["borrowed_input",[1,1,0,0]]]}"#,
+        ),
         end_of_input(br#"{"v":2,"reasons":[["borrowed_input",[2000000,1,0,0]]]}"#),
         end_of_input(b"not json"),
         end_of_input(b"{}")[..20].to_vec(),

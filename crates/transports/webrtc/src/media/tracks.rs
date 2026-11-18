@@ -5,13 +5,11 @@
 // Phase 4 (US2) media track infrastructure
 #![allow(dead_code)]
 
+use super::audio::{AudioEncoder, AudioEncoderConfig};
 use super::audio_packetizer::AudioPcmPacketizer;
 #[cfg(test)]
 use super::audio_packetizer::PcmFixtureExt;
-use remotemedia_types::{CopyContext, SharedBuffer};
-use super::audio::{AudioEncoder, AudioEncoderConfig};
 use super::audio_sender::{AudioSender, MediaClockPublisher, ReleaseReporter};
-use remotemedia_core::transport::turn_audio::{DroppedTurns, TurnSegments, TurnTag};
 use super::video::{VideoFormat, VideoFrame};
 use crate::{Error, Result};
 use parking_lot::RwLock;
@@ -21,6 +19,8 @@ use remotemedia_core::data::RuntimeData;
 use remotemedia_core::nodes::video::{
     VideoDecoderConfig, VideoDecoderNode, VideoEncoderConfig, VideoEncoderNode,
 };
+use remotemedia_core::transport::turn_audio::{DroppedTurns, TurnSegments, TurnTag};
+use remotemedia_types::{CopyContext, SharedBuffer};
 
 #[cfg(not(feature = "video"))]
 pub struct VideoEncoderConfig {
@@ -124,13 +124,19 @@ struct TurnState {
 #[tokio::test]
 async fn video_copy_disabled_backend_keeps_explicit_error_without_materialization() {
     let encoder = VideoEncoderNode;
-    let copies = CopyContext::new(remotemedia_types::CopyPolicy::RequireZeroCopy, "disabled-video");
+    let copies = CopyContext::new(
+        remotemedia_types::CopyPolicy::RequireZeroCopy,
+        "disabled-video",
+    );
     let error = encoder
         .encode_frame_with_copy_context(RuntimeData::Binary(vec![1].into()), &copies)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("Video support is disabled"));
-    assert!(encoder.process(RuntimeData::Binary(vec![1].into())).await.is_err());
+    assert!(encoder
+        .process(RuntimeData::Binary(vec![1].into()))
+        .await
+        .is_err());
     let decoder = VideoDecoderNode;
     assert!(decoder
         .process_with_copy_context(
@@ -142,8 +148,14 @@ async fn video_copy_disabled_backend_keeps_explicit_error_without_materializatio
         .unwrap_err()
         .to_string()
         .contains("Video support is disabled"));
-    assert!(decoder.process(RuntimeData::Binary(vec![1].into())).await.is_err());
-    assert!(copies.report().entries.iter()
+    assert!(decoder
+        .process(RuntimeData::Binary(vec![1].into()))
+        .await
+        .is_err());
+    assert!(copies
+        .report()
+        .entries
+        .iter()
         .all(|(_, c)| c.copied_bytes == 0 && c.rejected == 0));
 }
 
@@ -237,15 +249,20 @@ impl AudioTrack {
     /// - Transmission (dedicated thread): Dequeue frames and send at real-time pace (20ms intervals)
     /// - This decouples TTS generation speed from playback speed, preventing interruptions
     pub async fn send_audio(&self, samples: Arc<Vec<f32>>, sample_rate: u32) -> Result<()> {
-        self.send_audio_with_context(samples.into(), sample_rate, CopyContext::legacy()).await
+        self.send_audio_with_context(samples.into(), sample_rate, CopyContext::legacy())
+            .await
     }
 
     /// Send owning samples without PCM staging when a codec frame can borrow a
     /// contiguous range. Required assembly uses each retained input's authority.
     pub async fn send_audio_with_context(
-        &self, samples: SharedBuffer<f32>, sample_rate: u32, copies: &CopyContext,
+        &self,
+        samples: SharedBuffer<f32>,
+        sample_rate: u32,
+        copies: &CopyContext,
     ) -> Result<()> {
-        self.send_audio_tagged(samples, sample_rate, copies, None).await
+        self.send_audio_tagged(samples, sample_rate, copies, None)
+            .await
     }
 
     /// [`Self::send_audio_with_context`] for audio of a turn. The tag (turn
@@ -325,13 +342,21 @@ impl AudioTrack {
                 let frame_tag = self.turns.lock().segments.take(real);
                 let encoded = self.encoder.write().encode(&pcm)?;
                 sender
-                    .enqueue_frame_tagged(encoded, (pcm.len() / channels) as u32, frame_duration, frame_tag)
+                    .enqueue_frame_tagged(
+                        encoded,
+                        (pcm.len() / channels) as u32,
+                        frame_duration,
+                        frame_tag,
+                    )
                     .await?;
             }
             *self.encoder.write() = replacement;
             *packetizer = AudioPcmPacketizer::new(frame_size);
             self.turns.lock().segments.clear();
-            info!("Sample rate changed from {} to {} Hz, recreating encoder", old_rate, sample_rate);
+            info!(
+                "Sample rate changed from {} to {} Hz, recreating encoder",
+                old_rate, sample_rate
+            );
         }
 
         let mut frames_enqueued = 0;
@@ -343,14 +368,22 @@ impl AudioTrack {
                 let mut turns = self.turns.lock();
                 let frame_tag = turns.segments.take(pcm.len());
                 // Refused while this call was queueing: drop the rest.
-                if frame_tag.as_ref().is_some_and(|tag| turns.dropped.contains(&tag.turn_id)) {
+                if frame_tag
+                    .as_ref()
+                    .is_some_and(|tag| turns.dropped.contains(&tag.turn_id))
+                {
                     continue;
                 }
                 frame_tag
             };
             let encoded = self.encoder.write().encode(&pcm)?;
             sender
-                .enqueue_frame_tagged(encoded, (pcm.len() / channels) as u32, frame_duration, frame_tag)
+                .enqueue_frame_tagged(
+                    encoded,
+                    (pcm.len() / channels) as u32,
+                    frame_duration,
+                    frame_tag,
+                )
                 .await?;
             frames_enqueued += 1;
         }
@@ -376,14 +409,20 @@ impl AudioTrack {
     pub async fn finish_audio_tagged(&self, tag: Option<TurnTag>) -> Result<()> {
         let mut packetizer = self.packetizer.lock().await;
         let sender_guard = self.sender.read().await;
-        let sender = sender_guard.as_ref().ok_or_else(||
-            Error::MediaTrackError("AudioSender not initialized".to_string()))?;
+        let sender = sender_guard
+            .as_ref()
+            .ok_or_else(|| Error::MediaTrackError("AudioSender not initialized".to_string()))?;
         while let Some((pcm, real)) = packetizer.finish()? {
             let frame_tag = self.turns.lock().segments.take(real);
             let encoded = self.encoder.write().encode(&pcm)?;
             let channels = self.encoder.read().config.channels as usize;
             sender
-                .enqueue_frame_tagged(encoded, (pcm.len() / channels) as u32, Duration::from_millis(20), frame_tag)
+                .enqueue_frame_tagged(
+                    encoded,
+                    (pcm.len() / channels) as u32,
+                    Duration::from_millis(20),
+                    frame_tag,
+                )
                 .await?;
         }
         let refused = tag
@@ -434,7 +473,9 @@ impl AudioTrack {
         payload: &[u8],
         allocator: &dyn remotemedia_types::OutputAllocator,
     ) -> Result<SharedBuffer<f32>> {
-        self.decoder.write().decode_with_allocator(payload, allocator)
+        self.decoder
+            .write()
+            .decode_with_allocator(payload, allocator)
     }
 
     /// Drain queued TTS packets and discard any incomplete PCM frame
@@ -471,7 +512,9 @@ impl AudioTrack {
         }
         let sender = self.sender.read().await.clone();
         // First the queue, so a producer blocked on a full queue moves on.
-        let mut dropped = sender.as_ref().map_or(0, |sender| sender.flush_turn(turn_id, false));
+        let mut dropped = sender
+            .as_ref()
+            .map_or(0, |sender| sender.flush_turn(turn_id, false));
         {
             let mut packetizer = self.packetizer.lock().await;
             let mut turns = self.turns.lock();
@@ -483,7 +526,9 @@ impl AudioTrack {
             }
         }
         // Then whatever that producer queued meanwhile, and the report.
-        dropped += sender.as_ref().map_or(0, |sender| sender.flush_turn(turn_id, true));
+        dropped += sender
+            .as_ref()
+            .map_or(0, |sender| sender.flush_turn(turn_id, true));
         dropped
     }
 
@@ -893,7 +938,8 @@ impl VideoTrack {
                 if let RuntimeData::Video {
                     arrival_ts_us: arrival,
                     ..
-                } = &mut frame {
+                } = &mut frame
+                {
                     *arrival = Some(arrival_ts_us);
                 }
                 frame
@@ -995,7 +1041,10 @@ mod tests {
         let mut whole = AudioPcmPacketizer::new(960);
         let contiguous = whole.push(&pcm);
         let mut stream = AudioPcmPacketizer::new(960);
-        let per_tick: Vec<_> = pcm.chunks(1_600).flat_map(|chunk| stream.push(chunk)).collect();
+        let per_tick: Vec<_> = pcm
+            .chunks(1_600)
+            .flat_map(|chunk| stream.push(chunk))
+            .collect();
         let stats = |frames: &Vec<(SharedBuffer<f32>, usize)>| {
             (
                 frames.len(),
@@ -1015,9 +1064,14 @@ mod tests {
     fn aligned_opus_chunks_are_a_control() {
         let pcm = vec![0.25_f32; 48_000];
         let mut stream = AudioPcmPacketizer::new(960);
-        let frames: Vec<_> = pcm.chunks(960).flat_map(|chunk| stream.push(chunk)).collect();
+        let frames: Vec<_> = pcm
+            .chunks(960)
+            .flat_map(|chunk| stream.push(chunk))
+            .collect();
         assert_eq!(frames.len(), 50);
-        assert!(frames.iter().all(|(frame, original)| frame.len() == 960 && *original == 960));
+        assert!(frames
+            .iter()
+            .all(|(frame, original)| frame.len() == 960 && *original == 960));
     }
 
     #[test]
@@ -1046,7 +1100,10 @@ mod tests {
         assert!(stream.push(&vec![0.5; 500]).is_empty());
         stream.clear();
         assert!(stream.push(&vec![0.75; 460]).is_empty());
-        assert!(stream.finish().unwrap().is_some_and(|(f, real)| real == 460 && f[0] == 0.75));
+        assert!(stream
+            .finish()
+            .unwrap()
+            .is_some_and(|(f, real)| real == 460 && f[0] == 0.75));
     }
 
     #[tokio::test]
@@ -1169,7 +1226,9 @@ pub(crate) async fn audio_rtp_to_runtime_data(
     allocator: &dyn remotemedia_types::OutputAllocator,
 ) -> Result<RuntimeData> {
     let arrival_ts_us = Some(now_micros());
-    let samples = track.on_rtp_packet_with_allocator(payload, allocator).await?;
+    let samples = track
+        .on_rtp_packet_with_allocator(payload, allocator)
+        .await?;
     Ok(RuntimeData::Audio {
         samples: samples.into(),
         sample_rate: 48000,
@@ -1212,7 +1271,12 @@ pub async fn rtp_to_runtime_data(
             Error::MediaTrackError("No audio track available for decoding".to_string())
         })?;
 
-        audio_rtp_to_runtime_data(payload, audio_track, &remotemedia_types::HeapOutputAllocator).await
+        audio_rtp_to_runtime_data(
+            payload,
+            audio_track,
+            &remotemedia_types::HeapOutputAllocator,
+        )
+        .await
     } else {
         let video_track = video_track.ok_or_else(|| {
             Error::MediaTrackError("No video track available for decoding".to_string())

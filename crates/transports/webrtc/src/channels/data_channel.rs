@@ -329,7 +329,9 @@ impl DataChannel {
     pub fn on_message_with_context<F, Fut>(&self, copies: CopyContext, handler: F)
     where
         F: Fn(std::result::Result<DataChannelMessage, DataChannelDecodeError>) -> Fut
-            + Send + Sync + 'static,
+            + Send
+            + Sync
+            + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         self.on_binary_message_owned(move |data| {

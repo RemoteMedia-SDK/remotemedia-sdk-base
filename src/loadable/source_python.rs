@@ -428,7 +428,10 @@ async fn deliver_emitted(
 impl SourcePythonNode {
     /// Send this call's cancel to the worker, out of band, when the router
     /// fires the call's token (openspec: add-generator-cancellation).
-    fn forward_cancel(&self, ctx: &dyn NodeRuntimeContextRead) -> remotemedia_traits::CancelRegistration {
+    fn forward_cancel(
+        &self,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> remotemedia_traits::CancelRegistration {
         let cmd_tx = self.cmd_tx.clone();
         let session_id = self.session_id.clone();
         let node_type = self.node_type.clone();
@@ -552,8 +555,11 @@ impl StreamingNode for SourcePythonNode {
         _ctx: &dyn NodeRuntimeContextRead,
     ) -> Result<bool, Error> {
         if crate::transport::session_control::aux_port_of(&message).as_deref() == Some("shutdown") {
-            let (child, session_id, node_id) =
-                (self._child.clone(), self.session_id.clone(), self.node_id.clone());
+            let (child, session_id, node_id) = (
+                self._child.clone(),
+                self.session_id.clone(),
+                self.node_id.clone(),
+            );
             let _ = tokio::task::spawn_blocking(move || {
                 remotemedia_plugin_sdk::python_ipc::stop_runner(
                     &child,
@@ -891,7 +897,10 @@ mod wire_copy_tests {
         let RuntimeData::Json(value) = decode_output(&bytes, &copies).unwrap() else {
             panic!("expected json")
         };
-        assert_eq!(value, serde_json::json!({"kind": "turn_end", "complete": true}));
+        assert_eq!(
+            value,
+            serde_json::json!({"kind": "turn_end", "complete": true})
+        );
     }
 
     #[test]

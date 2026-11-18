@@ -1691,7 +1691,8 @@ impl PipelineExecutor {
         // Create and attach the per-session control bus. Must happen before
         // `start()` consumes the router's input_tx.
         let control = SessionControl::with_transport_copy_context(
-            session_id.clone(), transport_copies.clone(),
+            session_id.clone(),
+            transport_copies.clone(),
         );
         router.attach_control(control.clone()).await;
         self.control_bus.register(control.clone());
@@ -1871,11 +1872,11 @@ mod tests {
     use super::*;
     use crate::manifest::{Connection, ManifestMetadata, NodeManifest};
 
-    mod output_drain;
-    mod provenance;
     mod body;
     mod emit;
+    mod output_drain;
     mod participants;
+    mod provenance;
 
     fn create_test_manifest() -> Manifest {
         Manifest {

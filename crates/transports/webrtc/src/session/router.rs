@@ -660,8 +660,11 @@ impl SessionRouter {
                     Error::MediaTrackError("No audio track configured".to_string())
                 })?;
                 crate::media::tracks::audio_rtp_to_runtime_data(
-                    payload, &audio_track, self.output_allocator.as_ref(),
-                ).await?
+                    payload,
+                    &audio_track,
+                    self.output_allocator.as_ref(),
+                )
+                .await?
             } else {
                 let video_track = peer.video_track().await.ok_or_else(|| {
                     Error::MediaTrackError("No video track configured".to_string())
@@ -699,9 +702,10 @@ impl SessionRouter {
         let start = Instant::now();
         let bytes = payload.len();
         let peer = self.peer_manager.get_peer(peer_id).await?;
-        let video_track = peer.video_track().await.ok_or_else(|| {
-            Error::MediaTrackError("No video track configured".to_string())
-        })?;
+        let video_track = peer
+            .video_track()
+            .await
+            .ok_or_else(|| Error::MediaTrackError("No video track configured".to_string()))?;
         let frame = video_track
             .decode_owned_payload_with_context(payload, &self.copies, self.output_allocator.clone())
             .await?;
@@ -756,7 +760,11 @@ impl SessionRouter {
                 })?;
 
                 audio_track
-                    .send_audio_with_context(samples.clone().into_shared(), *sample_rate, &self.copies)
+                    .send_audio_with_context(
+                        samples.clone().into_shared(),
+                        *sample_rate,
+                        &self.copies,
+                    )
                     .await?;
 
                 // Record outgoing audio metrics
@@ -819,7 +827,8 @@ impl SessionRouter {
 
                 let limit = wire_output::message_size_limit(&peer).await?;
                 for message in wire_output::prepare_messages(encoded, &self.session_id, limit)? {
-                    peer.send_data_channel_message_with_context(&message, &self.copies).await?;
+                    peer.send_data_channel_message_with_context(&message, &self.copies)
+                        .await?;
                 }
                 Ok(())
             }

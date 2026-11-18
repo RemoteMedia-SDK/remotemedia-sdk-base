@@ -101,12 +101,19 @@ impl StreamingNodeFactory for MediaKindFilterNodeFactory {
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        let params = if params.is_null() { json!({}) } else { params.clone() };
+        let params = if params.is_null() {
+            json!({})
+        } else {
+            params.clone()
+        };
         let config: MediaKindFilterConfig = serde_json::from_value(params).map_err(|error| {
-            Error::Execution(format!("{MEDIA_KIND_FILTER_NODE} '{node_id}': invalid params: {error}"))
+            Error::Execution(format!(
+                "{MEDIA_KIND_FILTER_NODE} '{node_id}': invalid params: {error}"
+            ))
         })?;
-        let node = MediaKindFilterNode::new(&config)
-            .map_err(|error| Error::Execution(format!("{MEDIA_KIND_FILTER_NODE} '{node_id}': {error}")))?;
+        let node = MediaKindFilterNode::new(&config).map_err(|error| {
+            Error::Execution(format!("{MEDIA_KIND_FILTER_NODE} '{node_id}': {error}"))
+        })?;
         Ok(Box::new(SyncNodeWrapper(node)))
     }
 
@@ -121,10 +128,20 @@ impl StreamingNodeFactory for MediaKindFilterNodeFactory {
     fn schema(&self) -> Option<NodeSchema> {
         Some(
             NodeSchema::new(MEDIA_KIND_FILTER_NODE)
-                .description("Passes on only the listed kinds of data (audio, text, json), unchanged.")
+                .description(
+                    "Passes on only the listed kinds of data (audio, text, json), unchanged.",
+                )
                 .category("utility")
-                .accepts([RuntimeDataType::Audio, RuntimeDataType::Text, RuntimeDataType::Json])
-                .produces([RuntimeDataType::Audio, RuntimeDataType::Text, RuntimeDataType::Json])
+                .accepts([
+                    RuntimeDataType::Audio,
+                    RuntimeDataType::Text,
+                    RuntimeDataType::Json,
+                ])
+                .produces([
+                    RuntimeDataType::Audio,
+                    RuntimeDataType::Text,
+                    RuntimeDataType::Json,
+                ])
                 .config_schema_from::<MediaKindFilterConfig>(),
         )
     }
@@ -158,26 +175,45 @@ mod tests {
 
     #[test]
     fn an_audio_filter_drops_typed_frames() {
-        let node = MediaKindFilterNode::new(&MediaKindFilterConfig { allow: vec!["audio".into()] }).unwrap();
+        let node = MediaKindFilterNode::new(&MediaKindFilterConfig {
+            allow: vec!["audio".into()],
+        })
+        .unwrap();
         assert_eq!(passed(&node, audio()), 1);
-        assert_eq!(passed(&node, RuntimeData::Json(json!({ "v": 1, "type": "text", "text": "hi" }))), 0);
+        assert_eq!(
+            passed(
+                &node,
+                RuntimeData::Json(json!({ "v": 1, "type": "text", "text": "hi" }))
+            ),
+            0
+        );
         assert_eq!(passed(&node, RuntimeData::Text("hi".into())), 0);
     }
 
     #[test]
     fn a_text_filter_drops_audio() {
-        let node =
-            MediaKindFilterNode::new(&MediaKindFilterConfig { allow: vec!["json".into(), "Text".into()] }).unwrap();
+        let node = MediaKindFilterNode::new(&MediaKindFilterConfig {
+            allow: vec!["json".into(), "Text".into()],
+        })
+        .unwrap();
         assert_eq!(passed(&node, audio()), 0);
-        assert_eq!(passed(&node, RuntimeData::Json(json!({ "v": 1, "type": "interrupt" }))), 1);
+        assert_eq!(
+            passed(
+                &node,
+                RuntimeData::Json(json!({ "v": 1, "type": "interrupt" }))
+            ),
+            1
+        );
         assert_eq!(passed(&node, RuntimeData::Text("hi".into())), 1);
     }
 
     #[test]
     fn an_unknown_kind_is_refused_by_name() {
-        let error = MediaKindFilterNode::new(&MediaKindFilterConfig { allow: vec!["video".into()] })
-            .err()
-            .unwrap();
+        let error = MediaKindFilterNode::new(&MediaKindFilterConfig {
+            allow: vec!["video".into()],
+        })
+        .err()
+        .unwrap();
         assert!(error.contains("video"), "{error}");
     }
 

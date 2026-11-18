@@ -241,8 +241,7 @@ pub(super) fn sweep_dead_nodes_once() {
 }
 
 fn sweep_dead_nodes() {
-    let (cleanups, failed_cleanups) =
-        cleanup_dead_nodes(iceoryx2::config::Config::global_config());
+    let (cleanups, failed_cleanups) = cleanup_dead_nodes(iceoryx2::config::Config::global_config());
     if cleanups + failed_cleanups > 0 {
         tracing::info!(
             "iceoryx2: removed {} dead node(s), {} could not be removed",

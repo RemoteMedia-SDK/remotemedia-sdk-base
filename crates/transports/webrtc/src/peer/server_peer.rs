@@ -25,10 +25,10 @@ use remotemedia_core::{
     data::RuntimeData,
     manifest::Manifest,
     transport::{
-        data::participant, session_control::SessionControl,
+        data::participant,
+        session_control::SessionControl,
         turn_audio::{FlushTarget, TurnTag},
-        Participant, ParticipantSessionHandle,
-        PipelineSessionHost, SharedPipelineOutputReceivers,
+        Participant, ParticipantSessionHandle, PipelineSessionHost, SharedPipelineOutputReceivers,
         SharedPipelineSession as CoreSharedPipelineSession, TransportData,
     },
 };
@@ -214,7 +214,9 @@ impl PerTrackDispatcher {
                     }
                 }
             }
-            RuntimeData::Json(value) if value.get("kind").and_then(|v| v.as_str()) == Some("speech_end") => {
+            RuntimeData::Json(value)
+                if value.get("kind").and_then(|v| v.as_str()) == Some("speech_end") =>
+            {
                 // Enqueue behind the preceding audio in each per-track shard.
                 // Only then may the encoder pad the last partial codec frame.
                 let senders: Vec<_> = {
@@ -227,15 +229,21 @@ impl PerTrackDispatcher {
                 };
                 for tx in senders {
                     if tx.send(transport_data.clone()).await.is_err() {
-                        warn!("audio shard closed before speech_end (peer {})", self.peer_id);
+                        warn!(
+                            "audio shard closed before speech_end (peer {})",
+                            self.peer_id
+                        );
                     }
                 }
-                if let Err(e) = Self::send_data_channel(&self.data_channel, &transport_data, &self.copies).await {
+                if let Err(e) =
+                    Self::send_data_channel(&self.data_channel, &transport_data, &self.copies).await
+                {
                     error!("data channel send failed (peer {}): {}", self.peer_id, e);
                 }
             }
             RuntimeData::Json(value)
-                if self.realtime_hook && remotemedia_core::nodes::realtime_events::is_ui_frame(value) =>
+                if self.realtime_hook
+                    && remotemedia_core::nodes::realtime_events::is_ui_frame(value) =>
             {
                 trace!("UI frame not sent to realtime-hook peer {}", self.peer_id);
             }
@@ -291,12 +299,16 @@ impl PerTrackDispatcher {
             let mut first = true;
             let mut chunk_idx: u64 = 0;
             while let Some(td) = rx.recv().await {
-                if matches!(&td.data, RuntimeData::Json(v) if v.get("kind").and_then(|k| k.as_str()) == Some("speech_end")) {
+                if matches!(&td.data, RuntimeData::Json(v) if v.get("kind").and_then(|k| k.as_str()) == Some("speech_end"))
+                {
                     if let Some(track) = registry.get_audio_track(&stream).await {
                         // A `speech_end` of a turn's text chunk carries its tag.
                         let tag = TurnTag::from_metadata(&td.metadata);
                         if let Err(e) = track.finish_audio_tagged(tag).await {
-                            warn!("audio speech_end flush failed for '{}' (peer {}): {}", stream, peer, e);
+                            warn!(
+                                "audio speech_end flush failed for '{}' (peer {}): {}",
+                                stream, peer, e
+                            );
                         }
                     }
                     continue;
@@ -384,7 +396,10 @@ impl PerTrackDispatcher {
                     );
                     continue;
                 };
-                if let Err(e) = track.send_video_runtime_data_with_context(td.data, &copies).await {
+                if let Err(e) = track
+                    .send_video_runtime_data_with_context(td.data, &copies)
+                    .await
+                {
                     warn!(
                         "video send failed for stream '{}' (peer {}): {}",
                         stream, peer, e
@@ -555,7 +570,10 @@ impl SharedPipelineSession {
     /// the AI SDK realtime hook over WebRTC. Such a peer's data channel
     /// carries no D6 UI frames (design D13).
     pub fn set_realtime_hook_peer(&self, peer_id: &str, realtime_hook: bool) {
-        let mut peers = self.realtime_hook_peers.lock().expect("realtime hook peers lock");
+        let mut peers = self
+            .realtime_hook_peers
+            .lock()
+            .expect("realtime hook peers lock");
         if realtime_hook {
             peers.insert(peer_id.to_string());
         } else {
@@ -576,8 +594,13 @@ impl SharedPipelineSession {
             .lock()
             .expect("realtime hook peers lock")
             .contains(&peer_id);
-        let dispatcher =
-            PerTrackDispatcher::new(track_registry, data_channel, peer_id.clone(), copies, realtime_hook);
+        let dispatcher = PerTrackDispatcher::new(
+            track_registry,
+            data_channel,
+            peer_id.clone(),
+            copies,
+            realtime_hook,
+        );
         self.output_targets.write().await.insert(
             peer_id,
             PeerOutputTarget {
@@ -1609,7 +1632,9 @@ impl ServerPeer {
             .read()
             .expect("participant metadata lock")
             .get(remotemedia_core::nodes::realtime_events::ADMISSION_FIELD)
-            .is_some_and(|admission| remotemedia_core::nodes::realtime_events::admission_is_webrtc(admission));
+            .is_some_and(|admission| {
+                remotemedia_core::nodes::realtime_events::admission_is_webrtc(admission)
+            });
         shared_session.set_realtime_hook_peer(&peer_id, realtime_hook);
         shared_session
             .attach_peer(
@@ -1663,7 +1688,12 @@ impl ServerPeer {
         // the next `recv_from` on our socket fail (WSAECONNRESET), and the ICE
         // agent's receive loop of that local candidate ends for good, so the
         // connection never completes. The bundle's own candidates are enough.
-        if let Some(remote) = self.peer_connection.peer_connection().remote_description().await {
+        if let Some(remote) = self
+            .peer_connection
+            .peer_connection()
+            .remote_description()
+            .await
+        {
             if bundled_away(&remote.sdp, sdp_mid.as_deref(), sdp_mline_index) {
                 debug!(
                     "ServerPeer {} ignoring ICE candidate of a bundled-away m-section (mid={:?}, index={:?})",
@@ -1855,8 +1885,11 @@ a=mid:1
 
     #[test]
     fn nothing_is_bundled_away_without_a_bundle_group() {
-        let sdp = OFFER.replace("a=group:BUNDLE 0 1
-", "");
+        let sdp = OFFER.replace(
+            "a=group:BUNDLE 0 1
+",
+            "",
+        );
         assert!(!bundled_away(&sdp, Some("1"), Some(1)));
         assert!(!bundled_away("", Some("1"), Some(1)));
     }

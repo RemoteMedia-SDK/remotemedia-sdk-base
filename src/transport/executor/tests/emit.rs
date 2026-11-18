@@ -135,7 +135,9 @@ impl StreamingNode for EmitNode {
             }
             // Emit unattributed, also on a per-participant instance.
             "nobody" => {
-                emitter.emit_as(text(rest), EmitOrigin::Unattributed).await?;
+                emitter
+                    .emit_as(text(rest), EmitOrigin::Unattributed)
+                    .await?;
                 reply(text("ack"))?;
             }
             // A reply, an emit and a reply.
@@ -184,7 +186,10 @@ impl StreamingNodeFactory for EmitFactory {
             scope: self.scope,
             ticks: params.get("ticks").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             tick_ms: params.get("tick_ms").and_then(|v| v.as_u64()).unwrap_or(0),
-            finish: params.get("finish").and_then(|v| v.as_bool()).unwrap_or(false),
+            finish: params
+                .get("finish")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             self_driven: params.get("self_driven").and_then(|v| v.as_bool()),
             probe: self.probe.clone(),
             emitter: Mutex::new(None),
@@ -195,7 +200,10 @@ impl StreamingNodeFactory for EmitFactory {
         self.node_type
     }
     // A manifest may make this node a source, so it declares its output.
-    fn media_capabilities(&self, _params: &serde_json::Value) -> Option<crate::capabilities::MediaCapabilities> {
+    fn media_capabilities(
+        &self,
+        _params: &serde_json::Value,
+    ) -> Option<crate::capabilities::MediaCapabilities> {
         Some(crate::capabilities::MediaCapabilities::with_output(
             crate::capabilities::MediaConstraints::Text(Default::default()),
         ))
@@ -252,7 +260,10 @@ async fn executor() -> (PipelineExecutor, Arc<Probe>) {
 }
 
 /// `nodes`: (id, type, params).
-fn manifest(nodes: &[(&str, &str, serde_json::Value)], connections: &[(&str, &str)]) -> Arc<Manifest> {
+fn manifest(
+    nodes: &[(&str, &str, serde_json::Value)],
+    connections: &[(&str, &str)],
+) -> Arc<Manifest> {
     Arc::new(Manifest {
         version: "v1".to_string(),
         metadata: ManifestMetadata {
@@ -292,7 +303,10 @@ fn user(id: &str) -> Participant {
 }
 
 async fn say(handle: &ParticipantSessionHandle, command: &str) {
-    handle.send(TransportData::new(text(command))).await.unwrap();
+    handle
+        .send(TransportData::new(text(command)))
+        .await
+        .unwrap();
 }
 
 /// The next output as (text, participant id).
@@ -321,11 +335,19 @@ async fn collect(session: &mut SessionHandle, count: usize) -> HashMap<String, O
 async fn a_task_started_in_initialize_emits_with_no_input() {
     let (executor, probe) = executor().await;
     let mut session = executor
-        .create_session(manifest(&[("node", "EmitNode", serde_json::json!({"ticks": 3}))], &[]))
+        .create_session(manifest(
+            &[("node", "EmitNode", serde_json::json!({"ticks": 3}))],
+            &[],
+        ))
         .await
         .unwrap();
-    let control = executor.control_bus().get(&session.session_id).expect("session control");
-    let mut tap = control.subscribe(&ControlAddress::node_out("node")).unwrap();
+    let control = executor
+        .control_bus()
+        .get(&session.session_id)
+        .expect("session control");
+    let mut tap = control
+        .subscribe(&ControlAddress::node_out("node"))
+        .unwrap();
 
     // Nothing was sent to the session. Frames arrive in the order emitted,
     // attributed to nobody.
@@ -360,7 +382,10 @@ async fn an_emit_after_the_call_returned_is_delivered_unattributed() {
 
     say(&alice, "after:done").await;
     // The reply is alice's; the frame emitted later belongs to no input.
-    assert_eq!(next(&mut session).await, ("started".into(), Some("alice".into())));
+    assert_eq!(
+        next(&mut session).await,
+        ("started".into(), Some("alice".into()))
+    );
     assert_eq!(next(&mut session).await, ("done".into(), None));
     session.close().await.unwrap();
 }
@@ -372,10 +397,16 @@ async fn replies_and_emits_of_one_node_keep_their_order() {
     let alice = session.join_participant(user("alice")).unwrap();
 
     say(&alice, "order").await;
-    assert_eq!(next(&mut session).await, ("reply-1".into(), Some("alice".into())));
+    assert_eq!(
+        next(&mut session).await,
+        ("reply-1".into(), Some("alice".into()))
+    );
     // Emitted during alice's turn, and still not alice's.
     assert_eq!(next(&mut session).await, ("emitted".into(), None));
-    assert_eq!(next(&mut session).await, ("reply-2".into(), Some("alice".into())));
+    assert_eq!(
+        next(&mut session).await,
+        ("reply-2".into(), Some("alice".into()))
+    );
     session.close().await.unwrap();
 }
 
@@ -387,7 +418,10 @@ async fn a_node_keeps_an_inputs_origin_and_emits_with_it_later() {
     let bob = session.join_participant(user("bob")).unwrap();
 
     say(&alice, "remember").await;
-    assert_eq!(next(&mut session).await, ("remembered".into(), Some("alice".into())));
+    assert_eq!(
+        next(&mut session).await,
+        ("remembered".into(), Some("alice".into()))
+    );
     // Bob's input triggers the emit; the frame carries what the node kept.
     say(&bob, "later:for alice").await;
     let seen = collect(&mut session, 2).await;
@@ -420,9 +454,15 @@ async fn a_node_emits_as_a_current_participant_by_id() {
         }
     }
     let attributed = attributed.expect("the emitted frame");
-    assert_eq!(attributed.metadata.get(participant::ID).map(String::as_str), Some("alice"));
     assert_eq!(
-        attributed.metadata.get(participant::TRACK_ID).map(String::as_str),
+        attributed.metadata.get(participant::ID).map(String::as_str),
+        Some("alice")
+    );
+    assert_eq!(
+        attributed
+            .metadata
+            .get(participant::TRACK_ID)
+            .map(String::as_str),
         Some("alice-mic")
     );
 
@@ -430,7 +470,10 @@ async fn a_node_emits_as_a_current_participant_by_id() {
     // nothing is delivered for it.
     say(&bob, "as:ghost:boo").await;
     let (reply, _) = next(&mut session).await;
-    assert!(reply.starts_with("error:") && reply.contains("ghost"), "{reply}");
+    assert!(
+        reply.starts_with("error:") && reply.contains("ghost"),
+        "{reply}"
+    );
 
     // Someone who left is not one either.
     alice.leave().await.unwrap();
@@ -443,7 +486,10 @@ async fn a_node_emits_as_a_current_participant_by_id() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_per_participant_instance_emits_as_its_participant() {
     let (executor, _probe) = executor().await;
-    let mut session = executor.create_session(one("EmitPerParticipant")).await.unwrap();
+    let mut session = executor
+        .create_session(one("EmitPerParticipant"))
+        .await
+        .unwrap();
     let alice = session.join_participant(user("alice")).unwrap();
     let bob = session.join_participant(user("bob")).unwrap();
 
@@ -525,14 +571,21 @@ async fn client_input_does_not_reach_a_self_driven_source() {
     let mut session = executor
         .create_session(manifest(
             &[
-                ("source", "EmitNode", serde_json::json!({"ticks": 2, "session_input": false})),
+                (
+                    "source",
+                    "EmitNode",
+                    serde_json::json!({"ticks": 2, "session_input": false}),
+                ),
                 ("echo", "EmitNode", serde_json::json!({})),
             ],
             &[],
         ))
         .await
         .unwrap();
-    session.send_input(TransportData::new(text("hello"))).await.unwrap();
+    session
+        .send_input(TransportData::new(text("hello")))
+        .await
+        .unwrap();
     // Two frames from the source, and the input answered once: by `echo` only.
     let mut seen = Vec::new();
     for _ in 0..3 {
@@ -541,7 +594,9 @@ async fn client_input_does_not_reach_a_self_driven_source() {
     seen.sort();
     assert_eq!(seen, ["hello", "tick-0", "tick-1"]);
     assert!(
-        tokio::time::timeout(Duration::from_millis(300), session.recv_output()).await.is_err(),
+        tokio::time::timeout(Duration::from_millis(300), session.recv_output())
+            .await
+            .is_err(),
         "the self-driven source answered client input"
     );
     session.close().await.unwrap();
@@ -567,7 +622,10 @@ async fn a_session_with_only_a_self_driven_source_runs_without_input_and_ends_wi
     }
     // The source finished: the session drains and ends, though nobody
     // closed it and the client still holds its input.
-    assert!(ended(&mut session).await, "the session did not end with its source");
+    assert!(
+        ended(&mut session).await,
+        "the session did not end with its source"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -587,7 +645,10 @@ async fn the_end_of_client_input_does_not_end_a_session_with_a_running_source() 
         ))
         .await
         .unwrap();
-    session.send_input(TransportData::new(text("last words"))).await.unwrap();
+    session
+        .send_input(TransportData::new(text("last words")))
+        .await
+        .unwrap();
     session.signal_input_complete();
     // The input-driven branch drains, and the source's output keeps coming.
     let mut seen = Vec::new();
@@ -605,7 +666,14 @@ async fn unary_execution_rejects_a_pipeline_without_an_input_taking_node() {
     let (executor, _probe) = executor().await;
     let error = executor
         .execute_unary(
-            manifest(&[("source", "EmitNode", serde_json::json!({"session_input": false}))], &[]),
+            manifest(
+                &[(
+                    "source",
+                    "EmitNode",
+                    serde_json::json!({"session_input": false}),
+                )],
+                &[],
+            ),
             TransportData::new(text("anyone?")),
         )
         .await
@@ -616,7 +684,14 @@ async fn unary_execution_rejects_a_pipeline_without_an_input_taking_node() {
     // factory says so.
     let error = executor
         .execute_unary(
-            manifest(&[("source", "EmitNode", serde_json::json!({"self_driven": true}))], &[]),
+            manifest(
+                &[(
+                    "source",
+                    "EmitNode",
+                    serde_json::json!({"self_driven": true}),
+                )],
+                &[],
+            ),
             TransportData::new(text("anyone?")),
         )
         .await
@@ -647,19 +722,32 @@ async fn a_per_participant_self_driven_instance_runs_from_join_to_leave() {
     who.sort();
     assert_eq!(
         who,
-        [("tick-0".to_string(), Some("alice".to_string())), ("tick-0".to_string(), Some("bob".to_string()))]
+        [
+            ("tick-0".to_string(), Some("alice".to_string())),
+            ("tick-0".to_string(), Some("bob".to_string()))
+        ]
     );
 
     // Alice's instance stops when she leaves; bob's keeps running.
     alice.leave().await.unwrap();
     let mut closed = Vec::new();
     for _ in 0..100 {
-        closed = probe.emitters.lock().unwrap().iter().map(Emitter::is_closed).collect::<Vec<_>>();
+        closed = probe
+            .emitters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Emitter::is_closed)
+            .collect::<Vec<_>>();
         if closed.iter().any(|closed| *closed) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(closed.iter().filter(|closed| **closed).count(), 1, "{closed:?}");
+    assert_eq!(
+        closed.iter().filter(|closed| **closed).count(),
+        1,
+        "{closed:?}"
+    );
     session.close().await.unwrap();
 }

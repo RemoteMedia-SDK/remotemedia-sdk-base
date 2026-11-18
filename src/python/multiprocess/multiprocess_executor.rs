@@ -833,7 +833,10 @@ impl MultiprocessExecutor {
         let emitter = self.emitter.lock().unwrap().clone()?;
         Some(super::legacy_call::EmitSink {
             emitter,
-            copies: self.initial_copies.clone().unwrap_or_else(|| copies.clone()),
+            copies: self
+                .initial_copies
+                .clone()
+                .unwrap_or_else(|| copies.clone()),
             node_id: node_id.to_string(),
         })
     }
@@ -884,7 +887,11 @@ impl MultiprocessExecutor {
         let turn_seq = self
             .wire_turns
             .load(std::sync::atomic::Ordering::Acquire)
-            .then(|| self.turn_seq.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1);
+            .then(|| {
+                self.turn_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                    + 1
+            });
         if let Some(seq) = turn_seq {
             crate::multiprocess::python_wire::append_input_turn(
                 &mut ipc_data,
@@ -1777,7 +1784,10 @@ sys.stdout.flush()
         // plugin's entry module): the probe looks for the node type in them.
         cmd.env(
             "REMOTEMEDIA_DEPS_PROBE_MODULES",
-            self.process_manager.get_registered_modules().await.join(","),
+            self.process_manager
+                .get_registered_modules()
+                .await
+                .join(","),
         );
         #[cfg(windows)]
         if let Some(flags) = super::process_manager::no_window_flag() {
@@ -1807,7 +1817,11 @@ sys.stdout.flush()
             }
         };
 
-        type Probed = (Vec<String>, Option<String>, Option<crate::nodes::InstanceScope>);
+        type Probed = (
+            Vec<String>,
+            Option<String>,
+            Option<crate::nodes::InstanceScope>,
+        );
         let parse_marker = |stdout_bytes: &[u8]| -> Option<Probed> {
             let text = String::from_utf8_lossy(stdout_bytes);
             for line in text.lines() {
@@ -2110,7 +2124,9 @@ sys.stdout.flush()
                 r = worker.wait_for(Option::is_some) => match r { Ok(v) => v.clone(), Err(_) => return },
             }
             .unwrap_or_default();
-            let (Some(sessions), Some(process_manager)) = (sessions.upgrade(), process_manager.upgrade()) else {
+            let (Some(sessions), Some(process_manager)) =
+                (sessions.upgrade(), process_manager.upgrade())
+            else {
                 return;
             };
             let attached = sessions
@@ -2123,9 +2139,16 @@ sys.stdout.flush()
             }
             tracing::error!("Node {node_id} failed in its shared worker ({reason}); terminating pipeline {session_id}");
             let _ = health_monitor
-                .handle_process_exit(pid, ExitReason::Error(-1), Some(session_id.clone()), Some(node_id.clone()))
+                .handle_process_exit(
+                    pid,
+                    ExitReason::Error(-1),
+                    Some(session_id.clone()),
+                    Some(node_id.clone()),
+                )
                 .await;
-            if let Err(e) = Self::terminate_session_static(sessions, process_manager, &session_id).await {
+            if let Err(e) =
+                Self::terminate_session_static(sessions, process_manager, &session_id).await
+            {
                 tracing::error!("Failed to terminate session {}: {}", session_id, e);
             }
         });
@@ -2386,7 +2409,14 @@ sys.stdout.flush()
         session_id: &str,
         node_id: &str,
         timeout: std::time::Duration,
-    ) -> Result<(bool, Option<crate::nodes::InstanceScope>, bool, bool, bool, Option<Vec<u8>>)> {
+    ) -> Result<(
+        bool,
+        Option<crate::nodes::InstanceScope>,
+        bool,
+        bool,
+        bool,
+        Option<Vec<u8>>,
+    )> {
         let start = std::time::Instant::now();
         let control_channel_name = format!("control/{}_{}", session_id, node_id);
 
@@ -2705,7 +2735,10 @@ sys.stdout.flush()
             });
             let event_driven = wake_thread.is_some();
             if !event_driven {
-                tracing::debug!("IPC thread for node {} polls (no wake events)", node_id_clone);
+                tracing::debug!(
+                    "IPC thread for node {} polls (no wake events)",
+                    node_id_clone
+                );
             }
             let notify_node = |what: &str| {
                 if let Some(notifier) = &input_wake {
@@ -2773,16 +2806,14 @@ sys.stdout.flush()
                         // The subscriber will be polled continuously even between commands
                         // to ensure we capture all output from streaming nodes
                     }
-                    Ok(IpcCommand::SendDataNoAck { bytes }) => {
-                        match publisher.send(&bytes) {
-                            Ok(_) => notify_node("out-of-band input"),
-                            Err(e) => tracing::warn!(
-                                "[IPC Thread] Node '{}': out-of-band publish failed: {}",
-                                node_id_clone,
-                                e
-                            ),
-                        }
-                    }
+                    Ok(IpcCommand::SendDataNoAck { bytes }) => match publisher.send(&bytes) {
+                        Ok(_) => notify_node("out-of-band input"),
+                        Err(e) => tracing::warn!(
+                            "[IPC Thread] Node '{}': out-of-band publish failed: {}",
+                            node_id_clone,
+                            e
+                        ),
+                    },
                     // Nothing to do here: the next iteration polls the subscribers.
                     Ok(IpcCommand::Wake) => {}
                     Ok(IpcCommand::RegisterOutputCallback {
@@ -2859,10 +2890,12 @@ sys.stdout.flush()
                                     if output_data.as_slice().first()
                                         == Some(&super::copy_authority::END_OF_INPUT)
                                     {
-                                        if let Err(error) = super::copy_authority::replay_end_of_input(
-                                            copies,
-                                            output_data.as_slice(),
-                                        ) {
+                                        if let Err(error) =
+                                            super::copy_authority::replay_end_of_input(
+                                                copies,
+                                                output_data.as_slice(),
+                                            )
+                                        {
                                             tracing::error!(
                                                 "Copy report from node {} rejected: {}",
                                                 node_id_clone,
@@ -2871,7 +2904,12 @@ sys.stdout.flush()
                                         }
                                     }
                                 }
-                                deliver_ipc_output(output_data, turn, &mut output_callback, &resp_tx);
+                                deliver_ipc_output(
+                                    output_data,
+                                    turn,
+                                    &mut output_callback,
+                                    &resp_tx,
+                                );
                             }
                             Ok(None) if event_driven => {
                                 // Idle: block until a command arrives or the
@@ -3031,8 +3069,12 @@ sys.stdout.flush()
                 // could be terminated. Nothing of the session is left for a
                 // later one to read.
                 let registry = self.channel_registry.clone();
-                if let Err(error) = tokio::task::spawn_blocking(move || ipc.release(&registry)).await {
-                    tracing::error!("Releasing the IPC channels of session {session_id} failed: {error}");
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || ipc.release(&registry)).await
+                {
+                    tracing::error!(
+                        "Releasing the IPC channels of session {session_id} failed: {error}"
+                    );
                 }
                 if let Some(error) = failure {
                     return Err(error);
@@ -3277,7 +3319,8 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             // event after publishing an output or a control message. A side
             // that cannot open them falls back to polling.
             // `REMOTEMEDIA_IPC_WAKE_EVENTS=0` turns them off (both sides poll).
-            let wake_events = std::env::var("REMOTEMEDIA_IPC_WAKE_EVENTS").map_or(true, |v| v != "0");
+            let wake_events =
+                std::env::var("REMOTEMEDIA_IPC_WAKE_EVENTS").map_or(true, |v| v != "0");
             for channel in [&input_channel_name, &output_channel_name] {
                 if !wake_events {
                     break;
@@ -3374,7 +3417,11 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             self.declared_instance_scope = probed_scope;
             // A source plugin's `plugin.toml` `requires` are base dependencies,
             // like the class's own declaration.
-            if let Some(plugin_deps) = ctx.params.get("__python_plugin_deps__").and_then(|v| v.as_array()) {
+            if let Some(plugin_deps) = ctx
+                .params
+                .get("__python_plugin_deps__")
+                .and_then(|v| v.as_array())
+            {
                 for dep in plugin_deps.iter().filter_map(|v| v.as_str()) {
                     if !node_deps.iter().any(|existing| existing == dep) {
                         node_deps.push(dep.to_string());
@@ -3593,7 +3640,13 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 let authority = self
                     .initial_copies
                     .clone()
-                    .map(|copies| super::copy_authority::CopyAuthority::start(copies, &ctx.node_id, &session_id))
+                    .map(|copies| {
+                        super::copy_authority::CopyAuthority::start(
+                            copies,
+                            &ctx.node_id,
+                            &session_id,
+                        )
+                    })
                     .transpose()
                     .map_err(|e| Error::Execution(format!("Copy authority startup failed: {e}")))?;
                 match super::shared_workers::pool()
@@ -3672,13 +3725,25 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                                 ctx.node_id
                             );
                             self.process_manager
-                                .spawn_node_with_copy_context(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id, self.initial_copies.clone())
+                                .spawn_node_with_copy_context(
+                                    &ctx.node_type,
+                                    &ctx.node_id,
+                                    &ctx.params,
+                                    &session_id,
+                                    self.initial_copies.clone(),
+                                )
                                 .await?
                         }
                     } else {
                         // Regular multiprocess execution (Docker not requested)
                         self.process_manager
-                            .spawn_node_with_copy_context(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id, self.initial_copies.clone())
+                            .spawn_node_with_copy_context(
+                                &ctx.node_type,
+                                &ctx.node_id,
+                                &ctx.params,
+                                &session_id,
+                                self.initial_copies.clone(),
+                            )
                             .await?
                     }
                 }
@@ -3686,7 +3751,13 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                 {
                     // Regular multiprocess execution (Docker feature not enabled)
                     self.process_manager
-                        .spawn_node_with_copy_context(&ctx.node_type, &ctx.node_id, &ctx.params, &session_id, self.initial_copies.clone())
+                        .spawn_node_with_copy_context(
+                            &ctx.node_type,
+                            &ctx.node_id,
+                            &ctx.params,
+                            &session_id,
+                            self.initial_copies.clone(),
+                        )
                         .await?
                 }
             };
@@ -3748,7 +3819,14 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             // Python creates its input subscriber BEFORE sending READY, so when we receive
             // READY signal, Python is fully prepared to receive data
             // Wait for READY signal with configured timeout (allows time for heavy model loading)
-            let (ready, reported_scope, worker_tags_turns, worker_self_driven, worker_awaits_start, worker_meta) = self
+            let (
+                ready,
+                reported_scope,
+                worker_tags_turns,
+                worker_self_driven,
+                worker_awaits_start,
+                worker_meta,
+            ) = self
                 .wait_for_ready_signal_ipc(
                     &session_id,
                     &ctx.node_id,
@@ -3834,7 +3912,11 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
                                     return;
                                 }
                             }
-                            if command_tx.send(IpcCommand::SendDataNoAck { bytes }).await.is_err() {
+                            if command_tx
+                                .send(IpcCommand::SendDataNoAck { bytes })
+                                .await
+                                .is_err()
+                            {
                                 tracing::debug!(node = %node_id, "worker stopped before its session started");
                             }
                         });

@@ -93,7 +93,9 @@ async fn join_url(url: &str, peer_id: &str) -> Client {
         let out_tx = out_tx.clone();
         Box::pin(async move {
             let buffer = DataBuffer::decode(message.data).expect("DataBuffer output");
-            let Some(DataType::Text(text)) = buffer.data_type else { return };
+            let Some(DataType::Text(text)) = buffer.data_type else {
+                return;
+            };
             let text = String::from_utf8(text.text_data).unwrap();
             let _ = out_tx.send((buffer.metadata.get(participant::ID).cloned(), text));
         })
@@ -112,10 +114,14 @@ async fn join_url(url: &str, peer_id: &str) -> Client {
         2,
     )
     .await;
-    let sdp = answer["result"]["sdp"].as_str().unwrap_or_else(|| panic!("{answer}"));
+    let sdp = answer["result"]["sdp"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{answer}"));
     rtc.set_remote_description(
-        webrtc::peer_connection::sdp::session_description::RTCSessionDescription::answer(sdp.into())
-            .unwrap(),
+        webrtc::peer_connection::sdp::session_description::RTCSessionDescription::answer(
+            sdp.into(),
+        )
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -123,8 +129,12 @@ async fn join_url(url: &str, peer_id: &str) -> Client {
     let trickle = Arc::clone(&rtc);
     tokio::spawn(async move {
         while let Some(Ok(message)) = ws.next().await {
-            let Message::Text(text) = message else { continue };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
             if value["method"] != "peer.ice_candidate" {
                 continue;
             }
@@ -147,7 +157,11 @@ async fn join_url(url: &str, peer_id: &str) -> Client {
         .await
         .expect("data channel opens")
         .unwrap();
-    Client { rtc, channel, outputs }
+    Client {
+        rtc,
+        channel,
+        outputs,
+    }
 }
 
 impl Client {
@@ -200,7 +214,9 @@ async fn two_peers_in_a_room_share_one_session_with_attributed_outputs() {
     let server_state = Arc::clone(&state);
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { break };
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
             let state = Arc::clone(&server_state);
             tokio::spawn(async move {
                 let _ = handle_connection(stream, state).await;
@@ -212,20 +228,41 @@ async fn two_peers_in_a_room_share_one_session_with_attributed_outputs() {
     let mut bob = join(addr, "bob").await;
 
     // One session for the room.
-    let room = state.rooms.lock().await.get("standup").cloned().expect("room session");
+    let room = state
+        .rooms
+        .lock()
+        .await
+        .get("standup")
+        .cloned()
+        .expect("room session");
     let room_session = room.session_id().to_string();
     for peer in ["alice", "bob"] {
         let server_peer = state.server_peers.read().await.get(peer).cloned().unwrap();
-        assert_eq!(server_peer.session_id().await.as_deref(), Some(room_session.as_str()));
+        assert_eq!(
+            server_peer.session_id().await.as_deref(),
+            Some(room_session.as_str())
+        );
     }
 
     alice.say("hi from alice").await;
     // Every attached peer receives every output (v1), each attributed.
-    assert_eq!(alice.next().await, (Some("alice".into()), "hi from alice".into()));
-    assert_eq!(bob.next().await, (Some("alice".into()), "hi from alice".into()));
+    assert_eq!(
+        alice.next().await,
+        (Some("alice".into()), "hi from alice".into())
+    );
+    assert_eq!(
+        bob.next().await,
+        (Some("alice".into()), "hi from alice".into())
+    );
     bob.say("hello from bob").await;
-    assert_eq!(alice.next().await, (Some("bob".into()), "hello from bob".into()));
-    assert_eq!(bob.next().await, (Some("bob".into()), "hello from bob".into()));
+    assert_eq!(
+        alice.next().await,
+        (Some("bob".into()), "hello from bob".into())
+    );
+    assert_eq!(
+        bob.next().await,
+        (Some("bob".into()), "hello from bob".into())
+    );
 
     let telemetry = executor
         .control_bus()
@@ -237,7 +274,13 @@ async fn two_peers_in_a_room_share_one_session_with_attributed_outputs() {
     // Alice hangs up: she leaves the session and her instance stops; the
     // room keeps serving Bob.
     alice.rtc.close().await.unwrap();
-    let server_alice = state.server_peers.read().await.get("alice").cloned().unwrap();
+    let server_alice = state
+        .server_peers
+        .read()
+        .await
+        .get("alice")
+        .cloned()
+        .unwrap();
     server_alice.shutdown().await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while telemetry.live_instances("echo") != 1 {
@@ -289,7 +332,11 @@ async fn hosted_room_is_used_for_joins_and_outlives_its_last_peer() {
         turn_servers: Vec::new(),
         ..Default::default()
     });
-    let state = Arc::new(SharedState::new(config, executor.clone(), Arc::new(Manifest::default())));
+    let state = Arc::new(SharedState::new(
+        config,
+        executor.clone(),
+        Arc::new(Manifest::default()),
+    ));
     state.host_room("standup", Arc::clone(&room)).await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -297,7 +344,9 @@ async fn hosted_room_is_used_for_joins_and_outlives_its_last_peer() {
     let server_state = Arc::clone(&state);
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { break };
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
             let state = Arc::clone(&server_state);
             tokio::spawn(async move {
                 let _ = handle_connection(stream, state).await;
@@ -307,8 +356,17 @@ async fn hosted_room_is_used_for_joins_and_outlives_its_last_peer() {
     let url = format!("ws://{addr}/ws?room=standup");
 
     let mut alice = join_url(&url, "alice").await;
-    let server_alice = state.server_peers.read().await.get("alice").cloned().unwrap();
-    assert_eq!(server_alice.session_id().await.as_deref(), Some(hosted_session.as_str()));
+    let server_alice = state
+        .server_peers
+        .read()
+        .await
+        .get("alice")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        server_alice.session_id().await.as_deref(),
+        Some(hosted_session.as_str())
+    );
     alice.say("hi").await;
     assert_eq!(alice.next().await, (Some("alice".into()), "hi".into()));
 
@@ -316,17 +374,26 @@ async fn hosted_room_is_used_for_joins_and_outlives_its_last_peer() {
     alice.rtc.close().await.unwrap();
     server_alice.shutdown().await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(room.is_active().await, "a hosted room outlives its last peer");
+    assert!(
+        room.is_active().await,
+        "a hosted room outlives its last peer"
+    );
 
     let mut bob = join_url(&url, "bob").await;
     let server_bob = state.server_peers.read().await.get("bob").cloned().unwrap();
-    assert_eq!(server_bob.session_id().await.as_deref(), Some(hosted_session.as_str()));
+    assert_eq!(
+        server_bob.session_id().await.as_deref(),
+        Some(hosted_session.as_str())
+    );
     bob.say("still here").await;
     assert_eq!(bob.next().await, (Some("bob".into()), "still here".into()));
 
     // Ending the room refuses later joins and leaves the session to the host.
     assert!(state.end_room("standup").await.is_some());
-    assert!(state.room("standup").await.is_err(), "an ended room refuses joins");
+    assert!(
+        state.room("standup").await.is_err(),
+        "an ended room refuses joins"
+    );
     bob.rtc.close().await.unwrap();
     server_bob.shutdown().await.unwrap();
     room.close().await.unwrap();

@@ -73,7 +73,8 @@ impl AvatarSessionBridge {
         let config: BridgeConfig = serde_json::from_value(owner.params["avatar_session"].clone())
             .map_err(|e| Error::Execution(e.to_string()))?;
         let missing = |node: &Option<String>| {
-            node.as_ref().is_some_and(|id| !manifest.nodes.iter().any(|n| &n.id == id))
+            node.as_ref()
+                .is_some_and(|id| !manifest.nodes.iter().any(|n| &n.id == id))
         };
         if config.request_timeout_secs == 0
             || !manifest.nodes.iter().any(|n| n.id == config.motion_node)
@@ -126,10 +127,15 @@ impl PlannerMailbox {
                     _ = close.recv() => return,
                     changed = snapshots.changed() => if changed.is_err() { return },
                 }
-                let Some(state) = snapshots.borrow_and_update().clone() else { continue };
+                let Some(state) = snapshots.borrow_and_update().clone() else {
+                    continue;
+                };
                 let observation = json!({"kind":"office_observation", "state":state});
                 if let Err(error) = control
-                    .publish(&ControlAddress::node_in(&planner), RuntimeData::Json(observation))
+                    .publish(
+                        &ControlAddress::node_in(&planner),
+                        RuntimeData::Json(observation),
+                    )
                     .await
                 {
                     tracing::error!(%error, "office planner feedback stopped; motion continues");
@@ -198,7 +204,11 @@ impl FeedbackMailbox {
     }
 
     fn observe(&self, value: Value) {
-        if value.get("request_id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()) {
+        if value
+            .get("request_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
             if let Err(error) = self.queries.try_send(value) {
                 tracing::error!(%error, "office scene query feedback unavailable");
             }
@@ -209,7 +219,12 @@ impl FeedbackMailbox {
 }
 impl SceneFeedback {
     async fn forward(&mut self, value: &Value, control: &SessionControl) -> Result<()> {
-        if value["kind"] == "waypoint_path" && value.get("request_id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()) {
+        if value["kind"] == "waypoint_path"
+            && value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        {
             if let Some(llm) = &self.llm_node {
                 control.publish(&ControlAddress::node_in(llm), RuntimeData::Json(json!({
                     "kind":"office_tool_result", "request_id":value["request_id"],
@@ -237,7 +252,11 @@ impl SceneFeedback {
                     }
                 }
             }
-            if let Some(id) = value.get("request_id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+            if let Some(id) = value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
                 // run_bridge already refreshed the bounded system observation.
                 // Repeating the whole home here can exceed a 16K context even
                 // after older history is pruned.
@@ -258,24 +277,44 @@ fn interaction_state(office: &Value) -> Value {
         // Outcome planning needs identities, capabilities and actual progress,
         // not legacy avatar anchors, mesh data or per-joint coordinates.
         let mut state = serde_json::Map::new();
-        for key in ["motion", "motion_error", "scene_lifecycle", "scene_capabilities", "occupied_hands"] {
-            if let Some(value) = office.get(key) { state.insert(key.into(), value.clone()); }
+        for key in [
+            "motion",
+            "motion_error",
+            "scene_lifecycle",
+            "scene_capabilities",
+            "occupied_hands",
+        ] {
+            if let Some(value) = office.get(key) {
+                state.insert(key.into(), value.clone());
+            }
         }
-        state.insert("avatar".into(), json!({"ready":office["avatar"]["ready"],
+        state.insert(
+            "avatar".into(),
+            json!({"ready":office["avatar"]["ready"],
             "displayed_pts_ms":office["avatar"]["displayed_pts_ms"],
             "native_stream":office["avatar"]["native_stream"],
-            "native_seat":office["avatar"]["native_seat"]}));
+            "native_seat":office["avatar"]["native_seat"]}),
+        );
         // Named keypoints take precedence over legacy anchors (e.g. the plate's rim grasp).
         let has_role = |object: &Value, role: &str| {
-            object["keypoints"].as_object().is_some_and(|points| points.values().any(|p| p["role"] == role))
+            object["keypoints"]
+                .as_object()
+                .is_some_and(|points| points.values().any(|p| p["role"] == role))
         };
-        let objects: Vec<_> = office["objects"].as_array().into_iter().flatten().map(|object| json!({
-            "id":object["id"], "label":object["label"], "position":object["position"],
-            "dynamic":object["dynamic"],
-            "graspable":!object["grasp"].is_null() || has_role(object, "grasp"),
-            "placement":!object["surface"].is_null() || has_role(object, "placement"),
-            "seat_surface":!object["seat_surface_part"].is_null()
-        })).collect();
+        let objects: Vec<_> = office["objects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|object| {
+                json!({
+                    "id":object["id"], "label":object["label"], "position":object["position"],
+                    "dynamic":object["dynamic"],
+                    "graspable":!object["grasp"].is_null() || has_role(object, "grasp"),
+                    "placement":!object["surface"].is_null() || has_role(object, "placement"),
+                    "seat_surface":!object["seat_surface_part"].is_null()
+                })
+            })
+            .collect();
         state.insert("objects".into(), Value::Array(objects));
         return Value::Object(state);
     }
@@ -315,8 +354,14 @@ async fn run_bridge(
     // Stopping drops the latest-wins mailbox, so report the terminal reason
     // directly; a planner must never keep presenting a stopped step as running.
     if let (Err(error), Some(planner)) = (&result, &config.planner_node) {
-        let observation = json!({"kind":"office_observation", "state":{"motion_error":error.to_string()}});
-        let _ = control.publish(&ControlAddress::node_in(planner), RuntimeData::Json(observation)).await;
+        let observation =
+            json!({"kind":"office_observation", "state":{"motion_error":error.to_string()}});
+        let _ = control
+            .publish(
+                &ControlAddress::node_in(planner),
+                RuntimeData::Json(observation),
+            )
+            .await;
     }
     result
 }
@@ -350,7 +395,8 @@ async fn bridge_loop(
             event = scene.recv() => (true, event),
             event = motion.recv() => (false, event),
         };
-        let data = data.map_err(|e| Error::Execution(format!("avatar feedback tap lost data: {e}")))?;
+        let data =
+            data.map_err(|e| Error::Execution(format!("avatar feedback tap lost data: {e}")))?;
         let value = match &data {
             RuntimeData::Json(v) => v.clone(),
             RuntimeData::Text(t) => match serde_json::from_str(crate::data::split_text_str(&t).1) {
@@ -362,20 +408,28 @@ async fn bridge_loop(
         match value["kind"].as_str() {
             Some("motion_goal") if from_renderer => {
                 flight.observe(value);
-                control.publish(&ControlAddress::node_in(&config.motion_node), data).await?;
+                control
+                    .publish(&ControlAddress::node_in(&config.motion_node), data)
+                    .await?;
             }
             Some("scene_step") if from_renderer => {
                 // Forward already-signed bytes only. Output taps can be written
                 // by control clients, so this bridge must NEVER sign context.
-                let payload = value["payload"].as_str().filter(|p| p.len() <= 1_048_576)
+                let payload = value["payload"]
+                    .as_str()
+                    .filter(|p| p.len() <= 1_048_576)
                     .ok_or_else(|| Error::Execution("invalid signed scene envelope".into()))?;
                 let job: Value = serde_json::from_str(payload)
                     .map_err(|e| Error::Execution(format!("invalid scene payload: {e}")))?;
                 flight.observe(job["request"].clone());
-                control.publish(&ControlAddress::node_in(&config.motion_node), data).await?;
+                control
+                    .publish(&ControlAddress::node_in(&config.motion_node), data)
+                    .await?;
             }
             Some("motion_request") if from_renderer => {
-                return Err(Error::Execution("legacy motion_request is unsupported; submit motion_goal v2".into()));
+                return Err(Error::Execution(
+                    "legacy motion_request is unsupported; submit motion_goal v2".into(),
+                ));
             }
             Some("motion_tick") if !from_renderer => flight.acknowledge(&value),
             Some("motion_error") => {
@@ -398,7 +452,6 @@ async fn bridge_loop(
             }
             _ => {}
         }
-
     }
 }
 
@@ -410,10 +463,19 @@ mod tests {
         let control = SessionControl::new("ui-refresh");
         let (tx, mut rx) = mpsc::channel(8);
         control.attach_input_sender(tx).await;
-        let mut feedback = SceneFeedback { llm_node: Some("llm".into()), last_event_sequence: 0 };
+        let mut feedback = SceneFeedback {
+            llm_node: Some("llm".into()),
+            last_event_sequence: 0,
+        };
         for id in [Value::Null, json!(""), json!(12)] {
-            feedback.forward(&json!({"kind":"scene_state", "request_id":id,
-                "state":{"office":{"events":[]}}}), &control).await.unwrap();
+            feedback
+                .forward(
+                    &json!({"kind":"scene_state", "request_id":id,
+                "state":{"office":{"events":[]}}}),
+                    &control,
+                )
+                .await
+                .unwrap();
         }
         assert!(rx.try_recv().is_err());
     }
@@ -445,14 +507,24 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(2);
         control.attach_input_sender(tx).await;
         let mailbox = FeedbackMailbox::start("llm".into(), control);
-        mailbox.observe(json!({"kind":"waypoint_path","request_id":"route-1","ok":false,
-            "error":{"code":"no_path","message":"blocked"}}));
-        let packet = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        mailbox.observe(
+            json!({"kind":"waypoint_path","request_id":"route-1","ok":false,
+            "error":{"code":"no_path","message":"blocked"}}),
+        );
+        let packet = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(packet.to_node.as_deref(), Some("llm"));
-        let RuntimeData::Json(value) = packet.data else { panic!("expected query feedback") };
+        let RuntimeData::Json(value) = packet.data else {
+            panic!("expected query feedback")
+        };
         assert_eq!(value["request_id"], "route-1");
         assert!(value["text"].as_str().unwrap().contains("no_path"));
-        assert!(value["text"].as_str().unwrap().contains("not action completion"));
+        assert!(value["text"]
+            .as_str()
+            .unwrap()
+            .contains("not action completion"));
     }
     #[tokio::test]
     async fn blocked_llm_delivery_keeps_only_latest_scene_snapshot() {
@@ -505,19 +577,34 @@ mod tests {
         control.attach_input_sender(tx).await;
         let (scene_tx, scene) = broadcast::channel(8);
         let (motion_tx, motion) = broadcast::channel(8);
-        let config = BridgeConfig { motion_node:"ardy".into(), llm_node:None, planner_node:None, request_timeout_secs:1 };
+        let config = BridgeConfig {
+            motion_node: "ardy".into(),
+            llm_node: None,
+            planner_node: None,
+            request_timeout_secs: 1,
+        };
         let c = control.clone();
         let task = tokio::spawn(async move { run_bridge(&config, &c, scene, motion).await });
         let first = format!("  {}  ", goal(1, 0));
         scene_tx.send(RuntimeData::Text(first.clone())).unwrap();
-        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.unwrap().unwrap();
+        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(packet.to_node.as_deref(), Some("ardy"));
         assert!(matches!(packet.data, RuntimeData::Text(t) if t == first));
-        motion_tx.send(RuntimeData::Json(json!({"kind":"motion_tick", "session_id":"native",
-            "generation_revision":1,"pts_ms":0}))).unwrap();
+        motion_tx
+            .send(RuntimeData::Json(
+                json!({"kind":"motion_tick", "session_id":"native",
+            "generation_revision":1,"pts_ms":0}),
+            ))
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         scene_tx.send(RuntimeData::Json(goal(2, 200))).unwrap();
-        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.unwrap().unwrap();
+        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(packet.data, RuntimeData::Json(v) if v == goal(2, 200)));
         let mut scene_goal = goal(3, 250);
         scene_goal["version"] = 3.into();
@@ -525,15 +612,27 @@ mod tests {
         let payload = format!("  {}  ", json!({"request":scene_goal}));
         let signed = json!({"kind":"scene_step","payload":payload,"signature":"5c".repeat(32)});
         scene_tx.send(RuntimeData::Json(signed.clone())).unwrap();
-        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.unwrap().unwrap();
+        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(packet.data, RuntimeData::Json(v) if v == signed));
         // A stale acknowledgement must not disable the active request's watchdog.
-        for (session, revision, pts) in [("wrong",2,200), ("native",1,200), ("native",2,0)] {
-            motion_tx.send(RuntimeData::Json(json!({"kind":"motion_tick", "session_id":session,
-                "generation_revision":revision,"pts_ms":pts}))).unwrap();
+        for (session, revision, pts) in [("wrong", 2, 200), ("native", 1, 200), ("native", 2, 0)] {
+            motion_tx
+                .send(RuntimeData::Json(
+                    json!({"kind":"motion_tick", "session_id":session,
+                "generation_revision":revision,"pts_ms":pts}),
+                ))
+                .unwrap();
         }
-        assert!(tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap()
-            .unwrap_err().to_string().contains("timed out"));
+        assert!(tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("timed out"));
     }
 
     #[tokio::test]
@@ -543,46 +642,93 @@ mod tests {
         control.attach_input_sender(tx).await;
         let (scene_tx, scene) = broadcast::channel(8);
         let (motion_tx, motion) = broadcast::channel(8);
-        let config = BridgeConfig { motion_node:"ardy".into(), llm_node:None,
-            planner_node:Some("home".into()), request_timeout_secs:1 };
+        let config = BridgeConfig {
+            motion_node: "ardy".into(),
+            llm_node: None,
+            planner_node: Some("home".into()),
+            request_timeout_secs: 1,
+        };
         let c = control.clone();
         let task = tokio::spawn(async move { run_bridge(&config, &c, scene, motion).await });
         let office = json!({"scene_capabilities":{"operations":["navigate"]},
             "scene_lifecycle":{"complete":true}, "occupied_hands":[["right","plate"]],
             "avatar":{"ready":true,"displayed_pts_ms":5,"wrists":[1,2,3],"pelvis":[0,1,0]},
             "objects":[{"id":"sofa","label":"Sofa","surface":[0,0.5,0],"seat_surface_part":0,"parts":[1]}]});
-        scene_tx.send(RuntimeData::Json(json!({"kind":"scene_state","state":{"office":office}}))).unwrap();
-        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.unwrap().unwrap();
+        scene_tx
+            .send(RuntimeData::Json(
+                json!({"kind":"scene_state","state":{"office":office}}),
+            ))
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(packet.to_node.as_deref(), Some("home"));
-        let RuntimeData::Json(value) = packet.data else { panic!("expected planner observation") };
+        let RuntimeData::Json(value) = packet.data else {
+            panic!("expected planner observation")
+        };
         assert_eq!(value["kind"], "office_observation");
         assert_eq!(value["state"]["scene_lifecycle"]["complete"], true);
-        assert_eq!(value["state"]["occupied_hands"], json!([["right","plate"]]));
+        assert_eq!(
+            value["state"]["occupied_hands"],
+            json!([["right", "plate"]])
+        );
         assert_eq!(value["state"]["objects"][0]["placement"], true);
-        assert!(value["state"]["avatar"].get("wrists").is_none() && value["state"]["avatar"].get("pelvis").is_none());
+        assert!(
+            value["state"]["avatar"].get("wrists").is_none()
+                && value["state"]["avatar"].get("pelvis").is_none()
+        );
         assert!(value["state"]["objects"][0].get("parts").is_none());
-        motion_tx.send(RuntimeData::Json(json!({"kind":"motion_error","error":"root validation rejected"}))).unwrap();
-        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.unwrap().unwrap();
-        let RuntimeData::Json(value) = packet.data else { panic!("expected planner failure") };
+        motion_tx
+            .send(RuntimeData::Json(
+                json!({"kind":"motion_error","error":"root validation rejected"}),
+            ))
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let RuntimeData::Json(value) = packet.data else {
+            panic!("expected planner failure")
+        };
         assert_eq!(packet.to_node.as_deref(), Some("home"));
-        assert!(value["state"]["motion_error"].as_str().unwrap().contains("root validation rejected"));
-        assert!(tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
+        assert!(value["state"]["motion_error"]
+            .as_str()
+            .unwrap()
+            .contains("root validation rejected"));
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
     }
 
     #[tokio::test]
     async fn planner_node_must_exist_and_exclude_llm_producer() {
-        let manifest = |session: Value| -> Manifest { serde_json::from_value(json!({"version":"v1",
+        let manifest = |session: Value| -> Manifest {
+            serde_json::from_value(json!({"version":"v1",
             "metadata":{"name":"home"}, "connections":[], "nodes":[
                 {"id":"renderer","node_type":"CcRenderNode","params":{"avatar_session":session}},
                 {"id":"ardy","node_type":"ArdyMotionNode","params":{}},
                 {"id":"llm","node_type":"MultimodalLLMNode","params":{}},
-                {"id":"home","node_type":"HomeLifeNode","params":{}}]})).unwrap() };
-        for session in [json!({"motion_node":"ardy","planner_node":"missing"}),
-                        json!({"motion_node":"ardy","planner_node":"home","llm_node":"llm"})] {
-            assert!(AvatarSessionBridge::attach(&manifest(session), SessionControl::new("home")).is_err());
+                {"id":"home","node_type":"HomeLifeNode","params":{}}]}))
+            .unwrap()
+        };
+        for session in [
+            json!({"motion_node":"ardy","planner_node":"missing"}),
+            json!({"motion_node":"ardy","planner_node":"home","llm_node":"llm"}),
+        ] {
+            assert!(
+                AvatarSessionBridge::attach(&manifest(session), SessionControl::new("home"))
+                    .is_err()
+            );
         }
-        assert!(AvatarSessionBridge::attach(&manifest(json!({"motion_node":"ardy","planner_node":"home"})),
-            SessionControl::new("home")).unwrap().is_some());
+        assert!(AvatarSessionBridge::attach(
+            &manifest(json!({"motion_node":"ardy","planner_node":"home"})),
+            SessionControl::new("home")
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[tokio::test]
@@ -593,12 +739,16 @@ mod tests {
                 {"id":"ardy","node_type":"ArdyMotionNode","params":{}}
             ]})).unwrap();
         let control = SessionControl::new("native");
-        let bridge = AvatarSessionBridge::attach(&manifest, control.clone()).unwrap().unwrap();
+        let bridge = AvatarSessionBridge::attach(&manifest, control.clone())
+            .unwrap()
+            .unwrap();
         tokio::task::yield_now().await;
         control.signal_close(super::super::session_control::CloseReason::Normal);
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(bridge.0.is_finished());
-        let bridge = AvatarSessionBridge::attach(&manifest, control.clone()).unwrap().unwrap();
+        let bridge = AvatarSessionBridge::attach(&manifest, control.clone())
+            .unwrap()
+            .unwrap();
         drop(bridge);
         tokio::task::yield_now().await;
         assert_eq!(control.tap_receiver_count("renderer", None), 0);

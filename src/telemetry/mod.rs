@@ -33,7 +33,8 @@ pub use descriptor::{
 pub use identity::{file_digest, params_hash, ImplementationKind, NodeImplementation};
 pub use size::approx_payload_bytes;
 pub use snapshot::{
-    EdgeTelemetry, EndpointAdapterTelemetry, EndpointTelemetry, ErrorInfo, NodeStatus, NodeTelemetry, QueueDepth, TelemetrySnapshot,
+    EdgeTelemetry, EndpointAdapterTelemetry, EndpointTelemetry, ErrorInfo, NodeStatus,
+    NodeTelemetry, QueueDepth, TelemetrySnapshot,
 };
 
 use crate::executor::StreamingScheduler;
@@ -385,7 +386,9 @@ impl SessionTelemetry {
             .map(|(i, id)| (id.clone(), i))
             .collect::<HashMap<_, _>>();
         let nodes = (0..node_ids.len()).map(|_| NodeCell::new()).collect();
-        let edges = (0..descriptor.edges.len()).map(|_| EdgeCell::new()).collect();
+        let edges = (0..descriptor.edges.len())
+            .map(|_| EdgeCell::new())
+            .collect();
         let edge_from = descriptor
             .edges
             .iter()
@@ -571,7 +574,9 @@ impl SessionTelemetry {
         let mut pub_state = cell.error_publish.lock();
         pub_state.pending += 1;
         pub_state.pending_message = Some(msg);
-        if pub_state.last_publish_us == 0 || now_us.saturating_sub(pub_state.last_publish_us) >= 1_000_000 {
+        if pub_state.last_publish_us == 0
+            || now_us.saturating_sub(pub_state.last_publish_us) >= 1_000_000
+        {
             pub_state.last_publish_us = now_us.max(1);
             let count = std::mem::take(&mut pub_state.pending);
             let message = pub_state.pending_message.take().unwrap_or_default();
@@ -608,7 +613,8 @@ impl SessionTelemetry {
     /// Set the number of live per-participant instances of node `idx`.
     pub fn set_instances(&self, idx: usize, count: usize) {
         if let Some(cell) = self.nodes.get(idx) {
-            cell.instances.store(count.min(u32::MAX as usize) as u32, Relaxed);
+            cell.instances
+                .store(count.min(u32::MAX as usize) as u32, Relaxed);
         }
     }
 

@@ -108,7 +108,10 @@ impl DeploymentService {
             .as_ref()
             .ok_or_else(|| DeploymentError::MissingManifestDigest(name.to_owned()))?;
         let manifest = self.content.read(manifest_digest)?;
-        Ok((revision.clone(), self.resolve_native_plugin_paths(&revision, manifest)?))
+        Ok((
+            revision.clone(),
+            self.resolve_native_plugin_paths(&revision, manifest)?,
+        ))
     }
 
     pub fn preflight(
@@ -276,14 +279,16 @@ impl DeploymentService {
                             symlinks: Vec::new(),
                         },
                     );
-                    closure.files.extend(revision.external_assets.iter().map(|asset| {
-                        remotemedia_bundle::NativeRuntimeFile {
-                            digest: asset.digest.clone(),
-                            size: asset.size,
-                            path: format!("assets/{}", asset.name),
-                            mode: remotemedia_bundle::NativeRuntimeFileMode::ReadOnly,
-                        }
-                    }));
+                    closure
+                        .files
+                        .extend(revision.external_assets.iter().map(|asset| {
+                            remotemedia_bundle::NativeRuntimeFile {
+                                digest: asset.digest.clone(),
+                                size: asset.size,
+                                path: format!("assets/{}", asset.name),
+                                mode: remotemedia_bundle::NativeRuntimeFileMode::ReadOnly,
+                            }
+                        }));
                     if let Err(error) = self
                         .content
                         .materialize_native_runtime(&revision.bundle_digest, &closure)
@@ -368,7 +373,11 @@ impl DeploymentService {
     /// upload time; verify each one is present and content-addressed correctly
     /// before the runtime is loaded.
     fn verify_embedded_assets(&self, revision: &DeploymentRevision) -> Result<(), DeploymentError> {
-        for asset in revision.assets.iter().filter(|asset| is_embedded_asset(asset)) {
+        for asset in revision
+            .assets
+            .iter()
+            .filter(|asset| is_embedded_asset(asset))
+        {
             let bytes = self.content.read(&asset.digest)?;
             verify_embedded_asset_bytes(asset, &bytes)?;
         }
@@ -437,7 +446,9 @@ impl DeploymentService {
             Self::resolve_asset_paths(&mut value, &release, assets);
             return Ok(remotemedia_bundle::canonical_json(&value)?);
         };
-        let release = self.content.native_runtime_release(&revision.bundle_digest)?;
+        let release = self
+            .content
+            .native_runtime_release(&revision.bundle_digest)?;
         let plugin_paths: Vec<_> = closure
             .files
             .iter()
@@ -451,7 +462,9 @@ impl DeploymentService {
         let plugins = value
             .get_mut("plugins")
             .and_then(serde_json::Value::as_array_mut)
-            .ok_or_else(|| DeploymentError::Provisioning("native runtime has no manifest plugins".to_owned()))?;
+            .ok_or_else(|| {
+                DeploymentError::Provisioning("native runtime has no manifest plugins".to_owned())
+            })?;
         if plugins.len() != plugin_paths.len() {
             return Err(DeploymentError::Provisioning(
                 "native runtime plugin count does not match manifest plugins".to_owned(),
@@ -464,31 +477,38 @@ impl DeploymentService {
         Ok(remotemedia_bundle::canonical_json(&value)?)
     }
 
-
-fn resolve_asset_paths(
-    value: &mut serde_json::Value,
-    release: &std::path::Path,
-    assets: &[remotemedia_bundle::AssetDescriptor],
-) {
-    match value {
-        serde_json::Value::String(path) => {
-            if let Some(asset) = assets.iter().find(|asset| {
-                std::path::Path::new(path)
-                    .file_name()
-                    .is_some_and(|name| name == std::ffi::OsStr::new(&asset.name))
-            }) {
-                *path = release.join("assets").join(&asset.name).to_string_lossy().into_owned();
+    fn resolve_asset_paths(
+        value: &mut serde_json::Value,
+        release: &std::path::Path,
+        assets: &[remotemedia_bundle::AssetDescriptor],
+    ) {
+        match value {
+            serde_json::Value::String(path) => {
+                if let Some(asset) = assets.iter().find(|asset| {
+                    std::path::Path::new(path)
+                        .file_name()
+                        .is_some_and(|name| name == std::ffi::OsStr::new(&asset.name))
+                }) {
+                    *path = release
+                        .join("assets")
+                        .join(&asset.name)
+                        .to_string_lossy()
+                        .into_owned();
+                }
             }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    Self::resolve_asset_paths(value, release, assets);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    Self::resolve_asset_paths(value, release, assets);
+                }
+            }
+            _ => {}
         }
-        serde_json::Value::Array(values) => {
-            for value in values { Self::resolve_asset_paths(value, release, assets); }
-        }
-        serde_json::Value::Object(values) => {
-            for value in values.values_mut() { Self::resolve_asset_paths(value, release, assets); }
-        }
-        _ => {}
     }
-}
     fn set_status(
         &self,
         operation_id: &str,
@@ -680,7 +700,13 @@ mod tests {
         revision.manifest_digest = Some(manifest_digest.clone());
         revision.content_digests.insert(manifest_digest);
         service
-            .install(b"secret", "install", revision, manifest.len() as u64, |_| Ok(()))
+            .install(
+                b"secret",
+                "install",
+                revision,
+                manifest.len() as u64,
+                |_| Ok(()),
+            )
             .unwrap();
         service.activate(b"secret", "smoke", "bundle").unwrap();
 
@@ -711,7 +737,9 @@ mod tests {
             }),
         };
         let manifest = br#"{"plugins":[{"path":"./build/libplugin.so"}]}"#.to_vec();
-        let resolved = service.resolve_native_plugin_paths(&revision, manifest).unwrap();
+        let resolved = service
+            .resolve_native_plugin_paths(&revision, manifest)
+            .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&resolved).unwrap();
         assert_eq!(
             value["plugins"][0]["path"],

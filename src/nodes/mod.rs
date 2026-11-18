@@ -190,16 +190,18 @@ pub use conversation_flow::{
 
 pub mod hosted_turn;
 pub use hosted_turn::{HostedTurnConfig, HostedTurnNode, HostedTurnNodeFactory};
-pub mod realtime_events;
 /// A turn node's link to the members' media when it runs in another process than their connections.
 pub mod member_media;
-pub use member_media::{MemberFlushNode, MemberFlushNodeFactory, MemberMediaRelayNode, MemberMediaRelayNodeFactory};
+pub mod realtime_events;
+pub use member_media::{
+    MemberFlushNode, MemberFlushNodeFactory, MemberMediaRelayNode, MemberMediaRelayNodeFactory,
+};
 /// Passes on only the listed kinds of data; heads the audio and text paths of a voice pipeline.
 pub mod media_kind_filter;
-/// Test stand-in for a TTS node (a tone per text chunk); not speech synthesis.
-pub mod test_tone_tts;
 /// Test stand-in for a VAD node (loud = speech); not a speech detector.
 pub mod test_energy_vad;
+/// Test stand-in for a TTS node (a tone per text chunk); not speech synthesis.
+pub mod test_tone_tts;
 pub use realtime_events::{RealtimeEventsConfig, RealtimeEventsNode, RealtimeEventsNodeFactory};
 pub mod conversation_coordinator;
 pub use conversation_coordinator::{
@@ -222,9 +224,9 @@ pub mod audio_evidence;
 pub use audio_evidence::{AudioEvidenceConfig, AudioEvidenceNode, AudioEvidenceNodeFactory};
 
 pub mod audio_resample_streaming;
-mod media_buffer_contract;
 #[cfg(test)]
 mod generator_admission_tests;
+mod media_buffer_contract;
 pub use audio_resample_streaming::ResampleStreamingNode;
 
 pub mod audio_format_converter_streaming;
@@ -272,8 +274,8 @@ pub use provider::{iter_providers, provider_count, NodeProvider};
 pub use registry::{CompositeRegistry, NodeFactory as NodeFactoryTrait, RuntimeHint};
 pub use streaming_node::{
     AsyncNodeWrapper, AsyncStreamingNode, InitializeContext, InstanceScope, PacingNature,
-    StreamingNode,
-    StreamingNodeFactory, StreamingNodeRegistry, SyncNodeWrapper, SyncStreamingNode, Tick,
+    StreamingNode, StreamingNodeFactory, StreamingNodeRegistry, SyncNodeWrapper, SyncStreamingNode,
+    Tick,
 };
 
 // Read-trait surface lives in `remotemedia-traits`. Re-exported from

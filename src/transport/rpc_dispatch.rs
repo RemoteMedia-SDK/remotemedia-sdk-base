@@ -283,8 +283,9 @@ mod cancel_tests {
     #[tokio::test]
     async fn rpc_cancel_fires_the_calls_token_before_the_abort() {
         let seen = Arc::new(std::sync::Mutex::new(None));
-        let node: Arc<dyn StreamingNode> =
-            Arc::new(crate::nodes::AsyncNodeWrapper(Arc::new(Waits(seen.clone()))));
+        let node: Arc<dyn StreamingNode> = Arc::new(crate::nodes::AsyncNodeWrapper(Arc::new(
+            Waits(seen.clone()),
+        )));
         let ctx = NodeRuntimeContext::for_test("s", "n");
         let (tx, rx) = mpsc::channel(4);
         let (_stop, shutdown) = watch::channel(false);

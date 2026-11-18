@@ -1574,7 +1574,13 @@ mod fallback_tests {
             tokio::spawn(async move {
                 let mut sink = |_: RuntimeData| Ok(());
                 backend
-                    .run_turn("s", json!({"role":"user","content":"hi"}), &cfg, &turn, &mut sink)
+                    .run_turn(
+                        "s",
+                        json!({"role":"user","content":"hi"}),
+                        &cfg,
+                        &turn,
+                        &mut sink,
+                    )
                     .await
             })
         };

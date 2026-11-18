@@ -21,7 +21,9 @@ pub fn declares_output(factory: &dyn StreamingNodeFactory, params: &Value) -> bo
     };
     has_output(factory.media_capabilities(params))
         || has_output(factory.potential_capabilities(params))
-        || factory.schema().is_some_and(|schema| !schema.produces.is_empty())
+        || factory
+            .schema()
+            .is_some_and(|schema| !schema.produces.is_empty())
 }
 
 /// The error for a self-driven source that declares no output.
@@ -40,7 +42,9 @@ pub fn undeclared_source(node_id: &str, node_type: &str) -> Error {
 fn known_self_driven(node: &NodeManifest, factory: Option<&dyn StreamingNodeFactory>) -> bool {
     match node.session_input {
         Some(takes_input) => !takes_input,
-        None => factory.and_then(|factory| factory.self_driven()).unwrap_or(false),
+        None => factory
+            .and_then(|factory| factory.self_driven())
+            .unwrap_or(false),
     }
 }
 
@@ -52,10 +56,16 @@ pub fn check_self_driven_sources(
     registry: &StreamingNodeRegistry,
 ) -> Result<(), Error> {
     for node in &manifest.nodes {
-        if manifest.connections.iter().any(|connection| connection.to == node.id) {
+        if manifest
+            .connections
+            .iter()
+            .any(|connection| connection.to == node.id)
+        {
             continue;
         }
-        let factory = registry.get_factory(&node.node_type).map(|factory| factory.as_ref());
+        let factory = registry
+            .get_factory(&node.node_type)
+            .map(|factory| factory.as_ref());
         if !known_self_driven(node, factory) {
             continue;
         }

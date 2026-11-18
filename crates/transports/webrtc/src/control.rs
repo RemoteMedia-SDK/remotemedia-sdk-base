@@ -55,7 +55,9 @@ use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 
 pub mod access;
-pub use access::{ControlAccess, ControlBinding, ControlChannelPolicy, ControlGrant, ControlOp, TapScope};
+pub use access::{
+    ControlAccess, ControlBinding, ControlChannelPolicy, ControlGrant, ControlOp, TapScope,
+};
 
 #[cfg(feature = "grpc-signaling")]
 mod output;
@@ -336,8 +338,7 @@ async fn handle_inbound(
                             Target::Bound { ctrl, .. } => ctrl.session_id().to_string(),
                         },
                         attach_id: hello.attach_id,
-                        observer_schema_version:
-                            remotemedia_core::telemetry::SCHEMA_VERSION as u32,
+                        observer_schema_version: remotemedia_core::telemetry::SCHEMA_VERSION as u32,
                     })),
                 }))
                 .await;
@@ -400,8 +401,15 @@ async fn handle_inbound(
     }
 
     // Dispatch the frame.
-    if let Err(err) =
-        dispatch_frame(frame, &ctrl, out_tx, forwarders, &rpc_scope, target.binding()).await
+    if let Err(err) = dispatch_frame(
+        frame,
+        &ctrl,
+        out_tx,
+        forwarders,
+        &rpc_scope,
+        target.binding(),
+    )
+    .await
     {
         let _ = out_tx
             .send(Outbound::Metadata(ControlEvent {
@@ -437,7 +445,11 @@ async fn dispatch_frame(
                     .map_err(|message| refuse(message, Some(core.clone())))?;
                 if scope == TapScope::Own {
                     let rx = ctrl.subscribe_attributed(&core).map_err(|e| {
-                        error_inner(ControlErrorCode::Internal, e.to_string(), Some(core.clone()))
+                        error_inner(
+                            ControlErrorCode::Internal,
+                            e.to_string(),
+                            Some(core.clone()),
+                        )
                     })?;
                     let task = tokio::spawn(output::forward_own_taps(
                         rx,
@@ -458,7 +470,10 @@ async fn dispatch_frame(
                 )
             })?;
             let task = tokio::spawn(output::forward_taps(
-                rx, out_tx.clone(), core, ctrl.transport_copy_context(),
+                rx,
+                out_tx.clone(),
+                core,
+                ctrl.transport_copy_context(),
             ));
             forwarders.lock().await.push(task);
             Ok(())
@@ -491,18 +506,18 @@ async fn dispatch_frame(
                         remotemedia_core::transport::data::participant::role::CLIENT,
                     )
                     .frame_metadata();
-                    ctrl.publish_scoped_with_metadata(&core, rt, rpc_scope, metadata).await
+                    ctrl.publish_scoped_with_metadata(&core, rt, rpc_scope, metadata)
+                        .await
                 }
                 None => ctrl.publish_scoped(&core, rt, rpc_scope).await,
             };
-            published
-                .map_err(|e| {
-                    error_inner(
-                        ControlErrorCode::Internal,
-                        e.to_string(),
-                        Some(core.clone()),
-                    )
-                })?;
+            published.map_err(|e| {
+                error_inner(
+                    ControlErrorCode::Internal,
+                    e.to_string(),
+                    Some(core.clone()),
+                )
+            })?;
             Ok(())
         }
 
@@ -527,7 +542,10 @@ async fn dispatch_frame(
                 )
             })?;
             let task = tokio::spawn(output::forward_intercepts(
-                events, out_tx.clone(), core_addr_to_pb(&core), ctrl.transport_copy_context(),
+                events,
+                out_tx.clone(),
+                core_addr_to_pb(&core),
+                ctrl.transport_copy_context(),
             ));
             forwarders.lock().await.push(task);
             Ok(())
@@ -762,7 +780,9 @@ mod buffer_owner_tests {
             )),
             ..Default::default()
         };
-        let RuntimeData::Binary(owner) = pb_to_runtime_data(buffer, remotemedia_types::CopyContext::legacy()).unwrap() else {
+        let RuntimeData::Binary(owner) =
+            pb_to_runtime_data(buffer, remotemedia_types::CopyContext::legacy()).unwrap()
+        else {
             unreachable!()
         };
         assert_eq!(owner.as_ptr(), pointer);

@@ -90,8 +90,9 @@ impl PythonStreamingNode {
                     tracing::debug!(%error, node_id, "cancel frame queued asynchronously");
                     if let Some(runtime) = &runtime {
                         runtime.spawn(async move {
-                            let _ = MultiprocessExecutor::send_out_of_band(&session, &node_id, frame)
-                                .await;
+                            let _ =
+                                MultiprocessExecutor::send_out_of_band(&session, &node_id, frame)
+                                    .await;
                         });
                     }
                 }
@@ -651,7 +652,10 @@ impl AsyncStreamingNode for PythonStreamingNode {
         // instance's emitter; the input's sender travels with the input.
         let host = crate::nodes::NodeRuntimeContext::of(ctx);
         if let Some(host) = host {
-            self.emitter.lock().unwrap().get_or_insert_with(|| host.emitter());
+            self.emitter
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| host.emitter());
         }
         let origin = host.and_then(|host| host.origin());
         self.stream_with_copies(data, session, callback, copies, origin)
@@ -735,8 +739,7 @@ mod cancel_frame_tests {
             },
             elapsed_ms: Some(120),
         };
-        let frame: serde_json::Value =
-            serde_json::from_str(&cancel_call_frame(&request)).unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&cancel_call_frame(&request)).unwrap();
         assert_eq!(
             frame,
             serde_json::json!({
@@ -752,9 +755,9 @@ mod cancel_frame_tests {
             })
         );
         assert_eq!(
-            crate::transport::session_control::aux_port_of(&RuntimeData::Text(
-                cancel_call_frame(&request)
-            ))
+            crate::transport::session_control::aux_port_of(&RuntimeData::Text(cancel_call_frame(
+                &request
+            )))
             .as_deref(),
             Some(CANCEL_CALL_PORT)
         );

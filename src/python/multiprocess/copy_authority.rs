@@ -13,7 +13,9 @@
 //!   operation: its reason and size are unknown to the host.
 use crate::multiprocess::control_frames::MAX_FRAME;
 use crate::multiprocess::control_frames::{invalid, read_frame, write_frame};
-use remotemedia_types::{CopyContext, CopyEvent, CopyLedger, CopyOperation, CopyPolicy, CopyReason};
+use remotemedia_types::{
+    CopyContext, CopyEvent, CopyLedger, CopyOperation, CopyPolicy, CopyReason,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::io::Write;
@@ -57,8 +59,13 @@ struct Request {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
-    Begin { reason: CopyReason, bytes: u64 },
-    Complete { bytes: u64 },
+    Begin {
+        reason: CopyReason,
+        bytes: u64,
+    },
+    Complete {
+        bytes: u64,
+    },
     Fail {},
     Close {
         /// Version 2 only: totals not yet carried by an end-of-input frame.
@@ -92,12 +99,16 @@ impl Totals {
         if self.v != 2 {
             return Err("unsupported copy report version".into());
         }
-        for (index, (reason, [completed, bytes, failed, failed_bytes])) in self.reasons.iter().enumerate() {
+        for (index, (reason, [completed, bytes, failed, failed_bytes])) in
+            self.reasons.iter().enumerate()
+        {
             if self.reasons[..index].iter().any(|(seen, _)| seen == reason) {
                 return Err(format!("copy reason {reason:?} is reported twice"));
             }
             if !WORKER_REASONS.contains(reason) {
-                return Err(format!("copy reason {reason:?} is not reportable by a worker"));
+                return Err(format!(
+                    "copy reason {reason:?} is not reportable by a worker"
+                ));
             }
             if *completed > MAX_OPERATIONS || *failed > MAX_OPERATIONS {
                 return Err("copy report exceeds its operation bound".into());
@@ -115,11 +126,17 @@ impl Totals {
         for (reason, [completed, bytes, failed, failed_bytes]) in &self.reasons {
             for index in 0..*completed {
                 copies.record(*reason, CopyEvent::Started);
-                copies.record(*reason, CopyEvent::Completed(if index == 0 { *bytes } else { 0 }));
+                copies.record(
+                    *reason,
+                    CopyEvent::Completed(if index == 0 { *bytes } else { 0 }),
+                );
             }
             for index in 0..*failed {
                 copies.record(*reason, CopyEvent::Started);
-                copies.record(*reason, CopyEvent::Failed(if index == 0 { *failed_bytes } else { 0 }));
+                copies.record(
+                    *reason,
+                    CopyEvent::Failed(if index == 0 { *failed_bytes } else { 0 }),
+                );
             }
         }
     }
@@ -157,9 +174,16 @@ fn parse_end_of_input(frame: &[u8]) -> Result<Option<Totals>, String> {
     if frame.first() != Some(&END_OF_INPUT) {
         return Err("not an end-of-input frame".into());
     }
-    let session = u16::from_le_bytes(frame.get(1..3).ok_or_else(truncated)?.try_into().unwrap()) as usize;
+    let session =
+        u16::from_le_bytes(frame.get(1..3).ok_or_else(truncated)?.try_into().unwrap()) as usize;
     let at = 3 + session + 8;
-    let size = u32::from_le_bytes(frame.get(at..at + 4).ok_or_else(truncated)?.try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(
+        frame
+            .get(at..at + 4)
+            .ok_or_else(truncated)?
+            .try_into()
+            .unwrap(),
+    ) as usize;
     let payload = frame.get(at + 4..).ok_or_else(truncated)?;
     if payload.len() != size {
         return Err("end-of-input payload length mismatch".into());
@@ -209,7 +233,11 @@ pub(crate) struct CopyAuthority {
 impl CopyAuthority {
     pub(crate) fn start(copies: CopyContext, node: &str, session: &str) -> io::Result<Self> {
         // Version 2 needs no per-copy authorization, so only allow_copies uses it.
-        let version = if copies.policy() == CopyPolicy::AllowCopies { 2 } else { 1 };
+        let version = if copies.policy() == CopyPolicy::AllowCopies {
+            2
+        } else {
+            1
+        };
         Self::start_with_version(copies, node, session, version)
     }
 

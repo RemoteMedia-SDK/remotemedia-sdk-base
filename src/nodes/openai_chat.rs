@@ -706,7 +706,9 @@ mod tests {
         let node = OpenAIChatNode::with_config(OpenAIChatConfig::default());
         assert!(!node.supersede_on_new_input());
         let wrapped = crate::nodes::AsyncNodeWrapper(Arc::new(node));
-        assert!(!crate::nodes::StreamingNode::supersede_on_new_input(&wrapped));
+        assert!(!crate::nodes::StreamingNode::supersede_on_new_input(
+            &wrapped
+        ));
 
         // Both key spellings enable it, and the flag reaches the wrapper
         // the session router queries.
@@ -716,7 +718,8 @@ mod tests {
         ] {
             let config: OpenAIChatConfig = serde_json::from_value(params).unwrap();
             assert!(config.supersede_on_new_input);
-            let node = crate::nodes::AsyncNodeWrapper(Arc::new(OpenAIChatNode::with_config(config)));
+            let node =
+                crate::nodes::AsyncNodeWrapper(Arc::new(OpenAIChatNode::with_config(config)));
             assert!(crate::nodes::StreamingNode::supersede_on_new_input(&node));
         }
     }

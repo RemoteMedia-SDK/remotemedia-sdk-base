@@ -447,9 +447,12 @@ mod tests {
         // A cancel closes the mouth (openspec: add-generator-cancellation),
         // and the reply's queued audio is dropped by default.
         let role = node.generator().expect("a generator");
-        let interrupt = remotemedia_traits::CancelContext::new(remotemedia_traits::CancelReason::BargeIn);
+        let interrupt =
+            remotemedia_traits::CancelContext::new(remotemedia_traits::CancelReason::BargeIn);
         assert_eq!(
-            role.cancellable().default_disposition(&interrupt).pending_input,
+            role.cancellable()
+                .default_disposition(&interrupt)
+                .pending_input,
             remotemedia_traits::Retention::Discard
         );
         role.cancellable()
@@ -458,6 +461,9 @@ mod tests {
                 &remotemedia_traits::Cancellation::new(remotemedia_traits::CancelReason::BargeIn),
             )
             .await;
-        assert_eq!(typed_input.snapshot().expect("populated").value.mouth_open, 0.0);
+        assert_eq!(
+            typed_input.snapshot().expect("populated").value.mouth_open,
+            0.0
+        );
     }
 }

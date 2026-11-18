@@ -10,11 +10,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use remotemedia_core::transport::{data::participant, ExecutorConfig, PipelineExecutor, SharedPipelineSession};
+use remotemedia_core::transport::{
+    data::participant, ExecutorConfig, PipelineExecutor, SharedPipelineSession,
+};
 
 /// The process-wide executor for `config`. Calls with an equal configuration
 /// share one executor, and with it their shared sessions.
-pub(crate) fn shared_executor(config: ExecutorConfig) -> remotemedia_core::Result<Arc<PipelineExecutor>> {
+pub(crate) fn shared_executor(
+    config: ExecutorConfig,
+) -> remotemedia_core::Result<Arc<PipelineExecutor>> {
     static EXECUTORS: OnceLock<Mutex<HashMap<String, Arc<PipelineExecutor>>>> = OnceLock::new();
     let key = format!("{config:?}");
     let mut executors = EXECUTORS.get_or_init(Default::default).lock().unwrap();
@@ -38,7 +42,11 @@ pub(crate) struct SharedMembership {
 
 impl SharedMembership {
     pub(crate) fn join(session: Arc<SharedPipelineSession>) -> Self {
-        *attached().lock().unwrap().entry(session.session_id().to_string()).or_default() += 1;
+        *attached()
+            .lock()
+            .unwrap()
+            .entry(session.session_id().to_string())
+            .or_default() += 1;
         Self { session }
     }
 
@@ -66,7 +74,9 @@ impl SharedMembership {
 /// The producing participant of an output, as `(field, value)` pairs without
 /// the `participant.` prefix (`id`, `role`, `track_id`, `modality`,
 /// `display_name`); `None` for an unattributed output.
-pub(crate) fn participant_fields(metadata: &HashMap<String, String>) -> Option<Vec<(&'static str, String)>> {
+pub(crate) fn participant_fields(
+    metadata: &HashMap<String, String>,
+) -> Option<Vec<(&'static str, String)>> {
     metadata.get(participant::ID)?;
     Some(
         [

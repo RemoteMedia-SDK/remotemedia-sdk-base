@@ -591,7 +591,10 @@ impl RtpOutboundMediaSession {
         channels: u32,
         tag: Option<TurnTag>,
     ) -> Result<()> {
-        if tag.as_ref().is_some_and(|tag| self.dropped.contains(&tag.turn_id)) {
+        if tag
+            .as_ref()
+            .is_some_and(|tag| self.dropped.contains(&tag.turn_id))
+        {
             return Ok(());
         }
         let samples = prepare_pcm(
@@ -617,7 +620,10 @@ impl RtpOutboundMediaSession {
     /// packets before this point have been taken, the chunk is reported as
     /// wholly released.
     pub fn mark_chunk_end(&mut self, tag: Option<TurnTag>) {
-        if tag.as_ref().is_some_and(|tag| self.dropped.contains(&tag.turn_id)) {
+        if tag
+            .as_ref()
+            .is_some_and(|tag| self.dropped.contains(&tag.turn_id))
+        {
             return;
         }
         self.waiting.push_back(Waiting::End(tag));
@@ -634,10 +640,11 @@ impl RtpOutboundMediaSession {
                         .map_err(|error| Error::Rtp(error.to_string()))?;
                     self.segments.push(tag.as_ref(), count);
                 }
-                Some(Waiting::End(tag)) => {
-                    self.released
-                        .chunk_end(tag.as_ref(), std::time::Instant::now(), &mut self.reports)
-                }
+                Some(Waiting::End(tag)) => self.released.chunk_end(
+                    tag.as_ref(),
+                    std::time::Instant::now(),
+                    &mut self.reports,
+                ),
                 None => break,
             }
         }
@@ -681,7 +688,8 @@ impl RtpOutboundMediaSession {
         if drop_rest {
             self.dropped.drop_turn(turn_id);
         }
-        let of_turn = |tag: &Option<TurnTag>| tag.as_ref().is_some_and(|tag| &*tag.turn_id == turn_id);
+        let of_turn =
+            |tag: &Option<TurnTag>| tag.as_ref().is_some_and(|tag| &*tag.turn_id == turn_id);
         let mut dropped = 0;
         self.waiting.retain(|waiting| match waiting {
             Waiting::Audio(tag, samples) if of_turn(tag) => {

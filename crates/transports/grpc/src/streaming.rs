@@ -989,9 +989,15 @@ async fn run_shared_stream(
     use remotemedia_core::transport::{data::participant, Participant};
 
     if init.client_version.is_empty() {
-        return Err(ServiceError::Validation("client_version required".to_string()));
+        return Err(ServiceError::Validation(
+            "client_version required".to_string(),
+        ));
     }
-    let identity = init.participant.as_ref().map(participant_metadata).unwrap_or_default();
+    let identity = init
+        .participant
+        .as_ref()
+        .map(participant_metadata)
+        .unwrap_or_default();
     let Some(participant_id) = identity.get(participant::ID).cloned() else {
         return Err(ServiceError::Validation(
             "participant.id required with shared_session_key".to_string(),
@@ -999,12 +1005,14 @@ async fn run_shared_stream(
     };
     if !init.embedded_plugins.is_empty() || init.embedded_python_env.is_some() {
         return Err(ServiceError::Validation(
-            "embedded plugins and Python environments are not supported on shared sessions".to_string(),
+            "embedded plugins and Python environments are not supported on shared sessions"
+                .to_string(),
         ));
     }
     if !init.output_taps.is_empty() {
         return Err(ServiceError::Validation(
-            "output_taps are not supported on shared sessions; attach to the control bus instead".to_string(),
+            "output_taps are not supported on shared sessions; attach to the control bus instead"
+                .to_string(),
         ));
     }
     let manifest_proto = init
@@ -1021,9 +1029,20 @@ async fn run_shared_stream(
         .get_or_create_shared_session(key.clone(), Arc::new(manifest))
         .await
         .map_err(|error| ServiceError::Internal(format!("shared session: {error}")))?;
-    *shared_stream_clients().lock().unwrap().entry(key.clone()).or_default() += 1;
+    *shared_stream_clients()
+        .lock()
+        .unwrap()
+        .entry(key.clone())
+        .or_default() += 1;
     let info = init.participant.unwrap_or_default();
-    let mut who = Participant::new(participant_id.clone(), if info.role.is_empty() { participant::role::CLIENT.to_string() } else { info.role.clone() });
+    let mut who = Participant::new(
+        participant_id.clone(),
+        if info.role.is_empty() {
+            participant::role::CLIENT.to_string()
+        } else {
+            info.role.clone()
+        },
+    );
     if !info.track_id.is_empty() {
         who = who.with_track_id(info.track_id.clone());
     }
@@ -1059,7 +1078,9 @@ async fn run_shared_stream(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
                 // The output's metadata (participant.*) rides in DataBuffer.metadata.
-                let buffer = match crate::adapters::transport_data_to_data_buffer_with_context(&output, &copies) {
+                let buffer = match crate::adapters::transport_data_to_data_buffer_with_context(
+                    &output, &copies,
+                ) {
                     Ok(buffer) => buffer,
                     Err(error) => {
                         warn!(%error, "shared gRPC output not encoded");
@@ -1087,7 +1108,11 @@ async fn run_shared_stream(
     tx.send(Ok(StreamResponse {
         response: Some(StreamResponseType::Ready(StreamReady {
             session_id: shared.session_id().to_string(),
-            recommended_chunk_size: if init.expected_chunk_size > 0 { init.expected_chunk_size } else { 4096 },
+            recommended_chunk_size: if init.expected_chunk_size > 0 {
+                init.expected_chunk_size
+            } else {
+                4096
+            },
             max_buffer_latency_ms: 100,
         })),
     }))
@@ -1113,12 +1138,13 @@ async fn run_shared_stream(
                     };
                     let mut input = data_buffer_into_transport_data_with_context(buffer, &copies)
                         .map_err(|rejected| ServiceError::Validation(rejected.to_string()))?
-                        .ok_or_else(|| ServiceError::Validation("Data conversion failed".to_string()))?;
+                        .ok_or_else(|| {
+                            ServiceError::Validation("Data conversion failed".to_string())
+                        })?;
                     input.sequence = Some(chunk.sequence);
-                    handle
-                        .send(input)
-                        .await
-                        .map_err(|e| ServiceError::Internal(format!("shared session input: {e}")))?;
+                    handle.send(input).await.map_err(|e| {
+                        ServiceError::Internal(format!("shared session input: {e}"))
+                    })?;
                 }
                 Some(StreamRequestType::Control(_)) => {
                     tx.send(Ok(StreamResponse {
@@ -1129,11 +1155,15 @@ async fn run_shared_stream(
                         })),
                     }))
                     .await
-                    .map_err(|_| ServiceError::Internal("Failed to send StreamClosed".to_string()))?;
+                    .map_err(|_| {
+                        ServiceError::Internal("Failed to send StreamClosed".to_string())
+                    })?;
                     break;
                 }
                 Some(StreamRequestType::Init(_)) => {
-                    return Err(ServiceError::Validation("StreamInit already received".to_string()))
+                    return Err(ServiceError::Validation(
+                        "StreamInit already received".to_string(),
+                    ))
                 }
                 None => warn!("Received empty StreamRequest"),
             }
@@ -1264,9 +1294,8 @@ async fn handle_stream_init(
     // session lifetime.
     let embedded_python_env_guard = if let Some(py) = init.embedded_python_env.as_ref() {
         let decoded = crate::embedded_plugin::decode_embedded_python_env(py);
-        let (wheels_dir, guard) =
-            crate::embedded_plugin::materialize_embedded_python_env(&decoded)
-                .map_err(ServiceError::Validation)?;
+        let (wheels_dir, guard) = crate::embedded_plugin::materialize_embedded_python_env(&decoded)
+            .map_err(ServiceError::Validation)?;
         // The guard wires `UV_FIND_LINKS` for the session lifetime and restores
         // the previous value when the session (and guard) is dropped.
         let python_version =
@@ -1812,7 +1841,10 @@ mod origin_tests {
     fn stream_origin_header_is_sanitised() {
         let mut md = tonic::metadata::MetadataMap::new();
         assert_eq!(stream_origin(&md), None);
-        md.insert(STREAM_ORIGIN_HEADER, "  agent:claude-code ".parse().unwrap());
+        md.insert(
+            STREAM_ORIGIN_HEADER,
+            "  agent:claude-code ".parse().unwrap(),
+        );
         assert_eq!(stream_origin(&md).as_deref(), Some("agent:claude-code"));
         md.insert(STREAM_ORIGIN_HEADER, "".parse().unwrap());
         assert_eq!(stream_origin(&md), None);

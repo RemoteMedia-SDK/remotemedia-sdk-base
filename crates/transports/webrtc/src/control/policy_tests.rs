@@ -132,9 +132,16 @@ async fn control_forwarders_keep_session_authority_and_owners_after_shutdown() {
                 deadline_ms: 5000,
             }),
         ] {
-            dispatch_frame(ControlFrame { op: Some(op) }, &control, &tx, &tasks, &scope, None)
-                .await
-                .unwrap();
+            dispatch_frame(
+                ControlFrame { op: Some(op) },
+                &control,
+                &tx,
+                &tasks,
+                &scope,
+                None,
+            )
+            .await
+            .unwrap();
         }
         let bytes = vec![23; 32];
         let pointer = bytes.as_ptr();

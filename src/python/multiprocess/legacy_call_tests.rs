@@ -300,7 +300,11 @@ async fn frames_emitted_during_a_turn_go_to_the_emitter_not_to_the_turn() {
         tx.send(response).await.unwrap();
     }
     let (result, outputs) = tagged_turn(&mut rx, 1, Some(&sink)).await;
-    assert_eq!(result.unwrap(), 2, "an emitted frame is not an output of the turn");
+    assert_eq!(
+        result.unwrap(),
+        2,
+        "an emitted frame is not an output of the turn"
+    );
     assert_eq!(outputs, [10, 11]);
     assert_eq!(emitted_text(emits.recv().await.unwrap()), "on its own");
 }
@@ -339,7 +343,9 @@ async fn emits_between_turns_are_forwarded_and_a_turn_takes_the_lane() {
     }
 
     // After the turn the reader forwards again, until the lane closes.
-    tx.send(emitted("idle again", EmitTag::Default)).await.unwrap();
+    tx.send(emitted("idle again", EmitTag::Default))
+        .await
+        .unwrap();
     let frame = tokio::time::timeout(Duration::from_secs(2), emits.recv())
         .await
         .expect("forwarded after the turn")

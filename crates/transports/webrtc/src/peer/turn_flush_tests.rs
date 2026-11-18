@@ -16,7 +16,8 @@ struct Room {
 
 /// A shared session with members `alice` and `bob`, each with one audio track.
 async fn room() -> Room {
-    let (_executor, handle, control) = crate::test_support::core_session(CopyPolicy::AllowCopies).await;
+    let (_executor, handle, control) =
+        crate::test_support::core_session(CopyPolicy::AllowCopies).await;
     let core = CoreSharedPipelineSession::new("turn-flush", handle).unwrap();
     let shared = SharedPipelineSession::new(core, Some(control.clone()), false)
         .await
@@ -83,7 +84,9 @@ fn turn_audio(turn: &str, chunk: u64, ms: usize, to: Option<&str>) -> TransportD
         metadata: None,
     });
     output.metadata.insert(keys::TURN_ID.into(), turn.into());
-    output.metadata.insert(keys::CHUNK.into(), chunk.to_string());
+    output
+        .metadata
+        .insert(keys::CHUNK.into(), chunk.to_string());
     if let Some(to) = to {
         output.metadata.insert(participant::TO.into(), to.into());
     }
@@ -147,7 +150,10 @@ async fn flushing_member_a_for_turn_t_leaves_b_and_a_later_turn_intact() {
     // Intact; it is next in line, so its first frames may have been sent.
     let later = room.queued("alice", "u").await;
     assert!((17..=20).contains(&later), "alice's later turn: {later}");
-    assert!(room.queued("bob", "t").await + 3 >= bob_before, "bob's queue");
+    assert!(
+        room.queued("bob", "t").await + 3 >= bob_before,
+        "bob's queue"
+    );
 
     // The rest of t is dropped for alice and still plays for bob.
     for member in ["alice", "bob"] {
@@ -218,7 +224,8 @@ async fn session_wide_flush_behaves_as_before() {
 async fn released_audio_is_reported_per_member_on_the_session_bus() {
     let room = room().await;
     let mut events = room.control.subscribe_media();
-    room.dispatch("alice", turn_audio("t", 0, 200, Some("alice"))).await;
+    room.dispatch("alice", turn_audio("t", 0, 200, Some("alice")))
+        .await;
     let report = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = events.recv().await.unwrap();

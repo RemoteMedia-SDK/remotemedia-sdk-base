@@ -168,7 +168,10 @@ pub enum MemberEvent {
         fields: HashMap<String, String>,
         ts_ms: u64,
     },
-    MemberLeft { member: String, ts_ms: u64 },
+    MemberLeft {
+        member: String,
+        ts_ms: u64,
+    },
 }
 
 impl MemberEvent {
@@ -289,7 +292,13 @@ impl ReleaseTracker {
         }
     }
 
-    fn emit(progress: &mut Progress, now: Instant, flushed: bool, drained: bool, out: &mut Vec<ReleaseReport>) {
+    fn emit(
+        progress: &mut Progress,
+        now: Instant,
+        flushed: bool,
+        drained: bool,
+        out: &mut Vec<ReleaseReport>,
+    ) {
         progress.last_report = Some(now);
         progress.dirty = false;
         progress.drained_reported = drained;
@@ -304,7 +313,12 @@ impl ReleaseTracker {
     }
 
     /// Make `turn_id` the turn being sent, closing the one before it.
-    fn select(&mut self, turn_id: &Arc<str>, now: Instant, out: &mut Vec<ReleaseReport>) -> &mut Progress {
+    fn select(
+        &mut self,
+        turn_id: &Arc<str>,
+        now: Instant,
+        out: &mut Vec<ReleaseReport>,
+    ) -> &mut Progress {
         let current = self.open && self.turns.back().is_some_and(|p| p.turn_id == *turn_id);
         if !current {
             self.close_current(now, out);
@@ -595,7 +609,13 @@ mod tests {
 
     const FRAME: Duration = Duration::from_millis(20);
 
-    fn written(tracker: &mut ReleaseTracker, turn: &str, chunk: u64, frames: u32, at: &mut Instant) -> Vec<ReleaseReport> {
+    fn written(
+        tracker: &mut ReleaseTracker,
+        turn: &str,
+        chunk: u64,
+        frames: u32,
+        at: &mut Instant,
+    ) -> Vec<ReleaseReport> {
         let mut out = Vec::new();
         for _ in 0..frames {
             *at += FRAME;
@@ -610,7 +630,10 @@ mod tests {
         TurnTag::new("t1", 3).write_to(&mut metadata);
         assert_eq!(metadata[keys::TURN_ID], "t1");
         assert_eq!(metadata[keys::CHUNK], "3");
-        assert_eq!(TurnTag::from_metadata(&metadata), Some(TurnTag::new("t1", 3)));
+        assert_eq!(
+            TurnTag::from_metadata(&metadata),
+            Some(TurnTag::new("t1", 3))
+        );
         let alias = HashMap::from([(keys::TURN_ID_ALIAS.to_string(), "t2".to_string())]);
         assert_eq!(TurnTag::from_metadata(&alias), Some(TurnTag::new("t2", 0)));
         assert_eq!(TurnTag::from_metadata(&HashMap::new()), None);
@@ -633,7 +656,10 @@ mod tests {
             metadata: None,
         };
         let out = crate::transport::Routed::new(audio, Some(origin)).into_transport();
-        assert_eq!(TurnTag::from_metadata(&out.metadata), Some(TurnTag::new("t1", 2)));
+        assert_eq!(
+            TurnTag::from_metadata(&out.metadata),
+            Some(TurnTag::new("t1", 2))
+        );
     }
 
     #[test]
@@ -664,7 +690,10 @@ mod tests {
         let report = &out[0];
         assert!(report.flushed);
         assert_eq!(report.released, Duration::from_millis(540));
-        assert_eq!(report.chunks_released, 1, "chunk 1 was cut, chunk 2 never left");
+        assert_eq!(
+            report.chunks_released, 1,
+            "chunk 1 was cut, chunk 2 never left"
+        );
         // Nothing more is reported for it.
         tracker.drained(at, &mut out);
         assert_eq!(out.len(), 1);
@@ -725,16 +754,27 @@ mod tests {
         tracker.drained(at, &mut out);
         assert!(out[0].drained);
         assert_eq!(out[0].released, Duration::from_millis(60));
-        assert_eq!(out[0].chunks_released, 0, "the chunk may have more audio coming");
+        assert_eq!(
+            out[0].chunks_released, 0,
+            "the chunk may have more audio coming"
+        );
         // A turn flushed before any of it was written reports zero, and does
         // not close the turn being sent.
         tracker.flushed(Some("later"), at, &mut out);
-        assert_eq!((&*out[1].turn_id, out[1].released, out[1].flushed), ("later", Duration::ZERO, true));
+        assert_eq!(
+            (&*out[1].turn_id, out[1].released, out[1].flushed),
+            ("later", Duration::ZERO, true)
+        );
         let reports = written(&mut tracker, "t", 0, 5, &mut at);
-        assert!(reports.iter().all(|r| &*r.turn_id == "t" && r.chunks_released == 0));
+        assert!(reports
+            .iter()
+            .all(|r| &*r.turn_id == "t" && r.chunks_released == 0));
         // A session-wide flush reports the turn being sent.
         tracker.flushed(None, at, &mut out);
-        assert_eq!((&*out[2].turn_id, out[2].released), ("t", Duration::from_millis(160)));
+        assert_eq!(
+            (&*out[2].turn_id, out[2].released),
+            ("t", Duration::from_millis(160))
+        );
         let reports = written(&mut tracker, "u", 0, 1, &mut at);
         assert!(reports.iter().all(|r| &*r.turn_id == "u"), "{reports:?}");
     }
@@ -781,6 +821,9 @@ mod tests {
             serde_json::json!({"kind":"audio_released","member":"alice","turn_id":"t",
                 "released_ms":540,"chunks_released":1,"chunk":1,"flushed":true,"drained":false})
         );
-        assert_eq!(MediaEvent::from_runtime(&released.to_runtime()), Some(released));
+        assert_eq!(
+            MediaEvent::from_runtime(&released.to_runtime()),
+            Some(released)
+        );
     }
 }

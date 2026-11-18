@@ -637,9 +637,9 @@ mod tests {
                 first_error: None,
             });
             let (tx, rx) = mpsc::channel(1);
-            tx.try_send(crate::transport::origin::Routed::unattributed(RuntimeData::Json(
-                serde_json::json!("already full"),
-            )))
+            tx.try_send(crate::transport::origin::Routed::unattributed(
+                RuntimeData::Json(serde_json::json!("already full")),
+            ))
             .unwrap();
             let _receiver = if closed {
                 drop(rx);

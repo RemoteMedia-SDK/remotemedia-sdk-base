@@ -1,8 +1,8 @@
 //! Multiprocess execution for Python nodes via iceoryx2 IPC
 
-pub mod data_transfer;
 #[cfg(feature = "multiprocess")]
 mod copy_authority;
+pub mod data_transfer;
 #[cfg(feature = "multiprocess")]
 pub mod health_monitor;
 #[cfg(feature = "multiprocess")]

@@ -75,14 +75,19 @@ impl InterceptReplyHandle {
     /// previously received from [`InterceptSession::requests`]. Rejected bulk
     /// replacements return an admission error and leave the request open until
     /// its deadline, allowing retry or an explicit Pass/Drop decision.
-    pub async fn complete(&self, correlation_id: u64, decision: InterceptDecision) -> Result<(), Error> {
+    pub async fn complete(
+        &self,
+        correlation_id: u64,
+        decision: InterceptDecision,
+    ) -> Result<(), Error> {
         self.inner.complete(correlation_id, decision).await
     }
 }
 
 #[async_trait]
 trait InterceptReplyBackend: Send + Sync {
-    async fn complete(&self, correlation_id: u64, decision: InterceptDecision) -> Result<(), Error>;
+    async fn complete(&self, correlation_id: u64, decision: InterceptDecision)
+        -> Result<(), Error>;
 }
 
 struct InProcReplyBackend {
@@ -91,7 +96,11 @@ struct InProcReplyBackend {
 
 #[async_trait]
 impl InterceptReplyBackend for InProcReplyBackend {
-    async fn complete(&self, correlation_id: u64, decision: InterceptDecision) -> Result<(), Error> {
+    async fn complete(
+        &self,
+        correlation_id: u64,
+        decision: InterceptDecision,
+    ) -> Result<(), Error> {
         self.control.complete_intercept(correlation_id, decision)
     }
 }

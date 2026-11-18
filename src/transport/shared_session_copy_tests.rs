@@ -80,15 +80,17 @@ async fn output_drainer_promotes_once_for_every_subscriber() {
     SharedPipelineSession::spawn_output_drainer(rx, broadcast);
     let samples = vec![0.5_f32; 32];
     let original = samples.as_ptr();
-    tx.send(crate::transport::TransportData::new(crate::data::RuntimeData::Audio {
-        samples: crate::data::AudioSamples::Vec(samples),
-        sample_rate: 16_000,
-        channels: 1,
-        stream_id: None,
-        timestamp_us: None,
-        arrival_ts_us: None,
-        metadata: None,
-    }))
+    tx.send(crate::transport::TransportData::new(
+        crate::data::RuntimeData::Audio {
+            samples: crate::data::AudioSamples::Vec(samples),
+            sample_rate: 16_000,
+            channels: 1,
+            stream_id: None,
+            timestamp_us: None,
+            arrival_ts_us: None,
+            metadata: None,
+        },
+    ))
     .await
     .unwrap();
     for receiver in [&mut first, &mut second] {

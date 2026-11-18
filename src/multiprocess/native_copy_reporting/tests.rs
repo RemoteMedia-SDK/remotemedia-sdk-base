@@ -28,7 +28,10 @@ fn input_frame(call: u64, boundary: &str, body: &[u8]) -> Vec<u8> {
     let mut head = vec![MaybeUninit::uninit(); prefix];
     frame::write_input(&mut head, call, boundary).unwrap();
     // SAFETY: write_input initializes every byte of an exact-length prefix.
-    let mut bytes: Vec<u8> = head.into_iter().map(|b| unsafe { b.assume_init() }).collect();
+    let mut bytes: Vec<u8> = head
+        .into_iter()
+        .map(|b| unsafe { b.assume_init() })
+        .collect();
     bytes.extend_from_slice(body);
     bytes
 }
@@ -36,7 +39,10 @@ fn output_frame(call: u64, ok: bool, ledger: &CopyContext, body: &[u8]) -> Vec<u
     let mut head = vec![MaybeUninit::uninit(); OUTPUT_PREFIX];
     frame::write_output(&mut head, call, ok, &ledger.counts()).unwrap();
     // SAFETY: write_output initializes every byte of an exact-length prefix.
-    let mut bytes: Vec<u8> = head.into_iter().map(|b| unsafe { b.assume_init() }).collect();
+    let mut bytes: Vec<u8> = head
+        .into_iter()
+        .map(|b| unsafe { b.assume_init() })
+        .collect();
     bytes.extend_from_slice(body);
     bytes
 }
@@ -63,19 +69,31 @@ fn output_totals_replay_to_the_same_counts_as_direct_recording() {
     let worker = copies("worker");
     for bytes in [17, 31] {
         worker.record(CopyReason::PortableDeserialization, CopyEvent::Started);
-        worker.record(CopyReason::PortableDeserialization, CopyEvent::Completed(bytes));
+        worker.record(
+            CopyReason::PortableDeserialization,
+            CopyEvent::Completed(bytes),
+        );
     }
     worker.record(CopyReason::PortableSerialization, CopyEvent::Started);
     worker.record(CopyReason::PortableSerialization, CopyEvent::Failed(9));
     worker.record(CopyReason::VecMaterialization, CopyEvent::Rejected(11));
     let bytes = output_frame(3, true, &worker, b"body");
     let output = frame::parse_output(&bytes).unwrap();
-    assert_eq!((output.call, output.ok, output.body), (3, true, &b"body"[..]));
+    assert_eq!(
+        (output.call, output.ok, output.body),
+        (3, true, &b"body"[..])
+    );
     let host = copies("host");
     frame::replay(&host, &output.totals);
     assert_eq!(host.counts(), worker.counts());
-    assert_eq!(count(&host, CopyReason::PortableDeserialization).copied_bytes, 48);
-    assert_eq!(count(&host, CopyReason::PortableDeserialization).completed, 2);
+    assert_eq!(
+        count(&host, CopyReason::PortableDeserialization).copied_bytes,
+        48
+    );
+    assert_eq!(
+        count(&host, CopyReason::PortableDeserialization).completed,
+        2
+    );
     assert!(host.counts().iter().all(|c| c.in_flight == 0));
 }
 
@@ -91,10 +109,10 @@ fn malformed_or_incoherent_output_frames_are_rejected() {
     assert!(frame::parse_output(&good[..OUTPUT_PREFIX - 1]).is_err());
     let field = |reason: CopyReason, field: usize| 16 + (reason as usize * 6 + field) * 8;
     for corrupt in [
-        |b: &mut Vec<u8>| b[0] = b'X',  // magic
-        |b: &mut Vec<u8>| b[12] = 2,    // status
-        |b: &mut Vec<u8>| b[13] += 1,   // reason count
-        |b: &mut Vec<u8>| b[14] = 1,    // reserved
+        |b: &mut Vec<u8>| b[0] = b'X', // magic
+        |b: &mut Vec<u8>| b[12] = 2,   // status
+        |b: &mut Vec<u8>| b[13] += 1,  // reason count
+        |b: &mut Vec<u8>| b[14] = 1,   // reserved
     ] {
         let mut bytes = good.clone();
         corrupt(&mut bytes);
@@ -185,7 +203,11 @@ fn worker_exit_or_stray_bytes_fail_the_lane() {
     while host.check().is_ok() && Instant::now() < deadline {
         std::thread::yield_now();
     }
-    assert!(host.check().unwrap_err().to_string().contains("disconnected"));
+    assert!(host
+        .check()
+        .unwrap_err()
+        .to_string()
+        .contains("disconnected"));
     assert!(host.next_call(&copies("after")).is_err());
 
     let (host, mut worker) = connected();

@@ -41,7 +41,9 @@ pub(super) async fn forward_taps(
 /// [`forward_taps`] for a member that may only see its own frames: output
 /// produced from another member's input, or from nobody's, is not sent.
 pub(super) async fn forward_own_taps(
-    mut rx: tokio::sync::broadcast::Receiver<remotemedia_core::transport::session_control::AttributedTap>,
+    mut rx: tokio::sync::broadcast::Receiver<
+        remotemedia_core::transport::session_control::AttributedTap,
+    >,
     tx: mpsc::Sender<Outbound>,
     address: CoreAddress,
     copies: CopyContext,

@@ -102,11 +102,13 @@ struct SinkOutputs {
 
 impl SinkOutputs {
     fn pushed(&self) {
-        self.pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn forwarded(&self) {
-        self.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.pending
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         self.forwarded.notify_waiters();
     }
 
@@ -517,12 +519,17 @@ impl StreamingNodeFactory for LoadableFactoryAdapter {
                 value
                     .as_str()
                     .and_then(remotemedia_traits::streaming::InstanceScope::parse)
-                    .ok_or_else(|| Error::Execution(format!("invalid plugin instance scope: {value}")))?,
+                    .ok_or_else(|| {
+                        Error::Execution(format!("invalid plugin instance scope: {value}"))
+                    })?,
             ),
         };
         // Instance declarations (openspec: add-source-node-lifecycle).
         let self_driven = pacing.get("self_driven").and_then(Value::as_bool);
-        let background = pacing.get("background").and_then(Value::as_bool).unwrap_or(false);
+        let background = pacing
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let rpc_methods: Vec<RpcMethod> = serde_json::from_str(ffi_node.rpc_methods().as_str())
             .map_err(|e| Error::Execution(format!("invalid plugin RPC descriptors: {e}")))?;
         let snapshots = loadable_node_abi::snapshot::runtime::import_ports(
@@ -984,14 +991,18 @@ impl LoadableNodeAdapter {
     /// before it drops the call's future, the plugin's `cancel_call` gets the
     /// request with the explicit choices, so the plugin node re-resolves it
     /// with its own default. Held for the call; dropping it unregisters.
-    fn forward_cancel(&self, ctx: &dyn NodeRuntimeContextRead) -> remotemedia_traits::CancelRegistration {
+    fn forward_cancel(
+        &self,
+        ctx: &dyn NodeRuntimeContextRead,
+    ) -> remotemedia_traits::CancelRegistration {
         let inner = self.inner.clone();
         let identity = FfiCallContext {
             session_id: context_session(ctx).map(RString::from).into(),
             node_id: self.node_id.clone().into(),
             origin: ffi_origin(ctx),
         };
-        let call_cancel = crate::nodes::NodeRuntimeContext::of(ctx).map(|c| c.call_cancel().clone());
+        let call_cancel =
+            crate::nodes::NodeRuntimeContext::of(ctx).map(|c| c.call_cancel().clone());
         ctx.cancel_token().on_cancel(move |cancellation| {
             let request = match &call_cancel {
                 Some(call) => call.forwarded(cancellation),
@@ -1208,7 +1219,9 @@ fn context_session(ctx: &dyn NodeRuntimeContextRead) -> Option<String> {
 /// The participant of the input a call processes, as the plugin ABI
 /// carries it.
 fn ffi_origin(ctx: &dyn NodeRuntimeContextRead) -> abi_stable::std_types::ROption<RString> {
-    ctx.origin().map(|origin| RString::from(origin.to_json())).into()
+    ctx.origin()
+        .map(|origin| RString::from(origin.to_json()))
+        .into()
 }
 
 /// The host emitter behind the plugin ABI's `NodeEmitter`.
@@ -1228,10 +1241,12 @@ impl HostEmitter {
             EMIT_UNATTRIBUTED => crate::nodes::EmitOrigin::Unattributed,
             EMIT_AS_PARTICIPANT => crate::nodes::EmitOrigin::Participant(participant.into_string()),
             // An origin the plugin read from an input and kept.
-            EMIT_AS_ORIGIN => match crate::transport::origin::Origin::from_json(participant.as_str()) {
-                Some(origin) => crate::nodes::EmitOrigin::Origin(Arc::new(origin)),
-                None => return Err("emit origin names no participant".into()),
-            },
+            EMIT_AS_ORIGIN => {
+                match crate::transport::origin::Origin::from_json(participant.as_str()) {
+                    Some(origin) => crate::nodes::EmitOrigin::Origin(Arc::new(origin)),
+                    None => return Err("emit origin names no participant".into()),
+                }
+            }
             other => return Err(format!("unknown emit origin {other}").into()),
         };
         Ok((runtime_buffer::decode(message)?, origin))
@@ -1477,12 +1492,20 @@ mod emitter_contract_tests {
             let (rejected, saw_close) = (self.rejected.clone(), self.saw_close.clone());
             tokio::spawn(async move {
                 for n in 0..3 {
-                    if emitter.emit(RuntimeData::Text(format!("tick-{n}"))).await.is_err() {
+                    if emitter
+                        .emit(RuntimeData::Text(format!("tick-{n}")))
+                        .await
+                        .is_err()
+                    {
                         rejected.store(true, Ordering::SeqCst);
                         return;
                     }
                 }
-                if emitter.emit_as(RuntimeData::Text("boo".into()), "ghost").await.is_err() {
+                if emitter
+                    .emit_as(RuntimeData::Text("boo".into()), "ghost")
+                    .await
+                    .is_err()
+                {
                     rejected.store(true, Ordering::SeqCst);
                 }
                 emitter.closed().await;
@@ -1511,9 +1534,16 @@ mod emitter_contract_tests {
         }
     }
 
-    fn node(rejected: &Arc<AtomicBool>, saw_close: &Arc<AtomicBool>) -> Box<dyn crate::nodes::StreamingNode> {
+    fn node(
+        rejected: &Arc<AtomicBool>,
+        saw_close: &Arc<AtomicBool>,
+    ) -> Box<dyn crate::nodes::StreamingNode> {
         wrap_ffi_factory(TickerFactory(rejected.clone(), saw_close.clone()))
-            .create("ticker".into(), &serde_json::json!({}), Some("session".into()))
+            .create(
+                "ticker".into(),
+                &serde_json::json!({}),
+                Some("session".into()),
+            )
             .unwrap()
     }
 
@@ -1537,7 +1567,10 @@ mod emitter_contract_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_plugin_emits_from_a_task_through_the_hosts_emitter() {
-        let (rejected, saw_close) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (rejected, saw_close) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
         let node = node(&rejected, &saw_close);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let emitter = crate::nodes::Emitter::pending("ticker");
@@ -1565,7 +1598,10 @@ mod emitter_contract_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_plugin_on_a_host_without_an_emitter_gets_an_error_and_keeps_running() {
-        let (rejected, saw_close) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (rejected, saw_close) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
         let node = node(&rejected, &saw_close);
         // What a host that predates the emitter does: it binds nothing.
         node.initialize(&init_ctx()).await.unwrap();

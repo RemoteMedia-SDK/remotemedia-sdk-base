@@ -54,9 +54,17 @@ mod office_tests {
         ])).unwrap();
         let arguments = serde_json::json!({"kind":"motion_goal","version":2,"session_id":"native",
             "seed":42,"generation_revision":2,"pts_ms":8000,"goal":{"description":"A person stands up from a squat."}});
-        let call = ToolCallAccum { id:"tool-id".into(), name:"motion_goal".into(), arguments:arguments.to_string() };
+        let call = ToolCallAccum {
+            id: "tool-id".into(),
+            name: "motion_goal".into(),
+            arguments: arguments.to_string(),
+        };
         let mut output = Vec::new();
-        dispatch_tool_call(&registry, &call, "tts", &mut |data| { output.push(data); Ok(()) }).unwrap();
+        dispatch_tool_call(&registry, &call, "tts", &mut |data| {
+            output.push(data);
+            Ok(())
+        })
+        .unwrap();
         assert!(matches!(&output[0], crate::data::RuntimeData::Json(v) if v == &arguments));
     }
     #[test]
@@ -64,10 +72,17 @@ mod office_tests {
         let registry = serde_json::from_value::<Vec<crate::nodes::tool_spec::ToolSpec>>(serde_json::json!([
             {"name":"generate_waypoint","description":"Preview", "parameters":{"type":"object"},"kind":"side_effect"}
         ])).unwrap();
-        let call = ToolCallAccum { id:"route-7".into(), name:"generate_waypoint".into(),
-            arguments:r#"{"from":"avatar","to":"plate","request_id":"invented"}"#.into() };
+        let call = ToolCallAccum {
+            id: "route-7".into(),
+            name: "generate_waypoint".into(),
+            arguments: r#"{"from":"avatar","to":"plate","request_id":"invented"}"#.into(),
+        };
         let mut output = Vec::new();
-        dispatch_tool_call(&registry, &call, "tts", &mut |data| { output.push(data); Ok(()) }).unwrap();
+        dispatch_tool_call(&registry, &call, "tts", &mut |data| {
+            output.push(data);
+            Ok(())
+        })
+        .unwrap();
         assert!(matches!(&output[0], crate::data::RuntimeData::Json(v)
             if v["kind"] == "generate_waypoint" && v["request_id"] == "route-7" && v["to"] == "plate"));
     }

@@ -15,7 +15,9 @@
 use crate::data::RuntimeData;
 use crate::error::Error;
 use crate::nodes::schema::{NodeSchema, RuntimeDataType};
-use crate::nodes::{InstanceScope, StreamingNode, StreamingNodeFactory, SyncNodeWrapper, SyncStreamingNode};
+use crate::nodes::{
+    InstanceScope, StreamingNode, StreamingNodeFactory, SyncNodeWrapper, SyncStreamingNode,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -148,9 +150,15 @@ impl StreamingNodeFactory for TestEnergyVadNodeFactory {
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        let params = if params.is_null() { json!({}) } else { params.clone() };
+        let params = if params.is_null() {
+            json!({})
+        } else {
+            params.clone()
+        };
         let config: TestEnergyVadConfig = serde_json::from_value(params).map_err(|error| {
-            Error::Execution(format!("{TEST_ENERGY_VAD_NODE} '{node_id}': invalid params: {error}"))
+            Error::Execution(format!(
+                "{TEST_ENERGY_VAD_NODE} '{node_id}': invalid params: {error}"
+            ))
         })?;
         Ok(Box::new(SyncNodeWrapper(TestEnergyVadNode::new(config))))
     }
@@ -250,14 +258,22 @@ mod tests {
         assert!(feed(&node, frame(0.3)).is_empty());
         assert!(feed(&node, frame(0.0)).is_empty());
         assert!(feed(&node, RuntimeData::Text("hello".into())).is_empty());
-        assert!(feed(&node, RuntimeData::Json(json!({ "v": 1, "type": "text", "text": "hi" }))).is_empty());
+        assert!(feed(
+            &node,
+            RuntimeData::Json(json!({ "v": 1, "type": "text", "text": "hi" }))
+        )
+        .is_empty());
     }
 
     #[test]
     fn the_node_is_per_participant() {
         let node = TestEnergyVadNode::new(TestEnergyVadConfig::default());
         assert_eq!(node.instance_scope(), Some(InstanceScope::PerParticipant));
-        assert!(TestEnergyVadNodeFactory.create("vad".into(), &json!({ "hangoverMs": 200 }), None).is_ok());
-        assert!(TestEnergyVadNodeFactory.create("vad".into(), &json!({ "threshold": "loud" }), None).is_err());
+        assert!(TestEnergyVadNodeFactory
+            .create("vad".into(), &json!({ "hangoverMs": 200 }), None)
+            .is_ok());
+        assert!(TestEnergyVadNodeFactory
+            .create("vad".into(), &json!({ "threshold": "loud" }), None)
+            .is_err());
     }
 }

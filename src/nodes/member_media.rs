@@ -44,7 +44,9 @@
 use crate::data::RuntimeData;
 use crate::error::Error;
 use crate::nodes::schema::{NodeSchema, RuntimeDataType};
-use crate::nodes::{AsyncNodeWrapper, AsyncStreamingNode, NodeRuntimeContext, StreamingNode, StreamingNodeFactory};
+use crate::nodes::{
+    AsyncNodeWrapper, AsyncStreamingNode, NodeRuntimeContext, StreamingNode, StreamingNodeFactory,
+};
 use crate::transport::data::participant;
 use crate::transport::origin::Origin;
 use crate::transport::session_control::{ControlAddress, BARGE_IN_PORT};
@@ -87,8 +89,14 @@ pub fn relay_frame(event: &MediaEvent) -> RuntimeData {
 pub fn relay_origin(member: &str) -> Option<Arc<Origin>> {
     let fields = HashMap::from([
         (participant::ID.to_string(), member.to_string()),
-        (participant::ROLE.to_string(), participant::role::SYSTEM.to_string()),
-        (RELAY_ORIGIN_FIELD.to_string(), RELAY_ORIGIN_VALUE.to_string()),
+        (
+            participant::ROLE.to_string(),
+            participant::role::SYSTEM.to_string(),
+        ),
+        (
+            RELAY_ORIGIN_FIELD.to_string(),
+            RELAY_ORIGIN_VALUE.to_string(),
+        ),
     ]);
     Origin::from_metadata(&fields).map(Arc::new)
 }
@@ -218,7 +226,8 @@ impl AsyncStreamingNode for MemberMediaRelayNode {
 
     async fn process(&self, _data: RuntimeData) -> Result<RuntimeData, Error> {
         Err(Error::Execution(
-            "MemberMediaRelayNode runs in a streaming session: it emits from its background body".into(),
+            "MemberMediaRelayNode runs in a streaming session: it emits from its background body"
+                .into(),
         ))
     }
 
@@ -256,8 +265,13 @@ impl AsyncStreamingNode for MemberMediaRelayNode {
             transport: RELAYED_TRANSPORT.to_string(),
             ts_ms: crate::transport::turn_audio::now_ms(),
         };
-        let mut pending: Vec<MediaEvent> = control.media_ready_members().into_iter().map(ready).collect();
-        let resend = (self.config.resend_ms > 0).then(|| Duration::from_millis(self.config.resend_ms));
+        let mut pending: Vec<MediaEvent> = control
+            .media_ready_members()
+            .into_iter()
+            .map(ready)
+            .collect();
+        let resend =
+            (self.config.resend_ms > 0).then(|| Duration::from_millis(self.config.resend_ms));
         let mut next_resend = resend.map(|every| tokio::time::Instant::now() + every);
         loop {
             for event in pending.drain(..) {
@@ -315,13 +329,19 @@ impl StreamingNodeFactory for MemberMediaRelayNodeFactory {
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        let params = if params.is_null() { json!({}) } else { params.clone() };
+        let params = if params.is_null() {
+            json!({})
+        } else {
+            params.clone()
+        };
         let config: MemberMediaRelayConfig = serde_json::from_value(params).map_err(|error| {
-            Error::Execution(format!("{MEMBER_MEDIA_RELAY_NODE} '{node_id}': invalid params: {error}"))
+            Error::Execution(format!(
+                "{MEMBER_MEDIA_RELAY_NODE} '{node_id}': invalid params: {error}"
+            ))
         })?;
-        Ok(Box::new(AsyncNodeWrapper(Arc::new(MemberMediaRelayNode::new(
-            node_id, config,
-        )))))
+        Ok(Box::new(AsyncNodeWrapper(Arc::new(
+            MemberMediaRelayNode::new(node_id, config),
+        ))))
     }
 
     fn node_type(&self) -> &str {
@@ -343,7 +363,11 @@ impl StreamingNodeFactory for MemberMediaRelayNodeFactory {
                      input that reaches it is dropped.",
                 )
                 .category("conversation")
-                .accepts([RuntimeDataType::Audio, RuntimeDataType::Text, RuntimeDataType::Json])
+                .accepts([
+                    RuntimeDataType::Audio,
+                    RuntimeDataType::Text,
+                    RuntimeDataType::Json,
+                ])
                 .produces([RuntimeDataType::Json])
                 .config_schema_from::<MemberMediaRelayConfig>(),
         )
@@ -443,11 +467,19 @@ impl StreamingNodeFactory for MemberFlushNodeFactory {
         params: &Value,
         _session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        let params = if params.is_null() { json!({}) } else { params.clone() };
+        let params = if params.is_null() {
+            json!({})
+        } else {
+            params.clone()
+        };
         let config: MemberFlushConfig = serde_json::from_value(params).map_err(|error| {
-            Error::Execution(format!("{MEMBER_FLUSH_NODE} '{node_id}': invalid params: {error}"))
+            Error::Execution(format!(
+                "{MEMBER_FLUSH_NODE} '{node_id}': invalid params: {error}"
+            ))
         })?;
-        Ok(Box::new(AsyncNodeWrapper(Arc::new(MemberFlushNode::new(node_id, config)))))
+        Ok(Box::new(AsyncNodeWrapper(Arc::new(MemberFlushNode::new(
+            node_id, config,
+        )))))
     }
 
     fn node_type(&self) -> &str {
@@ -495,7 +527,9 @@ mod tests {
     #[test]
     fn a_relayed_event_round_trips_and_needs_the_relays_origin() {
         let event = released();
-        let RuntimeData::Json(frame) = relay_frame(&event) else { panic!("a Json frame") };
+        let RuntimeData::Json(frame) = relay_frame(&event) else {
+            panic!("a Json frame")
+        };
         assert_eq!(frame["v"], 1);
         assert_eq!(frame[RELAY_FRAME_KEY]["kind"], "audio_released");
         assert!(is_relay_frame(&frame));
@@ -505,14 +539,22 @@ mod tests {
         // The same frame as a member's own input, or as nobody's.
         let member = Origin::from_metadata(&HashMap::from([
             (participant::ID.to_string(), "ada".to_string()),
-            (participant::ROLE.to_string(), participant::role::CLIENT.to_string()),
+            (
+                participant::ROLE.to_string(),
+                participant::role::CLIENT.to_string(),
+            ),
         ]))
         .unwrap();
         assert_eq!(relayed_event(&frame, Some(&member)), None);
         assert_eq!(relayed_event(&frame, None), None);
         // Other frames are not relayed events.
-        assert!(!is_relay_frame(&json!({ "v": 1, "type": "text", "text": "hi" })));
-        assert_eq!(relayed_event(&json!({ "v": 2, RELAY_FRAME_KEY: {} }), Some(&origin)), None);
+        assert!(!is_relay_frame(
+            &json!({ "v": 1, "type": "text", "text": "hi" })
+        ));
+        assert_eq!(
+            relayed_event(&json!({ "v": 2, RELAY_FRAME_KEY: {} }), Some(&origin)),
+            None
+        );
     }
 
     #[test]
@@ -535,7 +577,10 @@ mod tests {
         // As text, and with the defaults.
         let text = RuntimeData::Text(r#"{"kind":"flush_audio","turn_id":"t"}"#.into());
         let read = FlushRequest::from_runtime(&text).unwrap();
-        assert_eq!((read.members.len(), read.drop_rest, read.barge), (0, false, false));
+        assert_eq!(
+            (read.members.len(), read.drop_rest, read.barge),
+            (0, false, false)
+        );
         for other in [
             RuntimeData::Json(json!({ "kind": "media_ready", "member": "ada", "turn_id": "t" })),
             RuntimeData::Json(json!({ "kind": "flush_audio", "turn_id": "" })),
@@ -547,8 +592,12 @@ mod tests {
 
     #[test]
     fn the_factories_take_no_parameters_and_reject_wrong_ones() {
-        assert!(MemberMediaRelayNodeFactory.create("relay".into(), &Value::Null, None).is_ok());
-        assert!(MemberFlushNodeFactory.create("flush".into(), &Value::Null, None).is_ok());
+        assert!(MemberMediaRelayNodeFactory
+            .create("relay".into(), &Value::Null, None)
+            .is_ok());
+        assert!(MemberFlushNodeFactory
+            .create("flush".into(), &Value::Null, None)
+            .is_ok());
         assert!(MemberFlushNodeFactory
             .create("flush".into(), &json!({ "speech_nodes": ["tts"] }), None)
             .is_ok());

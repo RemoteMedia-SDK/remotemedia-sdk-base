@@ -388,9 +388,13 @@ mod ensure_tests {
     async fn unknown_preset_is_named_and_nothing_is_started() {
         let root = tempfile::tempdir().unwrap();
         let ini = root.path().join("models.ini");
-        std::fs::write(&ini, "[known]
+        std::fs::write(
+            &ini,
+            "[known]
 model=/nowhere/model.gguf
-").unwrap();
+",
+        )
+        .unwrap();
         let config = ManagedLlamaServerConfig {
             executable: root.path().join("no-such-llama-server"),
             models_ini: ini,
@@ -450,10 +454,8 @@ HTTPServer(('127.0.0.1', int(sys.argv[sys.argv.index('--port')+1])), Handler).se
         let params = &first.nodes[0].params;
         assert_eq!(params, &second.nodes[0].params);
         assert!(params.get("max_tokens").is_none());
-        let config: ManagedLlamaServerConfig = serde_json::from_value(
-            manifest.nodes[0].params["managed_server"].clone(),
-        )
-        .unwrap();
+        let config: ManagedLlamaServerConfig =
+            serde_json::from_value(manifest.nodes[0].params["managed_server"].clone()).unwrap();
         let endpoint = owner.ensure(&config).await.unwrap();
         assert_eq!(endpoint.base_url, params["base_url"].as_str().unwrap());
         assert_eq!(endpoint.api_key, params["api_key"].as_str().unwrap());

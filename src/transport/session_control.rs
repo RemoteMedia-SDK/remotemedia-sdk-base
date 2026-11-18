@@ -615,9 +615,7 @@ fn aux_payload_of(data: &RuntimeData) -> Option<serde_json::Value> {
 /// The disposition a `barge_in` envelope chooses (openspec:
 /// add-generator-cancellation): its payload's `disposition` field, e.g.
 /// `{"pending_input":"discard"}`. `None` when absent or not a barge.
-pub fn barge_in_disposition(
-    data: &RuntimeData,
-) -> Option<remotemedia_traits::DispositionOverride> {
+pub fn barge_in_disposition(data: &RuntimeData) -> Option<remotemedia_traits::DispositionOverride> {
     if aux_port_of(data).as_deref() != Some(BARGE_IN_PORT) {
         return None;
     }
@@ -637,7 +635,9 @@ pub fn barge_in_disposition(
 /// with `None`, the node's own default applies (an LLM keeps its cut-off
 /// reply and the queued speech, a TTS node drops its queued text); a turn
 /// that is dropped discards pending input; a retraction aborts.
-pub fn barge_in_payload(disposition: Option<remotemedia_traits::DispositionOverride>) -> RuntimeData {
+pub fn barge_in_payload(
+    disposition: Option<remotemedia_traits::DispositionOverride>,
+) -> RuntimeData {
     RuntimeData::Json(match disposition {
         Some(d) if !d.is_empty() => serde_json::json!({ "disposition": d }),
         _ => serde_json::json!({}),
@@ -645,7 +645,9 @@ pub fn barge_in_payload(disposition: Option<remotemedia_traits::DispositionOverr
 }
 
 /// A whole `barge_in` envelope: [`barge_in_payload`] on the barge port.
-pub fn barge_in_envelope(disposition: Option<remotemedia_traits::DispositionOverride>) -> RuntimeData {
+pub fn barge_in_envelope(
+    disposition: Option<remotemedia_traits::DispositionOverride>,
+) -> RuntimeData {
     wrap_aux_port(BARGE_IN_PORT, barge_in_payload(disposition))
 }
 
@@ -877,7 +879,8 @@ impl SystemEventReceiver {
 impl SessionControl {
     pub fn new(session_id: impl Into<String>) -> Arc<Self> {
         Self::with_transport_copy_context(
-            session_id, remotemedia_types::CopyContext::legacy().clone(),
+            session_id,
+            remotemedia_types::CopyContext::legacy().clone(),
         )
     }
 
@@ -1132,7 +1135,10 @@ impl SessionControl {
     ) -> bool {
         {
             let mut ready = self.media.ready.write();
-            if ready.get(member).is_some_and(|current| current == connection) {
+            if ready
+                .get(member)
+                .is_some_and(|current| current == connection)
+            {
                 return false;
             }
             ready.insert(member.to_string(), connection.to_string());
@@ -1156,7 +1162,10 @@ impl SessionControl {
     pub fn publish_media_lost(&self, member: &str, transport: &str, connection: &str) -> bool {
         {
             let mut ready = self.media.ready.write();
-            if ready.get(member).is_none_or(|current| current != connection) {
+            if ready
+                .get(member)
+                .is_none_or(|current| current != connection)
+            {
                 return false;
             }
             ready.remove(member);
@@ -1185,7 +1194,8 @@ impl SessionControl {
     /// [`super::turn_audio::MemberEvent`]). A subscriber that attached late
     /// learns the current members from the inputs it sees.
     pub fn subscribe_members(&self) -> broadcast::Receiver<RuntimeData> {
-        self.tap_sender(super::turn_audio::MEMBERS_PORT, None).subscribe()
+        self.tap_sender(super::turn_audio::MEMBERS_PORT, None)
+            .subscribe()
     }
 
     /// The router saw a member join (its first input, or an explicit join).
@@ -1209,7 +1219,11 @@ impl SessionControl {
 
     /// Publish an `audio_released` report from a transport's audio sender.
     pub fn publish_audio_released(&self, report: AudioReleased) {
-        self.publish_tap(MEDIA_PORT, None, MediaEvent::AudioReleased(report).to_runtime());
+        self.publish_tap(
+            MEDIA_PORT,
+            None,
+            MediaEvent::AudioReleased(report).to_runtime(),
+        );
     }
 
     /// Speak `request.text` through the TTS node `request.node`: the text
@@ -1230,7 +1244,9 @@ impl SessionControl {
             Some(turn_id) => turn_id,
             None => format!(
                 "speak-{}",
-                self.media.speech_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                self.media
+                    .speech_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ),
         };
         request.turn_id = Some(turn_id.clone());
@@ -1259,10 +1275,16 @@ impl SessionControl {
                 .lock()
                 .iter()
                 .any(|pending| pending.turn_id == request.turn_id);
-            return Ok(SpeechAccepted { turn_id, queued: still });
+            return Ok(SpeechAccepted {
+                turn_id,
+                queued: still,
+            });
         }
         self.send_speech(&request).await?;
-        Ok(SpeechAccepted { turn_id, queued: false })
+        Ok(SpeechAccepted {
+            turn_id,
+            queued: false,
+        })
     }
 
     /// Send waiting speech whose listeners are ready, oldest first. Speech
@@ -1302,7 +1324,10 @@ impl SessionControl {
                     .cloned()
                     .unwrap_or_else(|| participant::role::AGENT.to_string()),
             ),
-            (participant::ROLE.to_string(), participant::role::AGENT.to_string()),
+            (
+                participant::ROLE.to_string(),
+                participant::role::AGENT.to_string(),
+            ),
         ]);
         if !request.to.is_empty() {
             metadata.insert(participant::TO.to_string(), request.to.join(","));
@@ -1402,14 +1427,18 @@ impl SessionControl {
 
     /// Clone the router input sender for transport-level participant joins.
     pub async fn input_sender(&self) -> Option<super::SessionPacketSender> {
-        self.input_tx.read().as_ref().and_then(|input| input.sender.clone())
+        self.input_tx
+            .read()
+            .as_ref()
+            .and_then(|input| input.sender.clone())
     }
 
     fn admit_external_control(&self, mut data: RuntimeData) -> Result<RuntimeData> {
         if let Some(input) = self.input_tx.read().as_ref() {
             input.admission.admit_payload(&mut data).map_err(|error| {
                 crate::Error::Execution(format!(
-                    "session {} control ingress buffer budget: {error}", self.session_id
+                    "session {} control ingress buffer budget: {error}",
+                    self.session_id
                 ))
             })?;
         }
@@ -1844,7 +1873,8 @@ impl SessionControl {
         data: RuntimeData,
         scope: &RpcCallScope,
     ) -> Result<()> {
-        self.publish_inner(addr, data, Some(scope.caller()), HashMap::new()).await
+        self.publish_inner(addr, data, Some(scope.caller()), HashMap::new())
+            .await
     }
 
     /// [`Self::publish_scoped`] with transport metadata for the injected
@@ -1858,7 +1888,8 @@ impl SessionControl {
         scope: &RpcCallScope,
         metadata: HashMap<String, String>,
     ) -> Result<()> {
-        self.publish_inner(addr, data, Some(scope.caller()), metadata).await
+        self.publish_inner(addr, data, Some(scope.caller()), metadata)
+            .await
     }
 
     async fn publish_inner(
@@ -2042,9 +2073,9 @@ impl SessionControl {
                     other => other,
                 };
                 let tx = pending.remove();
-                return tx.send(decision).map_err(|_| {
-                    crate::Error::Execution("intercept receiver closed".into())
-                });
+                return tx
+                    .send(decision)
+                    .map_err(|_| crate::Error::Execution("intercept receiver closed".into()));
             }
         }
         Ok(())
