@@ -1,5 +1,6 @@
-use crate::{codec, sse};
+use crate::{codec, stream};
 use bytes::Bytes;
+use prost::Message;
 use remotemedia_core::{data::RuntimeData, transport::TransportData};
 use remotemedia_types::{CopyContext, CopyCounts, CopyPolicy, CopyReason};
 
@@ -72,26 +73,50 @@ pub(crate) fn bulk_cases() -> [RuntimeData; 6] {
     ]
 }
 
+/// Bytes a decode must copy: only audio samples (to aligned f32s). Other
+/// payloads keep the received buffer.
+pub(crate) fn decode_copy_bytes(data: &RuntimeData) -> u64 {
+    match data {
+        RuntimeData::Audio { .. } => data.bulk_payload_bytes() as u64,
+        _ => 0,
+    }
+}
+
+/// One delimited event carrying `frame`.
+fn frame_event(frame: Vec<u8>) -> Vec<u8> {
+    let mut event = codec::frame_event_header(frame.len()).to_vec();
+    event.extend_from_slice(&frame);
+    event
+}
+
 #[test]
-fn json_roundtrip_attributes_all_bulk_types_and_rejects_strict_conversion() {
+fn protobuf_roundtrip_is_lossless_and_counts_only_real_copies() {
     for data in bulk_cases() {
-        let payload = data.bulk_payload_bytes();
-        let data = TransportData::new(data);
+        let payload = data.bulk_payload_bytes() as u64;
+        let mut data = TransportData::new(data);
+        data.sequence = Some(9);
+        data.metadata.insert("participant.id".into(), "ana".into());
         let ledger = copies(CopyPolicy::AllowCopies);
-        let wire = codec::encode(&data, payload, &ledger).unwrap();
-        let decoded: TransportData = codec::decode(&wire, &ledger).unwrap();
+        let wire = codec::encode_frame(&data, &ledger).unwrap();
+        let decoded = codec::decode_frame(Bytes::from(wire.clone()), &ledger).unwrap();
         assert_eq!(decoded.data, data.data);
+        assert_eq!(decoded.sequence, Some(9));
+        assert_eq!(decoded.metadata, data.metadata);
         assert_eq!(
             count(&ledger, CopyReason::PortableSerialization).copied_bytes,
-            payload as u64
+            payload
         );
         assert_eq!(
             count(&ledger, CopyReason::PortableDeserialization).copied_bytes,
-            payload as u64
+            decode_copy_bytes(&data.data)
         );
+
+        // Strict: encoding any bulk payload is a copy; decoding is one only
+        // for audio.
         let strict = copies(CopyPolicy::RequireZeroCopy);
-        assert!(codec::encode(&data, payload, &strict).is_err());
-        assert!(codec::decode::<TransportData>(&wire, &strict).is_err());
+        assert!(codec::encode_frame(&data, &strict).is_err());
+        let decoded = codec::decode_frame(Bytes::from(wire), &strict);
+        assert_eq!(decoded.is_err(), decode_copy_bytes(&data.data) > 0);
         assert_eq!(
             count(&strict, CopyReason::PortableDeserialization).copied_bytes,
             0
@@ -100,128 +125,124 @@ fn json_roundtrip_attributes_all_bulk_types_and_rejects_strict_conversion() {
 }
 
 #[test]
-fn json_failures_are_not_reported_as_completed_encoding() {
-    struct Broken;
-    impl serde::Serialize for Broken {
-        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
-            Err(serde::ser::Error::custom("encoding sentinel"))
-        }
-    }
-    let ledger = copies(CopyPolicy::AllowCopies);
-    assert!(codec::encode(&Broken, 12, &ledger)
-        .unwrap_err()
-        .to_string()
-        .contains("sentinel"));
-    let result = count(&ledger, CopyReason::PortableSerialization);
-    assert_eq!(result.copied_bytes, 0);
-    assert_eq!(result.failed_requested_bytes, 12);
-    assert_eq!(result.in_flight, 0);
-    let strict = copies(CopyPolicy::RequireZeroCopy);
-    assert!(!codec::encode(&Broken, 12, &strict)
-        .unwrap_err()
-        .to_string()
-        .contains("sentinel"));
-    let valid = serde_json::to_string(&audio()).unwrap();
-    assert!(
-        codec::decode::<TransportData>(format!("{valid} trailing").as_bytes(), &ledger).is_err()
-    );
+fn audio_crosses_as_raw_f32_bytes() {
+    let wire = codec::encode_frame(&audio(), CopyContext::legacy()).unwrap();
+    let raw: Vec<u8> = [0.25f32, -0.5, 1.0, 0.0]
+        .iter()
+        .flat_map(|sample| sample.to_le_bytes())
+        .collect();
+    assert!(wire.windows(raw.len()).any(|window| window == raw));
+    assert!(!wire.windows(4).any(|window| window == b"0.25"));
 }
 
 #[test]
-fn sse_retains_contiguous_wire_and_counts_one_fragment_assembly() {
+fn malformed_frames_are_invalid_data() {
+    let ledger = copies(CopyPolicy::AllowCopies);
+    for body in [&b"\xff\xff"[..], &b""[..], &b"{\"data\":1}"[..]] {
+        let error = codec::decode_frame(Bytes::copy_from_slice(body), &ledger).unwrap_err();
+        assert!(
+            matches!(error, remotemedia_core::Error::InvalidData(_))
+                || error.to_string().contains("HTTP transport"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn stream_retains_contiguous_events_and_counts_one_fragment_assembly() {
     let ledger = copies(CopyPolicy::AllowCopies);
     let data = TransportData::new(RuntimeData::Text("héllo 🎧".into()));
-    let wire = format!("data: {}\r\n\r\n", serde_json::to_string(&data).unwrap());
+    let wire = frame_event(codec::encode_frame(&data, &ledger).unwrap());
     let bytes = Bytes::from(wire.clone());
     let pointer = bytes.as_ptr();
-    let mut frames = sse::Frames::default();
-    frames.push(bytes);
-    let frame = frames.next(&ledger).unwrap().unwrap();
-    assert_eq!(frame.as_ptr(), pointer);
+    let mut events = stream::Events::default();
+    events.push(bytes);
+    let event = events.next(&ledger).unwrap().unwrap();
+    assert_eq!(event.as_ptr(), pointer.wrapping_add(1));
     assert_eq!(
-        sse::decode(&frame, &ledger).unwrap().unwrap().data,
+        stream::decode(event, &ledger).unwrap().unwrap().data,
         data.data
     );
     assert_eq!(
         count(&ledger, CopyReason::VecMaterialization).copied_bytes,
         0
     );
-    assert!(frames.is_empty());
-    // Every-byte fragmentation exercises split UTF-8 and CRLF boundaries.
-    for (index, byte) in wire.bytes().enumerate() {
-        frames.push(Bytes::from(vec![byte]));
-        let frame = frames.next(&ledger).unwrap();
+    assert!(events.is_empty());
+    // Every-byte fragmentation splits the length prefix and the payload.
+    for (index, byte) in wire.iter().enumerate() {
+        events.push(Bytes::from(vec![*byte]));
+        let event = events.next(&ledger).unwrap();
         if index + 1 == wire.len() {
             assert_eq!(
-                sse::decode(&frame.unwrap(), &ledger).unwrap().unwrap().data,
+                stream::decode(event.unwrap(), &ledger)
+                    .unwrap()
+                    .unwrap()
+                    .data,
                 data.data
             );
         } else {
-            assert!(frame.is_none());
+            assert!(event.is_none());
         }
     }
     assert_eq!(
         count(&ledger, CopyReason::VecMaterialization).copied_bytes,
-        wire.len() as u64
+        wire.len() as u64 - 1
     );
 }
 
 #[test]
-fn sse_strict_staging_rejection_preserves_chunks_and_errors_are_visible() {
+fn stream_strict_staging_rejection_preserves_chunks_and_errors_are_visible() {
     let strict = copies(CopyPolicy::RequireZeroCopy);
-    let mut frames = sse::Frames::default();
-    frames.push(Bytes::from_static(b"data: "));
-    frames.push(Bytes::from_static(b"{}\n\n"));
-    assert!(frames.next(&strict).is_err());
+    let event = frame_event(
+        codec::encode_frame(
+            &TransportData::new(RuntimeData::Text("x".into())),
+            CopyContext::legacy(),
+        )
+        .unwrap(),
+    );
+    let mut events = stream::Events::default();
+    events.push(Bytes::copy_from_slice(&event[..3]));
+    events.push(Bytes::copy_from_slice(&event[3..]));
+    assert!(events.next(&strict).is_err());
     assert_eq!(
         count(&strict, CopyReason::VecMaterialization).copied_bytes,
         0
     );
+    // The refused event is still there for a context that may copy.
     let allowed = copies(CopyPolicy::AllowCopies);
-    assert!(sse::decode(b"data: broken\n\n", &allowed).is_err());
-    assert!(
-        sse::decode(b"event: error\ndata: failed output\n\n", &allowed)
-            .unwrap_err()
-            .to_string()
-            .contains("failed output")
-    );
-    assert!(sse::decode(b": keepalive\n\n", &allowed).unwrap().is_none());
+    assert!(events.next(&allowed).unwrap().is_some());
+    assert!(events.is_empty());
+
+    let error =
+        stream::decode(codec::error_event("failed output").slice(1..), &allowed).unwrap_err();
+    assert!(error.to_string().contains("failed output"), "{error}");
+    events.push(Bytes::from_static(codec::KEEPALIVE));
+    let keepalive = events.next(&allowed).unwrap().unwrap();
+    assert!(stream::decode(keepalive, &allowed).unwrap().is_none());
+    assert!(stream::decode(Bytes::from_static(b"\x0a\x05ab"), &allowed).is_err());
 }
 
 #[test]
-fn sse_multiple_events_retain_ranges_and_multiline_json_counts_assembly() {
+fn stream_multiple_events_retain_ranges() {
     let ledger = copies(CopyPolicy::AllowCopies);
     let data = TransportData::new(RuntimeData::Text("hello".into()));
-    let json = serde_json::to_string(&data).unwrap();
-    let first = format!("data: {json}\n\n");
-    let bytes = Bytes::from(format!("{first}{first}"));
+    let one = frame_event(codec::encode_frame(&data, &ledger).unwrap());
+    let bytes = Bytes::from([one.clone(), one.clone()].concat());
     let pointer = bytes.as_ptr();
-    let mut frames = sse::Frames::default();
-    frames.push(bytes);
-    for offset in [0, first.len()] {
-        let frame = frames.next(&ledger).unwrap().unwrap();
-        assert_eq!(frame.as_ptr(), pointer.wrapping_add(offset));
+    let mut events = stream::Events::default();
+    events.push(bytes);
+    for offset in [1, one.len() + 1] {
+        let event = events.next(&ledger).unwrap().unwrap();
+        assert_eq!(event.as_ptr(), pointer.wrapping_add(offset));
         assert_eq!(
-            sse::decode(&frame, &ledger).unwrap().unwrap().data,
+            stream::decode(event, &ledger).unwrap().unwrap().data,
             data.data
         );
     }
-    assert!(frames.is_empty());
+    assert!(events.is_empty());
     assert_eq!(
         count(&ledger, CopyReason::VecMaterialization).copied_bytes,
         0
-    );
-    let multiline = format!("data: {{\ndata: {}\n\n", &json[1..]);
-    assert_eq!(
-        sse::decode(multiline.as_bytes(), &ledger)
-            .unwrap()
-            .unwrap()
-            .data,
-        data.data
-    );
-    assert_eq!(
-        count(&ledger, CopyReason::VecMaterialization).copied_bytes,
-        json.len() as u64 + 1
     );
 }
 
@@ -236,7 +257,7 @@ impl Drop for Fixture {
     }
 }
 
-async fn fixture(sse_body: impl Into<String>) -> Fixture {
+async fn fixture(stream_body: Vec<u8>, content_type: &'static str) -> Fixture {
     use axum::{
         body::Bytes,
         extract::State,
@@ -248,15 +269,18 @@ async fn fixture(sse_body: impl Into<String>) -> Fixture {
         Arc,
     };
     let calls = Arc::new(AtomicUsize::new(0));
-    let sse_body = sse_body.into();
     let router = Router::new()
         .route(
             "/execute",
             post(
                 |State(calls): State<Arc<AtomicUsize>>, body: Bytes| async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    Json(serde_json::json!({"output": value["input"]}))
+                    let request = codec::ExecuteRequest::decode(body).unwrap();
+                    serde_json::from_str::<serde_json::Value>(&request.manifest_json).unwrap();
+                    (
+                        [("content-type", codec::PROTOBUF)],
+                        request.input.unwrap().encode_to_vec(),
+                    )
                 },
             ),
         )
@@ -267,15 +291,15 @@ async fn fixture(sse_body: impl Into<String>) -> Fixture {
         .route(
             "/stream/test/output",
             get(move || {
-                let body = sse_body.clone();
-                async move { ([("content-type", "text/event-stream")], body) }
+                let body = stream_body.clone();
+                async move { ([("content-type", content_type)], body) }
             }),
         )
         .route(
             "/stream/test/input",
             post(
                 |State(calls): State<Arc<AtomicUsize>>, body: Bytes| async move {
-                    let _: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    remotemedia_wire::DataBuffer::decode(body).unwrap();
                     calls.fetch_add(1, Ordering::SeqCst);
                     axum::http::StatusCode::OK
                 },
@@ -307,7 +331,7 @@ fn manifest() -> std::sync::Arc<remotemedia_core::manifest::Manifest> {
 async fn real_http_client_accounts_unary_and_stream_sends_and_refuses_strict_before_request() {
     use remotemedia_core::transport::PipelineClient;
     use std::sync::atomic::Ordering;
-    let fixture = fixture(": keepalive\n\n").await;
+    let fixture = fixture(codec::KEEPALIVE.to_vec(), codec::PROTOBUF_STREAM).await;
     let ledger = copies(CopyPolicy::AllowCopies);
     let client = crate::HttpPipelineClient::new(&fixture.url, None)
         .await
@@ -348,14 +372,24 @@ async fn real_http_client_accounts_unary_and_stream_sends_and_refuses_strict_bef
 }
 
 #[tokio::test]
-async fn real_sse_client_surfaces_parse_server_and_truncated_event_errors() {
+async fn real_stream_client_surfaces_parse_server_truncation_and_type_errors() {
     use remotemedia_core::transport::PipelineClient;
-    for (body, expected) in [
-        ("data: broken\n\n", "HTTP compatibility"),
-        ("event: error\ndata: server sentinel\n\n", "server sentinel"),
-        ("data: incomplete", "incomplete event"),
+    let server_error = codec::error_event("server sentinel").to_vec();
+    for (body, content_type, expected) in [
+        (
+            vec![2, 0xff, 0xff],
+            codec::PROTOBUF_STREAM,
+            "HTTP transport",
+        ),
+        (server_error, codec::PROTOBUF_STREAM, "server sentinel"),
+        (vec![9, 0x0a], codec::PROTOBUF_STREAM, "incomplete event"),
+        (
+            b"data: {}\n\n".to_vec(),
+            "text/event-stream",
+            "content-type",
+        ),
     ] {
-        let fixture = fixture(body).await;
+        let fixture = fixture(body, content_type).await;
         let client = crate::HttpPipelineClient::new(&fixture.url, None)
             .await
             .unwrap();
@@ -374,13 +408,10 @@ async fn real_sse_client_surfaces_parse_server_and_truncated_event_errors() {
 }
 
 #[tokio::test]
-async fn real_sse_bulk_output_uses_retained_caller_authority() {
+async fn real_stream_bulk_output_uses_retained_caller_authority() {
     use remotemedia_core::transport::PipelineClient;
-    let fixture = fixture(format!(
-        "data: {}\n\n",
-        serde_json::to_string(&audio()).unwrap()
-    ))
-    .await;
+    let event = frame_event(codec::encode_frame(&audio(), CopyContext::legacy()).unwrap());
+    let fixture = fixture(event, codec::PROTOBUF_STREAM).await;
     for policy in [CopyPolicy::AllowCopies, CopyPolicy::RequireZeroCopy] {
         let ledger = copies(policy);
         let client = crate::HttpPipelineClient::new(&fixture.url, None)

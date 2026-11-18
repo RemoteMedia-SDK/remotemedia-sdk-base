@@ -16,7 +16,8 @@ pub fn data_buffer_into_runtime_data_with_context(
             data @ (DataType::Video(_)
             | DataType::Tensor(_)
             | DataType::Binary(_)
-            | DataType::Numpy(_)),
+            | DataType::Numpy(_)
+            | DataType::Image(_)),
         ) => Ok(decode_bytes(data, Some(now_micros()))),
         other => {
             buffer.data_type = other;
@@ -36,7 +37,7 @@ pub(super) fn decode_bytes(data: DataType, arrival_ts_us: Option<u64>) -> Option
             timestamp_us: video.timestamp_us,
             codec: proto_to_video_codec(video.codec),
             is_keyframe: video.is_keyframe,
-            stream_id: None,
+            stream_id: video.stream_id,
             arrival_ts_us,
         }),
         DataType::Tensor(tensor) => Some(RuntimeData::Tensor {
@@ -48,8 +49,33 @@ pub(super) fn decode_bytes(data: DataType, arrival_ts_us: Option<u64>) -> Option
                 .collect::<Result<_, _>>()
                 .ok()?,
             dtype: tensor.dtype,
-            metadata: None,
+            metadata: tensor
+                .metadata_json
+                .and_then(|json| serde_json::from_slice(&json).ok()),
         }),
+        DataType::Image(image) => {
+            use crate::generated::ImageEncoding;
+            use remotemedia_core::data::ImageFormat;
+            Some(RuntimeData::Image {
+                format: match ImageEncoding::try_from(image.encoding).ok()? {
+                    ImageEncoding::Jpeg => ImageFormat::Jpeg,
+                    ImageEncoding::Png => ImageFormat::Png,
+                    ImageEncoding::Webp => ImageFormat::WebP,
+                    ImageEncoding::Raw => ImageFormat::Raw {
+                        pixel_format: proto_to_pixel_format(image.pixel_format),
+                    },
+                    ImageEncoding::Unspecified => return None,
+                },
+                data: remotemedia_types::SharedBytes::from_owner(image.data),
+                width: image.width,
+                height: image.height,
+                timestamp_us: image.timestamp_us,
+                stream_id: image.stream_id,
+                metadata: image
+                    .metadata_json
+                    .and_then(|json| serde_json::from_slice(&json).ok()),
+            })
+        }
         DataType::Binary(binary) => Some(RuntimeData::Binary(
             remotemedia_types::SharedBytes::from_owner(binary.data),
         )),

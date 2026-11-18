@@ -1,6 +1,6 @@
 //! HTTP server binary entry point
 //!
-//! Starts the RemoteMedia HTTP/REST service with SSE streaming support.
+//! Starts the RemoteMedia HTTP/REST service (protobuf frames, streamed output).
 //!
 //! # Usage
 //!

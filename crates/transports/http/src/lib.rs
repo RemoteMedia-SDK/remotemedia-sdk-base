@@ -1,13 +1,14 @@
-//! HTTP/REST transport for RemoteMedia pipelines with SSE streaming
+//! HTTP/REST transport for RemoteMedia pipelines with streamed protobuf output
 //!
-//! Provides HTTP-based transport with Server-Sent Events (SSE) for
-//! bidirectional streaming support.
+//! Provides HTTP-based transport with streamed output. Frames cross as
+//! protobuf `remotemedia.v1.DataBuffer` (see the `codec` module docs for the
+//! wire format); only manifests and errors are JSON.
 //!
 //! # Features
 //!
 //! - **Unary execution**: Simple request/response via POST /execute
 //! - **Streaming sessions**: Create sessions via POST /stream
-//! - **SSE output**: Continuous output streaming via GET /stream/:id/output
+//! - **Streamed output**: delimited protobuf events via GET /stream/:id/output
 //! - **Input submission**: Send inputs via POST /stream/:id/input
 //! - **Health checks**: Monitor server health via GET /health
 //!
@@ -57,22 +58,22 @@
 //! let client = registry.create_client("http", &config).await?;
 //! ```
 
-pub mod builder;
 mod body;
+pub mod builder;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod client;
 mod codec;
-mod sse;
 pub mod error;
 pub mod plugin;
 pub mod server;
+mod stream;
 
 // Re-export main types
 pub use builder::{HttpServerBuilder, HttpTransportServer};
 #[cfg(feature = "cli")]
 pub use cli::HttpServeArgs;
-pub use client::{HttpPipelineClient, HttpStreamSession};
+pub use client::{HttpPipelineClient, HttpStreamSession, HttpTimeouts};
 pub use error::{Error, Result};
 pub use plugin::HttpTransportPlugin;
 pub use server::HttpServer;

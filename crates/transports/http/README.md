@@ -1,15 +1,53 @@
 # remotemedia-http
 
-HTTP/REST transport for RemoteMedia pipelines with Server-Sent Events (SSE) streaming support.
+HTTP/REST transport for RemoteMedia pipelines. Frames cross as protobuf
+`remotemedia.v1.DataBuffer` (`proto/common.proto`, codec in `crates/wire`):
+audio as raw f32 little-endian bytes, other bulk payloads as their own bytes.
+No frame is ever JSON. Manifests (configuration) and error responses are JSON.
 
 ## Features
 
-- **Unary Execution**: Simple request/response via `POST /execute`
-- **Streaming Sessions**: Create persistent sessions via `POST /stream`
-- **SSE Output**: Continuous output streaming via `GET /stream/:id/output`
-- **Input Submission**: Send inputs via `POST /stream/:id/input`
-- **Health Checks**: Monitor server health via `GET /health`
-- **Multiple SSE Subscribers**: Each session supports multiple concurrent SSE connections
+- **Unary Execution**: request/response via `POST /execute`
+- **Streaming Sessions**: create persistent sessions via `POST /stream`
+- **Streamed Output**: delimited protobuf events via `GET /stream/:id/output`
+- **Input Submission**: send inputs via `POST /stream/:id/input`
+- **Health Checks**: `GET /health`
+- **Multiple Output Subscribers**: each session supports several concurrent output streams
+
+## Wire format
+
+| Endpoint | Body | Content type |
+|----------|------|--------------|
+| `POST /execute` | `ExecuteRequest` (below) | `application/x-protobuf` |
+| `POST /execute` response | one `DataBuffer` | `application/x-protobuf` |
+| `POST /stream` | `{"manifest": {...}}` | `application/json` |
+| `POST /stream` response | `{"session_id": "..."}` | `application/json` |
+| `POST /stream/:id/input` | one `DataBuffer` | `application/x-protobuf` |
+| `GET /stream/:id/output` | delimited `StreamEvent`s | `application/x-protobuf; delimited=true` |
+| errors (4xx/5xx) | `{"error_type", "message", "validation_errors"?}` | `application/json` |
+
+```proto
+message ExecuteRequest {
+  string manifest_json = 1;              // the pipeline manifest
+  remotemedia.v1.DataBuffer input = 2;
+}
+
+// The output stream is a sequence of StreamEvents, each preceded by its
+// length as a varint (protobuf "length-delimited" framing).
+message StreamEvent {
+  oneof event {
+    remotemedia.v1.DataBuffer frame = 1;
+    string error = 2;                    // terminal: the stream ends
+  }
+}
+// An empty event (a single 0x00 length byte) is a keepalive, sent every 15 s.
+```
+
+A frame's transport metadata (e.g. `participant.*`) travels in
+`DataBuffer.metadata` and its sequence number in `DataBuffer.sequence`.
+`DataBuffer` carries every `RuntimeData` variant losslessly, including stream
+ids, timestamps, image encodings, tensor metadata and control messages.
+JSON request bodies for frames are refused with `415 Unsupported Media Type`.
 
 ## Architecture
 
@@ -20,33 +58,49 @@ The HTTP client implements the `PipelineClient` trait and provides:
 - Streaming sessions with `create_stream_session()`
 - Health checks with `health_check()`
 
-### Client copy policy
+### Copy accounting
 
-HTTP JSON is a copying compatibility format. The client owns an `AllowCopies`
-ledger by default; `client.copy_context()` retains it for inspection. To bind
-your own authority, call `client.with_copy_context(copies.clone())` before making
-requests. Stream handles retain that exact authority after the client is dropped.
-The supplied context covers all calls made through that client; give independent
-clients distinct contexts when separate accounting is required.
+The client owns an `AllowCopies` ledger by default; `client.copy_context()`
+retains it for inspection. To bind your own authority, call
+`client.with_copy_context(copies.clone())` before making requests. Stream handles
+retain that exact authority after the client is dropped. The supplied context
+covers all calls made through that client; give independent clients distinct
+contexts when separate accounting is required.
 
-Bulk JSON encoding/decoding reports logical payload bytes and rejects under
-`RequireZeroCopy`. Contiguous response and SSE wire chunks retain their storage.
-Unary response bodies retain network chunks and decode across them without a
-full-body assembly. Fragmented SSE events and multiline SSE data require
-separately counted assembly and also reject under strict policy, including
-metadata-only fragments.
-Counts exclude JSON codec internals, metadata allocations and HTTP/TLS/kernel
-transfers. This API does not negotiate or certify zero-copy execution remotely.
-The transport plugin accepts `extra_config: {"copy_policy":"require_zero_copy"}`
-(or `"allow_copies"`); invalid policy values are rejected.
+Encoding a frame counts its bulk bytes as `PortableSerialization` and is refused
+under `RequireZeroCopy` before any payload is read. Decoding counts only audio
+samples (`PortableDeserialization`, the conversion to aligned `f32`s); video,
+image, tensor, numpy and binary payloads keep the received network buffer as
+their storage, so a strict context accepts them. Request and response bodies
+keep their network chunks: a payload inside one chunk is a view of it, and only
+a field split across chunks is assembled (codec framing, not counted). On the
+output stream, an event split across chunks is assembled once and counted as
+`VecMaterialization`, which a strict context refuses. Counts exclude metadata
+allocations and HTTP/TLS/kernel transfers. This API does not negotiate or certify
+zero-copy execution remotely. The transport plugin accepts
+`extra_config: {"copy_policy":"require_zero_copy"}` (or `"allow_copies"`);
+invalid policy values are rejected.
 
-SSE accepts LF/CRLF event boundaries, split UTF-8 and multiline data, with a
-16 MiB per-event limit. Malformed/truncated events and explicit `event: error`
-messages are returned by `receive()`. Session creation waits for the output
-subscription to connect, and a failed subscription attempts remote cleanup.
-`close()` aborts and joins local receive work, releases queued outputs and requests
-remote deletion; deletion errors are returned. Dropping a stream aborts local
-receive work but does not perform an asynchronous remote deletion.
+### Timeouts
+
+Creating a session (`POST /stream`) and a unary run (`POST /execute`) are
+answered only once the server has built the pipeline, which for a cold pipeline
+means loading its models: these wait up to 10 minutes by default. Every other
+request (sending an input, opening the output stream, closing a session) is
+bounded by 30 s, and connecting by 10 s. Change them with
+`client.with_timeouts(HttpTimeouts { session_setup, request })`
+(`session_setup: None` waits indefinitely), or through the plugin:
+`ClientConfig.timeout_ms` sets the per-request limit and
+`extra_config: {"session_setup_timeout_ms": N}` the setup limit (0 = none).
+A request that runs out of time says which limit it hit.
+
+Output events are limited to 16 MiB. Malformed or truncated events, an output
+stream with another content type, and explicit error events are returned by
+`receive()`. Session creation waits for the output subscription to connect, and a
+failed subscription attempts remote cleanup. `close()` aborts and joins local
+receive work, releases queued outputs and requests remote deletion; deletion
+errors are returned. Dropping a stream aborts local receive work but does not
+perform an asynchronous remote deletion.
 
 ### Server-Side
 
@@ -57,35 +111,36 @@ The HTTP server implements the `PipelineTransport` trait and exposes:
 - `POST /execute` - Unary pipeline execution
 - `POST /stream` - Create streaming session (returns session_id)
 - `POST /stream/:session_id/input` - Send input data to session
-- `GET /stream/:session_id/output` - SSE stream of output data
+- `GET /stream/:session_id/output` - Stream of output events
 - `DELETE /stream/:session_id` - Close streaming session
 
-**SSE Implementation:**
-- Uses `tokio::sync::broadcast` channel for multiple subscribers
-- Each session can have multiple concurrent SSE connections
-- Reports lagged subscribers with a terminal SSE error instead of silently skipping
-- Keeps alive with periodic heartbeat
+**Output streaming:**
+- Uses `tokio::sync::broadcast` for multiple subscribers
+- Each session can have multiple concurrent output connections
+- Reports lagged subscribers with a terminal error event instead of silently skipping
+- Keeps alive with a periodic empty event
 
 HTTP handlers use each core session's `transport_materialization_policy` for
-bulk JSON decoding and encoding. Unary requests first parse only the manifest,
-then decode the input under the newly created session's authority. Request bodies
+frame decoding and encoding. Unary requests decode the manifest first, then
+convert the input under the newly created session's authority. Request bodies
 retain chunks, with a 2 MiB limit. `session_copy_context(id)` exposes active stream
 accounting; `with_copy_observer` lets the host retain unary and streaming contexts
 after closure. The synchronous observer runs before bulk conversion and must
 return promptly; retaining or bounding report history is the host's responsibility.
 
-An independent task drains pipeline outputs. Each output is serialized once into
+An independent task drains pipeline outputs. Each output is encoded once into
 immutable wire storage and broadcast by ownership, with capacity for 100 outputs.
-SSE framing emits separate prefix, payload and suffix chunks. Input handlers never
-wait for output while holding the session map lock. Explicit deletion stops and
-joins the drainer and core session; cancellation of a unary handler schedules the
-same cleanup. SSE disconnection alone does not delete a remotely owned session.
+Each event is written as a small header chunk followed by the encoded frame
+itself, never recopied. Input handlers never wait for output while holding the
+session map lock. Explicit deletion stops and joins the drainer and core session;
+cancellation of a unary handler schedules the same cleanup. Disconnecting an
+output stream alone does not delete a remotely owned session.
 
-Serialization failures and observed core `node_error` events terminate the HTTP
-session and reach SSE consumers as explicit errors. The error subscription is
+Encoding failures and observed core `node_error` events terminate the HTTP
+session and reach output consumers as error events. The error subscription is
 installed before HTTP input is accepted; it does not replay ephemeral errors
 emitted before attachment by an autonomous source. The core's general node-error
-policy is unchanged. HTTP JSON remains an accounted copying compatibility path.
+policy is unchanged.
 
 ## Usage
 
@@ -93,16 +148,16 @@ policy is unchanged. HTTP JSON remains an accounted copying compatibility path.
 
 ```rust
 use remotemedia_http::HttpPipelineClient;
-use remotemedia_runtime_core::transport::PipelineClient;
+use remotemedia_core::transport::PipelineClient;
 
 // Create client
 let client = HttpPipelineClient::new("http://localhost:8080", None).await?;
 
 // Unary execution
-let output = client.execute_unary(manifest, input).await?;
+let output = client.execute_unary(manifest, input, &[], None).await?;
 
 // Streaming session
-let mut session = client.create_stream_session(manifest).await?;
+let mut session = client.create_stream_session(manifest, &[], None).await?;
 session.send(input).await?;
 while let Some(output) = session.receive().await? {
     // Process output
@@ -114,16 +169,11 @@ session.close().await?;
 
 ```rust
 use remotemedia_http::HttpServer;
-use remotemedia_runtime_core::transport::PipelineRunner;
+use remotemedia_core::transport::PipelineExecutor;
 use std::sync::Arc;
 
-// Create pipeline runner
-let runner = Arc::new(PipelineRunner::new()?);
-
-// Create HTTP server
-let server = HttpServer::new("127.0.0.1:8080".to_string(), runner).await?;
-
-// Run server
+let executor = Arc::new(PipelineExecutor::new()?);
+let server = HttpServer::new("127.0.0.1:8080".to_string(), executor).await?;
 server.serve().await?;
 ```
 
@@ -146,10 +196,10 @@ The server binary is located in `crates/services/http-server/`.
 
 ```rust
 use remotemedia_http::HttpTransportPlugin;
-use remotemedia_runtime_core::transport::TransportPluginRegistry;
+use remotemedia_core::transport::TransportPluginRegistry;
 
 let mut registry = TransportPluginRegistry::new();
-registry.register(Box::new(HttpTransportPlugin));
+registry.register(Arc::new(HttpTransportPlugin));
 
 // Create client via registry
 let config = ClientConfig {
@@ -161,71 +211,47 @@ let config = ClientConfig {
 let client = registry.create_client("http", &config).await?;
 ```
 
-## SSE Message Format
-
-Server-Sent Events use the following format:
-
-```
-data: {"data":{"Text":"hello"},"sequence":1,"metadata":{}}
-
-data: {"data":{"Audio":{"samples":[0.1,0.2],"sample_rate":16000,"channels":1,"timestamp":0}},"sequence":2,"metadata":{}}
-```
-
-Each event is prefixed with `data: ` and contains a JSON-serialized `TransportData` object.
-
 ## Differences from gRPC Transport
 
-| Feature | HTTP/SSE | gRPC |
-|---------|----------|------|
+| Feature | HTTP | gRPC |
+|---------|------|------|
 | Protocol | HTTP/1.1 or HTTP/2 | HTTP/2 only |
-| Streaming | SSE (server→client), POST (client→server) | Bidirectional |
-| Browser Support | ✅ Native | ❌ Requires grpc-web |
-| Binary Efficiency | JSON | Protobuf |
-| Connection Overhead | Higher (separate connections) | Lower (multiplexed) |
+| Streaming | delimited protobuf (server→client), POST (client→server) | Bidirectional |
+| Frame encoding | protobuf `DataBuffer` | protobuf `DataBuffer` |
+| Connection Overhead | Higher (separate requests for inputs) | Lower (multiplexed) |
 | Firewall Friendly | ✅ Standard HTTP | ⚠️ May need proxy |
 
 ## Performance Considerations
 
-- **Latency**: Higher than gRPC due to JSON serialization and separate HTTP requests for inputs
-- **Throughput**: Lower than gRPC for high-frequency streaming
-- **Browser Compatibility**: Best option for web clients without WebRTC
-- **Scalability**: Each SSE connection is a separate stream; consider connection limits
+- **Latency**: higher than gRPC because each input is a separate HTTP request
+- **Throughput**: lower than gRPC for high-frequency streaming
+- **Scalability**: each output stream is a separate connection; consider connection limits
 
 ## Best Use Cases
 
-- ✅ Web dashboards and monitoring interfaces
-- ✅ Low-frequency streaming (< 10 messages/sec)
-- ✅ Browser-based clients without WebRTC support
-- ✅ Debugging and development (easy to test with curl)
+- ✅ Environments where only plain HTTP is allowed
+- ✅ Low-frequency streaming
 - ❌ High-frequency audio streaming (use gRPC or WebRTC)
 - ❌ Bidirectional real-time communication (use WebRTC)
 
-## Testing with curl
+## Testing by hand
 
 ```bash
 # Health check
 curl http://localhost:8080/health
 
-# Unary execution
-curl -X POST http://localhost:8080/execute \
-  -H "Content-Type: application/json" \
-  -d '{
-    "manifest": {...},
-    "input": {"data":{"Text":"hello"},"sequence":null,"metadata":{}}
-  }'
-
-# Create streaming session
+# Create streaming session (the manifest is JSON configuration)
 SESSION_ID=$(curl -X POST http://localhost:8080/stream \
   -H "Content-Type: application/json" \
   -d '{"manifest":{...}}' | jq -r '.session_id')
 
-# Send input
+# Send input: a binary DataBuffer, e.g. written by remotemedia_wire::encode_frame
 curl -X POST http://localhost:8080/stream/$SESSION_ID/input \
-  -H "Content-Type: application/json" \
-  -d '{"data":{"Text":"hello"}}'
+  -H "Content-Type: application/x-protobuf" \
+  --data-binary @frame.bin
 
-# Receive outputs (SSE stream)
-curl -N http://localhost:8080/stream/$SESSION_ID/output
+# Receive outputs (binary, length-delimited StreamEvents)
+curl -N http://localhost:8080/stream/$SESSION_ID/output -o outputs.bin
 
 # Close session
 curl -X DELETE http://localhost:8080/stream/$SESSION_ID

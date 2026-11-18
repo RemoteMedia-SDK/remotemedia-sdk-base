@@ -146,8 +146,7 @@ impl Drain {
                 data = self.outputs.next() => {
                     let Some(data) = data else { break Ok(()); };
                     // Metadata carries the producing participant (provenance).
-                    let payload = data.data.bulk_payload_bytes();
-                    match codec::encode(&data, payload, &copies) {
+                    match codec::encode_frame(&data, &copies) {
                         Ok(wire) => { let _ = output.send(Bytes::from(wire)); }
                         Err(error) => break Err(error),
                     }

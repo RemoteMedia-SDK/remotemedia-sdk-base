@@ -62,15 +62,9 @@ impl<'a> PreparedRuntimeData<'a> {
         let bytes = data.bulk_payload_bytes();
         copies.check(CopyReason::PortableSerialization, bytes as u64)?;
         let payload = match data {
-            RuntimeData::Audio {
+            RuntimeData::Audio { samples, .. } => Payload::Audio {
                 samples,
-                sample_rate,
-                channels,
-                metadata,
-                ..
-            } => Payload::Audio {
-                samples,
-                header: audio_metadata(*sample_rate, *channels, samples.len(), metadata),
+                header: audio_metadata(data),
             },
             RuntimeData::DeviceTensor { .. } => Payload::Other(device_data_buffer(data, copies)?),
             _ => Payload::Other(encode_data_buffer(data)),
@@ -84,10 +78,14 @@ impl<'a> PreparedRuntimeData<'a> {
     }
 
     /// Also write `metadata` into `DataBuffer.metadata` (no-op when empty).
-    pub(crate) fn with_metadata(mut self, metadata: &std::collections::HashMap<String, String>) -> Self {
+    pub(crate) fn with_metadata(
+        mut self,
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Self {
         self.metadata = (!metadata.is_empty()).then(|| DataBuffer {
             data_type: None,
             metadata: metadata.clone(),
+            sequence: None,
         });
         self
     }
@@ -129,7 +127,9 @@ impl<'a> PreparedRuntimeData<'a> {
                     }
                 }
                 if let Some(metadata) = &self.metadata {
-                    metadata.encode(wire).expect("sized DataBuffer metadata destination");
+                    metadata
+                        .encode(wire)
+                        .expect("sized DataBuffer metadata destination");
                 }
             })
     }

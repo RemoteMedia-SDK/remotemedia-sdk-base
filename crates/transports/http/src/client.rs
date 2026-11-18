@@ -1,4 +1,4 @@
-//! HTTP/REST client implementation with SSE streaming support
+//! HTTP/REST client implementation with streamed protobuf output
 //!
 //! This module provides an HTTP client that implements the `PipelineClient` trait
 //! for executing pipelines on remote HTTP/REST servers.
@@ -6,10 +6,10 @@
 //! # Features
 //!
 //! - Unary execution via POST /execute
-//! - SSE streaming via POST /stream (create session) and GET /stream/:id/output
+//! - Streaming via POST /stream (create session) and GET /stream/:id/output
 //! - Health checks via GET /health
 //! - Authentication via Authorization header
-//! - JSON serialization of manifests and data
+//! - Frames as protobuf `DataBuffer` (see `codec`); manifests as JSON
 //!
 //! # Usage
 //!
@@ -21,7 +21,7 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::{codec, sse};
+use crate::{codec, stream};
 use async_trait::async_trait;
 use futures::StreamExt;
 use remotemedia_core::manifest::Manifest;
@@ -29,8 +29,60 @@ use remotemedia_core::transport::client::EmbeddedPythonEnv;
 use remotemedia_core::transport::{ClientStreamSession, PipelineClient, TransportData};
 use remotemedia_types::{CopyContext, CopyPolicy};
 use serde::{Deserialize, Serialize};
+
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// How long the client waits on the server.
+///
+/// Creating a session (`POST /stream`) and a unary run (`POST /execute`)
+/// answer only after the server has built the pipeline, which for a cold
+/// pipeline means loading its models (and possibly building their Python
+/// environments): minutes, not seconds. Every other request (sending an
+/// input, opening the output stream, closing a session) is bounded by
+/// `request`. Connecting is always bounded by [`HttpTimeouts::CONNECT`], so
+/// an unreachable server still fails fast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpTimeouts {
+    /// Session creation and unary execution; `None` waits indefinitely.
+    pub session_setup: Option<Duration>,
+    /// Every other request.
+    pub request: Duration,
+}
+
+impl HttpTimeouts {
+    /// Bound on establishing a connection, whatever the request.
+    pub const CONNECT: Duration = Duration::from_secs(10);
+}
+
+impl Default for HttpTimeouts {
+    fn default() -> Self {
+        Self {
+            session_setup: Some(Duration::from_secs(600)),
+            request: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Apply an optional timeout to a request.
+fn bounded(request: reqwest::RequestBuilder, timeout: Option<Duration>) -> reqwest::RequestBuilder {
+    match timeout {
+        Some(timeout) => request.timeout(timeout),
+        None => request,
+    }
+}
+
+/// An error message naming a timed-out request's limit, so a caller can tell
+/// a slow server from a broken one.
+fn send_error(what: &str, error: reqwest::Error, limit: Option<Duration>) -> String {
+    match (error.is_timeout(), limit) {
+        (true, Some(limit)) => format!(
+            "{what}: no response within {limit:?} (raise the limit with HttpPipelineClient::with_timeouts)"
+        ),
+        _ => format!("{what}: {error}"),
+    }
+}
 
 /// HTTP client for remote pipeline execution
 ///
@@ -45,6 +97,7 @@ pub struct HttpPipelineClient {
     /// Reqwest HTTP client
     client: reqwest::Client,
     copies: CopyContext,
+    timeouts: HttpTimeouts,
 }
 
 impl HttpPipelineClient {
@@ -83,8 +136,10 @@ impl HttpPipelineClient {
             )));
         }
 
-        // Bound individual RPC requests; SSE connections remain open until closed.
+        // Requests are bounded per call (`HttpTimeouts`); output streams stay
+        // open until closed.
         let client = reqwest::Client::builder()
+            .connect_timeout(HttpTimeouts::CONNECT)
             .build()
             .map_err(|e| Error::ConnectionError(format!("Failed to create HTTP client: {}", e)))?;
 
@@ -96,7 +151,20 @@ impl HttpPipelineClient {
                 CopyPolicy::AllowCopies,
                 format!("http/client/{}", uuid::Uuid::new_v4()),
             ),
+            timeouts: HttpTimeouts::default(),
         })
+    }
+
+    /// Set how long requests wait on the server (see [`HttpTimeouts`]).
+    /// Stream sessions created afterwards keep these limits.
+    pub fn with_timeouts(mut self, timeouts: HttpTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    /// The limits requests wait on the server.
+    pub fn timeouts(&self) -> HttpTimeouts {
+        self.timeouts
     }
 
     /// Bind explicit authority for all subsequent requests and stream handles.
@@ -119,22 +187,6 @@ impl HttpPipelineClient {
     }
 }
 
-/// Request body for /execute endpoint
-#[derive(Debug, Serialize)]
-struct ExecuteRequest {
-    /// Pipeline manifest
-    manifest: serde_json::Value,
-    /// Input data
-    input: TransportData,
-}
-
-/// Response body from /execute endpoint
-#[derive(Debug, Deserialize)]
-struct ExecuteResponse {
-    /// Output data
-    output: TransportData,
-}
-
 /// Request body for POST /stream (create session)
 #[derive(Debug, Serialize)]
 struct CreateStreamRequest {
@@ -147,13 +199,6 @@ struct CreateStreamRequest {
 struct CreateStreamResponse {
     /// Unique session ID
     session_id: String,
-}
-
-/// Request body for POST /stream/:id/input
-#[derive(Debug, Serialize)]
-struct StreamInputRequest {
-    /// Input data
-    data: TransportData,
 }
 
 #[async_trait]
@@ -170,27 +215,14 @@ impl PipelineClient for HttpPipelineClient {
     ) -> remotemedia_core::Result<TransportData> {
         let url = format!("{}/execute", self.base_url);
 
-        // Serialize manifest to JSON
-        let manifest_json = serde_json::to_value(manifest.as_ref()).map_err(|e| {
+        // The manifest is configuration (JSON); the input is a protobuf frame.
+        let manifest_json = serde_json::to_vec(manifest.as_ref()).map_err(|e| {
             remotemedia_core::Error::Transport(format!("Failed to serialize manifest: {}", e))
         })?;
-
-        let request_body = ExecuteRequest {
-            manifest: manifest_json,
-            input,
-        };
-
-        // Build request
-        let bytes = codec::encode(
-            &request_body,
-            request_body.input.data.bulk_payload_bytes(),
-            &self.copies,
-        )?;
-        let mut request = self
-            .client
-            .post(&url)
-            .timeout(std::time::Duration::from_secs(30))
-            .header("content-type", "application/json")
+        let bytes = codec::encode_execute_request(&manifest_json, &input, &self.copies)?;
+        let mut request = bounded(self.client.post(&url), self.timeouts.session_setup)
+            .header("content-type", codec::PROTOBUF)
+            .header("accept", codec::PROTOBUF)
             .body(bytes);
 
         // Add auth header if present
@@ -200,7 +232,11 @@ impl PipelineClient for HttpPipelineClient {
 
         // Send request
         let response = request.send().await.map_err(|e| {
-            remotemedia_core::Error::RemoteExecutionFailed(format!("HTTP request failed: {}", e))
+            remotemedia_core::Error::RemoteExecutionFailed(send_error(
+                "HTTP request failed",
+                e,
+                self.timeouts.session_setup,
+            ))
         })?;
 
         // Check status
@@ -208,17 +244,14 @@ impl PipelineClient for HttpPipelineClient {
             .await
             .map_err(remotemedia_core::Error::RemoteExecutionFailed)?;
 
-        // Parse response
-        let body = crate::body::JsonBody::collect(response.bytes_stream(), usize::MAX).await?;
-        let execute_response: ExecuteResponse = body.decode(&self.copies)?;
-
-        Ok(execute_response.output)
+        let body = crate::body::Body::collect(response.bytes_stream(), usize::MAX).await?;
+        codec::frame_from_buffer(body.decode()?, &self.copies)
     }
 
-    /// Create a streaming session with SSE
+    /// Create a streaming session
     ///
     /// Creates a session on the server and returns a handle for sending inputs
-    /// and receiving outputs via Server-Sent Events.
+    /// and receiving outputs on a stream of delimited protobuf events.
     async fn create_stream_session(
         &self,
         manifest: Arc<Manifest>,
@@ -237,20 +270,19 @@ impl PipelineClient for HttpPipelineClient {
         };
 
         // Build request
-        let mut request = self
-            .client
-            .post(&url)
-            .timeout(std::time::Duration::from_secs(30))
-            .json(&request_body);
+        // The server answers once the pipeline is built (models loaded).
+        let mut request =
+            bounded(self.client.post(&url), self.timeouts.session_setup).json(&request_body);
         if let Some(auth_header) = self.build_auth_header() {
             request = request.header("authorization", auth_header);
         }
 
         // Send request
         let response = request.send().await.map_err(|e| {
-            remotemedia_core::Error::RemoteExecutionFailed(format!(
-                "Failed to create session: {}",
-                e
+            remotemedia_core::Error::RemoteExecutionFailed(send_error(
+                "Failed to create session",
+                e,
+                self.timeouts.session_setup,
             ))
         })?;
 
@@ -273,6 +305,7 @@ impl PipelineClient for HttpPipelineClient {
             self.auth_token.clone(),
             self.client.clone(),
             self.copies.clone(),
+            self.timeouts,
         )
         .await;
         match session {
@@ -283,6 +316,7 @@ impl PipelineClient for HttpPipelineClient {
                     &self.base_url,
                     &create_response.session_id,
                     self.auth_token.as_deref(),
+                    self.timeouts.request,
                 )
                 .await;
                 let detail = cleanup
@@ -309,7 +343,7 @@ impl PipelineClient for HttpPipelineClient {
         }
 
         // Send request with short timeout
-        match tokio::time::timeout(std::time::Duration::from_secs(5), request.send()).await {
+        match tokio::time::timeout(Duration::from_secs(5), request.send()).await {
             Ok(Ok(response)) => Ok(response.status().is_success()),
             Ok(Err(e)) => {
                 tracing::warn!("Health check failed for {}: {}", self.base_url, e);
@@ -323,9 +357,9 @@ impl PipelineClient for HttpPipelineClient {
     }
 }
 
-/// HTTP streaming session using SSE for output
+/// HTTP streaming session: inputs are POSTed, outputs arrive on one stream
 ///
-/// Uses Server-Sent Events (SSE) for receiving outputs from the server.
+/// of delimited protobuf events.
 /// Inputs are sent via POST requests.
 pub struct HttpStreamSession {
     /// Unique session ID
@@ -340,33 +374,34 @@ pub struct HttpStreamSession {
     /// HTTP client
     client: reqwest::Client,
 
-    /// Receiver for output data from SSE stream.
+    /// Receiver for output data from the output stream.
     ///
-    /// Bounded — the background SSE parser task `.await`s its send, so
-    /// a slow consumer back-pressures the SSE stream parsing rather
+    /// Bounded — the background parser task `.await`s its send, so
+    /// a slow consumer back-pressures stream parsing rather
     /// than buffering events unboundedly in memory.
     output_rx: mpsc::Receiver<remotemedia_core::Result<TransportData>>,
     copies: CopyContext,
+    timeouts: HttpTimeouts,
 
     /// Whether the session is active
     active: bool,
 
-    /// Handle to the background SSE task
-    sse_task: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the background output-stream task
+    output_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HttpStreamSession {
-    /// Create a new HTTP stream session with SSE
+    /// Create a new HTTP stream session
     async fn new(
         session_id: String,
         base_url: String,
         auth_token: Option<String>,
         client: reqwest::Client,
         copies: CopyContext,
+        timeouts: HttpTimeouts,
     ) -> Result<Self> {
-        // Create bounded channel for SSE outputs. Small capacity because
-        // SSE events are typically text/JSON frames and we want to
-        // back-pressure the stream quickly when the consumer falls behind.
+        // Bounded channel for stream outputs, small so a consumer that falls
+        // behind back-pressures the stream quickly.
         // Override via `REMOTEMEDIA_HTTP_CLIENT_OUTPUT_CAPACITY`.
         let capacity: usize = std::env::var("REMOTEMEDIA_HTTP_CLIENT_OUTPUT_CAPACITY")
             .ok()
@@ -377,18 +412,20 @@ impl HttpStreamSession {
 
         // Establish the subscription before returning, so the first input cannot
         // race the server's subscriber registration. HTTP failures remain visible.
-        let sse_url = format!("{}/stream/{}/output", base_url, session_id);
-        let mut request = client.get(sse_url);
+        let output_url = format!("{}/stream/{}/output", base_url, session_id);
+        let mut request = client
+            .get(output_url)
+            .header("accept", codec::PROTOBUF_STREAM);
         if let Some(token) = &auth_token {
             request = request.bearer_auth(token);
         }
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), request.send())
+        let response = tokio::time::timeout(timeouts.request, request.send())
             .await
             .map_err(|e| Error::ConnectionError(e.to_string()))??
             .error_for_status()?;
         let stream_copies = copies.clone();
-        let sse_task = tokio::spawn(async move {
-            if let Err(error) = receive_sse(response, &output_tx, &stream_copies).await {
+        let output_task = tokio::spawn(async move {
+            if let Err(error) = receive_stream(response, &output_tx, &stream_copies).await {
                 let _ = output_tx.send(Err(error)).await;
             }
         });
@@ -400,8 +437,9 @@ impl HttpStreamSession {
             client,
             output_rx,
             active: true,
-            sse_task: Some(sse_task),
+            output_task: Some(output_task),
             copies,
+            timeouts,
         })
     }
 }
@@ -421,19 +459,12 @@ impl ClientStreamSession for HttpStreamSession {
 
         let url = format!("{}/stream/{}/input", self.base_url, self.session_id);
 
-        let request_body = StreamInputRequest { data };
-
-        // Build request
-        let bytes = codec::encode(
-            &request_body,
-            request_body.data.data.bulk_payload_bytes(),
-            &self.copies,
-        )?;
+        let bytes = codec::encode_frame(&data, &self.copies)?;
         let mut request = self
             .client
             .post(&url)
-            .timeout(std::time::Duration::from_secs(30))
-            .header("content-type", "application/json")
+            .timeout(self.timeouts.request)
+            .header("content-type", codec::PROTOBUF)
             .body(bytes);
         if let Some(auth_header) = self.build_auth_header() {
             request = request.header("authorization", auth_header);
@@ -441,7 +472,11 @@ impl ClientStreamSession for HttpStreamSession {
 
         // Send request
         let response = request.send().await.map_err(|e| {
-            remotemedia_core::Error::Transport(format!("Failed to send data: {}", e))
+            remotemedia_core::Error::Transport(send_error(
+                "Failed to send data",
+                e,
+                Some(self.timeouts.request),
+            ))
         })?;
 
         let _response = checked_response(response)
@@ -456,7 +491,7 @@ impl ClientStreamSession for HttpStreamSession {
             return Ok(None);
         }
 
-        // Receive from SSE stream channel
+        // Receive from the output stream channel
         match self.output_rx.recv().await {
             Some(Ok(data)) => Ok(Some(data)),
             Some(Err(error)) => {
@@ -464,7 +499,7 @@ impl ClientStreamSession for HttpStreamSession {
                 Err(error)
             }
             None => {
-                // SSE stream ended
+                // Output stream ended
                 self.active = false;
                 Ok(None)
             }
@@ -474,7 +509,7 @@ impl ClientStreamSession for HttpStreamSession {
     async fn close(&mut self) -> remotemedia_core::Result<()> {
         self.active = false;
         self.output_rx.close();
-        if let Some(task) = self.sse_task.take() {
+        if let Some(task) = self.output_task.take() {
             task.abort();
             // Join releases retained wire chunks, including a blocked output send.
             let _ = task.await;
@@ -485,6 +520,7 @@ impl ClientStreamSession for HttpStreamSession {
             &self.base_url,
             &self.session_id,
             self.auth_token.as_deref(),
+            self.timeouts.request,
         )
         .await
     }
@@ -504,33 +540,42 @@ impl HttpStreamSession {
 
 impl Drop for HttpStreamSession {
     fn drop(&mut self) {
-        if let Some(task) = &self.sse_task {
+        if let Some(task) = &self.output_task {
             task.abort();
         }
     }
 }
 
-async fn receive_sse(
+async fn receive_stream(
     response: reqwest::Response,
     outputs: &mpsc::Sender<remotemedia_core::Result<TransportData>>,
     copies: &CopyContext,
 ) -> remotemedia_core::Result<()> {
-    let mut stream = response.bytes_stream();
-    let mut frames = sse::Frames::default();
-    while let Some(chunk) = stream.next().await {
-        frames.push(chunk.map_err(codec::error)?);
-        while let Some(frame) = frames.next(copies)? {
-            if let Some(data) = sse::decode(&frame, copies)? {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !codec::is_protobuf(content_type) {
+        return Err(codec::error(format!(
+            "output stream has content-type {content_type:?}, expected {}",
+            codec::PROTOBUF_STREAM
+        )));
+    }
+    let mut body = response.bytes_stream();
+    let mut events = stream::Events::default();
+    while let Some(chunk) = body.next().await {
+        events.push(chunk.map_err(codec::error)?);
+        while let Some(event) = events.next(copies)? {
+            if let Some(data) = stream::decode(event, copies)? {
                 if outputs.send(Ok(data)).await.is_err() {
                     return Ok(());
                 }
             }
         }
     }
-    if !frames.is_empty() {
-        return Err(codec::error(
-            "SSE connection ended with an incomplete event",
-        ));
+    if !events.is_empty() {
+        return Err(codec::error("output stream ended with an incomplete event"));
     }
     Ok(())
 }
@@ -559,10 +604,11 @@ async fn delete_session(
     base_url: &str,
     session_id: &str,
     auth: Option<&str>,
+    timeout: Duration,
 ) -> remotemedia_core::Result<()> {
     let mut request = client
         .delete(format!("{base_url}/stream/{session_id}"))
-        .timeout(std::time::Duration::from_secs(30));
+        .timeout(timeout);
     if let Some(token) = auth {
         request = request.bearer_auth(token);
     }
@@ -601,6 +647,103 @@ mod tests {
     async fn test_invalid_url_scheme() {
         let client = HttpPipelineClient::new("ftp://invalid.com", None).await;
         assert!(client.is_err());
+    }
+
+    /// A server that takes `delay` to create a session (as when it loads a
+    /// pipeline's models), then serves an output stream with one keepalive.
+    async fn slow_setup_server(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::routing::{delete, get, post};
+        let router = axum::Router::new()
+            .route(
+                "/stream",
+                post(move || async move {
+                    tokio::time::sleep(delay).await;
+                    axum::Json(serde_json::json!({"session_id": "slow"}))
+                }),
+            )
+            .route(
+                "/stream/slow/output",
+                get(|| async {
+                    (
+                        [("content-type", codec::PROTOBUF_STREAM)],
+                        codec::KEEPALIVE.to_vec(),
+                    )
+                }),
+            )
+            .route(
+                "/stream/slow",
+                delete(|| async { axum::http::StatusCode::OK }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (url, task)
+    }
+
+    fn manifest() -> Arc<Manifest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "version":"v1", "metadata":{}, "nodes":[], "connections":[]
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_setup_may_take_longer_than_a_request() {
+        let (url, task) = slow_setup_server(Duration::from_millis(1500)).await;
+        // Setup outlasting the per-request limit still succeeds.
+        let client = HttpPipelineClient::new(&url, None)
+            .await
+            .unwrap()
+            .with_timeouts(HttpTimeouts {
+                session_setup: Some(Duration::from_secs(10)),
+                request: Duration::from_millis(500),
+            });
+        let mut session = client
+            .create_stream_session(manifest(), &[], None)
+            .await
+            .unwrap();
+        session.close().await.unwrap();
+        // So does waiting without a limit.
+        let client = client.with_timeouts(HttpTimeouts {
+            session_setup: None,
+            request: Duration::from_millis(500),
+        });
+        let mut session = client
+            .create_stream_session(manifest(), &[], None)
+            .await
+            .unwrap();
+        session.close().await.unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn session_setup_limit_is_reported_as_a_timeout() {
+        let (url, task) = slow_setup_server(Duration::from_secs(5)).await;
+        let client = HttpPipelineClient::new(&url, None)
+            .await
+            .unwrap()
+            .with_timeouts(HttpTimeouts {
+                session_setup: Some(Duration::from_millis(300)),
+                ..HttpTimeouts::default()
+            });
+        let error = match client.create_stream_session(manifest(), &[], None).await {
+            Ok(_) => panic!("session setup should time out"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no response within 300ms"), "{error}");
+        assert!(error.contains("with_timeouts"), "{error}");
+        task.abort();
+    }
+
+    #[test]
+    fn default_setup_limit_allows_cold_pipelines() {
+        let timeouts = HttpTimeouts::default();
+        assert!(timeouts.session_setup.unwrap() >= Duration::from_secs(300));
+        assert_eq!(timeouts.request, Duration::from_secs(30));
     }
 
     #[tokio::test]

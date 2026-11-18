@@ -30,8 +30,10 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             samples,
             sample_rate,
             channels,
+            stream_id,
+            timestamp_us,
+            arrival_ts_us,
             metadata,
-            ..
         } => DataType::Audio(AudioBuffer {
             samples: samples.iter().flat_map(|f| f.to_le_bytes()).collect(),
             sample_rate: *sample_rate,
@@ -41,6 +43,9 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             metadata_json: metadata
                 .as_ref()
                 .map(|m| serde_json::to_vec(m).unwrap_or_default()),
+            stream_id: stream_id.clone(),
+            timestamp_us: *timestamp_us,
+            arrival_ts_us: *arrival_ts_us,
         }),
         RuntimeData::Video {
             pixel_data,
@@ -51,7 +56,8 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
             frame_number,
             timestamp_us,
             is_keyframe,
-            ..
+            stream_id,
+            arrival_ts_us,
         } => {
             DataType::Video(VideoFrame {
                 pixel_data: pixel_data.to_vec(),
@@ -62,16 +68,24 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
                 timestamp_us: *timestamp_us,
                 codec: codec.map(|c| c as i32).unwrap_or(0), // Convert VideoCodec to i32
                 is_keyframe: *is_keyframe,
+                stream_id: stream_id.clone(),
+                arrival_ts_us: *arrival_ts_us,
             })
         }
         RuntimeData::Tensor {
-            data, shape, dtype, ..
+            data,
+            shape,
+            dtype,
+            metadata,
         } => {
             DataType::Tensor(TensorBuffer {
                 data: data.to_vec(),
                 shape: shape.iter().map(|&s| s as u64).collect(),
                 dtype: *dtype,
                 layout: String::new(), // Empty layout - nodes document expected layout
+                metadata_json: metadata
+                    .as_ref()
+                    .map(|m| serde_json::to_vec(m).unwrap_or_default()),
             })
         }
         RuntimeData::Numpy {
@@ -196,6 +210,7 @@ pub fn runtime_data_to_data_buffer(data: &RuntimeData) -> DataBuffer {
     DataBuffer {
         data_type: Some(data_type),
         metadata: metadata_map,
+        sequence: None,
     }
 }
 
@@ -277,6 +292,7 @@ pub fn data_buffer_into_runtime_data_with_context(
 ) -> Result<Option<RuntimeData>, remotemedia_core::data::CopyRejected> {
     let owned = match buffer.data_type.as_mut() {
         Some(DataType::Video(video)) => Some(std::mem::take(&mut video.pixel_data)),
+        Some(DataType::Image(image)) => Some(std::mem::take(&mut image.data)),
         Some(DataType::Tensor(tensor)) => Some(std::mem::take(&mut tensor.data)),
         Some(DataType::Binary(binary)) => Some(std::mem::take(&mut binary.data)),
         Some(DataType::Numpy(numpy)) => Some(std::mem::take(&mut numpy.data)),
@@ -295,6 +311,7 @@ pub fn data_buffer_into_runtime_data_with_context(
         let shared: remotemedia_core::data::SharedBytes = bytes.into();
         match data {
             RuntimeData::Video { pixel_data, .. } => *pixel_data = shared,
+            RuntimeData::Image { data, .. } => *data = shared,
             RuntimeData::Tensor { data, .. } => *data = shared,
             RuntimeData::Numpy { data, .. } => *data = shared,
             RuntimeData::Binary(data) => *data = shared,
@@ -305,7 +322,10 @@ pub fn data_buffer_into_runtime_data_with_context(
     // through the payload's own metadata where the payload has one.
     if !buffer.metadata.is_empty() {
         decoded = decoded.map(|data| {
-            remotemedia_core::transport::data::apply_transport_metadata_to_runtime(data, &buffer.metadata)
+            remotemedia_core::transport::data::apply_transport_metadata_to_runtime(
+                data,
+                &buffer.metadata,
+            )
         });
     }
     Ok(decoded)
@@ -347,8 +367,8 @@ pub fn data_buffer_to_runtime_data_with_arrival(
                 samples: samples.into(),
                 sample_rate: audio.sample_rate,
                 channels: audio.channels,
-                stream_id: None,
-                timestamp_us: None,
+                stream_id: audio.stream_id.clone(),
+                timestamp_us: audio.timestamp_us,
                 arrival_ts_us: arrival_ts,
                 metadata: audio
                     .metadata_json
@@ -390,15 +410,74 @@ pub fn data_buffer_to_runtime_data_with_arrival(
                 frame_number: video.frame_number,
                 timestamp_us: video.timestamp_us,
                 is_keyframe: video.is_keyframe,
-                stream_id: None,
+                stream_id: video.stream_id.clone(),
                 arrival_ts_us: arrival_ts,
+            })
+        }
+        Some(DataType::Image(image)) => {
+            use crate::generated::ImageEncoding;
+            use remotemedia_core::data::{video::PixelFormat, ImageFormat};
+            let pixel_format = match image.pixel_format {
+                1 => PixelFormat::Rgb24,
+                2 => PixelFormat::Rgba32,
+                3 => PixelFormat::Yuv420p,
+                5 => PixelFormat::I420,
+                6 => PixelFormat::NV12,
+                255 => PixelFormat::Encoded,
+                _ => PixelFormat::Unspecified,
+            };
+            Some(RuntimeData::Image {
+                format: match ImageEncoding::try_from(image.encoding).ok()? {
+                    ImageEncoding::Jpeg => ImageFormat::Jpeg,
+                    ImageEncoding::Png => ImageFormat::Png,
+                    ImageEncoding::Webp => ImageFormat::WebP,
+                    ImageEncoding::Raw => ImageFormat::Raw { pixel_format },
+                    ImageEncoding::Unspecified => return None,
+                },
+                data: image.data.clone().into(),
+                width: image.width,
+                height: image.height,
+                timestamp_us: image.timestamp_us,
+                stream_id: image.stream_id.clone(),
+                metadata: image
+                    .metadata_json
+                    .as_ref()
+                    .and_then(|bytes| serde_json::from_slice(bytes).ok()),
+            })
+        }
+        Some(DataType::Control(control)) => {
+            use crate::generated::control_message::MessageType;
+            use remotemedia_core::data::ControlMessageType;
+            Some(RuntimeData::ControlMessage {
+                message_type: match control.message_type.as_ref()? {
+                    MessageType::CancelSpeculation(c) => ControlMessageType::CancelSpeculation {
+                        from_timestamp: c.from_timestamp,
+                        to_timestamp: c.to_timestamp,
+                    },
+                    MessageType::BatchHint(b) => ControlMessageType::BatchHint {
+                        suggested_batch_size: b.suggested_batch_size as usize,
+                    },
+                    MessageType::DeadlineWarning(d) => ControlMessageType::DeadlineWarning {
+                        deadline_us: d.deadline_us,
+                    },
+                },
+                segment_id: (!control.segment_id.is_empty()).then(|| control.segment_id.clone()),
+                timestamp_ms: control.timestamp_ms,
+                metadata: if control.metadata.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(&control.metadata).ok()?
+                },
             })
         }
         Some(DataType::Tensor(tensor)) => Some(RuntimeData::Tensor {
             data: tensor.data.clone().into(),
             shape: tensor.shape.iter().map(|&s| s as i32).collect(),
             dtype: tensor.dtype,
-            metadata: None,
+            metadata: tensor
+                .metadata_json
+                .as_ref()
+                .and_then(|bytes| serde_json::from_slice(bytes).ok()),
         }),
         Some(DataType::Json(json)) => {
             let mut value: serde_json::Value = serde_json::from_str(&json.json_payload).ok()?;
@@ -483,14 +562,15 @@ pub fn data_buffer_into_transport_data_with_context(
     copies: &remotemedia_core::data::CopyContext,
 ) -> Result<Option<TransportData>, remotemedia_core::data::CopyRejected> {
     let metadata = buffer.metadata.clone();
+    let sequence = buffer.sequence;
     let Some(runtime_data) = data_buffer_into_runtime_data_with_context(buffer, None, copies)?
     else {
         return Ok(None);
     };
     let mut transport_data = TransportData::new(runtime_data);
-    if let Some(seq) = metadata.get("sequence").and_then(|s| s.parse::<u64>().ok()) {
-        transport_data.sequence = Some(seq);
-    }
+    // The sequence field; older peers put it in metadata.
+    transport_data.sequence =
+        sequence.or_else(|| metadata.get("sequence").and_then(|s| s.parse::<u64>().ok()));
     for (key, value) in metadata {
         if key != "sequence" {
             transport_data.metadata.insert(key, value);
@@ -501,6 +581,7 @@ pub fn data_buffer_into_transport_data_with_context(
 
 pub fn transport_data_to_data_buffer(data: &TransportData) -> DataBuffer {
     let mut buffer = runtime_data_to_data_buffer(&data.data);
+    buffer.sequence = data.sequence;
 
     // Add sequence number to metadata if present
     if let Some(seq) = data.sequence {
@@ -522,12 +603,13 @@ pub fn data_buffer_to_transport_data(buffer: &DataBuffer) -> Option<TransportDat
     let runtime_data = data_buffer_to_runtime_data(buffer)?;
     let mut transport_data = TransportData::new(runtime_data);
 
-    // Extract sequence number from metadata if present
-    if let Some(seq_str) = buffer.metadata.get("sequence") {
-        if let Ok(seq) = seq_str.parse::<u64>() {
-            transport_data.sequence = Some(seq);
-        }
-    }
+    // The sequence field; older peers put it in metadata.
+    transport_data.sequence = buffer.sequence.or_else(|| {
+        buffer
+            .metadata
+            .get("sequence")
+            .and_then(|seq| seq.parse::<u64>().ok())
+    });
 
     // Copy metadata
     for (key, value) in &buffer.metadata {
@@ -543,6 +625,55 @@ pub fn data_buffer_to_transport_data(buffer: &DataBuffer) -> Option<TransportDat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Fields `DataBuffer` gained so frames cross losslessly.
+    #[test]
+    fn stream_fields_sequence_and_control_messages_cross() {
+        use remotemedia_core::data::ControlMessageType;
+        let audio = RuntimeData::Audio {
+            samples: vec![0.5f32, -0.5].into(),
+            sample_rate: 16_000,
+            channels: 1,
+            stream_id: Some("mic".into()),
+            timestamp_us: Some(42),
+            arrival_ts_us: None,
+            metadata: None,
+        };
+        let mut transport = TransportData::new(audio);
+        transport.sequence = Some(7);
+        let recovered =
+            data_buffer_to_transport_data(&transport_data_to_data_buffer(&transport)).unwrap();
+        assert_eq!(recovered.sequence, Some(7));
+        assert!(matches!(
+            recovered.data,
+            RuntimeData::Audio { stream_id: Some(ref id), timestamp_us: Some(42), .. } if id == "mic"
+        ));
+
+        let tensor = RuntimeData::Tensor {
+            data: vec![0u8; 4].into(),
+            shape: vec![2, 2],
+            dtype: 1,
+            metadata: Some(serde_json::json!({ "layout": "hw" })),
+        };
+        assert_eq!(
+            data_buffer_to_runtime_data(&runtime_data_to_data_buffer(&tensor)).unwrap(),
+            tensor
+        );
+
+        let control = RuntimeData::ControlMessage {
+            message_type: ControlMessageType::CancelSpeculation {
+                from_timestamp: 1,
+                to_timestamp: 2,
+            },
+            segment_id: Some("seg".into()),
+            timestamp_ms: 3,
+            metadata: serde_json::json!({ "reason": "barge" }),
+        };
+        assert_eq!(
+            data_buffer_to_runtime_data(&runtime_data_to_data_buffer(&control)).unwrap(),
+            control
+        );
+    }
 
     // File adapter roundtrip tests (Spec 001: RuntimeData.File)
 
@@ -745,6 +876,7 @@ mod copy_authority_tests {
                 mime_type: "application/octet-stream".into(),
             })),
             metadata: Default::default(),
+            sequence: None,
         };
         let decoded = data_buffer_into_runtime_data_with_context(buffer, None, &copies)
             .unwrap()

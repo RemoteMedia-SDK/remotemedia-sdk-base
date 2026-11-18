@@ -235,12 +235,14 @@ pub extern "system" fn Java_com_remotemedia_android_NativeInterface_nativeCreate
                     if msg.session_id != sid || msg.participant_id != pid {
                         continue;
                     }
-                    let runtime_data: RuntimeData = match serde_json::from_slice(&msg.transport_data) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            error!("Failed to deserialize output: {}", e);
-                            continue;
-                        }
+                    let Some(payload) = msg.payload else {
+                        continue;
+                    };
+                    let Some(runtime_data) =
+                        remotemedia_scaling_runner_protocol::runtime_payload::payload_into_runtime_data(payload)
+                    else {
+                        error!("Dropping malformed runner output payload");
+                        continue;
                     };
                     let kind = match &runtime_data {
                         RuntimeData::Audio { .. } => "audio",

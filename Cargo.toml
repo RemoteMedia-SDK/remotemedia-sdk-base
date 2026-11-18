@@ -410,6 +410,7 @@ members = [
     "crates/services/http-server",
     "crates/services/telephony-server",
     "crates/python-nodes",
+    "crates/wire",
 ]
 exclude = [
     "crates/android",  # Excluded: depends on sibling repo remotemedia-scaling (private) not present in SDK CI

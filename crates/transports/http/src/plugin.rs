@@ -26,13 +26,13 @@ use std::sync::Arc;
 ///
 /// Provides HTTP/REST-based client and server implementations for the RemoteMedia pipeline
 /// execution framework. This plugin enables remote execution of pipelines via HTTP with
-/// Server-Sent Events (SSE) for streaming.
+/// a stream of delimited protobuf events for output.
 ///
 /// # Features
 ///
 /// - Unary execution via POST /execute
 /// - Streaming sessions via POST /stream
-/// - SSE for continuous output streaming
+/// - Delimited protobuf output stream
 /// - Health checks via GET /health
 /// - Authentication via Bearer tokens
 pub struct HttpTransportPlugin;
@@ -69,16 +69,17 @@ impl TransportPlugin for HttpTransportPlugin {
             .await
             .map_err(|e| remotemedia_core::Error::Transport(e.to_string()))?;
 
-        let policy = copy_policy(
-            config
-                .extra_config
-                .as_ref()
-                .unwrap_or(&serde_json::Value::Null),
-        )?;
-        let client = client.with_copy_context(remotemedia_types::CopyContext::new(
-            policy,
-            format!("http/client/{}", uuid::Uuid::new_v4()),
-        ));
+        let extra = config
+            .extra_config
+            .as_ref()
+            .unwrap_or(&serde_json::Value::Null);
+        let policy = copy_policy(extra)?;
+        let client = client
+            .with_copy_context(remotemedia_types::CopyContext::new(
+                policy,
+                format!("http/client/{}", uuid::Uuid::new_v4()),
+            ))
+            .with_timeouts(timeouts(config.timeout_ms, extra)?);
         Ok(Box::new(client))
     }
 
@@ -126,10 +127,35 @@ impl TransportPlugin for HttpTransportPlugin {
     ///
     /// # Returns
     ///
-    /// Validates the optional copy_policy; other transport options remain open.
+    /// Validates the optional `copy_policy` and `session_setup_timeout_ms`;
+    /// other transport options remain open.
     fn validate_config(&self, extra_config: &serde_json::Value) -> Result<()> {
-        copy_policy(extra_config).map(|_| ())
+        copy_policy(extra_config)?;
+        timeouts(None, extra_config).map(|_| ())
     }
+}
+
+/// `ClientConfig.timeout_ms` bounds each request; `extra_config`'s
+/// `session_setup_timeout_ms` bounds session creation and unary runs, which
+/// wait for the server to load the pipeline (0 = no limit).
+fn timeouts(
+    request_ms: Option<u64>,
+    extra: &serde_json::Value,
+) -> Result<crate::client::HttpTimeouts> {
+    use std::time::Duration;
+    let mut timeouts = crate::client::HttpTimeouts::default();
+    if let Some(ms) = request_ms {
+        timeouts.request = Duration::from_millis(ms);
+    }
+    if let Some(value) = extra.get("session_setup_timeout_ms") {
+        let ms = value.as_u64().ok_or_else(|| {
+            crate::codec::error(format!(
+                "session_setup_timeout_ms must be a non-negative integer, got {value}"
+            ))
+        })?;
+        timeouts.session_setup = (ms > 0).then(|| Duration::from_millis(ms));
+    }
+    Ok(timeouts)
 }
 
 fn copy_policy(config: &serde_json::Value) -> Result<remotemedia_types::CopyPolicy> {

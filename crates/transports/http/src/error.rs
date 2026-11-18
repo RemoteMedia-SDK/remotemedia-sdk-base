@@ -9,8 +9,8 @@ pub enum Error {
     #[error("HTTP request failed: {0}")]
     RequestFailed(String),
 
-    /// SSE stream error
-    #[error("SSE stream error: {0}")]
+    /// Output stream error
+    #[error("output stream error: {0}")]
     StreamError(String),
 
     /// Connection error

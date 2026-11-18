@@ -23,8 +23,11 @@ pub struct DataBuffer {
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
     >,
+    /// Position of the frame in its stream, when the sender numbers frames
+    #[prost(uint64, optional, tag = "12")]
+    pub sequence: ::core::option::Option<u64>,
     /// Data type discriminator (exactly one must be set)
-    #[prost(oneof = "data_buffer::DataType", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "data_buffer::DataType", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 11")]
     pub data_type: ::core::option::Option<data_buffer::DataType>,
 }
 /// Nested message and enum types in `DataBuffer`.
@@ -54,6 +57,9 @@ pub mod data_buffer {
         /// Spec 001: File reference with metadata
         #[prost(message, tag = "9")]
         File(super::FileBuffer),
+        /// Still image with its encoding and geometry
+        #[prost(message, tag = "11")]
+        Image(super::ImageBuffer),
     }
 }
 /// Multi-channel audio data with sample rate and format metadata
@@ -87,6 +93,16 @@ pub struct AudioBuffer {
     /// Used for annotations like speaker diarization, confidence scores
     #[prost(bytes = "vec", optional, tag = "6")]
     pub metadata_json: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Stream the audio belongs to (e.g. a call leg or track id)
+    #[prost(string, optional, tag = "7")]
+    pub stream_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Capture/presentation timestamp in microseconds
+    #[prost(uint64, optional, tag = "8")]
+    pub timestamp_us: ::core::option::Option<u64>,
+    /// When the sender's transport received the frame, in microseconds
+    /// (spec 026). Receivers may stamp their own arrival instead.
+    #[prost(uint64, optional, tag = "9")]
+    pub arrival_ts_us: ::core::option::Option<u64>,
 }
 /// Video frame data with pixel format and dimensions
 ///
@@ -128,6 +144,13 @@ pub struct VideoFrame {
     /// False for P/B-frames (require previous frames)
     #[prost(bool, tag = "8")]
     pub is_keyframe: bool,
+    /// Stream the frame belongs to (e.g. a camera track id)
+    #[prost(string, optional, tag = "9")]
+    pub stream_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// When the sender's transport received the frame, in microseconds
+    /// (spec 026). Receivers may stamp their own arrival instead.
+    #[prost(uint64, optional, tag = "10")]
+    pub arrival_ts_us: ::core::option::Option<u64>,
 }
 /// Multi-dimensional tensor data with shape and dtype
 ///
@@ -162,6 +185,9 @@ pub struct TensorBuffer {
     /// No automatic conversion performed
     #[prost(string, tag = "4")]
     pub layout: ::prost::alloc::string::String,
+    /// Optional extensible metadata as JSON bytes (UTF-8)
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub metadata_json: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 /// Numpy array buffer for zero-copy passthrough
 ///
@@ -280,6 +306,30 @@ pub struct BinaryBuffer {
     /// Not validated by protocol (client responsibility)
     #[prost(string, tag = "2")]
     pub mime_type: ::prost::alloc::string::String,
+}
+/// A still image: an encoded file (JPEG/PNG/WebP) or raw pixels.
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ImageBuffer {
+    /// Encoded image bytes, or raw pixels laid out per `pixel_format`
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "ImageEncoding", tag = "2")]
+    pub encoding: i32,
+    /// Pixel layout of a RAW image; UNSPECIFIED otherwise
+    #[prost(enumeration = "PixelFormat", tag = "3")]
+    pub pixel_format: i32,
+    #[prost(uint32, tag = "4")]
+    pub width: u32,
+    #[prost(uint32, tag = "5")]
+    pub height: u32,
+    #[prost(uint64, optional, tag = "6")]
+    pub timestamp_us: ::core::option::Option<u64>,
+    #[prost(string, optional, tag = "7")]
+    pub stream_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional extensible metadata as JSON bytes (UTF-8)
+    #[prost(bytes = "vec", optional, tag = "8")]
+    pub metadata_json: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 /// File reference with metadata and byte range support
 ///
@@ -758,6 +808,42 @@ impl TensorDtype {
             "TENSOR_DTYPE_I32" => Some(Self::I32),
             "TENSOR_DTYPE_I8" => Some(Self::I8),
             "TENSOR_DTYPE_U8" => Some(Self::U8),
+            _ => None,
+        }
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ImageEncoding {
+    Unspecified = 0,
+    Jpeg = 1,
+    Png = 2,
+    Webp = 3,
+    Raw = 4,
+}
+impl ImageEncoding {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "IMAGE_ENCODING_UNSPECIFIED",
+            Self::Jpeg => "IMAGE_ENCODING_JPEG",
+            Self::Png => "IMAGE_ENCODING_PNG",
+            Self::Webp => "IMAGE_ENCODING_WEBP",
+            Self::Raw => "IMAGE_ENCODING_RAW",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "IMAGE_ENCODING_UNSPECIFIED" => Some(Self::Unspecified),
+            "IMAGE_ENCODING_JPEG" => Some(Self::Jpeg),
+            "IMAGE_ENCODING_PNG" => Some(Self::Png),
+            "IMAGE_ENCODING_WEBP" => Some(Self::Webp),
+            "IMAGE_ENCODING_RAW" => Some(Self::Raw),
             _ => None,
         }
     }

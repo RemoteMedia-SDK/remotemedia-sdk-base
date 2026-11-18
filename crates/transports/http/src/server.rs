@@ -1,16 +1,17 @@
-//! HTTP/REST server implementation with SSE streaming
+//! HTTP/REST server implementation with streamed output
 //!
-//! Provides HTTP endpoints for pipeline execution:
+//! Provides HTTP endpoints for pipeline execution (frames are protobuf; see
+//! `codec` for the wire format):
 //! - POST /execute - Unary execution
-//! - POST /stream - Create streaming session
+//! - POST /stream - Create streaming session (JSON manifest)
 //! - POST /stream/:id/input - Send input to session
-//! - GET /stream/:id/output - Receive outputs via SSE
+//! - GET /stream/:id/output - Receive outputs as delimited protobuf events
 //! - DELETE /stream/:id - Close session
 //! - GET /health - Health check
 
 mod output;
 mod session;
-use crate::body::JsonBody;
+use crate::body::Body;
 use crate::{
     codec,
     error::{Error, Result},
@@ -44,7 +45,7 @@ struct ServerState {
     sessions: Arc<RwLock<HashMap<String, Arc<HttpSession>>>>,
 }
 
-/// HTTP server with SSE streaming support
+/// HTTP server with streamed protobuf output
 pub struct HttpServer {
     /// Server bind address
     bind_address: String,
@@ -215,18 +216,6 @@ async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
-/// Request body for /execute
-#[derive(Debug, Deserialize)]
-struct ExecuteRequest {
-    input: TransportData,
-}
-
-/// Response body for /execute
-#[derive(Debug, Serialize)]
-struct ExecuteResponse {
-    output: TransportData,
-}
-
 /// Error response body for structured error responses
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
@@ -290,7 +279,25 @@ async fn execute_handler(
     request: Request,
 ) -> std::result::Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let body = read_body(request).await?;
-    let manifest = body.manifest().map_err(map_input_error)?;
+    let codec::ExecuteRequest {
+        manifest_json,
+        input,
+    } = body.decode().map_err(map_input_error)?;
+    let manifest: Manifest = serde_json::from_str(&manifest_json).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error_type: "manifest".to_string(),
+                message: format!("Invalid manifest: {}", e),
+                validation_errors: None,
+            }),
+        )
+    })?;
+    let input = input.ok_or_else(|| {
+        map_input_error(remotemedia_core::Error::InvalidData(
+            "execute request has no input".into(),
+        ))
+    })?;
     let session = state
         .executor
         .create_session(Arc::new(manifest))
@@ -303,28 +310,22 @@ async fn execute_handler(
     }
     let outcome = async {
         let mut errors = session::subscribe_errors(&state.executor, guard.core())?;
-        let request: ExecuteRequest = body
-            .decode(&copies)
+        let input = codec::frame_from_buffer(input, &copies)
             .map_err(|error| remotemedia_core::Error::InvalidData(error.to_string()))?;
-        guard.core().send_input(request.input).await?;
+        guard.core().send_input(input).await?;
         let output = tokio::select! {
             biased;
             error = session::failure(&mut errors) => return Err(error),
             output = guard.core().recv_output() => output?,
         }
         .ok_or_else(|| codec::error("No output from pipeline"))?;
-        let size = output.data.bulk_payload_bytes();
-        codec::encode(&ExecuteResponse { output }, size, &copies)
+        codec::encode_frame(&output, &copies)
     }
     .await;
     let cleanup = guard.close().await;
     let wire = outcome.map_err(map_runtime_error)?;
     cleanup.map_err(map_runtime_error)?;
-    Ok((
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        wire,
-    )
-        .into_response())
+    Ok(([(axum::http::header::CONTENT_TYPE, codec::PROTOBUF)], wire).into_response())
 }
 
 fn map_input_error(error: remotemedia_core::Error) -> (StatusCode, Json<ErrorResponse>) {
@@ -333,7 +334,7 @@ fn map_input_error(error: remotemedia_core::Error) -> (StatusCode, Json<ErrorRes
 
 async fn read_body(
     request: Request,
-) -> std::result::Result<JsonBody, (StatusCode, Json<ErrorResponse>)> {
+) -> std::result::Result<Body, (StatusCode, Json<ErrorResponse>)> {
     let content_type = request
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -343,20 +344,21 @@ async fn read_body(
         .next()
         .unwrap_or("")
         .trim();
-    if content_type != "application/json"
-        && !(content_type.starts_with("application/") && content_type.ends_with("+json"))
-    {
+    if !codec::is_protobuf(content_type) {
         return Err((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Json(ErrorResponse {
                 error_type: "input".into(),
-                message: "Expected application/json".into(),
+                message: format!(
+                    "Expected {}: frames are protobuf remotemedia.v1.DataBuffer",
+                    codec::PROTOBUF
+                ),
                 validation_errors: None,
             }),
         ));
     }
-    // Preserve Axum Json's default 2 MiB request bound without coalescing chunks.
-    JsonBody::collect(request.into_body().into_data_stream(), 2 * 1024 * 1024)
+    // Keep Axum's default 2 MiB request bound; chunks are kept, not joined.
+    Body::collect(request.into_body().into_data_stream(), 2 * 1024 * 1024)
         .await
         .map_err(map_input_error)
 }
@@ -414,12 +416,6 @@ async fn create_stream_handler(
     Ok(Json(CreateStreamResponse { session_id }))
 }
 
-/// Request body for POST /stream/:session_id/input
-#[derive(Debug, Deserialize)]
-struct StreamInputRequest {
-    data: TransportData,
-}
-
 /// POST /stream/:session_id/input - Send input to streaming session
 async fn stream_input_handler(
     State(state): State<ServerState>,
@@ -429,8 +425,11 @@ async fn stream_input_handler(
     let handle = find_session(&state, &session_id).await?;
     let input = handle.input().map_err(map_runtime_error)?;
     let body = read_body(request).await?;
-    let request: StreamInputRequest = body.decode(&handle.copies).map_err(map_input_error)?;
-    input.send(request.data).await.map_err(map_runtime_error)?;
+    let data = body
+        .decode()
+        .and_then(|buffer| codec::frame_from_buffer(buffer, &handle.copies))
+        .map_err(map_input_error)?;
+    input.send(data).await.map_err(map_runtime_error)?;
     Ok(StatusCode::OK)
 }
 

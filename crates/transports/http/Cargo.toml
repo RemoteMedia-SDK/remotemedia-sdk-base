@@ -17,6 +17,9 @@ crate-type = ["rlib"]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = true }
 remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "3be71019c3ebf9bd6dc932e3cd1faf64bdb78f41" }
 bytes = { workspace = true }
+# Frames on the wire: protobuf remotemedia.v1.DataBuffer
+remotemedia-wire = { path = "../../wire" }
+prost = { workspace = true }
 
 # HTTP client/server
 reqwest = { version = "0.12", features = ["json", "stream"] }
