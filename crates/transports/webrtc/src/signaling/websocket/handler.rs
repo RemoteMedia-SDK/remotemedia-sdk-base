@@ -721,6 +721,9 @@ async fn handle_message(
         "server.info" => {
             handle_server_info(request, tx).await?;
         }
+        "peer.stats" => {
+            handle_peer_stats(request, state, tx, peer_id).await?;
+        }
         _ => {
             let error = JsonRpcError::new(
                 error_codes::METHOD_NOT_FOUND,
@@ -1554,6 +1557,56 @@ async fn handle_server_info(
     );
     tx.send(response.to_json()?).await?;
 
+    Ok(())
+}
+
+/// `peer.stats`: what the server has sent the calling member, by video
+/// output: frames encoded, frames dropped before encoding because the member
+/// does not receive the track, and keyframes it asked for. A member sees its
+/// own counters only. They are the same counters the peer's telemetry
+/// reports, exposed here so a client (a test, a monitoring page) can read
+/// them without access to the serving process.
+async fn handle_peer_stats(
+    request: JsonRpcRequest,
+    state: &Arc<SharedState>,
+    tx: &mpsc::Sender<String>,
+    peer_id: &Arc<RwLock<Option<String>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let request_id = request.id.clone().unwrap_or(json!(null));
+    let Some(member) = peer_id.read().await.clone() else {
+        let error = JsonRpcError::new(
+            error_codes::INVALID_REQUEST,
+            "Not announced: call peer.announce before peer.stats".to_string(),
+            request_id,
+        );
+        tx.send(error.to_json()?).await?;
+        return Ok(());
+    };
+    let server_peer = state.server_peers.read().await.get(&member).cloned();
+    let mut video = Vec::new();
+    let mut unreceived = 0;
+    if let Some(server_peer) = &server_peer {
+        for (stream, track) in server_peer.video_output_tracks().await {
+            unreceived += track.frames_unreceived();
+            video.push(json!({
+                "stream": stream,
+                "frames_encoded": track.frames_encoded(),
+                "frames_unreceived": track.frames_unreceived(),
+                "keyframes_requested": track.keyframes_requested(),
+            }));
+        }
+    }
+    let response = JsonRpcResponse::new(
+        json!({
+            "peer_id": member,
+            // False until the member's offer has been answered.
+            "connected": server_peer.is_some(),
+            "video": video,
+            "video_frames_unreceived": unreceived,
+        }),
+        request_id,
+    );
+    tx.send(response.to_json()?).await?;
     Ok(())
 }
 

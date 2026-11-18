@@ -1697,9 +1697,17 @@ impl ServerPeer {
                 Box::pin(async move {
                     info!("Remote track added for peer {}: kind={}", peer_id, track.kind());
 
-                    // Only process audio tracks
+                    // A member's video track (a camera, a shared screen)
+                    // reaches the pipeline as encoded frames; a node that
+                    // wants pixels decodes them (`VideoDecoder`).
+                    #[cfg(feature = "ws-signaling")]
+                    if track.kind() == webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Video {
+                        info!("Starting video reception task for peer {}", peer_id);
+                        tokio::spawn(receive_member_video(track, peer_id, dc_input_tx));
+                        return;
+                    }
                     if track.kind() != webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Audio {
-                        info!("Ignoring non-audio track for peer {}", peer_id);
+                        info!("Ignoring non-media track for peer {}", peer_id);
                         return;
                     }
 
@@ -2091,6 +2099,61 @@ pub(crate) fn order_video_outputs(
         }
     }
     ordered
+}
+
+/// Read a member's video track and send each frame to the pipeline as an
+/// encoded [`RuntimeData::Video`] on stream `<peer>:video`, attributed to
+/// the member. Frames are reassembled from RTP, not decoded: the size comes
+/// from the keyframes that carry it and is repeated on the frames between.
+#[cfg(feature = "ws-signaling")]
+async fn receive_member_video(
+    track: Arc<webrtc::track::track_remote::TrackRemote>,
+    peer_id: String,
+    input: mpsc::Sender<PeerInput>,
+) {
+    use crate::peer_client::{AssembledCodec, FrameAssembler};
+    use remotemedia_core::data::video::{PixelFormat, VideoCodec};
+
+    let mime = track.codec().capability.mime_type;
+    let mut frames = FrameAssembler::new(&mime);
+    let codec = match frames.codec() {
+        AssembledCodec::H264 => VideoCodec::H264,
+        AssembledCodec::Vp8 => VideoCodec::Vp8,
+        AssembledCodec::Other => {
+            warn!("Video track of peer {} uses {}, which is not ingested", peer_id, mime);
+            return;
+        }
+    };
+    let stream = format!("{peer_id}:video");
+    let (mut size, mut number) = ((0u32, 0u32), 0u64);
+    while let Ok((packet, _)) = track.read_rtp().await {
+        let Some(frame) = frames.push(&packet) else { continue };
+        if let Some(dimensions) = frame.dimensions {
+            size = dimensions;
+        }
+        let transport_data = TransportData {
+            data: RuntimeData::Video {
+                pixel_data: frame.data.to_vec().into(),
+                width: size.0,
+                height: size.1,
+                format: PixelFormat::Encoded,
+                codec: Some(codec),
+                frame_number: number,
+                // RTP video clock: 90 kHz.
+                timestamp_us: u64::from(frame.rtp_timestamp) * 100 / 9,
+                is_keyframe: frame.keyframe,
+                stream_id: Some(stream.clone()),
+                arrival_ts_us: None,
+            },
+            sequence: None,
+            metadata: participant_metadata(&peer_id, stream.clone(), participant::modality::VIDEO),
+        };
+        number += 1;
+        if input.send(PeerInput::Data(transport_data)).await.is_err() {
+            break;
+        }
+    }
+    debug!("Video reception ended for peer {}", peer_id);
 }
 
 /// `receive.video` of `peer.offer` params: a list of stream ids, or `false`

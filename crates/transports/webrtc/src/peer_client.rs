@@ -76,6 +76,9 @@ pub struct PeerClientOptions {
     pub ticket: Option<String>,
     /// Add a microphone-like audio track, so [`PeerClient::send_audio`] works.
     pub send_audio: bool,
+    /// Add a camera-like H.264 video track, so
+    /// [`PeerClient::send_video_frame`] works.
+    pub send_video: bool,
     /// Offer an audio section to receive the pipeline's audio.
     pub receive_audio: bool,
     /// Which video outputs to receive.
@@ -93,6 +96,7 @@ impl Default for PeerClientOptions {
             capabilities: vec!["audio".into(), "video".into(), "data".into()],
             ticket: None,
             send_audio: true,
+            send_video: false,
             receive_audio: true,
             receive_video: ReceiveVideo::Planned,
             data_channel: true,
@@ -188,6 +192,7 @@ pub struct PeerClient {
     rtc: Arc<RTCPeerConnection>,
     channel: Option<Arc<RTCDataChannel>>,
     audio_out: Option<AudioOut>,
+    video_out: Option<Arc<TrackLocalStaticSample>>,
     events: Option<mpsc::UnboundedReceiver<PeerEvent>>,
     announce: Value,
     answered: Vec<AnsweredSection>,
@@ -398,6 +403,28 @@ impl PeerClient {
                 .await
                 .map_err(|e| Error::PeerConnectionError(e.to_string()))?;
         }
+        // After the receiving sections: the server gives its planned video
+        // outputs to the first video sections of the offer.
+        let mut video_out = None;
+        if options.send_video {
+            let track = Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: webrtc::api::media_engine::MIME_TYPE_H264.to_string(),
+                    clock_rate: 90_000,
+                    channels: 0,
+                    sdp_fmtp_line:
+                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                            .into(),
+                    rtcp_feedback: vec![],
+                },
+                "video".into(),
+                format!("{}-camera", options.peer_id),
+            ));
+            rtc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+                .await
+                .map_err(|e| Error::MediaTrackError(format!("video track: {e}")))?;
+            video_out = Some(track);
+        }
 
         let channel_open = Arc::new(AtomicBool::new(false));
         let mut channel = None;
@@ -496,6 +523,7 @@ impl PeerClient {
             rtc,
             channel,
             audio_out,
+            video_out,
             events: Some(events),
             announce,
             answered,
@@ -595,6 +623,23 @@ impl PeerClient {
         Ok(())
     }
 
+    /// Send one encoded H.264 frame (Annex B) on the camera track.
+    pub async fn send_video_frame(&self, frame: Bytes, duration: Duration) -> Result<()> {
+        let track = self
+            .video_out
+            .as_ref()
+            .ok_or_else(|| Error::MediaTrackError("joined without a sending video track".into()))?;
+        track
+            .write_sample(&webrtc::media::Sample {
+                data: frame,
+                duration,
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| Error::MediaTrackError(format!("write video: {e}")))
+    }
+
     /// One more JSON-RPC request on the signalling socket (`control.*`,
     /// `peer.list`, `server.info`, ...).
     pub async fn signaling_request(&self, method: &str, params: Value) -> Result<Value> {
@@ -684,9 +729,11 @@ async fn read_track(
     }
 }
 
-/// A reassembled video frame's facts.
+/// A reassembled video frame: its facts and its encoded bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoFrameInfo {
+    /// The encoded frame (H.264: Annex B).
+    pub data: Bytes,
     /// Encoded size.
     pub bytes: usize,
     /// Whether it is a keyframe.
@@ -700,6 +747,17 @@ pub struct VideoFrameInfo {
 enum VideoKind {
     H264(webrtc::rtp::codecs::h264::H264Packet),
     Vp8(webrtc::rtp::codecs::vp8::Vp8Packet),
+    Other,
+}
+
+/// The codec of a video track that [`FrameAssembler`] reassembles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssembledCodec {
+    /// H.264, frames in Annex B.
+    H264,
+    /// VP8.
+    Vp8,
+    /// Another codec: packets are grouped but not depacketized.
     Other,
 }
 
@@ -725,6 +783,15 @@ impl FrameAssembler {
             kind,
             data: Vec::new(),
             timestamp: None,
+        }
+    }
+
+    /// The codec this assembler was made for.
+    pub fn codec(&self) -> AssembledCodec {
+        match self.kind {
+            VideoKind::H264(_) => AssembledCodec::H264,
+            VideoKind::Vp8(_) => AssembledCodec::Vp8,
+            VideoKind::Other => AssembledCodec::Other,
         }
     }
 
@@ -764,6 +831,7 @@ impl FrameAssembler {
         };
         Some(VideoFrameInfo {
             bytes: data.len(),
+            data: Bytes::from(data),
             keyframe,
             dimensions,
             rtp_timestamp,

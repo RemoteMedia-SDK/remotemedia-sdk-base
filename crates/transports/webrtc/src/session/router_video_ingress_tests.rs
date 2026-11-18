@@ -12,20 +12,28 @@ async fn video_ingress_router_preserves_sample_owners_policy_and_selected_output
         ..Default::default()
     })
     .unwrap();
-    let RuntimeData::Video {
-        pixel_data: packet, ..
-    } = encoder
-        .encode_frame_with_copy_context(
-            frame(PixelFormat::Yuv420p),
-            &CopyContext::new(CopyPolicy::AllowCopies, "fixture"),
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("expected encoded packet")
-    };
+    // An encoder may hold frames back before its first packet (Media
+    // Foundation's H.264 MFT holds 16): feed the fixture frame until one
+    // comes out. This is outside the measured path.
+    let mut packet = None;
+    for _ in 0..64 {
+        let RuntimeData::Video { pixel_data, .. } = encoder
+            .encode_frame_with_copy_context(
+                frame(PixelFormat::Yuv420p),
+                &CopyContext::new(CopyPolicy::AllowCopies, "fixture"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected encoded packet")
+        };
+        if !pixel_data.is_empty() {
+            packet = Some(pixel_data);
+            break;
+        }
+    }
     drop(encoder);
-    assert!(!packet.is_empty());
+    let packet = packet.expect("the encoder produced no packet in 64 frames");
     // This snapshot emulates a network-owned encoded sample, outside the measured path.
     let wire: SharedBytes = packet.as_slice().to_vec().into();
     let peer = Arc::new(

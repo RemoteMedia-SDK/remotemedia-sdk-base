@@ -112,6 +112,10 @@ impl NodeProvider for CoreNodesProvider {
         registry.register(Arc::new(
             crate::nodes::test_pattern_video::TestPatternVideoNodeFactory,
         ));
+        // Test probe: a JSON description of every input.
+        registry.register(Arc::new(
+            crate::nodes::test_input_probe::TestInputProbeNodeFactory,
+        ));
         // Test stand-in for a VAD node: loud input is "speech".
         registry.register(Arc::new(
             crate::nodes::test_energy_vad::TestEnergyVadNodeFactory,

@@ -200,6 +200,12 @@ async fn a_member_that_declines_video_gets_none() {
         .send_data(&RuntimeData::Text("ping".into()))
         .await
         .unwrap();
+    // The server says so itself: frames were produced for this member and
+    // dropped before the encoder.
+    let stats = client.signaling_request("peer.stats", json!({})).await.unwrap();
+    assert!(stats["video_frames_unreceived"].as_u64().unwrap() >= 5, "{stats}");
+    assert_eq!(stats["video"][0]["stream"], "avatar");
+    assert_eq!(stats["video"][0]["frames_encoded"], 0, "{stats}");
     // The echo proves the pipeline ran; nothing before it may be video.
     until(&mut client, Duration::from_secs(20), "echo", |event| {
         assert!(

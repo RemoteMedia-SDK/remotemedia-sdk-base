@@ -201,6 +201,8 @@ pub use member_media::{
 pub mod audio_file_decoder;
 /// Passes on only the listed kinds of data; heads the audio and text paths of a voice pipeline.
 pub mod media_kind_filter;
+/// Test probe: a JSON description of every input, for checking what a transport delivers.
+pub mod test_input_probe;
 /// Test stand-in for a VAD node (loud = speech); not a speech detector.
 pub mod test_energy_vad;
 /// Test stand-in for a video source (a moving bar under a stream id); not a renderer.
