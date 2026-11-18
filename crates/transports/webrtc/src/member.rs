@@ -48,6 +48,14 @@ pub const PIPELINE_CHANNEL_LABEL: &str = "pipeline";
 /// The server peer's id in signalling.
 const SERVER_PEER: &str = "remotemedia-server";
 
+/// An ICE server for the member's connection.
+#[derive(Debug, Clone, Default)]
+pub struct MemberIceServer {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+}
+
 /// How to join.
 #[derive(Debug, Clone)]
 pub struct MemberPeerConfig {
@@ -56,7 +64,7 @@ pub struct MemberPeerConfig {
     /// The single-use ticket the admission returned.
     pub ticket: String,
     /// ICE servers for this member's connection. Empty: host candidates only.
-    pub ice_servers: Vec<RTCIceServer>,
+    pub ice_servers: Vec<MemberIceServer>,
     /// How long signalling, ICE and DTLS may take before `connect` fails.
     pub connect_timeout: Duration,
 }
@@ -223,7 +231,16 @@ impl MemberPeer {
             webrtc::api::APIBuilder::new()
                 .build()
                 .new_peer_connection(RTCConfiguration {
-                    ice_servers: config.ice_servers.clone(),
+                    ice_servers: config
+                        .ice_servers
+                        .iter()
+                        .map(|server| RTCIceServer {
+                            urls: server.urls.clone(),
+                            username: server.username.clone().unwrap_or_default(),
+                            credential: server.credential.clone().unwrap_or_default(),
+                            ..Default::default()
+                        })
+                        .collect(),
                     ..Default::default()
                 })
                 .await
