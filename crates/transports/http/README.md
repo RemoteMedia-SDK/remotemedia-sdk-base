@@ -81,6 +81,19 @@ zero-copy execution remotely. The transport plugin accepts
 `extra_config: {"copy_policy":"require_zero_copy"}` (or `"allow_copies"`);
 invalid policy values are rejected.
 
+### Timeouts
+
+Creating a session (`POST /stream`) and a unary run (`POST /execute`) are
+answered only once the server has built the pipeline, which for a cold pipeline
+means loading its models: these wait up to 10 minutes by default. Every other
+request (sending an input, opening the output stream, closing a session) is
+bounded by 30 s, and connecting by 10 s. Change them with
+`client.with_timeouts(HttpTimeouts { session_setup, request })`
+(`session_setup: None` waits indefinitely), or through the plugin:
+`ClientConfig.timeout_ms` sets the per-request limit and
+`extra_config: {"session_setup_timeout_ms": N}` the setup limit (0 = none).
+A request that runs out of time says which limit it hit.
+
 Output events are limited to 16 MiB. Malformed or truncated events, an output
 stream with another content type, and explicit error events are returned by
 `receive()`. Session creation waits for the output subscription to connect, and a

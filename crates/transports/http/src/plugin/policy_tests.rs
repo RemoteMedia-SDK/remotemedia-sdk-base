@@ -24,6 +24,31 @@ fn policy_configuration_accepts_only_supported_values() {
     );
 }
 
+#[test]
+fn timeout_configuration() {
+    use std::time::Duration;
+    let defaults = timeouts(None, &serde_json::Value::Null).unwrap();
+    assert_eq!(defaults, crate::HttpTimeouts::default());
+    let set = timeouts(
+        Some(2_000),
+        &serde_json::json!({"session_setup_timeout_ms": 900_000}),
+    )
+    .unwrap();
+    assert_eq!(set.request, Duration::from_secs(2));
+    assert_eq!(set.session_setup, Some(Duration::from_secs(900)));
+    let unlimited = timeouts(None, &serde_json::json!({"session_setup_timeout_ms": 0})).unwrap();
+    assert_eq!(unlimited.session_setup, None);
+    for invalid in [
+        serde_json::json!(-1),
+        serde_json::json!("10s"),
+        serde_json::json!(1.5),
+    ] {
+        assert!(HttpTransportPlugin
+            .validate_config(&serde_json::json!({"session_setup_timeout_ms": invalid}))
+            .is_err());
+    }
+}
+
 #[tokio::test]
 async fn factory_client_strict_policy_rejects_bulk_before_network_request() {
     let config = ClientConfig {

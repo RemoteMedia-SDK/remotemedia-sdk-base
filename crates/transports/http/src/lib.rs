@@ -73,7 +73,7 @@ mod stream;
 pub use builder::{HttpServerBuilder, HttpTransportServer};
 #[cfg(feature = "cli")]
 pub use cli::HttpServeArgs;
-pub use client::{HttpPipelineClient, HttpStreamSession};
+pub use client::{HttpPipelineClient, HttpStreamSession, HttpTimeouts};
 pub use error::{Error, Result};
 pub use plugin::HttpTransportPlugin;
 pub use server::HttpServer;
