@@ -66,6 +66,8 @@ impl InputSender {
 enum Outcome {
     Got(&'static str, TransportData),
     Closed(&'static str),
+    /// `close` was called while the receive was waiting.
+    SessionClosed,
 }
 
 type MembershipSlot = Arc<Mutex<Option<crate::shared_sessions::SharedMembership>>>;
@@ -87,6 +89,8 @@ pub struct PyStreamingSession {
     /// This handle's membership of a shared session (`None` for a private
     /// session); closing the last handle closes the shared session.
     membership: MembershipSlot,
+    /// Ends pending receives when `close` is called.
+    closing: crate::shared_sessions::CloseSignal,
     /// Keep the executor alive for the session's lifetime. The scheduler
     /// task spawned at session creation holds `Arc` clones internally, but
     /// holding the executor here is a defensive cheap guarantee.
@@ -176,6 +180,7 @@ impl PyStreamingSession {
             py,
             Arc::clone(&self.audio_rx),
             self.input_copies.session.clone(),
+            self.closing.clone(),
         )
     }
 
@@ -185,6 +190,7 @@ impl PyStreamingSession {
             py,
             Arc::clone(&self.data_rx),
             self.input_copies.session.clone(),
+            self.closing.clone(),
         )
     }
 
@@ -194,6 +200,7 @@ impl PyStreamingSession {
             py,
             Arc::clone(&self.video_rx),
             self.input_copies.session.clone(),
+            self.closing.clone(),
         )
     }
 
@@ -263,7 +270,11 @@ impl PyStreamingSession {
         let video = Arc::clone(&self.video_rx);
         let data = Arc::clone(&self.data_rx);
         let membership = Arc::clone(&self.membership);
+        let closing = self.closing.clone();
         future_into_py(py, async move {
+            // First, so a receive waiting for output lets go of the
+            // receivers' locks.
+            closing.close();
             // A participant leaves its shared session: its per-participant
             // node instances drain and stop.
             if let Some(InputSender::Participant(participant)) = input_sender.lock().await.take() {
@@ -306,6 +317,7 @@ impl PyStreamingSession {
         let video = Arc::clone(&self.video_rx);
         let data = Arc::clone(&self.data_rx);
         let copies = self.input_copies.session.clone();
+        let closing = self.closing.clone();
         future_into_py(py, async move {
             loop {
                 let mut a_guard = audio.lock().await;
@@ -346,6 +358,7 @@ impl PyStreamingSession {
                     tokio::pin!(a_fut, v_fut, d_fut);
                     tokio::select! {
                         biased;
+                        _ = closing.closed() => Outcome::SessionClosed,
                         v = &mut a_fut, if a_active => match v {
                             Some(rd) => Outcome::Got("audio", rd),
                             None => Outcome::Closed("audio"),
@@ -391,6 +404,8 @@ impl PyStreamingSession {
                         *d_guard = None;
                     }
                     Outcome::Closed(_) => unreachable!(),
+                    // The receivers taken above are dropped with the session.
+                    Outcome::SessionClosed => return Python::attach(|py| Ok(py.None())),
                 }
             }
         })
@@ -401,11 +416,16 @@ fn recv_kind_async(
     py: Python<'_>,
     rx_arc: RxSlot,
     copies: CopyContext,
+    closing: crate::shared_sessions::CloseSignal,
 ) -> PyResult<Bound<'_, PyAny>> {
     future_into_py(py, async move {
         let mut guard = rx_arc.lock().await;
         let result = match guard.as_mut() {
-            Some(rx) => rx.recv().await.map(|out| out.data),
+            Some(rx) => tokio::select! {
+                biased;
+                _ = closing.closed() => None,
+                out = rx.recv() => out.map(|out| out.data),
+            },
             None => None,
         };
         if result.is_none() {
@@ -622,6 +642,7 @@ pub(crate) async fn build_session(
         .ok_or_else(|| PyRuntimeError::new_err("session output receivers already taken"))?;
 
     Ok(PyStreamingSession {
+        closing: crate::shared_sessions::CloseSignal::new(),
         output_allocator: handle.output_allocator(),
         input_copies: InputCopies::new(handle.transport_copy_context()),
         node_copies: handle.node_materialization_copies(),
@@ -671,6 +692,7 @@ pub(crate) async fn build_shared_session(
     let membership = crate::shared_sessions::SharedMembership::join(Arc::clone(&shared));
 
     Ok(PyStreamingSession {
+        closing: crate::shared_sessions::CloseSignal::new(),
         output_allocator: shared.output_allocator().await,
         input_copies: InputCopies::new(shared.transport_copy_context().await),
         node_copies: shared.node_materialization_copies().await,

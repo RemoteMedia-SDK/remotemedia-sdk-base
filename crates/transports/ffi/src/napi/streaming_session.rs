@@ -160,6 +160,8 @@ pub struct NapiStreamingSession {
     handle: HandleSlot,
     /// Membership of a shared session; `None` for a private session.
     membership: MembershipSlot,
+    /// Ends pending receives when `close` is called.
+    closing: crate::shared_sessions::CloseSignal,
     _executor: Arc<PipelineExecutor>,
     output_allocator: Arc<dyn remotemedia_types::OutputAllocator>,
 }
@@ -217,19 +219,19 @@ impl NapiStreamingSession {
     /// `null` once the channel is closed.
     #[napi]
     pub async fn recv_audio(&self) -> Result<Option<NapiRuntimeData>> {
-        recv_kind(&self.audio_rx, &self.copies).await
+        recv_kind(&self.audio_rx, &self.copies, &self.closing).await
     }
 
     /// Await the next video-kind output.
     #[napi]
     pub async fn recv_video(&self) -> Result<Option<NapiRuntimeData>> {
-        recv_kind(&self.video_rx, &self.copies).await
+        recv_kind(&self.video_rx, &self.copies, &self.closing).await
     }
 
     /// Await the next data-kind output (text / json / tensor / etc.).
     #[napi]
     pub async fn recv_data(&self) -> Result<Option<NapiRuntimeData>> {
-        recv_kind(&self.data_rx, &self.copies).await
+        recv_kind(&self.data_rx, &self.copies, &self.closing).await
     }
 
     /// Await the next output across all kinds. Resolves to a
@@ -262,6 +264,8 @@ impl NapiStreamingSession {
             enum Outcome {
                 Got(&'static str, TransportData),
                 Closed(&'static str),
+                /// `close` was called while the receive was waiting.
+                SessionClosed,
             }
 
             let outcome: Outcome = {
@@ -286,6 +290,7 @@ impl NapiStreamingSession {
                 tokio::pin!(a_fut, v_fut, d_fut);
                 tokio::select! {
                     biased;
+                    _ = self.closing.closed() => Outcome::SessionClosed,
                     v = &mut a_fut, if a_active => match v {
                         Some(rd) => Outcome::Got("audio", rd),
                         None => Outcome::Closed("audio"),
@@ -328,6 +333,8 @@ impl NapiStreamingSession {
                     *d_guard = None;
                 }
                 Outcome::Closed(_) => unreachable!(),
+                // The receivers taken above are dropped with the session.
+                Outcome::SessionClosed => return Ok(None),
             }
         }
     }
@@ -343,6 +350,9 @@ impl NapiStreamingSession {
     /// Gracefully tear down the session. Idempotent.
     #[napi]
     pub async fn close(&self) -> Result<()> {
+        // First, so a receive waiting for output lets go of the receivers'
+        // locks.
+        self.closing.close();
         // A participant leaves its shared session: its per-participant node
         // instances drain and stop.
         if let Some(InputSender::Participant(participant)) = self.input_sender.lock().await.take() {
@@ -374,10 +384,15 @@ impl NapiStreamingSession {
 async fn recv_kind(
     rx_arc: &RxSlot,
     copies: &remotemedia_types::CopyContext,
+    closing: &crate::shared_sessions::CloseSignal,
 ) -> Result<Option<NapiRuntimeData>> {
     let mut guard = rx_arc.lock().await;
     let result = match guard.as_mut() {
-        Some(rx) => rx.recv().await.map(|out| out.data),
+        Some(rx) => tokio::select! {
+            biased;
+            _ = closing.closed() => None,
+            out = rx.recv() => out.map(|out| out.data),
+        },
         None => None,
     };
     if result.is_none() {
@@ -467,6 +482,7 @@ pub(crate) async fn build_session(
         .ok_or_else(|| Error::from_reason("session output receivers already taken"))?;
 
     Ok(NapiStreamingSession {
+        closing: crate::shared_sessions::CloseSignal::new(),
         output_allocator: handle.output_allocator(),
         copies: handle.transport_copy_context(),
         session_id,
@@ -537,6 +553,7 @@ pub async fn create_shared_streaming_session(
     let (audio_rx, video_rx, data_rx) = bridge_outputs(shared.subscribe_outputs());
     let membership = crate::shared_sessions::SharedMembership::join(Arc::clone(&shared));
     Ok(NapiStreamingSession {
+        closing: crate::shared_sessions::CloseSignal::new(),
         output_allocator: shared.output_allocator().await,
         copies: shared.transport_copy_context().await,
         session_id: shared.session_id().to_string(),
