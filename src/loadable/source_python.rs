@@ -71,12 +71,20 @@ pub struct SourcePythonPlugin {
 /// to know anything new about plugins.
 pub struct SourcePythonFactory {
     plugin: Arc<SourcePythonPlugin>,
-    protected_python: Option<PathBuf>,
+    protected_python: Option<ProtectedPython>,
     /// SHA-256 over the plugin's source files. Identifies the code a worker
     /// runs, so two versions of a plugin never share a worker.
     digest: String,
     /// `json_input = "text"` in `plugin.toml`.
     json_as_text: bool,
+}
+
+type ControllerInstance =
+    Arc<std::sync::OnceLock<Arc<crate::nodes::python_streaming::PythonStreamingNode>>>;
+
+struct ProtectedPython {
+    executable: PathBuf,
+    instance: ControllerInstance,
 }
 
 /// Environment switch that keeps the previous plugin-SDK runner for source
@@ -144,9 +152,16 @@ impl SourcePythonFactory {
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    pub(crate) fn with_protected_python(mut self, executable: PathBuf) -> Self {
-        self.protected_python = Some(executable);
-        self
+    pub(crate) fn with_protected_python(
+        mut self,
+        executable: PathBuf,
+    ) -> (Self, ControllerInstance) {
+        let instance = ControllerInstance::default();
+        self.protected_python = Some(ProtectedPython {
+            executable,
+            instance: instance.clone(),
+        });
+        (self, instance)
     }
 
     /// SHA-256 (hex) of the plugin's source files.
@@ -202,11 +217,16 @@ impl SourcePythonFactory {
             _ => PythonStreamingNode::new(node_id, &plugin.node_type, &params)?,
         }
         .with_spawn_settings(settings);
-        let node = match &self.protected_python {
-            Some(executable) => node.with_protected_python(executable.clone()),
-            None => node,
+        let node = if let Some(protected) = &self.protected_python {
+            let node = Arc::new(node.with_protected_python(protected.executable.clone()));
+            protected.instance.set(node.clone()).map_err(|_| {
+                Error::Execution("the protected controller already has an instance".into())
+            })?;
+            node
+        } else {
+            Arc::new(node)
         };
-        Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(node))))
+        Ok(Box::new(crate::nodes::AsyncNodeWrapper(node)))
     }
 
     /// Access the resolved plugin metadata.

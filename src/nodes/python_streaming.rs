@@ -153,6 +153,18 @@ impl PythonStreamingNode {
         self
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "python-source-plugin"
+    ))]
+    pub(crate) async fn reap_protected_worker(&self) -> Result<(), Error> {
+        if let Some(mut executor) = self.executor.lock().await.take() {
+            executor.cleanup().await?;
+        }
+        Ok(())
+    }
+
     /// Create with session ID for multiprocess execution (spec 002)
     pub fn with_session(
         node_id: String,
@@ -299,7 +311,14 @@ impl PythonStreamingNode {
             };
 
             // Initialize
-            py_executor.initialize(&context).await?;
+            if let Err(error) = py_executor.initialize(&context).await {
+                if self.protected_python.is_some() {
+                    if let Err(cleanup) = py_executor.cleanup().await {
+                        tracing::warn!(%cleanup, "protected controller startup cleanup failed");
+                    }
+                }
+                return Err(error);
+            }
             if let Some(scope) = Self::scope_of(py_executor.as_mut()) {
                 let _ = self.declared_instance_scope.set(scope);
             }

@@ -25,6 +25,7 @@ pub struct ProtectedPreparationSettings {
 #[must_use = "the preparation owner must close and join the session"]
 pub struct ProtectedSpacePreparation {
     session: SessionHandle,
+    controller: Arc<crate::nodes::python_streaming::PythonStreamingNode>,
     request: Option<String>,
     repository: String,
     commit: String,
@@ -77,7 +78,7 @@ impl VerifiedSpaceExecution {
         {
             return Err(invalid_controller());
         }
-        let factory = SourcePythonFactory::new(SourcePythonPlugin {
+        let (factory, instance) = SourcePythonFactory::new(SourcePythonPlugin {
             node_type: NODE_TYPE.into(),
             entry_module: source.entry_module,
             module_root,
@@ -102,8 +103,15 @@ impl VerifiedSpaceExecution {
         let session = executor
             .build_loaded_session(Arc::new(manifest), false)
             .await?;
+        let Some(controller) = instance.get().cloned() else {
+            let mut session = session;
+            session.close().await?;
+            session.wait().await?;
+            return Err(invalid_controller());
+        };
         Ok(ProtectedSpacePreparation {
             session,
+            controller,
             request: Some(request.to_string()),
             repository: approval.repository.clone(),
             commit: approval.commit.clone(),
@@ -165,8 +173,10 @@ impl ProtectedSpacePreparation {
 
     /// Stop the controller and wait for its worker to exit.
     pub async fn close(mut self) -> Result<()> {
-        self.session.close().await?;
-        self.session.wait().await
+        let close = self.session.close().await;
+        let joined = self.session.wait().await;
+        let reaped = self.controller.reap_protected_worker().await;
+        close.and(joined).and(reaped)
     }
 }
 
