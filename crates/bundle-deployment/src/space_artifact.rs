@@ -196,6 +196,51 @@ impl SpaceArtifactRegistry {
             }
         }
 
+        self.publish_registration(scope, artifact, source_tree)
+    }
+
+    /// Receive a local publisher stream. The big-endian u32 header length
+    /// precedes the registration JSON, then the verified closure's files in
+    /// source inventory order, wheel name order, and model/file order. After
+    /// verifying and importing them, send one ready byte. The trusted caller
+    /// rechecks policy and sends one commit byte followed by EOF to publish.
+    pub fn receive_publication(
+        &self,
+        mut input: impl Read,
+        mut ready: impl Write,
+    ) -> Result<(), SpaceArtifactError> {
+        let mut length = [0; 4];
+        input.read_exact(&mut length)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > MAX_REGISTRATION_BYTES {
+            return Err(invalid("publication header size limit exceeded"));
+        }
+        let mut header = vec![0; length];
+        input.read_exact(&mut header)?;
+        let record: Registration = serde_json::from_slice(&header)?;
+        let closure = validate(&record.scope, &record.artifact, &record.source_tree)?;
+        for file in closure.files {
+            self.content.import_verified_blob(
+                &file.descriptor,
+                input.by_ref().take(file.descriptor.size),
+            )?;
+        }
+        ready.write_all(&[1])?;
+        ready.flush()?;
+        let mut commit = [0; 1];
+        input.read_exact(&mut commit)?;
+        if commit != [1] || input.read(&mut commit)? != 0 {
+            return Err(invalid("invalid publication commit frame"));
+        }
+        self.publish_registration(&record.scope, &record.artifact, &record.source_tree)
+    }
+
+    fn publish_registration(
+        &self,
+        scope: &SpaceArtifactScope,
+        artifact: &str,
+        source_tree: &str,
+    ) -> Result<(), SpaceArtifactError> {
         let destination = self.registration_path(scope)?;
         let mut staged = NamedTempFile::new_in(destination.parent().unwrap())?;
         serde_json::to_writer(
@@ -705,6 +750,66 @@ mod tests {
             registry.register(&scope, &artifact, &tree),
             Err(SpaceArtifactError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn space_artifact_publication_requires_verified_stream_and_explicit_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = SpaceArtifactRegistry::open(root.path()).unwrap();
+        let (scope, artifact, source_tree) = fixture();
+        let header = serde_json::to_vec(&Registration {
+            scope: scope.clone(),
+            artifact,
+            source_tree,
+        })
+        .unwrap();
+        let mut stream = (header.len() as u32).to_be_bytes().to_vec();
+        stream.extend_from_slice(&header);
+        let content_start = stream.len();
+        for data in [SOURCE, WHEEL, MODEL] {
+            stream.extend_from_slice(data);
+        }
+
+        let mut corrupt = stream.clone();
+        corrupt[content_start] ^= 1;
+        let mut ready = Vec::new();
+        assert!(registry
+            .receive_publication(corrupt.as_slice(), &mut ready)
+            .is_err());
+        assert!(ready.is_empty());
+        assert!(registry
+            .receive_publication(stream.as_slice(), &mut ready)
+            .is_err());
+        assert_eq!(ready, &[1]);
+        assert!(matches!(
+            registry.check_registration(&scope),
+            Err(SpaceArtifactError::Unregistered)
+        ));
+
+        let mut trailing = stream.clone();
+        trailing.extend_from_slice(&[1, 0]);
+        assert!(registry
+            .receive_publication(trailing.as_slice(), std::io::sink())
+            .is_err());
+        assert!(matches!(
+            registry.check_registration(&scope),
+            Err(SpaceArtifactError::Unregistered)
+        ));
+        stream.push(1);
+        registry
+            .receive_publication(stream.as_slice(), std::io::sink())
+            .unwrap();
+        assert_eq!(
+            fs::read(
+                registry
+                    .lease(&scope)
+                    .unwrap()
+                    .root()
+                    .join("source/src/app.py")
+            )
+            .unwrap(),
+            SOURCE
+        );
     }
 
     #[test]
