@@ -8,10 +8,8 @@ use remotemedia_bundle_deployment::{
 };
 pub use remotemedia_workload_sandbox::runsc::{RunscConfig, RunscStream};
 use remotemedia_workload_sandbox::runsc::{RunscProvider, RunscReservation, RunscSandbox};
-pub use remotemedia_workload_sandbox::WorkloadLimits;
-use remotemedia_workload_sandbox::{
-    SandboxError, WorkloadExit, WorkloadPhase, WorkloadRequest, WorkloadTarget,
-};
+use remotemedia_workload_sandbox::{SandboxError, WorkloadPhase, WorkloadRequest, WorkloadTarget};
+pub use remotemedia_workload_sandbox::{WorkloadExit, WorkloadLimits};
 
 use super::{
     ProtectedSpaceApproval, ProtectedSpaceError, ProtectedSpacePhase, ProtectedSpaceProfile,
@@ -188,8 +186,20 @@ impl IsolatedSpaceRun {
         Ok(self.sandbox.wait().await?)
     }
 
+    /// A cancel-safe wait for the run owner to select against authorization
+    /// changes and stop requests.
+    pub async fn wait_for_exit(&mut self) -> Result<WorkloadExit, IsolatedSpaceError> {
+        Ok(self.sandbox.wait_for_exit().await?)
+    }
+
     pub async fn stop(self) -> Result<WorkloadExit, IsolatedSpaceError> {
         Ok(self.sandbox.stop().await?)
+    }
+}
+
+impl IsolatedSpaceError {
+    pub fn cleanup_pending(&self) -> bool {
+        matches!(self, Self::Sandbox(SandboxError::CleanupPending(_)))
     }
 }
 
