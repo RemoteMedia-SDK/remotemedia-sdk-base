@@ -13,7 +13,7 @@ use remotemedia_core::{
     manifest::Manifest,
     transport::{PipelineExecutor, PipelineSessionHost},
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::thread;
 use tokio::net::TcpListener;
@@ -57,6 +57,12 @@ impl WebSocketSignalingServer {
         ));
 
         Self { addr, state }
+    }
+
+    /// Bind signaling to a specific local IP address.
+    pub fn with_bind_ip(mut self, ip: IpAddr) -> Self {
+        self.addr.set_ip(ip);
+        self
     }
 
     /// Get shared state (for external access)
