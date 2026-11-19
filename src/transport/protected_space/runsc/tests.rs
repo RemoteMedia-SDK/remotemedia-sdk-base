@@ -5,7 +5,7 @@ use std::process::Command;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::super::tests::{encode, fixture};
 use super::*;
@@ -14,6 +14,8 @@ use crate::transport::PipelineExecutor;
 const SOURCE: &str = "verified source";
 const WHEEL: &str = "verified wheel";
 const MODEL: &str = "verified model";
+
+mod gradio;
 
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))

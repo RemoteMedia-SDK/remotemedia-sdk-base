@@ -322,6 +322,22 @@ impl SpaceArtifactRegistry {
             // individually and needs to traverse them as a different UID.
             set_snapshot_mode(&path, 0o755)?;
         }
+        let wheel_hashes: BTreeMap<_, _> = closure
+            .files
+            .iter()
+            .filter_map(|file| {
+                let name = file.path.strip_prefix("wheels").ok()?.to_str()?;
+                Some((name, &file.descriptor.digest[7..]))
+            })
+            .collect();
+        let inventory = destination.join("wheels/approved-wheels.json");
+        fs::write(
+            &inventory,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "python_abi": closure.metadata.python_abi, "wheels": wheel_hashes,
+            }))?,
+        )?;
+        set_snapshot_mode(&inventory, 0o444)?;
         for file in closure.files {
             let path = destination.join(file.path);
             self.content.stage_verified_blob(&file.descriptor, &path)?;
@@ -766,6 +782,15 @@ mod tests {
         registry.register(&scope, &artifact, &tree).unwrap();
         let lease = registry.lease(&scope).unwrap();
         assert_eq!(lease.entry_file(), "src/app.py");
+        let inventory: serde_json::Value = serde_json::from_slice(
+            &fs::read(lease.root().join("wheels/approved-wheels.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            inventory,
+            json!({"version":1, "python_abi":"cp312",
+            "wheels":{"fixture-1-py3-none-any.whl":hash(WHEEL)}})
+        );
         assert_eq!(
             fs::read(lease.root().join("source/src/app.py")).unwrap(),
             SOURCE
