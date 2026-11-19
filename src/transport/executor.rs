@@ -1635,6 +1635,14 @@ impl PipelineExecutor {
             return Err(e);
         }
         tracing::info!("cold_build_session: ensure_plugins_loaded ok");
+        self.build_loaded_session(manifest, parked).await
+    }
+
+    pub(super) async fn build_loaded_session(
+        &self,
+        manifest: Arc<Manifest>,
+        parked: bool,
+    ) -> Result<SessionHandle> {
         // Validate manifest (cycles, unknown node types) then run capability
         // negotiation. The returned manifest may have FastResampleNode entries
         // spliced in by negotiation when `metadata.auto_negotiate` is set.

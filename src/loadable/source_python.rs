@@ -71,6 +71,7 @@ pub struct SourcePythonPlugin {
 /// to know anything new about plugins.
 pub struct SourcePythonFactory {
     plugin: Arc<SourcePythonPlugin>,
+    protected_python: Option<PathBuf>,
     /// SHA-256 over the plugin's source files. Identifies the code a worker
     /// runs, so two versions of a plugin never share a worker.
     digest: String,
@@ -129,6 +130,7 @@ impl SourcePythonFactory {
         let digest = content_digest(&plugin.module_root);
         Self {
             plugin: Arc::new(plugin),
+            protected_python: None,
             digest,
             json_as_text: false,
         }
@@ -138,6 +140,12 @@ impl SourcePythonFactory {
     /// (`json_input = "text"`).
     pub fn json_as_text(mut self, on: bool) -> Self {
         self.json_as_text = on;
+        self
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn with_protected_python(mut self, executable: PathBuf) -> Self {
+        self.protected_python = Some(executable);
         self
     }
 
@@ -194,6 +202,10 @@ impl SourcePythonFactory {
             _ => PythonStreamingNode::new(node_id, &plugin.node_type, &params)?,
         }
         .with_spawn_settings(settings);
+        let node = match &self.protected_python {
+            Some(executable) => node.with_protected_python(executable.clone()),
+            None => node,
+        };
         Ok(Box::new(crate::nodes::AsyncNodeWrapper(Arc::new(node))))
     }
 
@@ -222,7 +234,9 @@ impl StreamingNodeFactory for SourcePythonFactory {
         params: &serde_json::Value,
         session_id: Option<String>,
     ) -> Result<Box<dyn StreamingNode>, Error> {
-        if std::env::var(RUNTIME_SWITCH).as_deref() != Ok("legacy") {
+        if self.protected_python.is_some()
+            || std::env::var(RUNTIME_SWITCH).as_deref() != Ok("legacy")
+        {
             return self.create_on_executor(node_id, params, session_id);
         }
         let plugin = self.plugin.clone();

@@ -8,6 +8,21 @@ use sha2::{Digest, Sha256};
 
 use crate::manifest::{Manifest, NodeManifest, PluginSpec};
 
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "loadable",
+    feature = "python-source-plugin"
+))]
+mod preparation;
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "loadable",
+    feature = "python-source-plugin"
+))]
+pub use preparation::{ProtectedPreparationSettings, ProtectedSpacePreparation};
+
 #[cfg(all(target_os = "linux", feature = "protected-space-runsc"))]
 pub mod runsc;
 

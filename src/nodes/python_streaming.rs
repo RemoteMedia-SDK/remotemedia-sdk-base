@@ -35,6 +35,8 @@ pub struct PythonSpawnSettings {
 pub struct PythonStreamingNode {
     /// Per-node spawn settings; `None` for nodes on the default import path.
     spawn: Option<PythonSpawnSettings>,
+    /// Operator-provisioned interpreter for the protected preparation controller.
+    protected_python: Option<std::path::PathBuf>,
     node_id: String,
     node_type: String,
     params: Value,
@@ -124,6 +126,7 @@ impl PythonStreamingNode {
 
         Ok(Self {
             spawn: None,
+            protected_python: None,
             node_id,
             node_type: node_type.to_string(),
             params: params.clone(),
@@ -144,6 +147,12 @@ impl PythonStreamingNode {
         self
     }
 
+    #[cfg(feature = "python-source-plugin")]
+    pub(crate) fn with_protected_python(mut self, executable: std::path::PathBuf) -> Self {
+        self.protected_python = Some(executable);
+        self
+    }
+
     /// Create with session ID for multiprocess execution (spec 002)
     pub fn with_session(
         node_id: String,
@@ -153,6 +162,7 @@ impl PythonStreamingNode {
     ) -> Result<Self, Error> {
         Ok(Self {
             spawn: None,
+            protected_python: None,
             node_id,
             node_type: node_type.to_string(),
             params: params.clone(),
@@ -179,6 +189,7 @@ impl PythonStreamingNode {
         }
         Ok(Self {
             spawn: None,
+            protected_python: None,
             node_id,
             node_type: node_type.to_string(),
             params: params.clone(),
@@ -227,9 +238,19 @@ impl PythonStreamingNode {
                 self.node_type
             );
 
-            // Load config from runtime.toml or use defaults
-            let mut config = crate::python::multiprocess::MultiprocessConfig::from_default_file()
-                .unwrap_or_default();
+            use crate::python::multiprocess::MultiprocessConfig;
+            let mut config = match &self.protected_python {
+                Some(executable) => MultiprocessConfig {
+                    python_executable: executable.clone(),
+                    init_timeout_secs: 20,
+                    python_env: crate::python::env_manager::PythonEnvConfig {
+                        mode: crate::python::env_manager::PythonEnvMode::System,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                None => MultiprocessConfig::from_default_file().unwrap_or_default(),
+            };
             if let Some(spawn) = &self.spawn {
                 // The node's own directories go first on the import path.
                 for (index, path) in spawn.python_path.iter().enumerate() {
@@ -240,6 +261,9 @@ impl PythonStreamingNode {
             }
 
             let mut executor = crate::python::multiprocess::MultiprocessExecutor::new(config);
+            if self.protected_python.is_some() {
+                executor.set_spawn_env("PYTHONNOUSERSITE", "1").await;
+            }
             if let Some(spawn) = &self.spawn {
                 for module in &spawn.register_modules {
                     executor.register_module(module).await;

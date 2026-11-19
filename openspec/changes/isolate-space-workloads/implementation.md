@@ -14,6 +14,12 @@ An executor created with `for_protected_spaces` denies ordinary plugin resolutio
 
 The Windows build with `loadable,python-source-plugin` passed three protected execution tests and the three existing source-Python wire tests. The protected tests cover both phases, expired or changed requests, environment and plugin overrides with matching digests, and refusal before ordinary loaders or warm sessions are called. Scaling exercised the SDK Base verifier over the real mutual TLS listener. [Scaling verification](../../../../remotemedia-scaling/openspec/changes/isolate-space-workloads/implementation.md)
 
+## Protected preparation controller
+
+On Linux x86-64 with `loadable,python-source-plugin`, `VerifiedSpaceExecution::start_preparation` opens a private one-shot session for an isolated CPU prepare grant. SDK Base accepts the released local source-Python `PrepareSpaceNode`, derives the request from the approved repository, commit and target, and takes the checkout path, policy file and preinstalled Python executable from worker settings. It invokes the worker policy check before resolving the controller and again before starting it. The selected interpreter bypasses dependency probes and managed installation. Only the trusted owner can submit the one request or receive the descriptor.
+
+SDK Base bounds the descriptor at 1 MiB and checks its repository, commit, source digest format and canonical checkout containment. A real Entry and Runner fixture used this session to fetch the approved public Hugging Face commit. A second fixture handed a pinned local Git checkout from this session to the protected Gradio runtime. [Spaces verification](../../../../huggingface-spaces-runner/openspec/changes/isolate-space-workloads/implementation.md)
+
 ## Artifact registration and staging
 
 `SpaceArtifactRegistry` uses an operator-owned directory with a dedicated content store, atomic registration records, and separate per-run staging directories. The trusted publisher imports bounded streams by SHA-256 and byte count and registers the exact `workload-artifact.json` and `source-tree.json` bytes against the launch scope. Registration checks repository, commit, target, Python ABI, policy, paths and closure before publishing. Store the directory outside workload access and restrict its ACLs or permissions to the trusted processes.
