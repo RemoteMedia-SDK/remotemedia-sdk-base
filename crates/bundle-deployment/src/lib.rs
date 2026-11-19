@@ -14,6 +14,7 @@ pub use preflight::preflight;
 pub use service::{DeploymentService, TokenAuthenticator};
 pub use space_artifact::{
     SpaceArtifactError, SpaceArtifactLease, SpaceArtifactRegistry, SpaceArtifactScope,
+    StagedSpaceArtifact,
 };
 pub use store::{
     ContentStore, ExternalAssetTransport, ReqwestExternalAssetTransport, UploadSession,

@@ -58,6 +58,13 @@ pub struct SpaceArtifactLease {
     entry_file: String,
 }
 
+/// Validated launch metadata returned along with staged artifact bytes.
+pub struct StagedSpaceArtifact {
+    pub entry_file: String,
+    pub python_abi: String,
+    pub sdk: String,
+}
+
 impl SpaceArtifactLease {
     pub fn root(&self) -> &Path {
         self.files.path()
@@ -142,7 +149,7 @@ struct StagedFile {
 }
 
 struct Closure {
-    entry_file: String,
+    metadata: StagedSpaceArtifact,
     directories: BTreeSet<PathBuf>,
     files: Vec<StagedFile>,
 }
@@ -282,27 +289,45 @@ impl SpaceArtifactRegistry {
         &self,
         scope: &SpaceArtifactScope,
     ) -> Result<SpaceArtifactLease, SpaceArtifactError> {
-        let record = self.registration(scope)?;
-        let closure = validate(scope, &record.artifact, &record.source_tree)?;
         let files = tempfile::Builder::new()
             .prefix("space-")
             .tempdir_in(self.root.join("leases"))?;
+        let staged = self.stage_lease(scope, files.path())?;
+        Ok(SpaceArtifactLease {
+            files,
+            entry_file: staged.entry_file,
+        })
+    }
+
+    /// Recheck and copy into an empty private directory owned by a provider
+    /// reservation. The reservation must be discarded if staging fails.
+    pub fn stage_lease(
+        &self,
+        scope: &SpaceArtifactScope,
+        destination: &Path,
+    ) -> Result<StagedSpaceArtifact, SpaceArtifactError> {
+        let record = self.registration(scope)?;
+        let closure = validate(scope, &record.artifact, &record.source_tree)?;
+        if !fs::symlink_metadata(destination)?.is_dir()
+            || fs::read_dir(destination)?.next().is_some()
+        {
+            return Err(invalid(
+                "artifact staging requires an empty private directory",
+            ));
+        }
         for directory in closure.directories {
-            let path = files.path().join(directory);
+            let path = destination.join(directory);
             fs::create_dir(&path)?;
             // The lease root stays private. The sandbox maps its input trees
             // individually and needs to traverse them as a different UID.
             set_snapshot_mode(&path, 0o755)?;
         }
         for file in closure.files {
-            let path = files.path().join(file.path);
+            let path = destination.join(file.path);
             self.content.stage_verified_blob(&file.descriptor, &path)?;
             set_snapshot_mode(&path, 0o444 | file.execute_bits)?;
         }
-        Ok(SpaceArtifactLease {
-            files,
-            entry_file: closure.entry_file,
-        })
+        Ok(closure.metadata)
     }
 
     fn registration_path(&self, scope: &SpaceArtifactScope) -> Result<PathBuf, SpaceArtifactError> {
@@ -362,7 +387,14 @@ fn validate(
     {
         return Err(invalid("unsupported or incomplete workload closure"));
     }
-    let mut closure = source_closure(tree, record.entry_file)?;
+    let mut closure = source_closure(
+        tree,
+        StagedSpaceArtifact {
+            entry_file: record.entry_file,
+            python_abi: record.target.abi,
+            sdk: record.sdk,
+        },
+    )?;
     let wheels_root = Path::new("wheels");
     closure.directories.insert(wheels_root.to_path_buf());
     let mut wheel_bytes = 0;
@@ -423,12 +455,15 @@ fn validate(
     Ok(closure)
 }
 
-fn source_closure(tree: &str, entry_file: String) -> Result<Closure, SpaceArtifactError> {
+fn source_closure(
+    tree: &str,
+    metadata: StagedSpaceArtifact,
+) -> Result<Closure, SpaceArtifactError> {
     let entries: Vec<SourceEntry> = serde_json::from_str(tree)?;
     if entries.is_empty() || entries.len() > 20_000 {
         return Err(invalid("source entry limit exceeded"));
     }
-    safe_path(&entry_file)?;
+    safe_path(&metadata.entry_file)?;
     let root = Path::new("source");
     let mut directories = BTreeSet::from([root.to_path_buf()]);
     let mut files = Vec::new();
@@ -449,7 +484,7 @@ fn source_closure(tree: &str, entry_file: String) -> Result<Closure, SpaceArtifa
                 let relative = safe_path(&name)?;
                 insert_path(&mut inventory, &name, false)?;
                 size = add_size(size, bytes, 32 * GIB)?;
-                if name == entry_file {
+                if name == metadata.entry_file {
                     executable_entry = true;
                 }
                 files.push(staged_file(root.join(relative), bytes, &hash, mode)?);
@@ -466,7 +501,7 @@ fn source_closure(tree: &str, entry_file: String) -> Result<Closure, SpaceArtifa
         return Err(invalid("source parent or entry file is missing"));
     }
     Ok(Closure {
-        entry_file,
+        metadata,
         directories,
         files,
     })

@@ -8,6 +8,9 @@ use sha2::{Digest, Sha256};
 
 use crate::manifest::{Manifest, NodeManifest, PluginSpec};
 
+#[cfg(all(target_os = "linux", feature = "protected-space-runsc"))]
+pub mod runsc;
+
 /// The protected contract shared with the authenticated admission service.
 pub const PROTECTED_SPACE_CONTRACT_VERSION: u32 = 1;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
@@ -26,7 +29,7 @@ pub enum ProtectedSpaceProfile {
 
 /// An approval supplied by the trusted host after checking the caller and the
 /// worker policy. This type has no manifest or wire deserializer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtectedSpaceApproval {
     pub grant_id: String,
     pub owner: String,
@@ -249,7 +252,7 @@ mod tests {
     use super::*;
     use crate::transport::{PipelineExecutor, WarmSessionPool};
 
-    fn fixture(phase: ProtectedSpacePhase) -> (ProtectedSpaceApproval, PathBuf, Value) {
+    pub(super) fn fixture(phase: ProtectedSpacePhase) -> (ProtectedSpaceApproval, PathBuf, Value) {
         let commit = "a".repeat(40);
         let path = std::env::current_dir()
             .unwrap()
@@ -284,7 +287,7 @@ mod tests {
         (approval, path, manifest)
     }
 
-    fn encode(approval: &mut ProtectedSpaceApproval, manifest: &Value) -> Vec<u8> {
+    pub(super) fn encode(approval: &mut ProtectedSpaceApproval, manifest: &Value) -> Vec<u8> {
         let bytes = serde_json::to_vec(manifest).unwrap();
         approval.manifest_sha256 = format!("{:x}", Sha256::digest(&bytes));
         bytes

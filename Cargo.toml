@@ -194,6 +194,10 @@ hf-hub = { version = "0.5.0", features = ["rustls-tls"], optional = true }
 nix = { version = "0.30.1", features = ["signal", "process"] }
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+remotemedia-bundle-deployment = { path = "crates/bundle-deployment", optional = true }
+remotemedia-workload-sandbox = { path = "../remotemedia-plugin-sdk/crates/workload-sandbox", optional = true }
+
 [target.'cfg(windows)'.dependencies]
 # JobObjects/Threading/ToolHelp/Security: Python node workers live in a
 # kill-on-close job, so they never outlive the host (process_manager.rs).
@@ -279,6 +283,7 @@ harness = false
 
 [features]
 default = []
+protected-space-runsc = ["dep:remotemedia-bundle-deployment", "dep:remotemedia-workload-sandbox"]
 multiprocess = ["iceoryx2", "iceoryx2-log", "iceoryx2-pal-configuration"]
 # Typed mapped native workers. Independent of the explicit legacy iceoryx2 codec.
 native-worker = ["dep:remotemedia-plugin-sdk", "remotemedia-plugin-sdk/native-worker"]
