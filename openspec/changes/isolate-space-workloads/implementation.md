@@ -20,6 +20,8 @@ The Windows build with `loadable,python-source-plugin` passed three protected ex
 
 An acquisition rechecks the registration and copies the exact verified source, wheels, and model files into an independent lease. Active leases keep their copied bytes if the content store changes. Failed and normally released leases are removed. The provider must retain the lease through confirmed teardown and expose its inputs through read-only mounts. Startup reconciliation remains open.
 
+On Unix, the lease root stays private at `0700`. The source, wheel and model directory trees use `0755` so a different guest UID can traverse them after each tree is mounted read-only. Files are readable and retain only their verified execute bits. The four focused Linux artifact tests passed with worker umask `077`, including exact mode checks for the lease root, nested trees and files.
+
 `receive_publication` accepts a bounded header and streams the closure in inventory order. It verifies and imports every file before returning its readiness byte. The worker rechecks launch policy, then sends a commit byte and closes the stream. The registry installs the record atomically after receiving both. A denied or interrupted publication may retain verified store blobs for reuse. Registration stays absent until the commit succeeds.
 
 All 27 Linux bundle-deployment library tests and four focused Windows registry tests passed. A Windows fixture generated the records with the Spaces Python worker code, including a Unicode source filename, and published those bytes through the native Runner subcommand. The live Runner denied the serve request before registration and reached the runtime availability check after publication.

@@ -288,12 +288,16 @@ impl SpaceArtifactRegistry {
             .prefix("space-")
             .tempdir_in(self.root.join("leases"))?;
         for directory in closure.directories {
-            fs::create_dir(files.path().join(directory))?;
+            let path = files.path().join(directory);
+            fs::create_dir(&path)?;
+            // The lease root stays private. The sandbox maps its input trees
+            // individually and needs to traverse them as a different UID.
+            set_snapshot_mode(&path, 0o755)?;
         }
         for file in closure.files {
             let path = files.path().join(file.path);
             self.content.stage_verified_blob(&file.descriptor, &path)?;
-            set_snapshot_mode(&path, file.execute_bits)?;
+            set_snapshot_mode(&path, 0o444 | file.execute_bits)?;
         }
         Ok(SpaceArtifactLease {
             files,
@@ -648,14 +652,14 @@ fn invalid(reason: &'static str) -> SpaceArtifactError {
     SpaceArtifactError::Invalid(reason)
 }
 
-fn set_snapshot_mode(path: &Path, execute_bits: u32) -> Result<(), SpaceArtifactError> {
+fn set_snapshot_mode(path: &Path, mode: u32) -> Result<(), SpaceArtifactError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o444 | execute_bits))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
-    let _ = (path, execute_bits);
+    let _ = (path, mode);
     Ok(())
 }
 
@@ -740,6 +744,24 @@ mod tests {
             MODEL
         );
         assert!(lease.root().join("source/docs").is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = |path: &str| {
+                fs::metadata(lease.root().join(path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(""), 0o700);
+            for path in ["source", "source/src", "wheels", "models/0/data"] {
+                assert_eq!(mode(path), 0o755);
+            }
+            assert_eq!(mode("source/src/app.py"), 0o555);
+            assert_eq!(mode("wheels/fixture-1-py3-none-any.whl"), 0o444);
+        }
         scope.policy_revision = "d".repeat(64);
         assert!(matches!(
             registry.lease(&scope),
