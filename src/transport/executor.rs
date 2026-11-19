@@ -31,6 +31,9 @@ use crate::executor::DriftThresholds;
 use crate::manifest::Manifest;
 use crate::nodes::{StreamingNodeFactory, StreamingNodeRegistry};
 use crate::transport::data::Participant;
+use crate::transport::protected_space::{
+    ProtectedSpaceApproval, ProtectedSpaceError, VerifiedSpaceExecution,
+};
 use crate::transport::session_control::{SessionControl, SessionControlBus};
 use crate::transport::session_router::{DataPacket, SessionRouter};
 use crate::transport::shared_session::SharedPipelineSession;
@@ -739,6 +742,7 @@ pub struct PipelineExecutor {
     managed_llama_servers: crate::llm::managed_server::ManagedLlamaServers,
     /// Configuration
     config: ExecutorConfig,
+    protected_spaces_only: bool,
     /// Node registry for creating nodes (wrapped in RwLock for mutable access)
     registry: Arc<RwLock<StreamingNodeRegistry>>,
     /// Streaming scheduler for node execution
@@ -833,6 +837,36 @@ impl PipelineExecutor {
         Self::with_config(ExecutorConfig::default())
     }
 
+    /// Create a worker that admits protected Space executions exclusively.
+    pub fn for_protected_spaces() -> Result<Self> {
+        let mut executor = Self::new()?;
+        executor.protected_spaces_only = true;
+        Ok(executor)
+    }
+
+    /// Verify the out-of-band handoff on a protected executor without invoking
+    /// ordinary plugin resolution or provisioning.
+    pub fn verify_protected_space(
+        &self,
+        approval: ProtectedSpaceApproval,
+        controller_path: &std::path::Path,
+        manifest_bytes: &[u8],
+    ) -> std::result::Result<VerifiedSpaceExecution, ProtectedSpaceError> {
+        if !self.protected_spaces_only {
+            return Err(ProtectedSpaceError::RuntimeUnavailable);
+        }
+        VerifiedSpaceExecution::validate(approval, controller_path, manifest_bytes)
+    }
+
+    fn require_ordinary_execution(&self) -> Result<()> {
+        if self.protected_spaces_only {
+            return Err(Error::ConfigError(
+                "worker requires verified protected execution".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a new PipelineExecutor with custom configuration
     pub fn with_config(config: ExecutorConfig) -> Result<Self> {
         let config = config.resolve_copy_policy()?;
@@ -865,6 +899,7 @@ impl PipelineExecutor {
             managed_llama_servers: Default::default(),
             managed_ardy_daemons: Default::default(),
             config,
+            protected_spaces_only: false,
             registry,
             scheduler,
             session_counter: std::sync::atomic::AtomicU64::new(0),
@@ -895,6 +930,7 @@ impl PipelineExecutor {
     /// the manifest actually tries to declare any plugins.
     #[cfg(feature = "loadable")]
     pub async fn ensure_plugins_loaded(&self, manifest: &Manifest) -> Result<()> {
+        self.require_ordinary_execution()?;
         if manifest.plugins.is_empty() {
             return Ok(());
         }
@@ -949,6 +985,7 @@ impl PipelineExecutor {
     /// confusing "unknown node type" validation errors).
     #[cfg(not(feature = "loadable"))]
     pub async fn ensure_plugins_loaded(&self, manifest: &Manifest) -> Result<()> {
+        self.require_ordinary_execution()?;
         if manifest.plugins.is_empty() {
             return Ok(());
         }
@@ -1376,6 +1413,7 @@ impl PipelineExecutor {
         manifest: Arc<Manifest>,
         input: TransportData,
     ) -> Result<TransportData> {
+        self.require_ordinary_execution()?;
         // Validate manifest (cycles, unknown node types) then run capability
         // negotiation. The returned manifest may have FastResampleNode entries
         // spliced in by negotiation when `metadata.auto_negotiate` is set.
@@ -1445,6 +1483,7 @@ impl PipelineExecutor {
     ///
     /// A SessionHandle for sending inputs and receiving outputs
     pub async fn create_session(&self, manifest: Arc<Manifest>) -> Result<SessionHandle> {
+        self.require_ordinary_execution()?;
         tracing::info!("create_session: begin");
         // Try the default pool first when one is attached. The Weak
         // upgrade returns None if the caller has dropped their last
@@ -1484,6 +1523,7 @@ impl PipelineExecutor {
         key: impl Into<String>,
         manifest: Arc<Manifest>,
     ) -> Result<Arc<SharedPipelineSession>> {
+        self.require_ordinary_execution()?;
         let key = key.into();
         if let Some(existing) = self.shared_sessions.read().await.get(&key).cloned() {
             if existing.is_active().await {

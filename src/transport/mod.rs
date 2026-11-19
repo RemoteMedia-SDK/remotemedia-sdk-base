@@ -61,6 +61,7 @@ pub mod warm_session_pool;
 
 // PipelineExecutor facade (spec 026)
 pub mod executor;
+pub mod protected_space;
 
 // Re-export key types for convenience
 pub use cancel_gate::{CancelGate, ProtectGuard};
