@@ -123,3 +123,32 @@ async fn output_drainer_promotes_once_for_every_subscriber() {
         Err(tokio::sync::broadcast::error::RecvError::Closed)
     ));
 }
+
+#[tokio::test]
+async fn a_host_watching_the_drain_sees_it_requested() {
+    let executor = PipelineExecutor::with_config(ExecutorConfig::default()).unwrap();
+    let manifest = Arc::new(Manifest {
+        nodes: vec![NodeManifest {
+            id: "calc".into(),
+            node_type: "CalculatorNode".into(),
+            params: serde_json::json!({}),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let handle = executor.create_session(manifest).await.unwrap();
+    let shared = SharedPipelineSession::new("drain".to_string(), handle).unwrap();
+    let mut drain = shared.watch_drain();
+    assert!(!*drain.borrow(), "no drain before it is requested");
+    shared.request_drain().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        drain.wait_for(|requested| *requested),
+    )
+    .await
+    .expect("the drain is seen")
+    .unwrap();
+    // A watch taken afterwards sees it too.
+    assert!(*shared.watch_drain().borrow());
+    shared.close().await.unwrap();
+}

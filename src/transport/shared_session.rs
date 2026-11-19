@@ -105,6 +105,8 @@ pub struct SharedPipelineSession {
     /// [`Self::request_drain`] was called: when every output has been
     /// broadcast, a [`DRAINED_MARKER_KEY`] marker follows on each kind.
     drain_requested: Arc<AtomicBool>,
+    /// The same, for a host that acts on the drain ([`Self::watch_drain`]).
+    drain_watch: tokio::sync::watch::Sender<bool>,
 }
 
 /// StreamSession adapter for one participant joined to a shared pipeline.
@@ -180,6 +182,7 @@ impl SharedPipelineSession {
             data_tx,
             closed: AtomicBool::new(false),
             drain_requested: Arc::new(AtomicBool::new(false)),
+            drain_watch: tokio::sync::watch::channel(false).0,
         });
 
         shared.spawn_output_drainers(receivers);
@@ -239,7 +242,15 @@ impl SharedPipelineSession {
     /// receive one marker frame ([`is_drained_marker`]) and nothing more.
     pub async fn request_drain(&self) {
         self.drain_requested.store(true, Ordering::Release);
+        self.drain_watch.send_replace(true);
         self.session_handle.lock().await.request_drain();
+    }
+
+    /// `true` once [`Self::request_drain`] was called. A host whose session
+    /// is one partition of a larger pipeline watches it to end the streams
+    /// it sends to the other partitions after their last frame.
+    pub fn watch_drain(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.drain_watch.subscribe()
     }
 
     pub async fn close(&self) -> Result<()> {
