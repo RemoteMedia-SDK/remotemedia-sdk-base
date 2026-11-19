@@ -3,10 +3,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use remotemedia_bundle::{
-    sha256_digest, AssetDescriptor, AssetStorage, CredentialPolicy, DescriptorIdentity,
-    NativeRuntimeClosure, NativeRuntimeFileMode,
+    AssetDescriptor, AssetStorage, CredentialPolicy, DescriptorIdentity, NativeRuntimeClosure,
+    NativeRuntimeFileMode,
 };
 use reqwest::header::{HeaderValue, AUTHORIZATION, RANGE};
+use sha2::{Digest, Sha256};
 
 use crate::DeploymentError;
 
@@ -245,6 +246,28 @@ impl ContentStore {
         Ok(fs::read(self.blob_path(digest)?)?)
     }
 
+    /// Copy a blob into a new file in a trusted staging directory. The caller
+    /// may expose that file only after success, when the copied bytes and size
+    /// have both been verified. Failed copies are discarded.
+    pub fn stage_verified_blob(
+        &self,
+        descriptor: &DescriptorIdentity,
+        destination: &Path,
+    ) -> Result<(), DeploymentError> {
+        let source = self.blob_path(&descriptor.digest)?;
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(destination)?;
+        let result = verify_blob_bytes(&source, descriptor, &mut output)
+            .and_then(|()| output.sync_all().map_err(DeploymentError::from));
+        drop(output);
+        if result.is_err() {
+            fs::remove_file(destination)?;
+        }
+        result
+    }
+
     pub fn native_runtime_release(&self, bundle_digest: &str) -> Result<PathBuf, DeploymentError> {
         validate_digest(bundle_digest)?;
         Ok(self
@@ -283,21 +306,18 @@ impl ContentStore {
                 if !materialized.insert(relative.clone()) {
                     return Err(DeploymentError::InvalidRuntimePath(file.path.clone()));
                 }
-                let source = self.blob_path(&file.digest)?;
-                let metadata = fs::metadata(&source)?;
-                if metadata.len() != file.size {
-                    return Err(DeploymentError::SizeMismatch {
-                        expected: file.size,
-                        actual: metadata.len(),
-                    });
-                }
                 let destination = temporary.join(&relative);
                 let parent = destination
                     .parent()
                     .expect("relative runtime path has parent");
                 fs::create_dir_all(parent)?;
-                fs::copy(source, &destination)?;
-                File::open(&destination)?.sync_all()?;
+                self.stage_verified_blob(
+                    &DescriptorIdentity {
+                        digest: file.digest.clone(),
+                        size: file.size,
+                    },
+                    &destination,
+                )?;
                 set_runtime_mode(&destination, file.mode)?;
             }
             for symlink in &closure.symlinks {
@@ -413,20 +433,19 @@ impl UploadSession {
                 actual: self.offset,
             });
         }
-        let mut file = File::open(&self.path)?;
-        let mut bytes = Vec::with_capacity(self.offset as usize);
-        file.read_to_end(&mut bytes)?;
-        let actual = sha256_digest(&bytes);
-        if actual != self.descriptor.digest {
-            let quarantine = quarantine_path(&self.store.root, &self.path, "digest-mismatch");
-            fs::rename(&self.path, quarantine)?;
-            return Err(DeploymentError::DigestMismatch {
-                expected: self.descriptor.digest,
-                actual,
-            });
+        if let Err(error) = verify_blob_bytes(&self.path, &self.descriptor, &mut std::io::sink()) {
+            if matches!(
+                error,
+                DeploymentError::DigestMismatch { .. } | DeploymentError::SizeMismatch { .. }
+            ) {
+                let quarantine = quarantine_path(&self.store.root, &self.path, "digest-mismatch");
+                fs::rename(&self.path, quarantine)?;
+            }
+            return Err(error);
         }
         let destination = self.store.blob_path(&self.descriptor.digest)?;
         if destination.exists() {
+            verify_blob_bytes(&destination, &self.descriptor, &mut std::io::sink())?;
             fs::remove_file(&self.path)?;
         } else {
             fs::rename(&self.path, &destination)?;
@@ -434,6 +453,54 @@ impl UploadSession {
         sync_parent(&destination)?;
         Ok(destination)
     }
+}
+
+fn verify_blob_bytes(
+    path: &Path,
+    descriptor: &DescriptorIdentity,
+    output: &mut impl Write,
+) -> Result<(), DeploymentError> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(DeploymentError::Provisioning(
+            "verified content must be a regular file".to_owned(),
+        ));
+    }
+    let mut input = File::open(path)?;
+    let metadata = input.metadata()?;
+    if !metadata.is_file() || metadata.len() != descriptor.size {
+        return Err(DeploymentError::SizeMismatch {
+            expected: descriptor.size,
+            actual: metadata.len(),
+        });
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    let mut copied = 0;
+    let mut bounded = (&mut input).take(descriptor.size);
+    loop {
+        let count = bounded.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        copied += count as u64;
+        digest.update(&buffer[..count]);
+        output.write_all(&buffer[..count])?;
+    }
+    copied += input.read(&mut buffer[..1])? as u64;
+    if copied != descriptor.size {
+        return Err(DeploymentError::SizeMismatch {
+            expected: descriptor.size,
+            actual: copied,
+        });
+    }
+    let actual = format!("sha256:{:x}", digest.finalize());
+    if actual != descriptor.digest {
+        return Err(DeploymentError::DigestMismatch {
+            expected: descriptor.digest.clone(),
+            actual,
+        });
+    }
+    Ok(())
 }
 
 fn validate_digest(digest: &str) -> Result<(), DeploymentError> {
@@ -521,6 +588,40 @@ mod tests {
     use remotemedia_bundle::sha256_digest;
 
     use super::*;
+
+    #[test]
+    fn staging_verified_blob_requires_original_bytes_and_a_new_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ContentStore::open(temporary.path().join("store")).unwrap();
+        let expected = b"approved wheel bytes";
+        let descriptor = DescriptorIdentity {
+            digest: sha256_digest(expected),
+            size: expected.len() as u64,
+        };
+        let blob = store.blob_path(&descriptor.digest).unwrap();
+        fs::write(&blob, expected).unwrap();
+        let staged = temporary.path().join("staged");
+        store.stage_verified_blob(&descriptor, &staged).unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), expected);
+
+        fs::write(&blob, b"replaced wheel bytes").unwrap();
+        assert!(matches!(store.stage_verified_blob(&descriptor, &staged),
+            Err(DeploymentError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists));
+        assert_eq!(fs::read(&staged).unwrap(), expected);
+        let refused = temporary.path().join("refused");
+        assert!(matches!(
+            store.stage_verified_blob(&descriptor, &refused),
+            Err(DeploymentError::DigestMismatch { .. })
+        ));
+        assert!(!refused.exists());
+
+        fs::write(&blob, b"truncated").unwrap();
+        assert!(matches!(
+            store.stage_verified_blob(&descriptor, &refused),
+            Err(DeploymentError::SizeMismatch { .. })
+        ));
+        assert!(!refused.exists());
+    }
 
     #[test]
     fn interrupted_upload_resumes_and_publishes_only_after_verification() {
