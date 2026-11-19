@@ -50,6 +50,25 @@ CI selects these packages together to unify features as a real host does. This d
 - Native worker or Python changes: validate the execution mode actually changed, including process startup, output draining, failure and cleanup. A test using another mode is not equivalent coverage.
 - Hardware, model, network and credential-dependent tests need their prerequisites. State what ran, what was skipped and why; do not equate unit tests with live transport or device validation.
 
+### Behaviour over a transport: `remotemedia test`
+
+To find out whether a node, a session path or a transport does what it should, as seen by a client, run a scenario with `remotemedia test` (the CLI in `../remotemedia-sdk/examples/cli/remotemedia-cli/`). Do not write a one-off client, server or measurement script for that, and do not grep logs: a scenario is a few lines of YAML, runs the same check over in-process, gRPC, HTTP, WebRTC and SIP, and gives a verdict with the measured values.
+
+```sh
+# from ../remotemedia-sdk, built against this checkout (its README, "Sibling repositories")
+remotemedia test examples/cli/remotemedia-cli/tests/scenarios --transport inproc,grpc,http,webrtc,sip
+```
+
+Exit codes: `0` passed, `1` failed, `2` invalid scenario, `3` unsupported or nothing ran; `2` and `3` mean "not verified". The scenario format, the assertions and what each transport carries are in `../remotemedia-sdk/examples/cli/remotemedia-cli/tests/scenarios/README.md`, and the SDK's `AGENTS.md` ("Checking that something works") has the rule in full. The SDK must be built against this checkout for a change here to be what is tested: the rev it pins is not your working tree.
+
+What this repository provides for it:
+
+- `remotemedia_webrtc::peer_client::PeerClient` (feature `ws-signaling`): a real WebRTC member in Rust. Use it in this crate's tests instead of hand-built peer connections or placeholder RTP payloads (`crates/transports/webrtc/src/peer_client_tests.rs` shows a server and a client in one test).
+- Model-free nodes: `PassThrough`, `MediaKindFilterNode`, `TestToneTtsNode` (text to a tone), `TestPatternVideoNode` (any input to a video frame), `TestEnergyVadNode`, and `TestInputProbeNode` (a JSON description of every input, for checking what a transport delivers into a pipeline).
+- `peer.stats` on WebSocket signalling: the calling member's own counters (frames encoded, frames not encoded, keyframes requested). Read counters there, not from log lines.
+
+When a check needs something the harness cannot observe, add it here (a counter, a field on the wire, a test node) and the assertion in the SDK in the same change, and say so in your report. On an FFmpeg build with neither libx264 nor NVENC, H.264 falls back to Media Foundation, which holds back 16 frames before its first packet: a test must not assume a packet per frame (`h264_encoder_emits_a_packet_for_the_first_frame`, ignored, measures it).
+
 ## Committing progress
 
 Commit development progress while implementing a task or an OpenSpec change; do not leave the whole result uncommitted until the end. Commit on the working feature branch, not the default branch, at each verified checkpoint: a completed task or coherent group of tasks that builds and passes its focused checks. Include the matching `tasks.md` checkbox updates in the same commit, and name the change ID and task numbers in the message when an OpenSpec change applies. Stage only the files the task touched; leave unrelated or pre-existing changes out. If partial or failing work must be saved, mark it as work in progress in the message and keep its tasks unchecked.
