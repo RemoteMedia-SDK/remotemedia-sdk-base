@@ -268,6 +268,42 @@ impl ContentStore {
         result
     }
 
+    /// Publish a complete stream in the CAS without opening a resumable upload.
+    /// The source is a reader owned by the authorized publisher and is never
+    /// interpreted as a filesystem path by the store.
+    pub(crate) fn import_verified_blob(
+        &self,
+        descriptor: &DescriptorIdentity,
+        source: impl Read,
+    ) -> Result<(), DeploymentError> {
+        let destination = self.blob_path(&descriptor.digest)?;
+        let mut staged = tempfile::NamedTempFile::new_in(destination.parent().unwrap())?;
+        verify_stream(source, descriptor, staged.as_file_mut())?;
+        staged.as_file().sync_all()?;
+        match staged.persist_noclobber(&destination) {
+            Ok(_) => {
+                #[cfg(unix)]
+                sync_parent(&destination)?;
+                Ok(())
+            }
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.verify_blob(descriptor)
+            }
+            Err(error) => Err(error.error.into()),
+        }
+    }
+
+    pub(crate) fn verify_blob(
+        &self,
+        descriptor: &DescriptorIdentity,
+    ) -> Result<(), DeploymentError> {
+        verify_blob_bytes(
+            &self.blob_path(&descriptor.digest)?,
+            descriptor,
+            &mut std::io::sink(),
+        )
+    }
+
     pub fn native_runtime_release(&self, bundle_digest: &str) -> Result<PathBuf, DeploymentError> {
         validate_digest(bundle_digest)?;
         Ok(self
@@ -465,7 +501,7 @@ fn verify_blob_bytes(
             "verified content must be a regular file".to_owned(),
         ));
     }
-    let mut input = File::open(path)?;
+    let input = File::open(path)?;
     let metadata = input.metadata()?;
     if !metadata.is_file() || metadata.len() != descriptor.size {
         return Err(DeploymentError::SizeMismatch {
@@ -473,6 +509,14 @@ fn verify_blob_bytes(
             actual: metadata.len(),
         });
     }
+    verify_stream(input, descriptor, output)
+}
+
+fn verify_stream(
+    mut input: impl Read,
+    descriptor: &DescriptorIdentity,
+    output: &mut impl Write,
+) -> Result<(), DeploymentError> {
     let mut digest = Sha256::new();
     let mut buffer = [0; 64 * 1024];
     let mut copied = 0;

@@ -6,11 +6,15 @@
 mod activation;
 mod preflight;
 mod service;
+mod space_artifact;
 mod store;
 
 pub use activation::{ActivationRegistry, DeploymentInfo, DeploymentRevision};
 pub use preflight::preflight;
 pub use service::{DeploymentService, TokenAuthenticator};
+pub use space_artifact::{
+    SpaceArtifactError, SpaceArtifactLease, SpaceArtifactRegistry, SpaceArtifactScope,
+};
 pub use store::{
     ContentStore, ExternalAssetTransport, ReqwestExternalAssetTransport, UploadSession,
 };
