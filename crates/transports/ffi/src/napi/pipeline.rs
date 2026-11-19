@@ -772,6 +772,19 @@ impl NapiRuntimeData {
             _ => Err(napi::Error::from_reason("Not file data")),
         }
     }
+
+    /// The stream this value belongs to, for the kinds that carry one
+    /// (audio, video, file): the track a media output is sent on. `null`
+    /// when the value names none, and for every other kind.
+    #[napi]
+    pub fn get_stream_id(&self) -> Option<String> {
+        match &self.inner {
+            RuntimeData::Audio { stream_id, .. }
+            | RuntimeData::Video { stream_id, .. }
+            | RuntimeData::File { stream_id, .. } => stream_id.clone(),
+            _ => None,
+        }
+    }
 }
 
 /// Pipeline execution result with owning native output handles. Outputs keep

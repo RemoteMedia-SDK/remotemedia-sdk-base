@@ -73,7 +73,7 @@ impl WebSocketSignalingServer {
         let state = Arc::clone(&self.state);
 
         // Channel to receive the startup result
-        let (startup_tx, startup_rx) = oneshot::channel::<Result<(), std::io::Error>>();
+        let (startup_tx, startup_rx) = oneshot::channel::<Result<SocketAddr, std::io::Error>>();
 
         // Shutdown channel
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -140,7 +140,7 @@ impl WebSocketSignalingServer {
 
                 // Signal successful startup
                 eprintln!("[WS-SERVER] Sending startup success signal...");
-                let _ = startup_tx.send(Ok(()));
+                let _ = startup_tx.send(Ok(local_addr));
 
                 // Subscribe to shutdown
                 let mut shutdown_rx = shutdown_tx_clone.subscribe();
@@ -179,11 +179,12 @@ impl WebSocketSignalingServer {
 
         // Wait for startup to complete
         match startup_rx.await {
-            Ok(Ok(())) => {
+            Ok(Ok(local_addr)) => {
                 info!("WebSocket signaling server started successfully");
                 Ok(WebSocketServerHandle {
                     thread: Some(thread_handle),
                     shutdown_tx,
+                    local_addr,
                 })
             }
             Ok(Err(e)) => {
@@ -210,9 +211,16 @@ impl WebSocketSignalingServer {
 pub struct WebSocketServerHandle {
     thread: Option<thread::JoinHandle<()>>,
     shutdown_tx: broadcast::Sender<()>,
+    local_addr: SocketAddr,
 }
 
 impl WebSocketServerHandle {
+    /// The address the server is listening on (the real port when it was
+    /// started on port 0).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
     /// Shut down the server
     pub async fn shutdown(mut self) {
         info!("Sending shutdown signal to WebSocket server");

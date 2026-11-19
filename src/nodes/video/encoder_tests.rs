@@ -136,6 +136,57 @@ mod tests {
         assert_eq!(config.threads, 0);
     }
 
+    /// A live stream should not wait for later frames: the encoder gives a
+    /// packet for the first frame it is fed. libx264 (zerolatency) and NVENC
+    /// do. Media Foundation's software H.264 MFT, the fallback of an FFmpeg
+    /// build with neither, holds back 16 frames (measured 2026-11-18; no
+    /// `h264_mf` option or `low_delay` flag changed it), which delays every
+    /// video track's start by about a second at 15 fps and never emits a
+    /// stream of only a few frames. Ignored because it fails on such a
+    /// build; run it with `--ignored --nocapture` to measure an encoder.
+    #[tokio::test]
+    #[ignore = "fails where H.264 falls back to Media Foundation (16 frames held back)"]
+    async fn h264_encoder_emits_a_packet_for_the_first_frame() {
+        let config = VideoEncoderConfig {
+            codec: VideoCodec::H264,
+            bitrate: 500_000,
+            framerate: 15,
+            ..Default::default()
+        };
+        let Ok(encoder) = VideoEncoderNode::new(config) else {
+            return;
+        };
+        let (width, height) = (320u32, 240u32);
+        let mut first_output = None;
+        for frame_number in 0..40u64 {
+            let frame = RuntimeData::Video {
+                pixel_data: vec![(frame_number * 5) as u8; (width * height * 3 / 2) as usize].into(),
+                width,
+                height,
+                format: PixelFormat::Yuv420p,
+                codec: None,
+                frame_number,
+                timestamp_us: frame_number * 66_666,
+                is_keyframe: false,
+                stream_id: None,
+                arrival_ts_us: None,
+            };
+            match encoder.process(frame).await {
+                Ok(RuntimeData::Video { pixel_data, .. }) => {
+                    if !pixel_data.is_empty() {
+                        first_output = Some(frame_number);
+                        break;
+                    }
+                }
+                // No H.264 encoder in this FFmpeg build: nothing to check.
+                Err(_) => return,
+                Ok(other) => panic!("expected video, got {}", other.data_type()),
+            }
+        }
+        eprintln!("first H.264 packet after input frame {first_output:?}");
+        assert_eq!(first_output, Some(0), "the encoder held frames back");
+    }
+
     #[tokio::test]
     async fn test_h264_encoder() {
         // Test H.264 encoding

@@ -91,3 +91,30 @@ pub(crate) fn participant_fields(
         .collect(),
     )
 }
+
+/// Tells a session handle's pending receives that `close` was called.
+///
+/// A receive holds the output receivers' locks while it waits for the next
+/// output, and `close` needs those locks to drop the receivers. Without this
+/// signal `close` waits for an output that may never come: a session with a
+/// receive pending could not be closed.
+#[derive(Clone)]
+pub(crate) struct CloseSignal(std::sync::Arc<tokio::sync::watch::Sender<bool>>);
+
+impl CloseSignal {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::watch::channel(false).0))
+    }
+
+    /// Wake every pending receive; later receives return at once.
+    pub(crate) fn close(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// Resolves once [`Self::close`] has been called.
+    pub(crate) async fn closed(&self) {
+        let mut rx = self.0.subscribe();
+        // The sender lives in `self`, so the wait cannot fail.
+        let _ = rx.wait_for(|closed| *closed).await;
+    }
+}

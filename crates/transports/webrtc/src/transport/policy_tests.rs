@@ -338,6 +338,26 @@ async fn check_audio(live: &mut LiveTransport, copies: &CopyContext, policy: Cop
     assert_eq!(budget.usage().owners, 0);
 }
 
+/// Whether this build's H.264 encoder returns a packet for the first frame
+/// it is given.
+#[cfg(feature = "video")]
+async fn h264_emits_a_packet_per_frame() -> bool {
+    use crate::media::tracks::video_copy_tests::frame;
+    use remotemedia_core::data::video::{PixelFormat, VideoCodec};
+    use remotemedia_core::nodes::streaming_node::AsyncStreamingNode;
+    use remotemedia_core::nodes::video::{VideoEncoderConfig, VideoEncoderNode};
+    let Ok(encoder) = VideoEncoderNode::new(VideoEncoderConfig {
+        codec: VideoCodec::H264,
+        ..Default::default()
+    }) else {
+        return false;
+    };
+    matches!(
+        encoder.process(frame(PixelFormat::Yuv420p)).await,
+        Ok(RuntimeData::Video { pixel_data, .. }) if !pixel_data.is_empty()
+    )
+}
+
 #[cfg(feature = "video")]
 async fn check_video(live: &mut LiveTransport, copies: &CopyContext, policy: CopyPolicy) {
     use crate::media::tracks::video_copy_tests::{frame, YUV_BYTES};
@@ -370,7 +390,13 @@ async fn check_video(live: &mut LiveTransport, copies: &CopyContext, policy: Cop
         generic.unwrap();
         direct.unwrap();
         assert_eq!(broadcast.sent_count, 1);
-        live.receive_media(RTPCodecType::Video).await;
+        // The four frames above only reach the wire if the encoder gives a
+        // packet per frame. One that holds frames back first (Media
+        // Foundation's H.264 MFT holds 16) sends nothing yet; the copy
+        // accounting below does not depend on it.
+        if h264_emits_a_packet_per_frame().await {
+            live.receive_media(RTPCodecType::Video).await;
+        }
         assert_eq!(
             counts(copies, CopyReason::ForeignPoolIngress).copied_bytes,
             4 * YUV_BYTES

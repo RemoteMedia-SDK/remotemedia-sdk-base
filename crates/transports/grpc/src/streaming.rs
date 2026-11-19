@@ -823,10 +823,42 @@ async fn handle_stream(
                     // release the session lock before the (bounded, awaited) send:
                     // the router takes this lock to lazily create node tasks, so
                     // holding it across a full-queue send deadlocks the session.
-                    let (router_input, transport_copies) = {
+                    let (router_input, transport_copies, targets) = {
                         let guard = sess.lock().await;
-                        (guard.router_input.clone(), guard.transport_copies.clone())
+                        // An empty node_id addresses no node: the input goes
+                        // to every source node (one with no incoming
+                        // connection), as a core session delivers it. This
+                        // router reads a packet without a target as a node's
+                        // output, so the sources are named here.
+                        let targets: Vec<String> = if data_chunk.node_id.is_empty() {
+                            let fed: std::collections::HashSet<&str> = guard
+                                .manifest
+                                .connections
+                                .iter()
+                                .map(|c| c.to.as_str())
+                                .collect();
+                            guard
+                                .manifest
+                                .nodes
+                                .iter()
+                                .filter(|n| !fed.contains(n.id.as_str()))
+                                .map(|n| n.id.clone())
+                                .collect()
+                        } else {
+                            vec![data_chunk.node_id.clone()]
+                        };
+                        (
+                            guard.router_input.clone(),
+                            guard.transport_copies.clone(),
+                            targets,
+                        )
                     };
+                    if targets.is_empty() {
+                        return Err(ServiceError::Validation(
+                            "DataChunk names no node and the manifest has no source node"
+                                .to_string(),
+                        ));
+                    }
                     if let Some(router_input) = router_input {
                         // Convert DataBuffer to RuntimeData with arrival timestamp (spec 026).
                         // The chunk owns its buffer: bulk bytes move into shared storage
@@ -861,19 +893,32 @@ async fn handle_stream(
 
                         // Create DataPacket - the data should be sent TO the node specified in data_chunk.node_id
                         // not FROM it. We use "client" as the source since this is input from the client.
-                        let packet = DataPacket {
-                            data: runtime_data,
-                            from_node: "client".to_string(), // Data comes from client
-                            to_node: Some(data_chunk.node_id.clone()), // Send TO this node for processing
-                            session_id: session_id.clone(),
-                            sequence: data_chunk.sequence,
-                            sub_sequence: 0,
-                        };
+                        // One packet per target; the last takes the value itself.
+                        let last = targets.len() - 1;
+                        let mut runtime_data = Some(runtime_data);
+                        for (index, target) in targets.into_iter().enumerate() {
+                            let data = if index == last {
+                                runtime_data.take().expect("moved only into the last target")
+                            } else {
+                                runtime_data
+                                    .as_ref()
+                                    .expect("kept until the last target")
+                                    .clone()
+                            };
+                            let packet = DataPacket {
+                                data,
+                                from_node: "client".to_string(), // Data comes from client
+                                to_node: Some(target), // Send TO this node for processing
+                                session_id: session_id.clone(),
+                                sequence: data_chunk.sequence,
+                                sub_sequence: 0,
+                            };
 
-                        // Bounded router-input: .await applies real backpressure.
-                        router_input.send(packet).await.map_err(|e| {
-                            ServiceError::Internal(format!("Failed to send to router: {}", e))
-                        })?;
+                            // Bounded router-input: .await applies real backpressure.
+                            router_input.send(packet).await.map_err(|e| {
+                                ServiceError::Internal(format!("Failed to send to router: {}", e))
+                            })?;
+                        }
 
                         sess.lock().await.chunks_processed += 1;
 

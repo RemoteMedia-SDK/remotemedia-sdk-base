@@ -506,7 +506,7 @@ impl AudioSender {
     ) {
         use tracing::info;
         // Use println as a backup in case tracing isn't working
-        println!("[AUDIO-SENDER-THREAD] Thread spawned!");
+        tracing::debug!("[AUDIO-SENDER-THREAD] Thread spawned!");
         info!("Audio transmission thread started - creating tokio runtime");
 
         // Create a dedicated tokio runtime for this thread

@@ -94,6 +94,9 @@ pub mod member;
 mod member_tests;
 pub mod media;
 mod peer;
+/// A Rust WebRTC member for a signalling server (tests, `remotemedia test`).
+#[cfg(feature = "ws-signaling")]
+pub mod peer_client;
 mod session;
 mod sync;
 mod transport;
@@ -162,6 +165,9 @@ mod tests {
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(all(test, feature = "ws-signaling", feature = "video"))]
+mod peer_client_tests;
 
 mod json_payload;
 /// Guards the committed protobuf bindings in `src/generated/`: fails when a
