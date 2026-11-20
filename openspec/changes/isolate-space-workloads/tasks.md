@@ -6,5 +6,5 @@
 
 ## 2. Runtime verification
 
-- [ ] 2.1 Test untrusted manifest overrides, unregistered digests, incorrect targets, mutation between validation and mount, and concurrent leases with failure recovery.
+- [x] 2.1 Test untrusted manifest overrides, unregistered digests, incorrect targets, mutation between validation and mount, and concurrent leases with failure recovery.
 - [ ] 2.2 Run the real source-Python control fixture with isolated provisioning and serving. Verify endpoint ownership, resource enforcement, and teardown on node failure, cancellation, and restart, alongside legacy trusted source-plugin tests.

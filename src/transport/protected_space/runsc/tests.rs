@@ -92,7 +92,8 @@ async fn registered_lease_launches_in_run_bound_sandbox() {
         std::env::var_os("RM_SPACE_TEST_CGROUP").expect("set exclusive cgroup subtree"),
     );
     let state = temp.path().join("state");
-    let artifacts = Arc::new(SpaceArtifactRegistry::open(temp.path().join("artifacts")).unwrap());
+    let store = temp.path().join("artifacts");
+    let artifacts = Arc::new(SpaceArtifactRegistry::open(&store).unwrap());
     let runtime = IsolatedSpaceRuntime::open(
         artifacts.clone(),
         IsolatedSpaceConfig {
@@ -127,6 +128,15 @@ async fn registered_lease_launches_in_run_bound_sandbox() {
 
     let (mut approval, controller, bytes, execution) =
         registered_execution(&executor, &artifacts, "3.12", "cp312");
+    let mut unsupported = approval.clone();
+    unsupported.target = "linux-arm64-cpu".into();
+    let unsupported = executor
+        .verify_protected_space(unsupported, &controller, &bytes)
+        .unwrap();
+    assert!(matches!(
+        runtime.stage(&unsupported).await,
+        Err(IsolatedSpaceError::UnsupportedProfile)
+    ));
     approval.run_id = "different-run".into();
     let other = executor
         .verify_protected_space(approval.clone(), &controller, &bytes)
@@ -147,13 +157,24 @@ async fn registered_lease_launches_in_run_bound_sandbox() {
     ));
     assert_eq!(fs::read_dir(state.join("bundles")).unwrap().count(), 0);
 
-    let run = runtime
-        .stage(&execution)
-        .await
-        .unwrap()
-        .start(&execution)
-        .await
-        .unwrap();
+    // A change after authorization must fail while copying the registered
+    // store. A staged run must then outlive a subsequent change to that store.
+    let cached_source = store
+        .join("content/blobs/sha256")
+        .join(hash(SOURCE.as_bytes()));
+    fs::write(&cached_source, vec![0; SOURCE.len()]).unwrap();
+    assert!(matches!(
+        runtime.stage(&execution).await,
+        Err(IsolatedSpaceError::Artifact(SpaceArtifactError::Content(
+            remotemedia_bundle_deployment::DeploymentError::DigestMismatch { .. }
+        )))
+    ));
+    assert_eq!(fs::read_dir(state.join("bundles")).unwrap().count(), 0);
+    fs::write(&cached_source, SOURCE).unwrap();
+    let staged = runtime.stage(&execution).await.unwrap();
+    fs::write(&cached_source, vec![0; SOURCE.len()]).unwrap();
+    let run = staged.start(&execution).await.unwrap();
+    assert!(!run.deadline_is_approval_expiry());
     assert!(matches!(
         run.open_stream(&other),
         Err(IsolatedSpaceError::WrongRun)

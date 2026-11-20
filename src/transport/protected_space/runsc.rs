@@ -64,6 +64,7 @@ pub struct PreparedIsolatedSpace {
 pub struct IsolatedSpaceRun {
     approval: ProtectedSpaceApproval,
     sandbox: RunscSandbox,
+    deadline_is_approval_expiry: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -194,6 +195,7 @@ impl PreparedIsolatedSpace {
         if remaining.is_zero() {
             return Err(ProtectedSpaceError::Expired.into());
         }
+        let deadline_is_approval_expiry = remaining <= self.request.limits.lifetime;
         self.request.limits.lifetime = self.request.limits.lifetime.min(remaining);
         let sandbox = self.reservation.start(self.request).await?;
         if let Err(error) = current.check_current() {
@@ -203,11 +205,18 @@ impl PreparedIsolatedSpace {
         Ok(IsolatedSpaceRun {
             approval: self.approval,
             sandbox,
+            deadline_is_approval_expiry,
         })
     }
 }
 
 impl IsolatedSpaceRun {
+    /// Whether the run's absolute approval expiry selected the provider lifetime.
+    /// Use the selected limit when interpreting the provider's monotonic deadline.
+    pub fn deadline_is_approval_expiry(&self) -> bool {
+        self.deadline_is_approval_expiry
+    }
+
     /// The authenticated gateway uses its current out-of-band authorization
     /// and receives only a stream to this run's fixed guest loopback port.
     pub fn open_stream(
