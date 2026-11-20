@@ -1,6 +1,6 @@
 use super::{
-    lower_hex, ProtectedPreparationCgroup, ProtectedSpacePhase, ProtectedSpaceProfile,
-    VerifiedSpaceExecution,
+    lower_hex, ProtectedPreparationBackend, ProtectedPreparationCgroup, ProtectedSpacePhase,
+    ProtectedSpaceProfile, VerifiedSpaceExecution,
 };
 use crate::data::RuntimeData;
 use crate::loadable::resolver::{PluginResolver, ResolvedPlugin};
@@ -27,6 +27,7 @@ pub struct ProtectedPreparationSettings {
     pub python_executable: PathBuf,
     pub cgroup_root: PathBuf,
     pub processes: u32,
+    pub workload_backend: ProtectedPreparationBackend,
 }
 
 /// The private input and output of a one-shot preparation pipeline.
@@ -102,8 +103,12 @@ impl VerifiedSpaceExecution {
         let executor = PipelineExecutor::for_protected_spaces()?;
         executor.register_factory(Arc::new(factory)).await;
         let mut manifest = self.manifest().clone();
+        let backend = match settings.workload_backend {
+            ProtectedPreparationBackend::Cpu => "cpu",
+            ProtectedPreparationBackend::Cuda => "cuda",
+        };
         let request = json!({"space_id": approval.repository, "revision": approval.commit,
-                             "expected_commit": approval.commit, "backend": "cpu"});
+                             "expected_commit": approval.commit, "backend": backend});
         manifest.nodes[0].params["cache"] = json!(root);
         manifest.nodes[0].params["preparation"] = json!({
             "request": request, "policy_path": policy, "policy_revision": approval.policy_revision,
@@ -334,6 +339,7 @@ mod tests {
             python_executable: python,
             cgroup_root: PathBuf::from(std::env::var_os("RM_SPACE_PREPARATION_CGROUP").unwrap()),
             processes: 32,
+            workload_backend: ProtectedPreparationBackend::Cpu,
         };
         let cgroup = settings.reserve_cgroup().await.unwrap();
         let rechecks = std::cell::Cell::new(0);

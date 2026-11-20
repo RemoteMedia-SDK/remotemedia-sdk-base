@@ -45,6 +45,16 @@ pub const PROTECTED_SPACE_CONTRACT_VERSION: u32 = 1;
 pub const PROTECTED_CUDA_TARGET: &str = "linux-amd64-cuda";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
+/// Target of the artifact being prepared. The preparation workload itself
+/// runs on CPU and receives no GPU assignment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProtectedPreparationBackend {
+    #[default]
+    Cpu,
+    Cuda,
+}
+
 /// Isolated CUDA serving requires one canonical NVIDIA physical-device UUID.
 /// Other phases and profiles receive no protected device assignment.
 pub fn valid_protected_device_scope(
