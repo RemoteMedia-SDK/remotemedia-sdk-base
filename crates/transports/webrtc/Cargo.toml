@@ -43,7 +43,7 @@ base64 = "0.22"
 bytemuck = { workspace = true }
 # from_owner retains immutable runtime owners in WebRTC samples.
 bytes = "1.11"
-remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "3be71019c3ebf9bd6dc932e3cd1faf64bdb78f41" }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b359edb0d9b55658817d19fd4dc2f8be2b56fd91" }
 async-trait = { workspace = true }
 clap = { version = "4.5", features = ["derive", "env"], optional = true }
 bollard = { workspace = true }
