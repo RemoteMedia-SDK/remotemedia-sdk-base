@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use remotemedia_bundle_deployment::{
     SpaceArtifactError, SpaceArtifactRegistry, SpaceArtifactScope,
 };
-pub use remotemedia_workload_sandbox::runsc::{RunscConfig, RunscStream};
+pub use remotemedia_workload_sandbox::runsc::{ApprovedWheelBuild, RunscConfig, RunscStream};
 use remotemedia_workload_sandbox::runsc::{RunscProvider, RunscReservation, RunscSandbox};
 use remotemedia_workload_sandbox::{SandboxError, WorkloadPhase, WorkloadRequest, WorkloadTarget};
 pub use remotemedia_workload_sandbox::{WorkloadExit, WorkloadLimits};
@@ -20,6 +20,21 @@ use super::{
 mod tests;
 
 const TARGET: &str = "linux-amd64-cpu";
+
+/// Build a reviewed dependency using a provider dedicated to the build. The
+/// result remains unpublished until the trusted caller admits its artifact.
+pub async fn build_approved_space_wheel(
+    config: RunscConfig,
+    inputs: &std::path::Path,
+    plan: &ApprovedWheelBuild,
+    limits: WorkloadLimits,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> Result<std::fs::File, IsolatedSpaceError> {
+    let builder = RunscProvider::open(config).await?;
+    Ok(builder
+        .build_python_wheel(inputs, plan, limits, cancelled)
+        .await?)
+}
 
 /// All fields come from the host operator. The launcher is a program in the
 /// verified rootfs. It receives the SDK name, mounted entry path and port.
