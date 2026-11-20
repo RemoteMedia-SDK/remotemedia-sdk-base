@@ -3,7 +3,7 @@ use super::{
     ProtectedSpaceProfile, VerifiedSpaceExecution,
 };
 use crate::data::RuntimeData;
-use crate::loadable::resolver::{PluginResolver, ResolvedPlugin};
+use crate::loadable::plugin_toml::{PluginLanguage, PluginToml};
 use crate::loadable::source_python::{SourcePythonFactory, SourcePythonPlugin};
 use crate::transport::{PipelineExecutor, SessionHandle, TransportData};
 use crate::{Error, Result};
@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod checkout_storage;
+mod controller;
 
 const NODE_TYPE: &str = "PrepareSpaceNode";
 const ENTRY_MODULE: &str = "hf_spaces_runner.nodes";
@@ -28,6 +29,7 @@ pub struct ProtectedPreparationSettings {
     pub cgroup_root: PathBuf,
     pub processes: u32,
     pub workload_backend: ProtectedPreparationBackend,
+    pub controller_sha256: String,
 }
 
 /// The private input and output of a one-shot preparation pipeline.
@@ -39,6 +41,7 @@ pub struct ProtectedSpacePreparation {
     repository: String,
     commit: String,
     checkout_root: PathBuf,
+    _staged_controller: tempfile::TempDir,
 }
 
 impl VerifiedSpaceExecution {
@@ -69,19 +72,17 @@ impl VerifiedSpaceExecution {
         require_current().await?;
         self.require_live_preparation()?;
 
-        let resolver = PluginResolver::new(self.controller_path());
-        let resolved = resolver
-            .resolve_async(&self.manifest().plugins[0])
+        let source_root = self.controller_path().to_owned();
+        let digest = settings.controller_sha256.clone();
+        let staged = tokio::task::spawn_blocking(move || controller::stage(&source_root, &digest))
             .await
+            .map_err(|_| invalid_controller())??;
+        let manifest = std::fs::read_to_string(staged.path().join("plugin.toml"))
             .map_err(|_| invalid_controller())?;
-        let ResolvedPlugin::SourcePython {
-            plugin_toml,
-            module_root,
-            hash,
-        } = resolved
-        else {
+        let plugin_toml = PluginToml::parse(&manifest).map_err(|_| invalid_controller())?;
+        if plugin_toml.plugin.language != PluginLanguage::Python {
             return Err(invalid_controller());
-        };
+        }
         let source = plugin_toml.python.ok_or_else(invalid_controller)?;
         if source.entry_module != ENTRY_MODULE
             || !source.node_types.iter().any(|name| name == NODE_TYPE)
@@ -93,9 +94,9 @@ impl VerifiedSpaceExecution {
         let (factory, instance) = SourcePythonFactory::new(SourcePythonPlugin {
             node_type: NODE_TYPE.into(),
             entry_module: source.entry_module,
-            module_root,
+            module_root: staged.path().to_owned(),
             requires: Vec::new(),
-            hash,
+            hash: settings.controller_sha256.clone(),
         })
         .with_protected_python(settings.python_executable.clone(), cgroup.membership());
 
@@ -134,6 +135,7 @@ impl VerifiedSpaceExecution {
             repository: approval.repository.clone(),
             commit: approval.commit.clone(),
             checkout_root: settings.checkout_root.clone(),
+            _staged_controller: staged,
         })
     }
 
@@ -144,6 +146,15 @@ impl VerifiedSpaceExecution {
 }
 
 impl ProtectedPreparationSettings {
+    /// Verify that the advertised controller still has its approved bytes.
+    pub async fn check_controller(&self, root: &Path) -> Result<()> {
+        let root = root.to_owned();
+        let expected = self.controller_sha256.clone();
+        tokio::task::spawn_blocking(move || controller::verify(&root, &expected))
+            .await
+            .map_err(|_| invalid_controller())?
+    }
+
     pub fn check_resources(&self) -> Result<()> {
         self.check_checkout_storage()?;
         ProtectedPreparationCgroup::check(&self.cgroup_root, self.processes)
@@ -184,6 +195,7 @@ impl ProtectedPreparationSettings {
             || !self.checkout_root.is_dir()
             || !self.policy_file.is_file()
             || !self.python_executable.is_file()
+            || !lower_hex(&self.controller_sha256, 64)
         {
             return Err(invalid());
         }
@@ -340,6 +352,7 @@ mod tests {
             cgroup_root: PathBuf::from(std::env::var_os("RM_SPACE_PREPARATION_CGROUP").unwrap()),
             processes: 32,
             workload_backend: ProtectedPreparationBackend::Cpu,
+            controller_sha256: controller::digest_fixture(&plugin),
         };
         let cgroup = settings.reserve_cgroup().await.unwrap();
         let rechecks = std::cell::Cell::new(0);

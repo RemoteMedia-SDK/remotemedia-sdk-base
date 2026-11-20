@@ -195,6 +195,7 @@ nix = { version = "0.30.1", features = ["signal", "process"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+tempfile = { workspace = true }
 remotemedia-bundle-deployment = { path = "crates/bundle-deployment", optional = true }
 remotemedia-workload-sandbox = { path = "../remotemedia-plugin-sdk/crates/workload-sandbox", optional = true }
 
