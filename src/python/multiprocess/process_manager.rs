@@ -366,6 +366,7 @@ pub struct ProcessManager {
 
     /// Spawn configuration (wrapped in RwLock for runtime updates)
     spawn_config: Arc<RwLock<SpawnConfig>>,
+    preparation_cgroup: std::sync::OnceLock<Arc<std::fs::File>>,
 
     /// Configuration
     #[allow(dead_code)] // Reserved for future process management policies
@@ -499,6 +500,7 @@ impl ProcessManager {
             processes: Arc::new(RwLock::new(HashMap::new())),
             copy_authorities: Arc::new(std::sync::Mutex::new(HashMap::new())),
             spawn_config: Arc::new(RwLock::new(spawn_config)),
+            preparation_cgroup: std::sync::OnceLock::new(),
             config,
             exit_handlers: Arc::new(RwLock::new(Vec::new())),
         }
@@ -515,6 +517,16 @@ impl ProcessManager {
     /// Get access to the spawn configuration (for updating python_executable etc.)
     pub fn spawn_config(&self) -> &Arc<RwLock<SpawnConfig>> {
         &self.spawn_config
+    }
+
+    pub(super) fn bind_preparation_cgroup(&self, membership: Arc<std::fs::File>) -> Result<()> {
+        self.preparation_cgroup
+            .set(membership)
+            .map_err(|_| Error::ConfigError("protected preparation cgroup already assigned".into()))
+    }
+
+    pub(super) fn has_preparation_cgroup(&self) -> bool {
+        self.preparation_cgroup.get().is_some()
     }
 
     /// Register a Python module for node registration
@@ -706,9 +718,22 @@ impl ProcessManager {
             // Only available on Linux; macOS/BSD lack PR_SET_PDEATHSIG.
             #[cfg(target_os = "linux")]
             unsafe {
-                command.pre_exec(|| {
+                use std::os::fd::AsRawFd;
+                let membership = self.preparation_cgroup.get().cloned();
+                let parent = std::process::id() as libc::pid_t;
+                command.pre_exec(move || {
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
                         return Err(std::io::Error::last_os_error());
+                    }
+                    if let Some(membership) = &membership {
+                        if libc::getppid() != parent {
+                            return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                        }
+                        // Joining before exec puts the interpreter and all of
+                        // its descendants under the aggregate limits from birth.
+                        if libc::write(membership.as_raw_fd(), b"0".as_ptr().cast(), 1) != 1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                     Ok(())
                 });

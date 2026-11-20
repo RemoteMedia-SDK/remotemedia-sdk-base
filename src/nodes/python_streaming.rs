@@ -31,12 +31,17 @@ pub struct PythonSpawnSettings {
     pub json_as_text: bool,
 }
 
+struct ProtectedPythonSpawn {
+    executable: std::path::PathBuf,
+    membership: Arc<std::fs::File>,
+}
+
 /// Wrapper that adapts a Python node to the AsyncStreamingNode trait
 pub struct PythonStreamingNode {
     /// Per-node spawn settings; `None` for nodes on the default import path.
     spawn: Option<PythonSpawnSettings>,
     /// Operator-provisioned interpreter for the protected preparation controller.
-    protected_python: Option<std::path::PathBuf>,
+    protected_python: Option<ProtectedPythonSpawn>,
     node_id: String,
     node_type: String,
     params: Value,
@@ -148,8 +153,15 @@ impl PythonStreamingNode {
     }
 
     #[cfg(feature = "python-source-plugin")]
-    pub(crate) fn with_protected_python(mut self, executable: std::path::PathBuf) -> Self {
-        self.protected_python = Some(executable);
+    pub(crate) fn with_protected_python(
+        mut self,
+        executable: std::path::PathBuf,
+        membership: Arc<std::fs::File>,
+    ) -> Self {
+        self.protected_python = Some(ProtectedPythonSpawn {
+            executable,
+            membership,
+        });
         self
     }
 
@@ -252,8 +264,8 @@ impl PythonStreamingNode {
 
             use crate::python::multiprocess::MultiprocessConfig;
             let mut config = match &self.protected_python {
-                Some(executable) => MultiprocessConfig {
-                    python_executable: executable.clone(),
+                Some(preparation) => MultiprocessConfig {
+                    python_executable: preparation.executable.clone(),
                     init_timeout_secs: 20,
                     python_env: crate::python::env_manager::PythonEnvConfig {
                         mode: crate::python::env_manager::PythonEnvMode::System,
@@ -273,7 +285,8 @@ impl PythonStreamingNode {
             }
 
             let mut executor = crate::python::multiprocess::MultiprocessExecutor::new(config);
-            if self.protected_python.is_some() {
+            if let Some(preparation) = &self.protected_python {
+                executor.bind_preparation_cgroup(preparation.membership.clone())?;
                 executor.set_spawn_env("PYTHONNOUSERSITE", "1").await;
             }
             if let Some(spawn) = &self.spawn {

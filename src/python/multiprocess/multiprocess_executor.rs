@@ -1392,6 +1392,10 @@ impl MultiprocessExecutor {
 
     /// Set an environment variable for this executor's worker processes.
     /// It is part of the shared-worker key.
+    pub(crate) fn bind_preparation_cgroup(&self, membership: Arc<std::fs::File>) -> Result<()> {
+        self.process_manager.bind_preparation_cgroup(membership)
+    }
+
     pub async fn set_spawn_env(&self, key: &str, value: &str) {
         self.process_manager
             .spawn_config()
@@ -3237,6 +3241,12 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             .get("use_docker")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        #[cfg(feature = "docker")]
+        if use_docker && self.process_manager.has_preparation_cgroup() {
+            return Err(Error::ConfigError(
+                "protected preparation requires its assigned worker cgroup".into(),
+            ));
+        }
 
         #[cfg(feature = "docker")]
         let docker_config = if use_docker {
@@ -3635,7 +3645,10 @@ impl ExecutorNodeExecutor for MultiprocessExecutor {
             #[cfg(not(feature = "docker"))]
             let docker = false;
             let policy = self.config.worker_sharing.clone().with_env_overrides();
-            if !docker && policy.applies_to(&ctx.node_type, &ctx.params) {
+            if !docker
+                && !self.process_manager.has_preparation_cgroup()
+                && policy.applies_to(&ctx.node_type, &ctx.params)
+            {
                 let spawn = self.process_manager.spawn_config().read().await.clone();
                 let authority = self
                     .initial_copies

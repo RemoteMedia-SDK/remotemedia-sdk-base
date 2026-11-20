@@ -1,4 +1,7 @@
-use super::{lower_hex, ProtectedSpacePhase, ProtectedSpaceProfile, VerifiedSpaceExecution};
+use super::{
+    lower_hex, ProtectedPreparationCgroup, ProtectedSpacePhase, ProtectedSpaceProfile,
+    VerifiedSpaceExecution,
+};
 use crate::data::RuntimeData;
 use crate::loadable::resolver::{PluginResolver, ResolvedPlugin};
 use crate::loadable::source_python::{SourcePythonFactory, SourcePythonPlugin};
@@ -19,6 +22,8 @@ pub struct ProtectedPreparationSettings {
     pub checkout_root: PathBuf,
     pub policy_file: PathBuf,
     pub python_executable: PathBuf,
+    pub cgroup_root: PathBuf,
+    pub processes: u32,
 }
 
 /// The private input and output of a one-shot preparation pipeline.
@@ -38,6 +43,7 @@ impl VerifiedSpaceExecution {
     pub async fn start_preparation<F, Fut>(
         &self,
         settings: &ProtectedPreparationSettings,
+        cgroup: &ProtectedPreparationCgroup,
         require_current: F,
     ) -> Result<ProtectedSpacePreparation>
     where
@@ -54,6 +60,7 @@ impl VerifiedSpaceExecution {
             ));
         }
         let (root, policy) = settings.validate()?;
+        cgroup.verify_root(&settings.cgroup_root, settings.processes)?;
         require_current().await?;
         self.require_live_preparation()?;
 
@@ -85,7 +92,7 @@ impl VerifiedSpaceExecution {
             requires: Vec::new(),
             hash,
         })
-        .with_protected_python(settings.python_executable.clone());
+        .with_protected_python(settings.python_executable.clone(), cgroup.membership());
 
         // No other session can see this controller factory or its control bus.
         let executor = PipelineExecutor::for_protected_spaces()?;
@@ -127,6 +134,16 @@ impl VerifiedSpaceExecution {
 }
 
 impl ProtectedPreparationSettings {
+    pub fn check_cgroup(&self) -> Result<()> {
+        ProtectedPreparationCgroup::check(&self.cgroup_root, self.processes)
+            .map(|_| ())
+            .map_err(|error| Error::ConfigError(format!("protected preparation cgroup: {error}")))
+    }
+
+    pub async fn reserve_cgroup(&self) -> Result<ProtectedPreparationCgroup> {
+        ProtectedPreparationCgroup::reserve(self.cgroup_root.clone(), self.processes).await
+    }
+
     fn validate(&self) -> Result<(&str, &str)> {
         let invalid = || Error::ConfigError("invalid worker preparation settings".into());
         if !self.checkout_root.is_absolute()
@@ -249,7 +266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires the released Spaces controller, prebuilt Python environment, and public Hub access"]
+    #[ignore = "requires the released Spaces controller, prebuilt Python environment, a delegated cgroup, and public Hub access"]
     async fn verified_preparation_executes_the_real_source_controller() {
         let plugin = PathBuf::from(std::env::var_os("RM_SPACE_PREPARATION_PLUGIN").unwrap());
         let python = PathBuf::from(std::env::var_os("RM_SPACE_PREPARATION_PYTHON").unwrap());
@@ -277,10 +294,13 @@ mod tests {
             checkout_root,
             policy_file,
             python_executable: python,
+            cgroup_root: PathBuf::from(std::env::var_os("RM_SPACE_PREPARATION_CGROUP").unwrap()),
+            processes: 32,
         };
+        let cgroup = settings.reserve_cgroup().await.unwrap();
         let rechecks = std::cell::Cell::new(0);
         let mut session = execution
-            .start_preparation(&settings, || {
+            .start_preparation(&settings, &cgroup, || {
                 rechecks.set(rechecks.get() + 1);
                 std::future::ready(Ok(()))
             })
@@ -290,6 +310,7 @@ mod tests {
         let descriptor =
             tokio::time::timeout(std::time::Duration::from_secs(90), session.resolve()).await;
         session.close().await.unwrap();
+        cgroup.close().await.unwrap();
         let descriptor: Value = serde_json::from_str(&descriptor.unwrap().unwrap()).unwrap();
         assert_eq!(descriptor["space_id"], "not-lain/background-removal");
         assert!(executor.control_bus().list().is_empty());

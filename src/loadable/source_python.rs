@@ -84,6 +84,7 @@ type ControllerInstance =
 
 struct ProtectedPython {
     executable: PathBuf,
+    membership: Arc<std::fs::File>,
     instance: ControllerInstance,
 }
 
@@ -155,10 +156,12 @@ impl SourcePythonFactory {
     pub(crate) fn with_protected_python(
         mut self,
         executable: PathBuf,
+        membership: Arc<std::fs::File>,
     ) -> (Self, ControllerInstance) {
         let instance = ControllerInstance::default();
         self.protected_python = Some(ProtectedPython {
             executable,
+            membership,
             instance: instance.clone(),
         });
         (self, instance)
@@ -218,7 +221,11 @@ impl SourcePythonFactory {
         }
         .with_spawn_settings(settings);
         let node = if let Some(protected) = &self.protected_python {
-            let node = Arc::new(node.with_protected_python(protected.executable.clone()));
+            let node =
+                Arc::new(node.with_protected_python(
+                    protected.executable.clone(),
+                    protected.membership.clone(),
+                ));
             protected.instance.set(node.clone()).map_err(|_| {
                 Error::Execution("the protected controller already has an instance".into())
             })?;

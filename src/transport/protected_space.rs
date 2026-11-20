@@ -21,7 +21,21 @@ mod preparation;
     feature = "loadable",
     feature = "python-source-plugin"
 ))]
+mod preparation_cgroup;
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "loadable",
+    feature = "python-source-plugin"
+))]
 pub use preparation::{ProtectedPreparationSettings, ProtectedSpacePreparation};
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "loadable",
+    feature = "python-source-plugin"
+))]
+pub use preparation_cgroup::ProtectedPreparationCgroup;
 
 #[cfg(all(target_os = "linux", feature = "protected-space-runsc"))]
 pub mod runsc;
