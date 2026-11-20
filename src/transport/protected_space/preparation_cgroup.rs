@@ -66,14 +66,31 @@ impl ProtectedPreparationCgroup {
         Ok((root, capacity))
     }
 
-    pub(super) async fn reserve(root: PathBuf, processes: u32) -> Result<Self> {
+    pub(super) async fn has_capacity(root: PathBuf, processes: u32) -> Result<bool> {
+        tokio::task::spawn_blocking(move || {
+            let (root, _) = Self::check(&root, processes)?;
+            let parent = File::open(&root)?;
+            if !try_lock(&parent)? {
+                return Ok(false);
+            }
+            let (_, capacity) = Self::check(&root, processes)?;
+            Ok(available_processes(&root, capacity, None)? >= u64::from(processes))
+        })
+        .await
+        .map_err(|error| Error::Execution(error.to_string()))?
+        .map_err(|error: io::Error| {
+            Error::ConfigError(format!("protected preparation cgroup: {error}"))
+        })
+    }
+
+    pub(super) async fn reserve(root: PathBuf, processes: u32) -> Result<Option<Self>> {
         tokio::task::spawn_blocking(move || Self::open(&root, processes))
             .await
             .map_err(|error| Error::Execution(error.to_string()))?
             .map_err(|error| Error::ConfigError(format!("protected preparation cgroup: {error}")))
     }
 
-    fn open(root: &Path, processes: u32) -> io::Result<Self> {
+    fn open(root: &Path, processes: u32) -> io::Result<Option<Self>> {
         let (root, _) = Self::check(root, processes)?;
         // Serialize creation and abandoned-scope recovery across dedicated
         // Runners. The per-scope lock stays held for the controller lifetime.
@@ -82,44 +99,11 @@ impl ProtectedPreparationCgroup {
         while !try_lock(&parent)? {
             wait(deadline)?;
         }
-        let (_, mut available) = Self::check(&root, processes)?;
-        for entry in fs::read_dir(&root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            if !owned_name(&entry.file_name().to_string_lossy()) {
-                return Err(io::Error::other(
-                    "preparation cgroup parent has an unrelated child",
-                ));
-            }
-            let file = match File::open(entry.path()) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if try_lock(&file)? {
-                if let Err(error) = cleanup(&entry.path(), deadline) {
-                    // A live owner can finish removal between our directory
-                    // scan and acquisition of the now-unlinked inode's lock.
-                    if error.kind() != io::ErrorKind::NotFound || entry.path().try_exists()? {
-                        return Err(error);
-                    }
-                }
-            } else {
-                match pid_limit(&entry.path()) {
-                    Ok(limit) => available = available.saturating_sub(limit),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
+        let (_, capacity) = Self::check(&root, processes)?;
         // cgroup.procs permits migration past pids.max. Reserve every leaf's
         // full allowance before admitting a controller from outside the parent.
-        if available < u64::from(processes) {
-            return Err(io::Error::other(
-                "protected preparation process capacity is reserved",
-            ));
+        if available_processes(&root, capacity, Some(deadline))? < u64::from(processes) {
+            return Ok(None);
         }
 
         let directory = root.join(format!("{PREFIX}{}", uuid::Uuid::new_v4().simple()));
@@ -150,7 +134,7 @@ impl ProtectedPreparationCgroup {
         if result.is_err() {
             let _ = fs::remove_dir(&directory);
         }
-        result
+        result.map(Some)
     }
 
     pub(super) fn verify_root(&self, root: &Path, processes: u32) -> Result<()> {
@@ -190,6 +174,49 @@ impl Drop for ProtectedPreparationCgroup {
             let _ = fs::write(self.directory.join("cgroup.kill"), "1");
         }
     }
+}
+
+/// Count existing reservations while holding the parent lock. Only admission
+/// reaps unowned scopes, and it must finish doing so before creating a new one.
+fn available_processes(
+    root: &Path,
+    mut available: u64,
+    recover_until: Option<Instant>,
+) -> io::Result<u64> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if !owned_name(&entry.file_name().to_string_lossy()) {
+            return Err(io::Error::other(
+                "preparation cgroup parent has an unrelated child",
+            ));
+        }
+        let path = entry.path();
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if try_lock(&file)? {
+            if let Some(deadline) = recover_until {
+                if let Err(error) = cleanup(&path, deadline) {
+                    // A live owner can finish removal before we acquire the lock.
+                    if error.kind() != io::ErrorKind::NotFound || path.try_exists()? {
+                        return Err(error);
+                    }
+                }
+            }
+        } else {
+            match pid_limit(&path) {
+                Ok(limit) => available = available.saturating_sub(limit),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(available)
 }
 
 fn cleanup(directory: &Path, deadline: Instant) -> io::Result<()> {
@@ -278,5 +305,22 @@ mod tests {
             fs::write(directory.path().join(file), value).unwrap();
         }
         assert!(ProtectedPreparationCgroup::check(directory.path(), 16).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an exclusive delegated cgroup v2 parent with bounded resources"]
+    async fn shared_process_budget_reports_and_refuses_exhaustion() {
+        let root = PathBuf::from(std::env::var_os("RM_SPACE_PREPARATION_CGROUP").unwrap());
+        let processes = u32::try_from(pid_limit(&root).unwrap()).unwrap();
+        let available = || ProtectedPreparationCgroup::has_capacity(root.clone(), processes);
+        let reserve = || ProtectedPreparationCgroup::reserve(root.clone(), processes);
+
+        assert!(available().await.unwrap());
+        let first = reserve().await.unwrap().unwrap();
+        assert!(!available().await.unwrap());
+        assert!(reserve().await.unwrap().is_none());
+        first.close().await.unwrap();
+        assert!(available().await.unwrap());
+        reserve().await.unwrap().unwrap().close().await.unwrap();
     }
 }

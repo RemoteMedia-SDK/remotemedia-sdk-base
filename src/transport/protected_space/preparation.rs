@@ -152,8 +152,23 @@ impl ProtectedPreparationSettings {
         })
     }
 
-    pub async fn reserve_cgroup(&self) -> Result<ProtectedPreparationCgroup> {
+    /// Advisory capacity check. The reservation must still verify the budget.
+    pub async fn has_process_capacity(&self) -> Result<bool> {
+        ProtectedPreparationCgroup::has_capacity(self.cgroup_root.clone(), self.processes).await
+    }
+
+    /// Returns `None` when other controllers reserve the remaining budget.
+    pub async fn try_reserve_cgroup(&self) -> Result<Option<ProtectedPreparationCgroup>> {
         ProtectedPreparationCgroup::reserve(self.cgroup_root.clone(), self.processes).await
+    }
+
+    pub async fn reserve_cgroup(&self) -> Result<ProtectedPreparationCgroup> {
+        self.try_reserve_cgroup().await?.ok_or_else(|| {
+            Error::ConfigError(
+                "protected preparation cgroup: protected preparation process capacity is reserved"
+                    .into(),
+            )
+        })
     }
 
     fn validate(&self) -> Result<(&str, &str)> {
