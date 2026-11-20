@@ -95,7 +95,8 @@ impl VerifiedSpaceExecution {
                              "expected_commit": approval.commit, "backend": "cpu"});
         manifest.nodes[0].params["cache"] = json!(root);
         manifest.nodes[0].params["preparation"] = json!({
-            "request": request, "policy_path": policy, "policy_revision": approval.policy_revision
+            "request": request, "policy_path": policy, "policy_revision": approval.policy_revision,
+            "isolated_owner": approval.owner
         });
 
         require_current().await?;

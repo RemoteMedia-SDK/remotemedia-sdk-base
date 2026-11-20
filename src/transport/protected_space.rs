@@ -327,6 +327,15 @@ mod tests {
             assert_eq!(verified.approval().run_id, "run-1");
             assert_eq!(verified.controller_path(), path);
             assert_eq!(verified.manifest().nodes.len(), 1);
+            let mut override_owner = manifest.clone();
+            override_owner["nodes"][0]["params"]["preparation"] =
+                json!({"isolated_owner": "other-peer"});
+            let mut override_approval = approval.clone();
+            let override_bytes = encode(&mut override_approval, &override_owner);
+            assert!(matches!(
+                executor.verify_protected_space(override_approval, &path, &override_bytes),
+                Err(ProtectedSpaceError::Controller)
+            ));
             bytes.push(b' ');
             assert!(matches!(
                 executor.verify_protected_space(approval.clone(), &path, &bytes),

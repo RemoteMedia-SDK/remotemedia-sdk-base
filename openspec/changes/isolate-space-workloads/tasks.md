@@ -1,6 +1,6 @@
 ## 1. Verified execution and artifact handoff
 
-- [ ] 1.1 Add a validated context consumed by runtime and source-plugin loading. Prove node and manifest parameters cannot supply or overwrite trusted policy and authorization.
+- [x] 1.1 Add a validated context consumed by runtime and source-plugin loading. Prove node and manifest parameters cannot supply or overwrite trusted policy and authorization.
 - [x] 1.2 Extend or reuse `crates/bundle-deployment` to verify and pin trusted artifact registrations and complete immutable contents. Check safe paths, target, policy, limits, and closure before making an artifact usable. Publish atomically and lease immutable content for the run.
 - [ ] 1.3 Wire `src/loadable/source_python.rs` and the runtime lifecycle to use trusted control dependencies and a separate provider-backed workload. Expose a run-bound private endpoint to the trusted gateway. Keep provider handles, remote fetch credentials, and IPC outside workload access.
 
