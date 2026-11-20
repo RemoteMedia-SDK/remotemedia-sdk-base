@@ -12,6 +12,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod checkout_storage;
+
 const NODE_TYPE: &str = "PrepareSpaceNode";
 const ENTRY_MODULE: &str = "hf_spaces_runner.nodes";
 const MAX_DESCRIPTOR_BYTES: usize = 1024 * 1024;
@@ -20,6 +22,7 @@ const MAX_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtectedPreparationSettings {
     pub checkout_root: PathBuf,
+    pub checkout_bytes: u64,
     pub policy_file: PathBuf,
     pub python_executable: PathBuf,
     pub cgroup_root: PathBuf,
@@ -60,6 +63,7 @@ impl VerifiedSpaceExecution {
             ));
         }
         let (root, policy) = settings.validate()?;
+        settings.check_checkout_storage()?;
         cgroup.verify_root(&settings.cgroup_root, settings.processes)?;
         require_current().await?;
         self.require_live_preparation()?;
@@ -108,6 +112,7 @@ impl VerifiedSpaceExecution {
 
         require_current().await?;
         self.require_live_preparation()?;
+        settings.check_checkout_storage()?;
         let session = executor
             .build_loaded_session(Arc::new(manifest), false)
             .await?;
@@ -134,10 +139,17 @@ impl VerifiedSpaceExecution {
 }
 
 impl ProtectedPreparationSettings {
-    pub fn check_cgroup(&self) -> Result<()> {
+    pub fn check_resources(&self) -> Result<()> {
+        self.check_checkout_storage()?;
         ProtectedPreparationCgroup::check(&self.cgroup_root, self.processes)
             .map(|_| ())
             .map_err(|error| Error::ConfigError(format!("protected preparation cgroup: {error}")))
+    }
+
+    fn check_checkout_storage(&self) -> Result<()> {
+        checkout_storage::check(&self.checkout_root, self.checkout_bytes).map_err(|error| {
+            Error::ConfigError(format!("protected preparation checkout storage: {error}"))
+        })
     }
 
     pub async fn reserve_cgroup(&self) -> Result<ProtectedPreparationCgroup> {
@@ -203,6 +215,11 @@ fn validate_descriptor(bytes: &str, repository: &str, commit: &str, root: &Path)
         return Err(invalid_descriptor());
     }
     let descriptor: Value = serde_json::from_str(bytes).map_err(|_| invalid_descriptor())?;
+    if descriptor["preparation_error"].as_str() == Some("failed") {
+        return Err(Error::Execution(
+            "protected preparation controller reported failure".into(),
+        ));
+    }
     if descriptor["space_id"].as_str() != Some(repository)
         || descriptor["revision"].as_str() != Some(commit)
         || !descriptor["source_tree_sha256"]
@@ -248,6 +265,8 @@ mod tests {
             validate_descriptor(&descriptor.to_string(), "org/demo", &commit, root.path())
         };
         validate(&expected).unwrap();
+        let failure = validate(&json!({"preparation_error": "failed"})).unwrap_err();
+        assert!(failure.to_string().contains("controller reported failure"));
         let outside = tempfile::tempdir().unwrap();
         let link = root.path().join("host");
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
@@ -266,13 +285,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires the released Spaces controller, prebuilt Python environment, a delegated cgroup, and public Hub access"]
+    #[ignore = "requires a prebuilt Spaces controller, delegated cgroup, bounded checkout mount, and public Hub access"]
     async fn verified_preparation_executes_the_real_source_controller() {
         let plugin = PathBuf::from(std::env::var_os("RM_SPACE_PREPARATION_PLUGIN").unwrap());
         let python = PathBuf::from(std::env::var_os("RM_SPACE_PREPARATION_PYTHON").unwrap());
         let root = tempfile::tempdir().unwrap();
-        let checkout_root = root.path().join("checkouts");
-        std::fs::create_dir(&checkout_root).unwrap();
+        let checkout_root =
+            PathBuf::from(std::env::var_os("RM_SPACE_PREPARATION_CHECKOUT").unwrap());
         let policy_file = root.path().join("policy.json");
         let (mut approval, _, mut manifest) = fixture(ProtectedSpacePhase::Prepare);
         approval.repository = "not-lain/background-removal".into();
@@ -292,6 +311,10 @@ mod tests {
             .unwrap();
         let settings = ProtectedPreparationSettings {
             checkout_root,
+            checkout_bytes: std::env::var("RM_SPACE_PREPARATION_CHECKOUT_BYTES")
+                .unwrap()
+                .parse()
+                .unwrap(),
             policy_file,
             python_executable: python,
             cgroup_root: PathBuf::from(std::env::var_os("RM_SPACE_PREPARATION_CGROUP").unwrap()),
