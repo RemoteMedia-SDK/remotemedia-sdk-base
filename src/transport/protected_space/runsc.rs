@@ -70,6 +70,17 @@ pub enum IsolatedSpaceError {
 }
 
 impl IsolatedSpaceRuntime {
+    pub async fn check_ready(&self) -> Result<(), IsolatedSpaceError> {
+        self.provider
+            .check_ready(std::path::Path::new(&self.launcher))
+            .await?;
+        Ok(())
+    }
+
+    pub fn limits(&self) -> &WorkloadLimits {
+        &self.limits
+    }
+
     /// Reconcile abandoned provider state without opening the artifact registry
     /// or starting a listener. Provider locks exclude a live worker.
     pub async fn reconcile_abandoned(config: RunscConfig) -> Result<(), IsolatedSpaceError> {
