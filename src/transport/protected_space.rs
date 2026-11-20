@@ -42,7 +42,30 @@ pub mod runsc;
 
 /// The protected contract shared with the authenticated admission service.
 pub const PROTECTED_SPACE_CONTRACT_VERSION: u32 = 1;
+pub const PROTECTED_CUDA_TARGET: &str = "linux-amd64-cuda";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+
+/// Isolated CUDA serving requires one canonical NVIDIA physical-device UUID.
+/// Other phases and profiles receive no protected device assignment.
+pub fn valid_protected_device_scope(
+    phase: &str,
+    target: &str,
+    profile: &str,
+    device: Option<&str>,
+) -> bool {
+    let requires_device = (phase, target, profile) == ("serve", PROTECTED_CUDA_TARGET, "isolated");
+    match device {
+        None => !requires_device,
+        Some(device) => {
+            requires_device
+                && device.strip_prefix("GPU-").is_some_and(|value| {
+                    value.len() == 36
+                        && uuid::Uuid::parse_str(value)
+                            .is_ok_and(|id| !id.is_nil() && id.hyphenated().to_string() == value)
+                })
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProtectedSpacePhase {
@@ -68,6 +91,7 @@ pub struct ProtectedSpaceApproval {
     pub commit: String,
     pub target: String,
     pub profile: ProtectedSpaceProfile,
+    pub cuda_device_uuid: Option<String>,
     pub policy_revision: String,
     pub expires_unix: u64,
     pub phase: ProtectedSpacePhase,
@@ -170,6 +194,18 @@ impl ProtectedSpaceApproval {
         ]
         .iter()
         .all(|value| identifier(value))
+            && valid_protected_device_scope(
+                match &self.phase {
+                    ProtectedSpacePhase::Prepare => "prepare",
+                    ProtectedSpacePhase::Serve { .. } => "serve",
+                },
+                &self.target,
+                match self.profile {
+                    ProtectedSpaceProfile::Reviewed => "reviewed",
+                    ProtectedSpaceProfile::Isolated => "isolated",
+                },
+                self.cuda_device_uuid.as_deref(),
+            )
             && self
                 .repository
                 .split_once('/')
@@ -308,6 +344,7 @@ mod tests {
             commit,
             target: "linux-amd64-cpu".into(),
             profile: ProtectedSpaceProfile::Isolated,
+            cuda_device_uuid: None,
             policy_revision: "b".repeat(64),
             expires_unix: u64::MAX,
             phase,
@@ -361,6 +398,47 @@ mod tests {
                 Err(ProtectedSpaceError::Expired)
             ));
         }
+    }
+
+    #[test]
+    fn protected_cuda_assignment_is_bound_to_the_verified_serve_context() {
+        let executor = PipelineExecutor::for_protected_spaces().unwrap();
+        let (mut approval, path, mut manifest) = fixture(ProtectedSpacePhase::Serve {
+            artifact_sha256: "c".repeat(64),
+        });
+        let bytes = encode(&mut approval, &manifest);
+        let uuid = "GPU-12345678-1234-1234-1234-123456789abc";
+        approval.cuda_device_uuid = Some(uuid.into());
+        assert!(matches!(
+            executor.verify_protected_space(approval.clone(), &path, &bytes),
+            Err(ProtectedSpaceError::Approval)
+        ));
+
+        approval.target = PROTECTED_CUDA_TARGET.into();
+        for invalid in [
+            None,
+            Some("GPU-ALL"),
+            Some("GPU-00000000-0000-0000-0000-000000000000"),
+            Some("GPU-12345678-1234-1234-1234-123456789ABC"),
+        ] {
+            let mut invalid_approval = approval.clone();
+            invalid_approval.cuda_device_uuid = invalid.map(str::to_owned);
+            assert!(matches!(
+                executor.verify_protected_space(invalid_approval, &path, &bytes),
+                Err(ProtectedSpaceError::Approval)
+            ));
+        }
+        let verified = executor
+            .verify_protected_space(approval.clone(), &path, &bytes)
+            .unwrap();
+        assert_eq!(verified.approval().cuda_device_uuid.as_deref(), Some(uuid));
+
+        manifest["nodes"][0]["params"]["cuda_device_uuid"] = json!(uuid);
+        let changed = encode(&mut approval, &manifest);
+        assert!(matches!(
+            executor.verify_protected_space(approval, &path, &changed),
+            Err(ProtectedSpaceError::Controller)
+        ));
     }
 
     #[test]
