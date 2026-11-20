@@ -12,6 +12,7 @@ pub use remotemedia_workload_sandbox::runsc::{
 use remotemedia_workload_sandbox::runsc::{RunscProvider, RunscReservation, RunscSandbox};
 use remotemedia_workload_sandbox::{SandboxError, WorkloadPhase, WorkloadRequest, WorkloadTarget};
 pub use remotemedia_workload_sandbox::{WorkloadExit, WorkloadLimits};
+use tokio::io::AsyncReadExt;
 
 use super::{
     ProtectedSpaceApproval, ProtectedSpaceError, ProtectedSpacePhase, ProtectedSpaceProfile,
@@ -100,6 +101,10 @@ impl IsolatedSpaceRuntime {
         &self.limits
     }
 
+    pub fn cuda_device_uuid(&self) -> Option<&str> {
+        self.cuda_device_uuid.as_deref()
+    }
+
     /// Reconcile abandoned provider state without opening the artifact registry
     /// or starting a listener. Provider locks exclude a live worker.
     pub async fn reconcile_abandoned(config: RunscConfig) -> Result<(), IsolatedSpaceError> {
@@ -107,6 +112,25 @@ impl IsolatedSpaceRuntime {
             return Err(IsolatedSpaceError::UnsupportedProfile);
         }
         RunscProvider::open(config).await?;
+        Ok(())
+    }
+
+    /// Recover the original provider's durable CUDA claim even when the GPU
+    /// or driver is unavailable. Release is an explicit operator action.
+    pub async fn reconcile_abandoned_cuda(
+        config: RunscConfig,
+        cuda: &RunscCudaConfig,
+        release_device: bool,
+    ) -> Result<(), IsolatedSpaceError> {
+        if !cfg!(target_arch = "x86_64") {
+            return Err(IsolatedSpaceError::UnsupportedProfile);
+        }
+        let provider =
+            RunscProvider::open_for_exclusive_device(config, &cuda.registry, &cuda.device_uuid)
+                .await?;
+        if release_device {
+            provider.release_exclusive_device().await?;
+        }
         Ok(())
     }
 
@@ -122,7 +146,75 @@ impl IsolatedSpaceRuntime {
         config: IsolatedSpaceConfig,
         cuda: RunscCudaConfig,
     ) -> Result<Self, IsolatedSpaceError> {
-        Self::open_inner(artifacts, config, Some(cuda)).await
+        let runtime = Self::open_inner(artifacts, config, Some(cuda)).await?;
+        runtime.check_ready().await?;
+        runtime.qualify_cuda().await?;
+        Ok(runtime)
+    }
+
+    async fn qualify_cuda(&self) -> Result<(), IsolatedSpaceError> {
+        // The provider runs its trusted GPU verifier before this process. A
+        // reply also proves that the Runner can reach the guest's loopback
+        // service over the private relay. There are no Space inputs.
+        const PROBE: &str = r#"
+import socket
+import sys
+
+with socket.socket() as listener:
+    listener.bind(('127.0.0.1', int(sys.argv[1])))
+    listener.listen()
+    while True:
+        with listener.accept()[0] as client:
+            try:
+                client.sendall(b'cuda-ready')
+            except OSError:
+                pass
+"#;
+        const REPLY: &[u8; 10] = b"cuda-ready";
+        const STARTUP_LIMIT: Duration = Duration::from_secs(30);
+        let sandbox = self
+            .provider
+            .reserve()?
+            .start(WorkloadRequest {
+                target: WorkloadTarget::LinuxCuda,
+                phase: WorkloadPhase::Serve {
+                    loopback_port: self.loopback_port,
+                },
+                limits: WorkloadLimits {
+                    lifetime: self.limits.lifetime.min(STARTUP_LIMIT),
+                    ..self.limits
+                },
+                argv: vec![
+                    "/usr/bin/python3".into(),
+                    "-I".into(),
+                    "-c".into(),
+                    PROBE.into(),
+                    self.loopback_port.to_string(),
+                ],
+            })
+            .await?;
+        let proof = tokio::time::timeout(STARTUP_LIMIT, async {
+            loop {
+                if let Ok(mut relay) = sandbox.open_stream() {
+                    let mut bytes = [0; REPLY.len()];
+                    let read = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        relay.output.read_exact(&mut bytes),
+                    )
+                    .await;
+                    if matches!(read, Ok(Ok(_))) && &bytes == REPLY {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        let exit = sandbox.stop().await?;
+        if proof.is_err() || exit != WorkloadExit::Stopped {
+            return Err(SandboxError::Runtime("CUDA startup qualification").into());
+        }
+        Ok(())
     }
 
     async fn open_inner(
@@ -290,6 +382,10 @@ impl IsolatedSpaceRun {
 impl IsolatedSpaceError {
     pub fn cleanup_pending(&self) -> bool {
         matches!(self, Self::Sandbox(SandboxError::CleanupPending(_)))
+    }
+
+    pub fn capacity_reserved(&self) -> bool {
+        matches!(self, Self::Sandbox(SandboxError::DeviceBusy))
     }
 }
 
