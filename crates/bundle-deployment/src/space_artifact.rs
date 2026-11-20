@@ -61,6 +61,7 @@ pub struct SpaceArtifactLease {
 /// Validated launch metadata returned along with staged artifact bytes.
 pub struct StagedSpaceArtifact {
     pub entry_file: String,
+    pub python_version: String,
     pub python_abi: String,
     pub sdk: String,
 }
@@ -289,9 +290,14 @@ impl SpaceArtifactRegistry {
         &self,
         scope: &SpaceArtifactScope,
     ) -> Result<SpaceArtifactLease, SpaceArtifactError> {
-        let files = tempfile::Builder::new()
-            .prefix("space-")
-            .tempdir_in(self.root.join("leases"))?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("space-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let files = builder.tempdir_in(self.root.join("leases"))?;
         let staged = self.stage_lease(scope, files.path())?;
         Ok(SpaceArtifactLease {
             files,
@@ -334,7 +340,10 @@ impl SpaceArtifactRegistry {
         fs::write(
             &inventory,
             serde_json::to_vec(&serde_json::json!({
-                "version": 1, "python_abi": closure.metadata.python_abi, "wheels": wheel_hashes,
+                "version": 2,
+                "python_version": closure.metadata.python_version,
+                "python_abi": closure.metadata.python_abi,
+                "wheels": wheel_hashes,
             }))?,
         )?;
         set_snapshot_mode(&inventory, 0o444)?;
@@ -407,6 +416,7 @@ fn validate(
         tree,
         StagedSpaceArtifact {
             entry_file: record.entry_file,
+            python_version: record.target.python,
             python_abi: record.target.abi,
             sdk: record.sdk,
         },
@@ -788,7 +798,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             inventory,
-            json!({"version":1, "python_abi":"cp312",
+            json!({"version":2, "python_version":"3.12", "python_abi":"cp312",
             "wheels":{"fixture-1-py3-none-any.whl":hash(WHEEL)}})
         );
         assert_eq!(

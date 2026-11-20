@@ -2,12 +2,16 @@ use super::*;
 
 const APP: &str = r#"
 from pathlib import Path
+import sys
 import time
 import gradio as gr
 
 def respond(file):
     text = Path(file).read_text()
-    yield f"started {text}"
+    marker = Path(sys.prefix) / ".fixture-venv-marker"
+    previous = marker.read_text() if marker.exists() else "fresh"
+    marker.write_text(text)
+    yield f"started {text} (venv: {previous})"
     time.sleep(0.1)
     yield f"finished {text}"
 
@@ -51,29 +55,19 @@ async fn gradio_upload_and_stream_from_locked_wheels() {
         .import_blob(&source_digest, APP.len() as u64, APP.as_bytes())
         .unwrap();
     let tree = json!([["app.py", "file", APP.len(), 0, source_digest]]).to_string();
+    let python = std::env::var("RM_SPACE_TEST_GRADIO_PYTHON").unwrap_or_else(|_| "3.12".into());
     let artifact = json!({
         "version":1, "repository":"org/demo", "commit":"a".repeat(40), "sdk":"gradio", "entry_file":"app.py",
         "source_tree_sha256":hash(tree.as_bytes()),
-        "target":{"platform":"linux", "arch":"x86_64", "python":"3.12", "abi":"cp312", "backend":"cpu"},
+        "target":{"platform":"linux", "arch":"x86_64", "python":python, "abi":"cp312", "backend":"cpu"},
         "wheels":wheels, "models":[],
-    }).to_string();
-    let digest = hash(artifact.as_bytes());
-    let (mut approval, controller, manifest) = fixture(ProtectedSpacePhase::Serve {
-        artifact_sha256: digest.clone(),
     });
-    let scope = SpaceArtifactScope {
-        artifact_sha256: digest,
-        repository: approval.repository.clone(),
-        commit: approval.commit.clone(),
-        target: approval.target.clone(),
-        profile: "isolated".into(),
-        policy_revision: approval.policy_revision.clone(),
-    };
-    registry.register(&scope, &artifact, &tree).unwrap();
-    let bytes = encode(&mut approval, &manifest);
-    let execution = executor
-        .verify_protected_space(approval, &controller, &bytes)
-        .unwrap();
+    let execution = authorize_artifact(&executor, &registry, &artifact, &tree, "original");
+    let sibling = authorize_artifact(&executor, &registry, &artifact, &tree, "sibling");
+    let mut wrong_version = artifact;
+    wrong_version["target"]["python"] = json!("3.12.999");
+    let wrong_version =
+        authorize_artifact(&executor, &registry, &wrong_version, &tree, "wrong-python");
 
     let runtime = IsolatedSpaceRuntime::open(
         registry,
@@ -100,16 +94,45 @@ async fn gradio_upload_and_stream_from_locked_wheels() {
     )
     .await
     .unwrap();
-    let run = runtime
-        .stage(&execution)
-        .await
-        .unwrap()
-        .start(&execution)
-        .await
-        .unwrap();
+    let rejected = runtime.stage(&wrong_version).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        match rejected.start(&wrong_version).await {
+            Ok(run) => assert!(
+                matches!(run.wait().await.unwrap(), WorkloadExit::Exited(code) if code != 0)
+            ),
+            Err(error @ IsolatedSpaceError::Sandbox(_)) => {
+                assert!(!error.cleanup_pending(), "{error}")
+            }
+            Err(error) => panic!("unexpected interpreter mismatch outcome: {error}"),
+        }
+    })
+    .await
+    .expect("an image with a mismatched Python patch stayed active");
+    assert_eq!(fs::read_dir(state.join("bundles")).unwrap().count(), 0);
+    let original = runtime.stage(&execution).await.unwrap();
+    let staged_sibling = runtime.stage(&sibling).await.unwrap();
+    let (run, sibling_run) =
+        tokio::try_join!(original.start(&execution), staged_sibling.start(&sibling)).unwrap();
+    tokio::join!(
+        wait_for_gradio(&run, &execution),
+        wait_for_gradio(&sibling_run, &sibling)
+    );
+    assert!(matches!(
+        run.open_stream(&sibling),
+        Err(IsolatedSpaceError::WrongRun)
+    ));
+    assert_inference(&run, &execution, "original upload", "fresh").await;
+    assert_inference(&sibling_run, &sibling, "sibling upload", "fresh").await;
+    assert_eq!(run.stop().await.unwrap(), WorkloadExit::Stopped);
+    assert_inference(&sibling_run, &sibling, "later upload", "sibling upload").await;
+    assert_eq!(sibling_run.stop().await.unwrap(), WorkloadExit::Stopped);
+    assert_eq!(fs::read_dir(state.join("bundles")).unwrap().count(), 0);
+}
+
+async fn wait_for_gradio(run: &IsolatedSpaceRun, execution: &VerifiedSpaceExecution) {
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            if let Ok(reply) = request(&run, &execution, "GET", "/config", "", "").await {
+            if let Ok(reply) = request(run, execution, "GET", "/config", "", "").await {
                 if reply.starts_with("HTTP/1.1 200 ") {
                     break;
                 }
@@ -119,15 +142,22 @@ async fn gradio_upload_and_stream_from_locked_wheels() {
     })
     .await
     .expect("isolated Gradio did not start");
+}
 
-    let upload = "--rm-test\r\nContent-Disposition: form-data; name=\"files\"; filename=\"example.txt\"\r\nContent-Type: text/plain\r\n\r\nverified upload\r\n--rm-test--\r\n";
+async fn assert_inference(
+    run: &IsolatedSpaceRun,
+    execution: &VerifiedSpaceExecution,
+    text: &str,
+    previous: &str,
+) {
+    let upload = format!("--rm-test\r\nContent-Disposition: form-data; name=\"files\"; filename=\"example.txt\"\r\nContent-Type: text/plain\r\n\r\n{text}\r\n--rm-test--\r\n");
     let reply = request(
-        &run,
-        &execution,
+        run,
+        execution,
         "POST",
         "/gradio_api/upload",
         "multipart/form-data; boundary=rm-test",
-        upload,
+        &upload,
     )
     .await
     .unwrap();
@@ -135,8 +165,8 @@ async fn gradio_upload_and_stream_from_locked_wheels() {
     assert_eq!(paths.len(), 1);
     let input = json!({"data":[{"path":paths[0], "meta":{"_type":"gradio.FileData"}}]}).to_string();
     let reply = request(
-        &run,
-        &execution,
+        run,
+        execution,
         "POST",
         "/gradio_api/call/respond",
         "application/json",
@@ -149,18 +179,47 @@ async fn gradio_upload_and_stream_from_locked_wheels() {
         "/gradio_api/call/respond/{}",
         call["event_id"].as_str().unwrap()
     );
-    let events = request(&run, &execution, "GET", &result_path, "", "")
+    let events = request(run, execution, "GET", &result_path, "", "")
         .await
         .unwrap();
     assert!(events.contains("text/event-stream"), "{events}");
-    let first = events.find("started verified upload").expect(&events);
-    let last = events.find("finished verified upload").expect(&events);
+    let first = events
+        .find(&format!("started {text} (venv: {previous})"))
+        .expect(&events);
+    let last = events.find(&format!("finished {text}")).expect(&events);
     assert!(
         first < last && events.contains("event: complete"),
         "{events}"
     );
-    assert_eq!(run.stop().await.unwrap(), WorkloadExit::Stopped);
-    assert_eq!(fs::read_dir(state.join("bundles")).unwrap().count(), 0);
+}
+
+fn authorize_artifact(
+    executor: &PipelineExecutor,
+    registry: &SpaceArtifactRegistry,
+    artifact: &serde_json::Value,
+    tree: &str,
+    run_id: &str,
+) -> VerifiedSpaceExecution {
+    let artifact = artifact.to_string();
+    let digest = hash(artifact.as_bytes());
+    let (mut approval, controller, manifest) = fixture(ProtectedSpacePhase::Serve {
+        artifact_sha256: digest.clone(),
+    });
+    approval.run_id = run_id.into();
+    approval.session_id = format!("session-{run_id}");
+    let scope = SpaceArtifactScope {
+        artifact_sha256: digest,
+        repository: approval.repository.clone(),
+        commit: approval.commit.clone(),
+        target: approval.target.clone(),
+        profile: "isolated".into(),
+        policy_revision: approval.policy_revision.clone(),
+    };
+    registry.register(&scope, &artifact, tree).unwrap();
+    let bytes = encode(&mut approval, &manifest);
+    executor
+        .verify_protected_space(approval, &controller, &bytes)
+        .unwrap()
 }
 
 fn fixture_path(variable: &str) -> PathBuf {
