@@ -287,7 +287,6 @@ impl PythonStreamingNode {
             let mut executor = crate::python::multiprocess::MultiprocessExecutor::new(config);
             if let Some(preparation) = &self.protected_python {
                 executor.bind_preparation_cgroup(preparation.membership.clone())?;
-                executor.set_spawn_env("PYTHONNOUSERSITE", "1").await;
             }
             if let Some(spawn) = &self.spawn {
                 for module in &spawn.register_modules {

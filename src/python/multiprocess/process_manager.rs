@@ -649,6 +649,10 @@ impl ProcessManager {
 
         // Build command for Python subprocess
         let mut command = Command::new(&spawn_config.python_executable);
+        let preparation_cgroup = self.preparation_cgroup.get();
+        if preparation_cgroup.is_some() {
+            command.env_clear();
+        }
 
         // Add multiprocess runner module
         command.args([
@@ -691,20 +695,39 @@ impl ProcessManager {
             command.env(key, value);
         }
 
-        // Set Python path
-        if !spawn_config.python_path.is_empty() {
-            command.env(
-                "PYTHONPATH",
-                python_path_with_inherited(
-                    &spawn_config.python_path,
-                    std::env::var("PYTHONPATH").ok().as_deref(),
-                ),
-            );
-        }
-
-        // Set working directory
-        if let Some(ref dir) = spawn_config.working_dir {
-            command.current_dir(dir);
+        if preparation_cgroup.is_some() {
+            let controller = spawn_config
+                .python_path
+                .first()
+                .filter(|path| path.is_absolute() && path.is_dir())
+                .ok_or_else(|| {
+                    Error::ConfigError("protected controller import root is unavailable".into())
+                })?;
+            let python_path = std::env::join_paths(&spawn_config.python_path).map_err(|_| {
+                Error::ConfigError("invalid protected controller import path".into())
+            })?;
+            // The released controller and interpreter come from worker approval.
+            command
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("LANG", "C.UTF-8")
+                .env("PYTHONPATH", python_path)
+                .env("PYTHONNOUSERSITE", "1")
+                .env("PYTHONSAFEPATH", "1")
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                .current_dir(controller);
+        } else {
+            if !spawn_config.python_path.is_empty() {
+                command.env(
+                    "PYTHONPATH",
+                    python_path_with_inherited(
+                        &spawn_config.python_path,
+                        std::env::var("PYTHONPATH").ok().as_deref(),
+                    ),
+                );
+            }
+            if let Some(ref dir) = spawn_config.working_dir {
+                command.current_dir(dir);
+            }
         }
 
         // Configure process group and parent-death signal for cleanup
@@ -719,7 +742,7 @@ impl ProcessManager {
             #[cfg(target_os = "linux")]
             unsafe {
                 use std::os::fd::AsRawFd;
-                let membership = self.preparation_cgroup.get().cloned();
+                let membership = preparation_cgroup.cloned();
                 let parent = std::process::id() as libc::pid_t;
                 command.pre_exec(move || {
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
