@@ -70,6 +70,16 @@ pub enum IsolatedSpaceError {
 }
 
 impl IsolatedSpaceRuntime {
+    /// Reconcile abandoned provider state without opening the artifact registry
+    /// or starting a listener. Provider locks exclude a live worker.
+    pub async fn reconcile_abandoned(config: RunscConfig) -> Result<(), IsolatedSpaceError> {
+        if !cfg!(target_arch = "x86_64") {
+            return Err(IsolatedSpaceError::UnsupportedProfile);
+        }
+        RunscProvider::open(config).await?;
+        Ok(())
+    }
+
     pub async fn open(
         artifacts: Arc<SpaceArtifactRegistry>,
         config: IsolatedSpaceConfig,
