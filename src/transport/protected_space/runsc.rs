@@ -10,8 +10,10 @@ pub use remotemedia_workload_sandbox::runsc::{
     ApprovedWheelBuild, RunscConfig, RunscCudaConfig, RunscStream,
 };
 use remotemedia_workload_sandbox::runsc::{RunscProvider, RunscReservation, RunscSandbox};
-use remotemedia_workload_sandbox::{SandboxError, WorkloadPhase, WorkloadRequest, WorkloadTarget};
-pub use remotemedia_workload_sandbox::{WorkloadExit, WorkloadLimits};
+use remotemedia_workload_sandbox::{SandboxError, WorkloadRequest};
+pub use remotemedia_workload_sandbox::{
+    WorkloadCapabilities, WorkloadExit, WorkloadLimits, WorkloadPhase, WorkloadTarget,
+};
 use tokio::io::AsyncReadExt;
 
 use super::{
@@ -23,6 +25,7 @@ use super::{
 mod tests;
 
 const TARGET: &str = "linux-amd64-cpu";
+const SUPPORTED_PROVIDER_CONTRACT: u32 = 1;
 
 /// Build a reviewed dependency using a provider dedicated to the build. The
 /// result remains unpublished until the trusted caller admits its artifact.
@@ -51,6 +54,7 @@ pub struct IsolatedSpaceConfig {
 
 pub struct IsolatedSpaceRuntime {
     provider: RunscProvider,
+    capabilities: WorkloadCapabilities,
     artifacts: Arc<SpaceArtifactRegistry>,
     launcher: String,
     python_abi: String,
@@ -90,6 +94,12 @@ pub enum IsolatedSpaceError {
 }
 
 impl IsolatedSpaceRuntime {
+    /// The versioned provider policy observed at open. Use `check_ready` to
+    /// verify current health and `limits` for the configured resource bounds.
+    pub fn capabilities(&self) -> &WorkloadCapabilities {
+        &self.capabilities
+    }
+
     pub async fn check_ready(&self) -> Result<(), IsolatedSpaceError> {
         self.provider
             .check_ready(std::path::Path::new(&self.launcher))
@@ -235,9 +245,13 @@ with socket.socket() as listener:
                 WorkloadTarget::LinuxCpu,
             ),
         };
-        provider.probe(target).await?;
+        let capabilities = provider.capabilities(target).await?;
+        if capabilities.contract_version != SUPPORTED_PROVIDER_CONTRACT {
+            return Err(IsolatedSpaceError::UnsupportedProfile);
+        }
         Ok(Self {
             provider,
+            capabilities,
             artifacts,
             launcher: config.launcher,
             python_abi: config.python_abi,

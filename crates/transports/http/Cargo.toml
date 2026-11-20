@@ -15,7 +15,7 @@ crate-type = ["rlib"]
 [dependencies]
 # Core runtime (NO transport dependencies)
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../..", default-features = true }
-remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b359edb0d9b55658817d19fd4dc2f8be2b56fd91" }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "232927f4f62b1b6ba4c74b806aa87773ae96c36d" }
 bytes = { workspace = true }
 # Frames on the wire: protobuf remotemedia.v1.DataBuffer
 remotemedia-wire = { path = "../../wire" }

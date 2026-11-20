@@ -142,6 +142,11 @@ async fn registered_lease_launches_in_run_bound_sandbox() {
     )
     .await
     .unwrap();
+    let capabilities = runtime.capabilities();
+    assert_eq!(capabilities.contract_version, 1);
+    assert_eq!(capabilities.target, WorkloadTarget::LinuxCpu);
+    assert!(capabilities.runtime_version.starts_with("runsc version "));
+    assert_eq!(runtime.limits().cpu_millis, 500);
     let executor = PipelineExecutor::for_protected_spaces().unwrap();
     let (_, _, _, wrong_abi) = registered_execution(&executor, &artifacts, "3.11", "cp311");
     assert!(matches!(

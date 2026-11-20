@@ -40,9 +40,9 @@ remotemedia-grpc = { path = "../grpc", optional = true }
 pyo3 = { version = "0.28", features = ["abi3-py311", "auto-initialize"], default-features = false, optional = true }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"], optional = true }
 numpy = { version = "0.28", optional = true }
-remotemedia-python-buffers = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b359edb0d9b55658817d19fd4dc2f8be2b56fd91", optional = true }
-remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b359edb0d9b55658817d19fd4dc2f8be2b56fd91" }
-remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b359edb0d9b55658817d19fd4dc2f8be2b56fd91" }
+remotemedia-python-buffers = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "232927f4f62b1b6ba4c74b806aa87773ae96c36d", optional = true }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "232927f4f62b1b6ba4c74b806aa87773ae96c36d" }
+remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "232927f4f62b1b6ba4c74b806aa87773ae96c36d" }
 
 # Node.js FFI (optional - enabled with napi feature)
 napi = { version = "2", features = ["napi6", "async", "tokio_rt"], optional = true }

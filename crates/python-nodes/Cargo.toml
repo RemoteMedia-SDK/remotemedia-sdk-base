@@ -11,8 +11,8 @@ description = "Python wrapper nodes for RemoteMedia pipelines"
 [dependencies]
 # Core dependency for traits
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../", default-features = false }
-remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b359edb0d9b55658817d19fd4dc2f8be2b56fd91" }
-remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b359edb0d9b55658817d19fd4dc2f8be2b56fd91" }
+remotemedia-traits = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "232927f4f62b1b6ba4c74b806aa87773ae96c36d" }
+remotemedia-types = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "232927f4f62b1b6ba4c74b806aa87773ae96c36d" }
 
 # Async runtime
 tokio.workspace = true
@@ -34,7 +34,7 @@ inventory.workspace = true
 [dev-dependencies]
 remotemedia-core = { package = "remotemedia-sdk-base", path = "../../", default-features = false, features = ["native-worker"] }
 pyo3.workspace = true
-remotemedia-shared-memory = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "b359edb0d9b55658817d19fd4dc2f8be2b56fd91" }
+remotemedia-shared-memory = { git = "https://github.com/RemoteMedia-SDK/remotemedia-plugin-sdk", rev = "232927f4f62b1b6ba4c74b806aa87773ae96c36d" }
 
 [features]
 default = ["multiprocess"]
