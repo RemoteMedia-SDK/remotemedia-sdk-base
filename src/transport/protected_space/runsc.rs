@@ -1,4 +1,4 @@
-//! Verified, run-bound access to the standalone Linux CPU workload provider.
+//! Verified, run-bound access to the standalone Linux workload provider.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,14 +6,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use remotemedia_bundle_deployment::{
     SpaceArtifactError, SpaceArtifactRegistry, SpaceArtifactScope,
 };
-pub use remotemedia_workload_sandbox::runsc::{ApprovedWheelBuild, RunscConfig, RunscStream};
+pub use remotemedia_workload_sandbox::runsc::{
+    ApprovedWheelBuild, RunscConfig, RunscCudaConfig, RunscStream,
+};
 use remotemedia_workload_sandbox::runsc::{RunscProvider, RunscReservation, RunscSandbox};
 use remotemedia_workload_sandbox::{SandboxError, WorkloadPhase, WorkloadRequest, WorkloadTarget};
 pub use remotemedia_workload_sandbox::{WorkloadExit, WorkloadLimits};
 
 use super::{
     ProtectedSpaceApproval, ProtectedSpaceError, ProtectedSpacePhase, ProtectedSpaceProfile,
-    VerifiedSpaceExecution,
+    VerifiedSpaceExecution, PROTECTED_CUDA_TARGET,
 };
 
 #[cfg(test)]
@@ -53,6 +55,7 @@ pub struct IsolatedSpaceRuntime {
     python_abi: String,
     loopback_port: u16,
     limits: WorkloadLimits,
+    cuda_device_uuid: Option<String>,
 }
 
 pub struct PreparedIsolatedSpace {
@@ -73,7 +76,7 @@ pub enum IsolatedSpaceError {
     Approval(#[from] ProtectedSpaceError),
     #[error("the verified execution does not match this run")]
     WrongRun,
-    #[error("the Linux CPU sandbox cannot provide the approved phase or profile")]
+    #[error("the Linux sandbox cannot provide the approved phase, target or device")]
     UnsupportedProfile,
     #[error("the verified artifact requires a different Python ABI")]
     WrongPythonAbi,
@@ -111,11 +114,36 @@ impl IsolatedSpaceRuntime {
         artifacts: Arc<SpaceArtifactRegistry>,
         config: IsolatedSpaceConfig,
     ) -> Result<Self, IsolatedSpaceError> {
+        Self::open_inner(artifacts, config, None).await
+    }
+
+    pub async fn open_cuda(
+        artifacts: Arc<SpaceArtifactRegistry>,
+        config: IsolatedSpaceConfig,
+        cuda: RunscCudaConfig,
+    ) -> Result<Self, IsolatedSpaceError> {
+        Self::open_inner(artifacts, config, Some(cuda)).await
+    }
+
+    async fn open_inner(
+        artifacts: Arc<SpaceArtifactRegistry>,
+        config: IsolatedSpaceConfig,
+        cuda: Option<RunscCudaConfig>,
+    ) -> Result<Self, IsolatedSpaceError> {
         if !cfg!(target_arch = "x86_64") {
             return Err(IsolatedSpaceError::UnsupportedProfile);
         }
-        let provider = RunscProvider::open(config.runtime).await?;
-        provider.probe(WorkloadTarget::LinuxCpu).await?;
+        let (provider, target) = match &cuda {
+            Some(cuda) => (
+                RunscProvider::open_cuda(config.runtime, cuda).await?,
+                WorkloadTarget::LinuxCuda,
+            ),
+            None => (
+                RunscProvider::open(config.runtime).await?,
+                WorkloadTarget::LinuxCpu,
+            ),
+        };
+        provider.probe(target).await?;
         Ok(Self {
             provider,
             artifacts,
@@ -123,6 +151,7 @@ impl IsolatedSpaceRuntime {
             python_abi: config.python_abi,
             loopback_port: config.loopback_port,
             limits: config.limits,
+            cuda_device_uuid: cuda.map(|cuda| cuda.device_uuid),
         })
     }
 
@@ -137,9 +166,7 @@ impl IsolatedSpaceRuntime {
         let ProtectedSpacePhase::Serve { artifact_sha256 } = &approval.phase else {
             return Err(IsolatedSpaceError::UnsupportedProfile);
         };
-        if approval.profile != ProtectedSpaceProfile::Isolated || approval.target != TARGET {
-            return Err(IsolatedSpaceError::UnsupportedProfile);
-        }
+        let target = placement_target(approval, self.cuda_device_uuid.as_deref())?;
         let scope = SpaceArtifactScope {
             artifact_sha256: artifact_sha256.clone(),
             repository: approval.repository.clone(),
@@ -164,7 +191,7 @@ impl IsolatedSpaceRuntime {
             approval: approval.clone(),
             reservation,
             request: WorkloadRequest {
-                target: WorkloadTarget::LinuxCpu,
+                target,
                 phase: WorkloadPhase::Serve {
                     loopback_port: self.loopback_port,
                 },
@@ -178,6 +205,24 @@ impl IsolatedSpaceRuntime {
             },
         })
     }
+}
+
+fn placement_target(
+    approval: &ProtectedSpaceApproval,
+    assigned_cuda: Option<&str>,
+) -> Result<WorkloadTarget, IsolatedSpaceError> {
+    let (required_target, target) = if assigned_cuda.is_some() {
+        (PROTECTED_CUDA_TARGET, WorkloadTarget::LinuxCuda)
+    } else {
+        (TARGET, WorkloadTarget::LinuxCpu)
+    };
+    if approval.profile != ProtectedSpaceProfile::Isolated
+        || approval.target != required_target
+        || approval.cuda_device_uuid.as_deref() != assigned_cuda
+    {
+        return Err(IsolatedSpaceError::UnsupportedProfile);
+    }
+    Ok(target)
 }
 
 impl PreparedIsolatedSpace {

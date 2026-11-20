@@ -17,6 +17,29 @@ const MODEL: &str = "verified model";
 
 mod gradio;
 
+#[test]
+fn runtime_placement_requires_the_configured_cuda_uuid_and_target() {
+    const ASSIGNED: &str = "GPU-11111111-1111-1111-1111-111111111111";
+    const OTHER: &str = "GPU-22222222-2222-2222-2222-222222222222";
+    let (mut approval, _, _) = fixture(ProtectedSpacePhase::Serve {
+        artifact_sha256: "a".repeat(64),
+    });
+    assert_eq!(
+        placement_target(&approval, None).unwrap(),
+        WorkloadTarget::LinuxCpu
+    );
+    assert!(placement_target(&approval, Some(ASSIGNED)).is_err());
+    approval.target = PROTECTED_CUDA_TARGET.into();
+    approval.cuda_device_uuid = Some(OTHER.into());
+    assert!(placement_target(&approval, None).is_err());
+    assert!(placement_target(&approval, Some(ASSIGNED)).is_err());
+    approval.cuda_device_uuid = Some(ASSIGNED.into());
+    assert_eq!(
+        placement_target(&approval, Some(ASSIGNED)).unwrap(),
+        WorkloadTarget::LinuxCuda
+    );
+}
+
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
